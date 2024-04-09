@@ -17,3 +17,9 @@ pub struct SystemLogWriteRequest {
 pub enum HttpCommand {
     WriteLog(SystemLogWriteRequest),
 }
+
+impl From<SystemLogWriteRequest> for HttpCommand {
+    fn from(v: SystemLogWriteRequest) -> Self {
+        Self::WriteLog(v)
+    }
+}

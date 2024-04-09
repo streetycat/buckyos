@@ -4,7 +4,7 @@ use crate::{inner_types::SystemLogWriteRequest, LogLever, LogType};
 
 pub struct SystemLog {
     log_type: LogType,
-    url: tide::http::Url,
+    url: String,
     node: String,
 }
 
@@ -16,7 +16,7 @@ impl SystemLog {
 
         Some(Self {
             log_type,
-            url: tide::http::Url::parse(format!("http://127.0.0.1:{}/log", port).as_str()).unwrap(),
+            url: format!("http://127.0.0.1:{}/log", port),
             node: node.to_string(),
         })
     }

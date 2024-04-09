@@ -2,6 +2,6 @@
 resolver = "2"
 
 members = [
-    "./component/kLog",
-    "./component/kLog-iter",
+    "./component/kLog/logger",
+    "./component/kLog/visitor",
 ]

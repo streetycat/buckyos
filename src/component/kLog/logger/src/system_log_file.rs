@@ -46,7 +46,7 @@ impl LogFile {
             return;
         }
 
-        let mut buf = match (serde_json::to_vec(log)) {
+        let mut buf = match serde_json::to_vec(log) {
             Ok(buf) => buf,
             Err(err) => {
                 log::error!(
