@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task;
 
-use buckyos_kit::*;
 use buckyos_api::*;
+use buckyos_kit::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
@@ -21,8 +21,7 @@ use std::os::windows::ffi::OsStrExt;
 use windows::core::PCWSTR;
 #[cfg(windows)]
 use windows::{
-    Win32::UI::Shell::ShellExecuteW,
-    Win32::Foundation::HINSTANCE,
+    Win32::Foundation::HINSTANCE, Win32::UI::Shell::ShellExecuteW,
     Win32::UI::WindowsAndMessaging::SW_HIDE,
 };
 
@@ -50,7 +49,7 @@ struct BuckyStatusScanerMgr {
 
 #[repr(C)]
 #[derive(PartialEq, Eq, Copy, Clone)]
-enum BuckyStatus {
+pub enum BuckyStatus {
     Running = 0,
     Stopped = 1,
     NotActive = 2,
@@ -61,11 +60,12 @@ enum BuckyStatus {
 #[repr(C)]
 struct BuckyStatusScaner(u32);
 
+#[derive(Clone)]
 struct NodeInfomationObj {
     node_id: String,
     home_page_url: String,
     node_host_name: String,
-    sys_cfg_client: buckyos_api::SystemConfigClient,
+    sys_cfg_client: Arc<buckyos_api::SystemConfigClient>,
 }
 
 #[repr(C)]
@@ -113,74 +113,11 @@ extern "C" fn bucky_status_scaner_scan(
                 },
                 _ = tokio::time::sleep(interval).fuse() => {
                     let old_status = status;
-                    status = BuckyStatus::Stopped;
+                    status = get_bucky_status().await;
 
-                    let bin_dir = get_buckyos_system_bin_dir();
-
-                    log::info!("buckyos has been installed at: {:?}", bin_dir);
-
-                    let is_dir = match fs::metadata(bin_dir) {
-                        Ok(meta) if meta.is_dir() => true,
-                        _ => false
-                    };
-                    if !is_dir {
-                        status = BuckyStatus::NotInstall;
-                        interval = std::time::Duration::from_millis(5000);
-                        log::warn!("buckyos status: NotInstall");
-                    }
-
-                    if status != BuckyStatus::NotInstall {
-                        let mut system = System::new_all();
-                        system.refresh_all();
-                        let mut exist_process = HashSet::new();
-                        
-                        #[cfg(windows)]
-                        let ext_path = ".exe";
-                        
-                        #[cfg(not(any(windows, target_os = "macos")))]
-                        let ext_path = "";
-
-                        let mut not_exist_process = buckyos_process.iter().map(|name| name.to_string() + ext_path).collect::<HashSet<_>>();
-                        let node_daemon_process = "node_daemon".to_string() + ext_path;
-
-                        for process in system.processes().values() {
-                            let name = process.name().to_ascii_lowercase().into_string().unwrap();
-
-                            if node_daemon_process == name {
-                                unsafe {
-                                    let info = get_node_info_impl().await;
-                                    if info.is_null() || (*info).node_id.is_null() {
-                                        status = BuckyStatus::NotActive;
-                                        log::warn!("buckyos status: NotActive");
-                                    } else {
-                                        status = BuckyStatus::Running;
-                                        log::info!("buckyos status: Running");
-                                    }
-                                    free_node_info(info);
-                                }
-                                interval = std::time::Duration::from_millis(5000);
-                                break;
-                            }
-
-                            if buckyos_process.contains(name.as_str()) {
-                                not_exist_process.remove(name.as_str());
-                                exist_process.insert(name);
-                            }
-                        }
-
-                        if status != BuckyStatus::Running && status != BuckyStatus::NotActive {
-                            if !not_exist_process.is_empty() {
-                                if !exist_process.is_empty() {
-                                    status = BuckyStatus::Failed;
-                                    interval = std::time::Duration::from_millis(500);
-                                    log::warn!("buckyos status: Failed");
-                                } else {
-                                    status = BuckyStatus::Stopped;
-                                    interval = std::time::Duration::from_millis(5000);
-                                    log::warn!("buckyos status: Stopped");
-                                }
-                            }
-                        }
+                    match status {
+                        BuckyStatus::NotInstall | BuckyStatus::NotActive | BuckyStatus::Stopped => interval = std::time::Duration::from_millis(5000),
+                        BuckyStatus::Running | BuckyStatus::Failed => interval = std::time::Duration::from_millis(500)
                     }
 
                     if status != old_status {
@@ -199,6 +136,79 @@ extern "C" fn bucky_status_scaner_scan(
 
         Box::into_raw(Box::new(BuckyStatusScaner(seq)))
     })
+}
+
+pub async fn get_bucky_status() -> BuckyStatus {
+    let mut status = BuckyStatus::Stopped;
+
+    let bin_dir = get_buckyos_system_bin_dir();
+
+    log::info!("buckyos has been installed at: {:?}", bin_dir);
+
+    let is_dir = match fs::metadata(bin_dir) {
+        Ok(meta) if meta.is_dir() => true,
+        _ => false,
+    };
+    if !is_dir {
+        status = BuckyStatus::NotInstall;
+        log::warn!("buckyos status: NotInstall");
+    }
+
+    if status != BuckyStatus::NotInstall {
+        let mut system = System::new_all();
+        system.refresh_all();
+        let mut exist_process = HashSet::new();
+
+        #[cfg(windows)]
+        let ext_path = ".exe";
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let ext_path = "";
+
+        let mut not_exist_process = buckyos_process
+            .iter()
+            .map(|name| name.to_string() + ext_path)
+            .collect::<HashSet<_>>();
+        let node_daemon_process = "node_daemon".to_string() + ext_path;
+
+        for process in system.processes().values() {
+            let name = process.name().to_ascii_lowercase().into_string().unwrap();
+
+            if node_daemon_process == name {
+                let info = get_node_info_impl().await;
+                match info.as_ref() {
+                    Some(_) => {
+                        status = BuckyStatus::Running;
+                        log::info!("buckyos status: Running");
+                    }
+                    None => {
+                        status = BuckyStatus::NotActive;
+                        log::warn!("buckyos status: NotActive");
+                    }
+                }
+                break;
+            }
+
+            if buckyos_process.contains(name.as_str()) {
+                not_exist_process.remove(name.as_str());
+                exist_process.insert(name);
+            }
+        }
+
+        if status != BuckyStatus::Running && status != BuckyStatus::NotActive {
+            if !not_exist_process.is_empty() {
+                if !exist_process.is_empty() {
+                    status = BuckyStatus::Failed;
+                    log::warn!("buckyos status: Failed");
+                } else {
+                    status = BuckyStatus::Stopped;
+                    log::warn!("buckyos status: Stopped");
+                }
+            }
+        }
+    }
+
+    status
 }
 
 #[no_mangle]
@@ -569,12 +579,15 @@ async fn looking_zone_config(
         //owner zone is a NAME, need query NameInfo to get DID
         log::info!("owner zone is a NAME, try nameclient.query to get did");
 
-        let zone_jwt = name_client::resolve(node_identity.zone_name.as_str(), Some(name_client::RecordType::DID))
-            .await
-            .map_err(|err| {
-                log::error!("query zone config by nameclient failed! {}", err);
-                "query zone config failed!".to_string()
-            })?;
+        let zone_jwt = name_client::resolve(
+            node_identity.zone_name.as_str(),
+            Some(name_client::RecordType::DID),
+        )
+        .await
+        .map_err(|err| {
+            log::error!("query zone config by nameclient failed! {}", err);
+            "query zone config failed!".to_string()
+        })?;
 
         if zone_jwt.did_document.is_none() {
             log::error!("get zone jwt failed!");
@@ -715,15 +728,14 @@ async fn select_node() -> Result<Option<NodeInfomationObj>, String> {
             node_id: node_id.to_owned(),
             home_page_url: format!("http://{}.web3.buckyos.io", cfg.owner_name),
             node_host_name: device_doc.name,
-            sys_cfg_client,
+            sys_cfg_client: Arc::new(sys_cfg_client),
         }))
     } else {
         Ok(None)
     }
 }
 
-
-async fn get_node_info_impl() -> *mut NodeInfomation {
+async fn get_node_info_impl() -> Option<NodeInfomationObj> {
     let mut info = node_infomation.lock().await;
     let is_actived = info.is_some();
     if !is_actived {
@@ -732,33 +744,34 @@ async fn get_node_info_impl() -> *mut NodeInfomation {
         }
     }
 
-    let is_actived = info.is_some();
-    let c_info = if is_actived {
-        let info = info.as_ref().unwrap();
-        NodeInfomation {
-            node_id: CString::new(info.node_id.clone())
-                .expect("no memory for c_node_id")
-                .into_raw(),
-            home_page_url: CString::new(info.home_page_url.clone())
-                .expect("no memory for c_home_page_url")
-                .into_raw(),
-        }
-    } else {
-        NodeInfomation {
-            node_id: std::ptr::null_mut(),
-            home_page_url: CString::new("http://127.0.0.1:3180/index.html")
-                .expect("no memory for c_home_page_url")
-                .into_raw(),
-        }
-    };
-
-    Box::into_raw(Box::new(c_info))
+    info.clone()
 }
 
 #[no_mangle]
 extern "C" fn get_node_info() -> *mut NodeInfomation {
     g_runtime.block_on(async move {
-        get_node_info_impl().await
+        let info = get_node_info_impl().await;
+        let is_actived = info.is_some();
+        let c_info = if is_actived {
+            let info = info.as_ref().unwrap();
+            NodeInfomation {
+                node_id: CString::new(info.node_id.clone())
+                    .expect("no memory for c_node_id")
+                    .into_raw(),
+                home_page_url: CString::new(info.home_page_url.clone())
+                    .expect("no memory for c_home_page_url")
+                    .into_raw(),
+            }
+        } else {
+            NodeInfomation {
+                node_id: std::ptr::null_mut(),
+                home_page_url: CString::new("http://127.0.0.1:3180/index.html")
+                    .expect("no memory for c_home_page_url")
+                    .into_raw(),
+            }
+        };
+
+        Box::into_raw(Box::new(c_info))
     })
 }
 
@@ -793,7 +806,11 @@ fn run_as_admin(command: &str, parameters: Option<&str>) -> Result<HINSTANCE, ()
             None,
             PCWSTR(operation.as_ptr() as *const u16),
             PCWSTR(command_wide.as_ptr() as *const u16),
-            PCWSTR(params_wide.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()) as *const u16),
+            PCWSTR(
+                params_wide
+                    .as_ref()
+                    .map_or(std::ptr::null(), |v| v.as_ptr()) as *const u16,
+            ),
             PCWSTR(std::ptr::null() as *const u16),
             SW_HIDE,
         )
@@ -850,7 +867,7 @@ extern "C" fn start_buckyos() {
     //     Ok(_) => println!("Process started successfully"),
     //     Err(e) => eprintln!("Failed to start process: {}", e),
     // }
-    
+
     #[cfg(windows)]
     let _ = start_buckyos_service();
 }

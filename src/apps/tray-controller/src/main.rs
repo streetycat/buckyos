@@ -1,4 +1,5 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs::OpenOptions;
 use std::process;
@@ -9,14 +10,8 @@ use fs2::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 
-mod ffi_extern;
-
-#[cfg(any(windows, target_os = "macos"))]
-extern "C" {
-    fn entry();
-}
-
-fn main() {
+#[tokio::main]
+async fn main() {
     init_logging("tray-controller", true);
 
     let mut file = OpenOptions::new();
@@ -33,10 +28,7 @@ fn main() {
         Ok(_) => {
             log::info!("buckyos tray-controller started.");
 
-            #[cfg(any(windows, target_os = "macos"))]
-            unsafe {
-                entry();
-            }
+            app_lib::run();
 
             #[cfg(not(any(windows, target_os = "macos")))]
             log::error!("only for windows/macos.")
