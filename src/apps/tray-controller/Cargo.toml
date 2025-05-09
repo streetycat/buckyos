@@ -35,7 +35,9 @@ buckyos-api = { path = "../../kernel/buckyos-api" }
 kRPC = { path = "../../kernel/kRPC" }
 fs2 = "*"
 tauri = { version = "2.5.0" , features = ["tray-icon", "image-ico"]}
-tauri-plugin-log = "2.0.0-rc"
+tauri-plugin-log = "2.4.0"
+# tauri_plugin_dialog = "2.2.1"
+webbrowser = "1.0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "*", features = ["Win32_System_Services", "Win32_UI", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

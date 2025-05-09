@@ -61,11 +61,11 @@ pub enum BuckyStatus {
 struct BuckyStatusScaner(u32);
 
 #[derive(Clone)]
-struct NodeInfomationObj {
-    node_id: String,
-    home_page_url: String,
-    node_host_name: String,
-    sys_cfg_client: Arc<buckyos_api::SystemConfigClient>,
+pub struct NodeInfomationObj {
+    pub node_id: String,
+    pub home_page_url: String,
+    pub node_host_name: String,
+    pub sys_cfg_client: Arc<buckyos_api::SystemConfigClient>,
 }
 
 #[repr(C)]
@@ -175,7 +175,7 @@ pub async fn get_bucky_status() -> BuckyStatus {
             let name = process.name().to_ascii_lowercase().into_string().unwrap();
 
             if node_daemon_process == name {
-                let info = get_node_info_impl().await;
+                let info = get_node_info_rust().await;
                 match info.as_ref() {
                     Some(_) => {
                         status = BuckyStatus::Running;
@@ -235,12 +235,13 @@ struct ApplicationInfo {
     is_running: c_char,
 }
 
-struct ApplicationInfoRust {
-    id: String,
-    name: String,
-    icon_path: String,
-    home_page_url: String,
-    is_running: bool,
+#[derive(Clone)]
+pub struct ApplicationInfoRust {
+    pub id: String,
+    pub name: String,
+    pub icon_path: String,
+    pub home_page_url: String,
+    pub is_running: bool,
 }
 
 type ListAppCallback = extern "C" fn(
@@ -388,33 +389,38 @@ async fn set_node_config(
     Ok(())
 }
 
-async fn list_application_rust(
-    node_host_name: &str,
-    buckyos_api_client: &buckyos_api::SystemConfigClient,
-) -> Result<Vec<ApplicationInfoRust>, String> {
-    let node_config = load_node_config(node_host_name, buckyos_api_client)
-        .await
-        .map_err(|err| {
-            log::error!("load node config failed! {}", err);
-            "cann't load node config!".to_string()
-        })?;
+pub async fn list_application_rust() -> Result<Vec<ApplicationInfoRust>, String> {
+    let info = node_infomation.lock().await;
 
-    let apps = node_config
-        .apps
-        .into_iter()
-        .map(|(app_id_with_name, app_cfg)| {
-            let target_state = RunItemTargetState::from_str(&app_cfg.target_state).unwrap();
-            ApplicationInfoRust {
-                id: app_id_with_name.clone(),
-                name: app_id_with_name,
-                icon_path: "".to_string(),
-                home_page_url: "https://www.google.com".to_string(),
-                is_running: target_state == RunItemTargetState::Running,
-            }
-        })
-        .collect::<Vec<_>>();
+    if let Some(node_info) = info.as_ref() {
+        let node_host_name = node_info.node_host_name.as_str();
+        let buckyos_api_client = &node_info.sys_cfg_client;
 
-    Ok(apps)
+        let node_config = load_node_config(node_host_name, buckyos_api_client)
+            .await
+            .map_err(|err| {
+                log::error!("load node config failed! {}", err);
+                "cann't load node config!".to_string()
+            })?;
+
+        let apps = node_config
+            .apps
+            .into_iter()
+            .map(|(app_id_with_name, app_cfg)| {
+                let target_state = RunItemTargetState::from_str(&app_cfg.target_state).unwrap();
+                ApplicationInfoRust {
+                    id: app_id_with_name.clone(),
+                    name: app_id_with_name,
+                    icon_path: "".to_string(),
+                    home_page_url: "https://www.google.com".to_string(),
+                    is_running: target_state == RunItemTargetState::Running,
+                }
+            })
+            .collect::<Vec<_>>();
+        Ok(apps)
+    } else {
+        Ok(vec![])
+    }
 }
 
 #[no_mangle]
@@ -430,28 +436,22 @@ extern "C" fn list_application(seq: c_int, callback: ListAppCallback, userdata: 
     g_runtime.spawn(async move {
         let mut apps = vec![];
         {
-            let info = node_infomation.lock().await;
-            if let Some(node_info) = info.as_ref() {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(500),
-                    list_application_rust(
-                        node_info.node_host_name.as_str(),
-                        &node_info.sys_cfg_client,
-                    ),
-                )
-                .await
-                {
-                    Ok(result_apps) => match result_apps {
-                        Ok(mut result_apps) => {
-                            std::mem::swap(&mut apps, &mut result_apps);
-                        }
-                        Err(err) => {
-                            log::error!("{}", err);
-                        }
-                    },
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                list_application_rust(),
+            )
+            .await
+            {
+                Ok(result_apps) => match result_apps {
+                    Ok(mut result_apps) => {
+                        std::mem::swap(&mut apps, &mut result_apps);
+                    }
                     Err(err) => {
                         log::error!("{}", err);
                     }
+                },
+                Err(err) => {
+                    log::error!("{}", err);
                 }
             }
         }
@@ -735,7 +735,7 @@ async fn select_node() -> Result<Option<NodeInfomationObj>, String> {
     }
 }
 
-async fn get_node_info_impl() -> Option<NodeInfomationObj> {
+pub async fn get_node_info_rust() -> Option<NodeInfomationObj> {
     let mut info = node_infomation.lock().await;
     let is_actived = info.is_some();
     if !is_actived {
@@ -750,7 +750,7 @@ async fn get_node_info_impl() -> Option<NodeInfomationObj> {
 #[no_mangle]
 extern "C" fn get_node_info() -> *mut NodeInfomation {
     g_runtime.block_on(async move {
-        let info = get_node_info_impl().await;
+        let info = get_node_info_rust().await;
         let is_actived = info.is_some();
         let c_info = if is_actived {
             let info = info.as_ref().unwrap();
@@ -834,7 +834,7 @@ fn stop_buckyos_service() -> Result<HINSTANCE, ()> {
 }
 
 #[no_mangle]
-extern "C" fn start_buckyos() {
+pub extern "C" fn start_buckyos() {
     // let deamon_path = get_buckyos_system_bin_dir().join("node_deamon");
 
     // #[cfg(windows)]
@@ -873,7 +873,7 @@ extern "C" fn start_buckyos() {
 }
 
 #[no_mangle]
-extern "C" fn stop_buckyos() {
+pub extern "C" fn stop_buckyos() {
     #[cfg(windows)]
     let _ = stop_buckyos_service();
 
@@ -899,26 +899,43 @@ extern "C" fn stop_buckyos() {
     }
 }
 
+pub async fn start_app_rust(app_id: &str) {
+    let info = node_infomation.lock().await;
+    if let Some(node_info) = info.as_ref() {
+        let _ = set_node_config(
+            node_info.node_host_name.as_str(),
+            &node_info.sys_cfg_client,
+            format!("apps/{:?}/target_state", app_id).as_str(),
+            "Running",
+        )
+        .await;
+    }
+}
 #[no_mangle]
 extern "C" fn start_app(app_id: *mut c_char) {
     if app_id.is_null() {
         return;
     }
     let c_app_id = unsafe { CString::from_raw(app_id) };
+    let app_id = format!("{:?}", c_app_id);
+    let _ = c_app_id.into_raw();
 
     g_runtime.block_on(async move {
-        let info = node_infomation.lock().await;
-        if let Some(node_info) = info.as_ref() {
-            let _ = set_node_config(
-                node_info.node_host_name.as_str(),
-                &node_info.sys_cfg_client,
-                format!("apps/{:?}/target_state", c_app_id).as_str(),
-                "Running",
-            )
-            .await;
-        }
-        let _ = c_app_id.into_raw();
+        start_app_rust(app_id.as_str()).await;
     });
+}
+
+pub async fn stop_app_rust(app_id: &str) {
+    let info = node_infomation.lock().await;
+    if let Some(node_info) = info.as_ref() {
+        let _ = set_node_config(
+            node_info.node_host_name.as_str(),
+            &node_info.sys_cfg_client,
+            format!("apps/{:?}/target_state", app_id).as_str(),
+            "Stopped",
+        )
+        .await;
+    }
 }
 
 #[no_mangle]
@@ -927,18 +944,8 @@ extern "C" fn stop_app(app_id: *mut c_char) {
         return;
     }
     let c_app_id = unsafe { CString::from_raw(app_id) };
+    let app_id = format!("{:?}", c_app_id);
+    let _ = c_app_id.into_raw();
 
-    g_runtime.block_on(async move {
-        let info = node_infomation.lock().await;
-        if let Some(node_info) = info.as_ref() {
-            let _ = set_node_config(
-                node_info.node_host_name.as_str(),
-                &node_info.sys_cfg_client,
-                format!("apps/{:?}/target_state", c_app_id).as_str(),
-                "Stopped",
-            )
-            .await;
-        }
-        let _ = c_app_id.into_raw();
-    });
+    g_runtime.block_on(async move { stop_app_rust(app_id.as_str()).await });
 }
