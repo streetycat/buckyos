@@ -48,7 +48,7 @@ struct BuckyStatusScanerMgr {
 }
 
 #[repr(C)]
-#[derive(PartialEq, Eq, Copy, Clone)]
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum BuckyStatus {
     Running = 0,
     Stopped = 1,
