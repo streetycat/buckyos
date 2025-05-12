@@ -25,6 +25,8 @@ use windows::{
     Win32::UI::WindowsAndMessaging::SW_HIDE,
 };
 
+pub const ACTIVE_PAGE_URL: &str = "http://127.0.0.1:3180/index.html";
+
 lazy_static::lazy_static! {
     static ref g_runtime: tokio::runtime::Runtime = tokio::runtime::Runtime::new().unwrap();
 
