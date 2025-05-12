@@ -190,7 +190,7 @@ fn entry_rust() {
                                 match bucky_status {
                                     BuckyStatus::Running => "Stop",
                                     BuckyStatus::Stopped => "Start",
-                                    BuckyStatus::NotActive => "Active",
+                                    BuckyStatus::NotActive => "Stop",
                                     BuckyStatus::NotInstall => "Install",
                                     BuckyStatus::Failed => "Stop",
                                 },
@@ -238,15 +238,7 @@ fn entry_rust() {
                                     match bucky_status {
                                         BuckyStatus::Running => stop_buckyos(),
                                         BuckyStatus::Stopped => start_buckyos(),
-                                        BuckyStatus::NotActive => {
-                                            webbrowser::open(ACTIVE_PAGE_URL).map_err(|err| {
-                                                log::error!(
-                                                    "open home page failed: {}, {:?}",
-                                                    ACTIVE_PAGE_URL,
-                                                    err
-                                                )
-                                            });
-                                        }
+                                        BuckyStatus::NotActive => stop_buckyos(),
                                         BuckyStatus::NotInstall => unimplemented!("Install"),
                                         BuckyStatus::Failed => stop_buckyos(),
                                     }
