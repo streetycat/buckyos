@@ -872,6 +872,19 @@ pub extern "C" fn start_buckyos() {
 
     #[cfg(windows)]
     let _ = start_buckyos_service();
+
+    let output = std::process::Command::new("python")
+        .arg(format!(
+            "{:?}/start_node_daemon.py",
+            get_buckyos_system_bin_dir()
+        ))
+        .output()
+        .expect("start_node_daemon.py execute failed.");
+
+    log::info!(
+        "stop-buckyos: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 #[no_mangle]
@@ -879,26 +892,36 @@ pub extern "C" fn stop_buckyos() {
     #[cfg(windows)]
     let _ = stop_buckyos_service();
 
-    let mut system = System::new_all();
-    system.refresh_all();
+    let output = std::process::Command::new("python")
+        .arg(format!("{:?}/killall.py", get_buckyos_system_bin_dir()))
+        .output()
+        .expect("killall.py execute failed.");
 
-    let mut kill_count = 0;
-    for (_, process) in system.processes() {
-        let name = std::path::PathBuf::from(process.name());
+    log::info!(
+        "stop-buckyos: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 
-        #[cfg(windows)]
-        let name = name.with_extension("");
+    // let mut system = System::new_all();
+    // system.refresh_all();
 
-        let name = name.as_os_str().to_ascii_lowercase().into_string().unwrap();
+    // let mut kill_count = 0;
+    // for (_, process) in system.processes() {
+    //     let name = std::path::PathBuf::from(process.name());
 
-        if buckyos_process.contains(name.as_str()) {
-            process.kill();
-            kill_count += 1;
-            if kill_count >= buckyos_process.len() {
-                break;
-            }
-        }
-    }
+    //     #[cfg(windows)]
+    //     let name = name.with_extension("");
+
+    //     let name = name.as_os_str().to_ascii_lowercase().into_string().unwrap();
+
+    //     if buckyos_process.contains(name.as_str()) {
+    //         process.kill();
+    //         kill_count += 1;
+    //         if kill_count >= buckyos_process.len() {
+    //             break;
+    //         }
+    //     }
+    // }
 }
 
 pub async fn start_app_rust(app_id: &str) {
