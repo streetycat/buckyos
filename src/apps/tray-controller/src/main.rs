@@ -4,8 +4,9 @@
 use std::fs::OpenOptions;
 use std::process;
 
-use buckyos_kit::init_logging;
+use buckyos_kit::{init_logging, BuckyOSMachineConfig};
 use fs2::FileExt;
+use name_client::init_name_lib;
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -27,6 +28,20 @@ async fn main() {
     match file.try_lock_exclusive() {
         Ok(_) => {
             log::info!("buckyos tray-controller started.");
+
+            let mut real_machine_config = BuckyOSMachineConfig::default();
+            let machine_config = BuckyOSMachineConfig::load_machine_config();
+            if machine_config.is_some() {
+                real_machine_config = machine_config.unwrap();
+            }
+
+            init_name_lib(&real_machine_config.web3_bridge)
+                .await
+                .map_err(|err| {
+                    log::error!("init default name client failed! {}", err);
+                    return String::from("init default name client failed!");
+                })
+                .expect("init name-lib failed");
 
             app_lib::run();
 

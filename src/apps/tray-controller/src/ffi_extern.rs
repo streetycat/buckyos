@@ -1,5 +1,7 @@
 use futures::FutureExt;
-use name_lib::DIDDocumentTrait;
+use jsonwebtoken::DecodingKey;
+use name_client::resolve_did;
+use name_lib::{DIDDocumentTrait, NodeIdentityConfig, ZoneBootConfig};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsStr};
 use std::os::raw::{c_char, c_int, c_void};
@@ -270,71 +272,6 @@ impl RunItemTargetState {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RunItemControlOperation {
-    pub command: String,
-    pub params: Option<Vec<String>>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct KernelServiceConfig {
-    pub target_state: RunItemTargetState,
-    pub pkg_id: String,
-    pub operations: HashMap<String, RunItemControlOperation>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct AppServiceConfig {
-    pub target_state: String,
-    pub app_id: String,
-    pub user_id: String,
-
-    pub docker_image_name: Option<String>,
-    pub data_mount_point: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_mount_point: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local_cache_mount_point: Option<String>,
-    //extra mount pint, real_path:docker_inner_path
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_mounts: Option<HashMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_cpu_num: Option<u32>,
-    // 0 - 100
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_cpu_percent: Option<u32>,
-
-    // memory quota in bytes
-    pub memory_quota: Option<u64>,
-
-    // target port ==> real port in docker
-    pub tcp_ports: HashMap<u16, u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub udp_ports: Option<HashMap<u16, u16>>,
-    //pub service_image_name : String, // support mutil platform image name (arm/x86...)
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct FrameServiceConfig {
-    pub target_state: RunItemTargetState,
-    //pub name : String, // service name
-    pub pkg_id: String,
-    pub operations: HashMap<String, RunItemControlOperation>,
-
-    //不支持serizalize
-    #[serde(skip)]
-    service_pkg: Option<package_lib::MediaInfo>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct NodeConfig {
-    revision: u64,
-    kernel: HashMap<String, KernelServiceConfig>,
-    apps: HashMap<String, AppServiceConfig>,
-    services: HashMap<String, FrameServiceConfig>,
-    is_running: bool,
-}
-
 async fn load_node_config(
     node_host_name: &str,
     buckyos_api_client: &buckyos_api::SystemConfigClient,
@@ -410,6 +347,7 @@ pub async fn list_application_rust() -> Result<Vec<ApplicationInfoRust>, String>
             .into_iter()
             .map(|(app_id_with_name, app_cfg)| {
                 let target_state = RunItemTargetState::from_str(&app_cfg.target_state).unwrap();
+                log::debug!("app state: {:?}", target_state);
                 ApplicationInfoRust {
                     id: app_id_with_name.clone(),
                     name: app_id_with_name,
@@ -492,17 +430,6 @@ extern "C" fn list_application(seq: c_int, callback: ListAppCallback, userdata: 
     });
 }
 
-//NodeIdentity from ood active progress
-#[derive(Deserialize, Debug)]
-struct NodeIdentityConfig {
-    zone_name: String,                        // $name.buckyos.org or did:ens:$name
-    owner_public_key: jsonwebtoken::jwk::Jwk, //owner is zone_owner
-    owner_name: String,                       //owner's name
-    device_doc_jwt: String,                   //device document,jwt string,siged by owner
-    zone_nonce: String,                       // random string, is default password of some service
-                                              //device_private_key: ,storage in partical file
-}
-
 type NodeId = String;
 type StrError = String;
 
@@ -517,12 +444,12 @@ fn list_nodes() -> Result<HashMap<NodeId, NodeIdentityConfig>, StrError> {
 
         if file_path.is_file() {
             if let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) {
-                if let Some(node_id) = file_name.strip_suffix("_identity.toml") {
+                if let Some(node_id) = file_name.strip_suffix("_identity.json") {
                     let contents = std::fs::read_to_string(file_path.as_path())
                         .map_err(|err| err.to_string())?;
 
                     let config: NodeIdentityConfig =
-                        toml::from_str(&contents).map_err(|err| err.to_string())?;
+                        serde_json::from_str(&contents).map_err(|err| err.to_string())?;
 
                     nodes.insert(node_id.to_string(), config);
                 }
@@ -533,112 +460,127 @@ fn list_nodes() -> Result<HashMap<NodeId, NodeIdentityConfig>, StrError> {
     Ok(nodes)
 }
 
-async fn looking_zone_config(
-    node_identity: &NodeIdentityConfig,
-) -> Result<name_lib::ZoneConfig, String> {
+async fn looking_zone_config(node_identity: &NodeIdentityConfig) -> Result<ZoneBootConfig, String> {
     //If local files exist, priority loads local files
     let etc_dir = get_buckyos_system_etc_dir();
-    let json_config_path = format!(
-        "{}/{}_zone_config.json",
-        etc_dir.to_string_lossy(),
-        node_identity.zone_name
-    );
+    let json_config_path = etc_dir.join(format!(
+        "{}.zone.json",
+        node_identity.zone_did.to_host_name()
+    ));
     log::info!(
-        "try load zone config from {} for debug",
-        json_config_path.as_str()
+        "check  {} is exist for debug ...",
+        json_config_path.display()
     );
-    let json_config = std::fs::read_to_string(json_config_path.clone());
-    if json_config.is_ok() {
-        let zone_config = serde_json::from_str(&json_config.unwrap());
-        if zone_config.is_ok() {
-            log::warn!(
-                "debug load zone config from {} success!",
-                json_config_path.as_str()
-            );
-            return Ok(zone_config.unwrap());
+    let mut zone_boot_config: ZoneBootConfig;
+    //在离线环境中，可以利用下面机制来绕开DNS查询
+    if json_config_path.exists() {
+        log::info!(
+            "try load zone boot config from {} for debug",
+            json_config_path.display()
+        );
+        let json_config = std::fs::read_to_string(json_config_path.clone());
+        if json_config.is_ok() {
+            let zone_boot_config_result = serde_json::from_str(&json_config.unwrap());
+            if zone_boot_config_result.is_ok() {
+                log::warn!(
+                    "debug load zone boot config from {} success!",
+                    json_config_path.display()
+                );
+                zone_boot_config = zone_boot_config_result.unwrap();
+            } else {
+                log::error!(
+                    "parse debug zone boot config {} failed! {}",
+                    json_config_path.display(),
+                    zone_boot_config_result.err().unwrap()
+                );
+                return Err("parse debug zone boot config from local file failed!".to_string());
+            }
         } else {
-            log::error!(
-                "parse debug zone config {} failed! {}",
-                json_config_path.as_str(),
-                zone_config.err().unwrap()
-            );
-            return Err("parse debug zone config from local file failed!".to_string());
+            return Err("parse debug zone boot config from local file failed!".to_string());
         }
-    }
+    } else {
+        let mut zone_did = node_identity.zone_did.clone();
+        log::info!(
+            "node_identity.owner_public_key: {:?}",
+            node_identity.owner_public_key
+        );
+        let owner_public_key =
+            DecodingKey::from_jwk(&node_identity.owner_public_key).map_err(|err| {
+                log::error!("parse owner public key failed! {}", err);
+                return "parse owner public key failed!".to_string();
+            })?;
 
-    let mut zone_did = name_lib::DID::undefined();
-    log::info!(
-        "node_identity.owner_public_key: {:?}",
-        node_identity.owner_public_key
-    );
-    let owner_public_key = jsonwebtoken::DecodingKey::from_jwk(&node_identity.owner_public_key)
-        .map_err(|err| {
-            log::error!("parse owner public key failed! {}", err);
-            return "parse owner public key failed!".to_string();
-        })?;
-
-    if !name_lib::is_did(node_identity.zone_name.as_str()) {
         //owner zone is a NAME, need query NameInfo to get DID
-        log::info!("owner zone is a NAME, try nameclient.query to get did");
+        // info!("owner zone is a NAME, try nameclient.query to get did");
+        // let zone_jwt = resolve(node_identity.zone_did.as_str(),RecordType::from_str("DID")).await
+        //     .map_err(|err| {
+        //         error!("query zone config by nameclient failed! {}", err);
+        //         return NodeDaemonErrors::ReasonError("query zone config failed!".to_string());
+        //     })?;
+        // let owner_from_resolve = zone_jwt.get_owner_pk();
+        // if owner_from_resolve.is_some() {
+        //     let owner_from_resolve = owner_from_resolve.unwrap();
+        //     //if owner_public_key != owner_from_resolve {
+        //     //    error!("owner public key from resolve is not match!");
+        //     //    return Err(NodeDaemonErrors::ReasonError("owner public key from resolve is not match!".to_string()));
+        //     //}
+        // }
+        // if zone_jwt.did_document.is_none() {
+        //     error!("get zone jwt failed!");
+        //     return Err(NodeDaemonErrors::ReasonError("get zone jwt failed!".to_string()));
+        // }
+        // let zone_jwt = zone_jwt.did_document.unwrap();
+        // info!("zone_jwt: {:?}",zone_jwt);
 
-        let zone_jwt = name_client::resolve(
-            node_identity.zone_name.as_str(),
-            Some(name_client::RecordType::DID),
-        )
-        .await
-        .map_err(|err| {
-            log::error!("query zone config by nameclient failed! {}", err);
-            "query zone config failed!".to_string()
-        })?;
-
-        if zone_jwt.did_document.is_none() {
-            log::error!("get zone jwt failed!");
-            return Err("get zone jwt failed!".to_string());
-        }
-        let zone_jwt = zone_jwt.did_document.unwrap();
-        log::info!("zone_jwt: {:?}", zone_jwt);
-
-        let mut zone_config = name_lib::ZoneConfig::decode(&zone_jwt, Some(&owner_public_key))
+        let zone_doc = resolve_did(&node_identity.zone_did, None)
+            .await
             .map_err(|err| {
+                log::error!("resolve zone did failed! {}", err);
+                return "resolve zone did failed!".to_string();
+            })?;
+
+        zone_boot_config =
+            ZoneBootConfig::decode(&zone_doc, Some(&owner_public_key)).map_err(|err| {
                 log::error!("parse zone config failed! {}", err);
                 return "parse zone config failed!".to_string();
             })?;
+    }
 
-        zone_did = zone_config.id.clone();
-        zone_config.name = Some(node_identity.owner_name.clone());
-        zone_config.name = Some(node_identity.zone_name.clone());
-        let zone_config_json = serde_json::to_value(zone_config).unwrap();
-        let cache_did_doc = name_lib::EncodedDocument::JsonLd(zone_config_json);
-        name_client::add_did_cache(zone_did.clone(), cache_did_doc)
-            .await
-            .unwrap();
-        log::info!("add zone did {:?}  to cache success!", zone_did);
+    zone_boot_config.id = Some(node_identity.zone_did.clone());
+    if node_identity.zone_iat > zone_boot_config.iat {
+        log::error!("zone_boot_config.iat is earlier than node_identity.zone_iat!");
+        return Err("zone_boot_config.iat is not match!".to_string());
+    }
+
+    if zone_boot_config.owner.is_some() {
+        if zone_boot_config.owner.as_ref().unwrap() != &node_identity.owner_did {
+            log::error!("zone boot config's owner is not match node_identity's owner_did!");
+            return Err("zone owner is not match!".to_string());
+        }
     } else {
-        zone_did = name_lib::DID::from_str(node_identity.zone_name.as_str()).map_err(|err| {
-            log::error!("parse did failed! {}", err);
-            "parse did failed!".to_string()
-        })?;
+        zone_boot_config.owner = Some(node_identity.owner_did.clone());
     }
+    zone_boot_config.owner_key = Some(node_identity.owner_public_key.clone());
 
+    //zone_config.name = Some(node_identity.zone_did.clone());
+    //let zone_config_json = serde_json::to_value(zone_config.clone()).unwrap();
+    //let cache_did_doc = EncodedDocument::JsonLd(zone_config_json);
+    //add_did_cache(zone_did,cache_did_doc).await.unwrap();
+    //info!("add zone did {}  to cache success!",zone_did.to_string());
     //try load lasted document from name_lib
-    let zone_doc: name_lib::EncodedDocument = name_client::resolve_did(&zone_did, None)
-        .await
-        .map_err(|err| {
-            log::error!("resolve zone did failed! {}", err);
-            "resolve zone did failed!".to_string()
-        })?;
+    // let zone_doc: EncodedDocument = resolve_did(zone_did.as_str(),None).await.map_err(|err| {
+    //     error!("resolve zone did failed! {}", err);
+    //     return NodeDaemonErrors::ReasonError("resolve zone did failed!".to_string());
+    // })?;
+    // let mut zone_config:ZoneConfig = ZoneConfig::decode(&zone_doc,Some(&owner_public_key)).map_err(|err| {
+    //     error!("parse zone config failed! {}", err);
+    //     return NodeDaemonErrors::ReasonError("parse zone config failed!".to_string());
+    // })?;
+    // if zone_config.name.is_none() {
+    //     zone_config.name = Some(node_identity.zone_did.clone());
+    // }
 
-    let mut zone_config = name_lib::ZoneConfig::decode(&zone_doc, Some(&owner_public_key))
-        .map_err(|err| {
-            log::error!("parse zone config failed! {}", err);
-            "parse zone config failed!".to_string()
-        })?;
-
-    if zone_config.name.is_none() {
-        zone_config.name = Some(node_identity.zone_name.clone());
-    }
-
-    return Ok(zone_config);
+    return Ok(zone_boot_config);
 }
 
 fn load_device_private_key(node_id: &str) -> Result<jsonwebtoken::EncodingKey, String> {
@@ -673,6 +615,7 @@ async fn select_node() -> Result<Option<NodeInfomationObj>, String> {
             &cfg.owner_public_key,
         )
         .map_err(|err| format!("decode device doc failed! {}", err))?;
+        log::debug!("decoded device-doc-json: {}", device_doc_json);
         let device_doc = serde_json::from_value::<name_lib::DeviceConfig>(device_doc_json)
             .map_err(|err| format!("parse device doc failed! {}", err))?;
 
@@ -728,7 +671,7 @@ async fn select_node() -> Result<Option<NodeInfomationObj>, String> {
         };
         Ok(Some(NodeInfomationObj {
             node_id: node_id.to_owned(),
-            home_page_url: format!("http://{}.web3.buckyos.io", cfg.owner_name),
+            home_page_url: format!("http://{}", cfg.zone_did.to_host_name()),
             node_host_name: device_doc.name,
             sys_cfg_client: Arc::new(sys_cfg_client),
         }))
@@ -741,8 +684,9 @@ pub async fn get_node_info_rust() -> Option<NodeInfomationObj> {
     let mut info = node_infomation.lock().await;
     let is_actived = info.is_some();
     if !is_actived {
-        if let Ok(node) = select_node().await {
-            *info = node;
+        match select_node().await {
+            Ok(node) => *info = node,
+            Err(err) => log::error!("select node failed: {:?}", err),
         }
     }
 
@@ -873,17 +817,20 @@ pub extern "C" fn start_buckyos() {
     #[cfg(windows)]
     let _ = start_buckyos_service();
 
-    let output = std::process::Command::new("python")
-        .arg(format!(
-            "{:?}/start_node_daemon.py",
-            get_buckyos_system_bin_dir()
-        ))
-        .output()
-        .expect("start_node_daemon.py execute failed.");
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg(get_buckyos_system_bin_dir().join("start_node_daemon.py"))
+        .arg("--enable_active");
+
+    // #[cfg(windows)]
+    // cmd.arg("--as_win_srv");
+
+    let output = cmd.output().expect("start_node_daemon.py execute failed.");
 
     log::info!(
-        "stop-buckyos: {:?}",
-        String::from_utf8_lossy(&output.stdout)
+        "start-buckyos: {:?}, err: {:?}, path: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        get_buckyos_system_bin_dir()
     );
 }
 
@@ -892,10 +839,13 @@ pub extern "C" fn stop_buckyos() {
     #[cfg(windows)]
     let _ = stop_buckyos_service();
 
-    let output = std::process::Command::new("python")
-        .arg(format!("{:?}/killall.py", get_buckyos_system_bin_dir()))
-        .output()
-        .expect("killall.py execute failed.");
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg(get_buckyos_system_bin_dir().join("killall.py"));
+
+    #[cfg(windows)]
+    cmd.arg("--as_win_srv");
+
+    let output = cmd.output().expect("killall.py execute failed.");
 
     log::info!(
         "stop-buckyos: {:?}",

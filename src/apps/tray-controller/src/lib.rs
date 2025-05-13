@@ -28,7 +28,7 @@ fn entry_rust() {
         click_seq: u32,
         popup_seq: u32,
         app_list_seq: u32,
-        bucky_status: BuckyStatus,
+        bucky_status: Option<BuckyStatus>,
         app_list: Vec<ApplicationInfoRust>,
     }
 
@@ -69,16 +69,16 @@ fn entry_rust() {
                         ))
                         .expect("update icon failed.");
 
-                    match status {
-                        BuckyStatus::NotInstall | BuckyStatus::NotActive | BuckyStatus::Stopped => {
-                            interval = std::time::Duration::from_millis(5000)
-                        }
-                        BuckyStatus::Running | BuckyStatus::Failed => {
-                            interval = std::time::Duration::from_millis(500)
-                        }
-                    }
-
                     *app_state.bucky_status.lock().await = status;
+                }
+
+                match status {
+                    BuckyStatus::NotInstall | BuckyStatus::NotActive | BuckyStatus::Stopped => {
+                        interval = std::time::Duration::from_millis(5000)
+                    }
+                    BuckyStatus::Running | BuckyStatus::Failed => {
+                        interval = std::time::Duration::from_millis(500)
+                    }
                 }
 
                 tokio::time::sleep(interval).await;
@@ -150,7 +150,10 @@ fn entry_rust() {
                 {
                     let new_bucky_status = *app_state.bucky_status.lock().await;
                     let old_bucky_status = app_state.menu_state.lock().await.bucky_status;
-                    if !is_app_update && new_bucky_status == old_bucky_status {
+                    if !is_app_update
+                        && old_bucky_status.is_some()
+                        && new_bucky_status == old_bucky_status.unwrap()
+                    {
                         log::debug!(
                             "bucky_status: {:?} -> {:?}",
                             old_bucky_status,
@@ -199,7 +202,7 @@ fn entry_rust() {
                             .text("exit", "Exit")
                             .build()
                             .expect("build tray menu failed");
-                        menu_state.bucky_status = bucky_status;
+                        menu_state.bucky_status = Some(bucky_status);
                         Some((menu, app_list))
                     } else {
                         None
@@ -290,18 +293,21 @@ fn entry_rust() {
     tauri::Builder::default()
         .setup(|app| {
             let tray = {
-                let app_handle = app.app_handle().clone();
                 tauri::tray::TrayIconBuilder::new()
-                    // .on_tray_icon_event(move |_, event| match event {
-                    //     TrayIconEvent::Click {
-                    //         button: MouseButton::Right,
-                    //         ..
-                    //     } => {
-                    //         log::info!("tray icon clicked.");
-                    //         popup_menu(app_handle.clone());
-                    //     }
-                    //     _ => println!("Clicked: {:?}", event.id()),
-                    // })
+                    .icon(
+                        tauri::image::Image::from_bytes(ICON_STOPPED)
+                            .expect("load icon from file failed."),
+                    )
+                    .on_tray_icon_event(move |_, event| match event {
+                        TrayIconEvent::Click {
+                            button: MouseButton::Right,
+                            ..
+                        } => {
+                            log::info!("tray icon clicked.");
+                            // popup_menu(app_handle.clone());
+                        }
+                        _ => println!("Clicked: {:?}", event.id()),
+                    })
                     .build(app)?
             };
 
@@ -315,7 +321,7 @@ fn entry_rust() {
                     popup_seq: 0,
                     app_list_seq: 0,
                     app_list: vec![],
-                    bucky_status: BuckyStatus::Stopped,
+                    bucky_status: None,
                 })),
             };
             app.manage(app_state);
