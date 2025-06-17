@@ -595,7 +595,7 @@ async fn ndn_local_obj_map_verify_failed() {
             .expect_err("should failed for chunk_list has been replaced");
     }
 
-    let fake_proof = fake_obj_map
+    let mut fake_proof = fake_obj_map
         .get_object_proof_path(append_chunk_id.to_string().as_str())
         .await
         .expect("get_object_proof_path should success for chunk_list has been replaced")
@@ -608,6 +608,13 @@ async fn ndn_local_obj_map_verify_failed() {
     verifier
         .verify(&obj_map_id, &fake_proof)
         .expect_err("should failed for chunk_list has been replaced");
+
+    let root_id_pos = fake_proof.proof.len() - 1;
+    fake_proof.proof[root_id_pos].1 = obj_map_id.obj_hash.clone(); // change the last proof item to fake obj_map_id
+    let is_ok = verifier
+        .verify(&obj_map_id, &fake_proof)
+        .expect("should failed for chunk_list has been replaced");
+    assert!(!is_ok, "should failed for item is in fake proof");
 
     info!("ndn_local_obj_map_verify_failed test end.");
 }

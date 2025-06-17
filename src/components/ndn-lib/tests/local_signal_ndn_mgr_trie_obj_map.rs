@@ -326,7 +326,7 @@ async fn ndn_local_trie_obj_map_basic() {
     let verify_ret = verifier
         .verify_object(
             "chunk1",
-            &&chunks.get("chunk1").unwrap().0.to_obj_id(),
+            &chunks.get("chunk1").unwrap().0.to_obj_id(),
             &fake_root_proof,
         )
         .expect("verify chunk list should success for exclude object");
