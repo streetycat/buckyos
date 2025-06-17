@@ -320,6 +320,13 @@ async fn ndn_local_obj_map_basic() {
         .expect("verify chunk list should success for exclude object");
     assert!(!is_ok, "verify chunk list should fail for fake key and obj");
 
+    let mut fake_root_obj_id = obj_map.get_obj_id().expect("obj-map id should calc finish");
+    fake_root_obj_id.obj_hash.as_mut_slice()[0] += 1;
+    let is_ok = verifier
+        .verify(&fake_root_obj_id, &proof)
+        .expect("verify chunk list should success for exclude object");
+    assert!(!is_ok, "verify chunk list should fail for root obj");
+
     info!("ndn_local_obj_map_basic test end.");
 }
 
