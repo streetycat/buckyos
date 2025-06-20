@@ -39,6 +39,15 @@ pub struct DirObject {
     pub extra_info: HashMap<String, Value>,
 }
 
+impl DirObject {
+    pub fn gen_obj_id(&self) -> (ObjId, String) {
+        build_named_object_by_json(
+            OBJ_TYPE_DIR,
+            &serde_json::to_value(self).expect("json::value from DirObject failed"),
+        )
+    }
+}
+
 pub struct FileStorageItem {
     pub obj: FileObject,
     pub chunk_size: Option<u64>,
@@ -152,6 +161,11 @@ pub trait Storage: Send + Sync + Sized + Clone {
     async fn begin_hash(&self, item_id: &Self::ItemId) -> NdnResult<()>;
     async fn begin_transfer(&self, item_id: &Self::ItemId, content: &ObjId) -> NdnResult<()>;
     async fn complete(&self, item_id: &Self::ItemId) -> NdnResult<()>;
+    async fn complete_chilren_exclude(
+        &self,
+        item_id: &Self::ItemId,
+        exclude_item_obj_ids: &[ObjId],
+    ) -> NdnResult<()>;
     async fn get_item(
         &self,
         item_id: &Self::ItemId,
@@ -178,7 +192,7 @@ pub trait Storage: Send + Sync + Sized + Clone {
         depth: Option<PathDepth>,
         offset: Option<u64>,
         limit: Option<u64>,
-    ) -> NdnResult<Vec<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)>>; // to transfer dir
+    ) -> NdnResult<Vec<(Self::ItemId, DirObject, PathBuf, ItemStatus, PathDepth)>>; // to transfer dir
     async fn select_item_transfer_with_all_children_complete(
         &self,
     ) -> NdnResult<Option<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)>>; // to continue transfer after all children complete
@@ -249,11 +263,11 @@ pub trait NdnReader: Send + Sync + Sized {
 }
 
 pub async fn file_system_to_ndn<
-    S: Storage,
-    FDR: FileSystemDirReader,
-    FFR: FileSystemFileReader,
-    F: FileSystemReader<FDR, FFR>,
-    N: NdnWriter,
+    S: Storage + 'static,
+    FDR: FileSystemDirReader + 'static,
+    FFR: FileSystemFileReader + 'static,
+    F: FileSystemReader<FDR, FFR> + 'static,
+    N: NdnWriter + 'static,
 >(
     path: &Path,
     writer: N,
@@ -261,7 +275,7 @@ pub async fn file_system_to_ndn<
     storage: S,
     chunk_size: u64,
     ndn_mgr_id: &str,
-) -> NdnResult<ObjId> {
+) -> NdnResult<S::ItemId> {
     let is_finish_scan = Arc::new(tokio::sync::Mutex::new(false));
     let (continue_hash_emiter, continue_hash_handler) = tokio::sync::mpsc::channel::<()>(64);
 
@@ -270,16 +284,16 @@ pub async fn file_system_to_ndn<
                                    storage: S,
                                    chunk_size: u64,
                                    emiter: tokio::sync::mpsc::Sender<()>|
-           -> NdnResult<()> {
+           -> NdnResult<S::ItemId> {
         let insert_new_item = async |item: FileSystemItem,
                                      parent_path: &Path,
                                      storage: &S,
                                      level: u64,
                                      parent_item_id: Option<S::ItemId>|
-               -> NdnResult<()> {
-            match item {
+               -> NdnResult<S::ItemId> {
+            let item_id = match item {
                 FileSystemItem::Dir(dir_object) => {
-                    storage
+                    let (item_id, _, _) = storage
                         .create_new_item(
                             &StorageItem::Dir(dir_object),
                             level,
@@ -287,6 +301,7 @@ pub async fn file_system_to_ndn<
                             parent_item_id,
                         )
                         .await?;
+                    item_id
                 }
                 FileSystemItem::File(file_object) => {
                     let file_size = file_object.size;
@@ -341,14 +356,15 @@ pub async fn file_system_to_ndn<
                     }
 
                     storage.begin_hash(&file_item_id).await?;
+                    file_item_id
                 }
-            }
-            Ok(())
+            };
+            Ok(item_id)
         };
 
         let none_path = PathBuf::from("");
         let fs_item = reader.info(path).await?;
-        insert_new_item(
+        let root_item_id = insert_new_item(
             fs_item,
             path.parent().unwrap_or(none_path.as_path()),
             &storage,
@@ -392,7 +408,7 @@ pub async fn file_system_to_ndn<
             }
         }
 
-        Ok(())
+        Ok(root_item_id)
     };
 
     let scan_task = {
@@ -402,7 +418,9 @@ pub async fn file_system_to_ndn<
         let is_finish_scan = is_finish_scan.clone();
         let emiter = continue_hash_emiter.clone();
         tokio::spawn(async move {
-            let ret = scan_task_process(path.as_path(), reader, storage, chunk_size, emiter).await;
+            let ret =
+                scan_task_process(path.as_path(), reader, storage, chunk_size, emiter.clone())
+                    .await;
             *is_finish_scan.lock().await = true;
             emiter.send(()).await;
             ret
@@ -423,6 +441,7 @@ pub async fn file_system_to_ndn<
                 match storage.select_file_hashing_or_transfer().await? {
                     Some((item_id, mut file_item, parent_path, mut file_status, depth)) => {
                         info!("hashing file: {:?}, status: {:?}", item_id, file_status);
+                        let file_path = parent_path.join(file_item.obj.name.as_str());
                         let (file_obj_id, file_obj_str, file_chunk_list_id, file_chunk_list_str) =
                             if file_status.is_hashing() {
                                 assert!(
@@ -517,6 +536,12 @@ pub async fn file_system_to_ndn<
 
                                 file_item.obj.content = file_chunk_list_id.to_string();
                                 let (file_obj_id, file_obj_str) = file_item.obj.gen_obj_id();
+                                NamedDataMgr::put_object(
+                                    Some(ndn_mgr_id),
+                                    &file_obj_id,
+                                    file_obj_str.as_str(),
+                                )
+                                .await?;
                                 storage.begin_transfer(&item_id, &file_obj_id).await?;
 
                                 (
@@ -527,17 +552,26 @@ pub async fn file_system_to_ndn<
                                 )
                             } else if file_status.is_transfer() {
                                 info!("transfer file: {:?}, status: {:?}", item_id, file_status);
-                                let (file_obj_id, file_obj_str) = file_item.obj.gen_obj_id();
+                                let file_obj = NamedDataMgr::get_object(
+                                    Some(ndn_mgr_id),
+                                    file_status
+                                        .get_obj_id()
+                                        .expect("file status should have obj id for transfer."),
+                                    None,
+                                )
+                                .await?;
+                                let (file_obj_id, file_obj_str) =
+                                    build_named_object_by_json(OBJ_TYPE_FILE, &file_obj);
+                                let file_obj: FileObject = serde_json::from_value(file_obj)
+                                    .expect("file object should be valid json value.");
                                 assert_eq!(
                                     file_status.get_obj_id(),
                                     Some(&file_obj_id),
                                     "file content should be set to chunk list id before transfer."
                                 );
 
-                                let file_chunk_list_id = ObjId::try_from(
-                                    file_item.obj.content.as_str(),
-                                )
-                                .expect("file content should be a valid ObjId for chunk-list.");
+                                let file_chunk_list_id = ObjId::try_from(file_obj.content.as_str())
+                                    .expect("file content should be a valid ObjId for chunk-list.");
 
                                 let chunk_list_json_value = NamedDataMgr::get_object(
                                     Some(ndn_mgr_id),
@@ -585,7 +619,6 @@ pub async fn file_system_to_ndn<
                                 );
                                 let lost_chunk_ids = writer.push_container(lost_obj_id).await?;
                                 let limit = 16;
-                                let file_path = parent_path.join(file_item.obj.name.as_str());
                                 for i in 0..(lost_chunk_ids.len() + limit - 1) / limit {
                                     let chunk_ids = &lost_chunk_ids[i * limit
                                         ..std::cmp::min((i + 1) * limit, lost_chunk_ids.len())];
@@ -668,7 +701,7 @@ pub async fn file_system_to_ndn<
                     .select_dir_hashing_with_all_child_dir_transfer_and_file_complete()
                     .await?
                 {
-                    Some((item_id, dir_object, parent_path, item_status, depth)) => {
+                    Some((item_id, mut dir_object, parent_path, item_status, depth)) => {
                         info!("hashing dir: {:?}, status: {:?}", item_id, item_status);
                         assert!(item_status.is_hashing());
 
@@ -741,7 +774,15 @@ pub async fn file_system_to_ndn<
 
                         dir_obj_map.save().await?;
                         let dir_obj_map_id = dir_obj_map.get_obj_id().await;
-                        storage.begin_transfer(&item_id, &dir_obj_map_id).await?;
+                        dir_object.content = dir_obj_map_id.to_string();
+                        let (dir_obj_id, dir_obj_str) = dir_object.gen_obj_id();
+                        NamedDataMgr::put_object(
+                            Some(ndn_mgr_id),
+                            &dir_obj_id,
+                            dir_obj_str.as_str(),
+                        )
+                        .await?;
+                        storage.begin_transfer(&item_id, &dir_obj_id).await?;
                     }
                     None => {
                         break;
@@ -777,52 +818,122 @@ pub async fn file_system_to_ndn<
 
         // transfer dirs
         let mut scan_depth = 0;
-        let scan_batch_limit = 64;
         let mut scan_batch_index = 0;
+        let scan_batch_limit = 64;
         loop {
-            match storage
+            let dir_items = storage
                 .select_dir_transfer(
                     Some(scan_depth),
                     Some(scan_batch_index * scan_batch_limit),
                     Some(scan_batch_limit),
                 )
-                .await?
-            {
-                Some((item_id, item, parent_path, item_status, depth)) => {
-                    info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
-                    assert!(item_status.is_transfer());
-
-                    let dir_obj = match item {
-                        StorageItem::Dir(dir_obj) => dir_obj,
-                        _ => Err(NdnError::InvalidObjType(format!(
-                            "expect dir object, got: {:?} in history storage",
-                            item.item_type()
-                        )))?,
-                    };
-
-                    let (dir_obj_id, dir_obj_str) = dir_obj.gen_obj_id();
-                    let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
-                    if !lost_obj_ids.is_empty() {
-                        debug!(
-                            "lost child objects when push dir object: {}, lost: {:?}",
-                            dir_obj_id, lost_obj_ids
-                        );
-                        let lost_container = writer.push_container(&dir_obj_id).await?;
-                        assert!(
-                            lost_container.is_empty(),
-                            "lost container should be empty after push object."
-                        );
-                    }
-
-                    storage.complete(&item_id).await?;
-
-                    info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
-                }
-                None => {
+                .await?;
+            let is_depth_finish = (dir_items.len() as u64) < scan_batch_limit;
+            scan_batch_index += 1;
+            if is_depth_finish {
+                if scan_batch_index == 0 && dir_items.is_empty() {
+                    info!("no more dir with more depth.");
                     break;
                 }
+                scan_depth += 1;
+                scan_batch_index = 0;
+            }
+
+            for (item_id, dir_item, parent_path, item_status, depth) in dir_items {
+                info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
+                assert!(item_status.is_transfer());
+                assert_eq!(
+                    depth, scan_depth,
+                    "dir item depth should match the scan depth."
+                );
+
+                let dir_obj_id = item_status
+                    .get_obj_id()
+                    .expect("dir item status should have obj id for transfer.");
+                let dir_obj = NamedDataMgr::get_object(Some(ndn_mgr_id), &dir_obj_id, None).await?;
+                let (dir_obj_id, dir_obj_str) = build_named_object_by_json(OBJ_TYPE_DIR, &dir_obj);
+                assert_eq!(
+                    &dir_obj_id,
+                    item_status
+                        .get_obj_id()
+                        .expect("dir item should have obj id."),
+                    "dir object id should match the item status obj id."
+                );
+
+                let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
+                if let Some(lost_obj_map_id) = lost_obj_ids.get(0) {
+                    debug!(
+                        "lost child objects when push dir object: {}, lost: {:?}",
+                        dir_obj_id, lost_obj_map_id
+                    );
+                    assert_eq!(
+                        serde_json::from_value::<DirObject>(dir_obj)
+                            .expect("DirObject from josn-value failed")
+                            .content,
+                        lost_obj_map_id.to_string(),
+                        "dir object content should match the lost object map id."
+                    );
+                    let lost_children = writer.push_container(&lost_obj_map_id).await?;
+                    //
+                    storage
+                        .complete_chilren_exclude(&item_id, lost_children.as_slice())
+                        .await?;
+                    if lost_children.is_empty() {
+                        storage.complete(&item_id).await?;
+                    }
+                } else {
+                    storage.complete(&item_id).await?;
+                }
+
+                info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
             }
         }
+
+        while scan_depth > 0 {
+            scan_depth -= 1;
+            let dir_items = storage
+                .select_dir_transfer(
+                    Some(scan_depth),
+                    Some(scan_batch_index * scan_batch_limit),
+                    Some(scan_batch_limit),
+                )
+                .await?;
+            let is_depth_finish = (dir_items.len() as u64) < scan_batch_limit;
+            scan_batch_index += 1;
+            if is_depth_finish {
+                scan_depth -= 1;
+                scan_batch_index = 0;
+            }
+
+            for (item_id, dir_item, parent_path, item_status, depth) in dir_items {
+                info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
+                assert!(item_status.is_transfer());
+                assert_eq!(
+                    depth, scan_depth,
+                    "dir item depth should match the scan depth."
+                );
+
+                let (dir_obj_id, dir_obj_str) = dir_item.gen_obj_id();
+                let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
+                if let Some(lost_obj_map_id) = lost_obj_ids.get(0) {
+                    debug!(
+                        "lost child objects when push dir object: {}, lost: {:?}",
+                        dir_obj_id, lost_obj_map_id
+                    );
+                    let lost_children = writer.push_container(&lost_obj_map_id).await?;
+                    if lost_children.is_empty() {
+                        panic!(
+                            "all children should exist in remote, item_id: {:?}, lost: {:?}",
+                            item_id, lost_children
+                        );
+                    }
+                }
+                storage.complete(&item_id).await?;
+
+                info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
+            }
+        }
+
         Ok(())
     };
 
@@ -846,10 +957,10 @@ pub async fn file_system_to_ndn<
         })
     };
 
-    let root_obj_id = transfer_task.await.expect("task run failed")?;
-    scan_task.await.expect("task run failed")?;
+    transfer_task.await.expect("task run failed")?;
+    let root_item_id = scan_task.await.expect("task run failed")?;
 
-    Ok(())
+    Ok(root_item_id)
 }
 
 fn generate_random_bytes(size: u64) -> Vec<u8> {
