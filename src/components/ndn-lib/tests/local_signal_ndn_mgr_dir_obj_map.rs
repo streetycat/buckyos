@@ -65,11 +65,13 @@ pub enum StorageItem {
     Chunk(ChunkItem), // (seq, offset, ChunkId)
 }
 
+#[derive(Debug)]
 pub enum StorageItemName {
     Name(String),
     ChunkSeq(u64), // seq
 }
 
+#[derive(Debug)]
 pub enum StorageItemNameRef<'a> {
     Name(&'a str),
     ChunkSeq(u64), // seq
@@ -161,6 +163,9 @@ pub trait Storage: Send + Sync + Sized + Clone {
     async fn begin_hash(&self, item_id: &Self::ItemId) -> NdnResult<()>;
     async fn begin_transfer(&self, item_id: &Self::ItemId, content: &ObjId) -> NdnResult<()>;
     async fn complete(&self, item_id: &Self::ItemId) -> NdnResult<()>;
+    async fn get_root(
+        &self,
+    ) -> NdnResult<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)>;
     async fn complete_chilren_exclude(
         &self,
         item_id: &Self::ItemId,
@@ -196,6 +201,11 @@ pub trait Storage: Send + Sync + Sized + Clone {
     async fn select_item_transfer_with_all_children_complete(
         &self,
     ) -> NdnResult<Option<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)>>; // to continue transfer after all children complete
+    async fn select_item_transfer(
+        &self,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> NdnResult<Vec<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)>>; // to transfer dir
     async fn list_children_order_by_name(
         &self,
         item_id: &Self::ItemId,
@@ -237,16 +247,15 @@ pub trait FileSystemFileReader: Send + Sync + Sized {
 
 #[async_trait::async_trait]
 pub trait FileSystemWriter<W: FileSystemFileWriter>: Send + Sync + Sized {
-    async fn mkdir(&self, dir: &DirObject, parent_path: &Path) -> NdnResult<()>;
+    async fn create_dir_all(&self, dir_path: &Path) -> NdnResult<()>;
+    async fn create_dir(&self, dir: &DirObject, parent_path: &Path) -> NdnResult<()>;
     async fn open_file(&self, file: &FileObject, parent_path: &Path) -> NdnResult<W>;
 }
 
 #[async_trait::async_trait]
-pub trait FileSystemDirWriter: Send + Sync + Sized {}
-
-#[async_trait::async_trait]
 pub trait FileSystemFileWriter: Send + Sync + Sized {
-    async fn write_chunk(&self, offset: SeekFrom, limit: Option<u64>) -> NdnResult<Vec<u8>>;
+    async fn length(&self) -> NdnResult<u64>;
+    async fn write_chunk(&self, chunk_data: &[u8], offset: SeekFrom) -> NdnResult<()>;
 }
 
 #[async_trait::async_trait]
@@ -258,8 +267,9 @@ pub trait NdnWriter: Send + Sync + Sized + Clone {
 
 #[async_trait::async_trait]
 pub trait NdnReader: Send + Sync + Sized {
-    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value>; // lost child-obj-list
+    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value>;
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>>;
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<()>;
 }
 
 pub async fn file_system_to_ndn<
@@ -269,7 +279,7 @@ pub async fn file_system_to_ndn<
     F: FileSystemReader<FDR, FFR> + 'static,
     N: NdnWriter + 'static,
 >(
-    path: &Path,
+    path: Option<&Path>, // None for continue
     writer: N,
     reader: F,
     storage: S,
@@ -279,16 +289,16 @@ pub async fn file_system_to_ndn<
     let is_finish_scan = Arc::new(tokio::sync::Mutex::new(false));
     let (continue_hash_emiter, continue_hash_handler) = tokio::sync::mpsc::channel::<()>(64);
 
-    let scan_task_process = async |path: &Path,
+    let scan_task_process = async |path: Option<&Path>,
                                    reader: F,
                                    storage: S,
                                    chunk_size: u64,
                                    emiter: tokio::sync::mpsc::Sender<()>|
-           -> NdnResult<S::ItemId> {
+           -> NdnResult<()> {
         let insert_new_item = async |item: FileSystemItem,
                                      parent_path: &Path,
                                      storage: &S,
-                                     level: u64,
+                                     depth: u64,
                                      parent_item_id: Option<S::ItemId>|
                -> NdnResult<S::ItemId> {
             let item_id = match item {
@@ -296,7 +306,7 @@ pub async fn file_system_to_ndn<
                     let (item_id, _, _) = storage
                         .create_new_item(
                             &StorageItem::Dir(dir_object),
-                            level,
+                            depth,
                             parent_path,
                             parent_item_id,
                         )
@@ -314,7 +324,7 @@ pub async fn file_system_to_ndn<
                                 obj: file_object,
                                 chunk_size: Some(chunk_size),
                             }),
-                            level,
+                            depth,
                             parent_path,
                             parent_item_id.clone(),
                         )
@@ -345,7 +355,7 @@ pub async fn file_system_to_ndn<
                                     offset: SeekFrom::Start(i * chunk_size),
                                     chunk_id: chunk_id.clone(),
                                 }),
-                                level,
+                                depth,
                                 parent_path,
                                 Some(parent_item_id.clone().unwrap()),
                             )
@@ -362,16 +372,18 @@ pub async fn file_system_to_ndn<
             Ok(item_id)
         };
 
-        let none_path = PathBuf::from("");
-        let fs_item = reader.info(path).await?;
-        let root_item_id = insert_new_item(
-            fs_item,
-            path.parent().unwrap_or(none_path.as_path()),
-            &storage,
-            0,
-            None,
-        )
-        .await?;
+        if let Some(path) = path {
+            let none_path = PathBuf::from("");
+            let fs_item = reader.info(path).await?;
+            insert_new_item(
+                fs_item,
+                path.parent().unwrap_or(none_path.as_path()),
+                &storage,
+                0,
+                None,
+            )
+            .await?;
+        }
 
         emiter.send(()).await;
 
@@ -408,19 +420,24 @@ pub async fn file_system_to_ndn<
             }
         }
 
-        Ok(root_item_id)
+        Ok(())
     };
 
     let scan_task = {
-        let path = path.to_path_buf();
+        let path = path.map(|p| p.to_path_buf());
         let reader = reader.clone();
         let storage = storage.clone();
         let is_finish_scan = is_finish_scan.clone();
         let emiter = continue_hash_emiter.clone();
         tokio::spawn(async move {
-            let ret =
-                scan_task_process(path.as_path(), reader, storage, chunk_size, emiter.clone())
-                    .await;
+            let ret = scan_task_process(
+                path.as_ref().map(|p| p.as_path()),
+                reader,
+                storage,
+                chunk_size,
+                emiter.clone(),
+            )
+            .await;
             *is_finish_scan.lock().await = true;
             emiter.send(()).await;
             ret
@@ -431,7 +448,9 @@ pub async fn file_system_to_ndn<
                                        reader: F,
                                        writer: N,
                                        is_finish_scan: Arc<tokio::sync::Mutex<bool>>,
-                                       continue_hash_handler: tokio::sync::mpsc::Receiver<()>,
+                                       mut continue_hash_handler: tokio::sync::mpsc::Receiver<
+        (),
+    >,
                                        ndn_mgr_id: &str|
            -> NdnResult<()> {
         let mut is_hash_finish_pending = false;
@@ -509,7 +528,8 @@ pub async fn file_system_to_ndn<
                                                     )
                                                 );
                                                 chunk_list_builder
-                                                    .append(chunk_item.chunk_id.clone());
+                                                    .append(chunk_item.chunk_id.clone())
+                                                    .expect("add chunk failed");
                                             }
                                             _ => {
                                                 unreachable!(
@@ -958,7 +978,290 @@ pub async fn file_system_to_ndn<
     };
 
     transfer_task.await.expect("task run failed")?;
-    let root_item_id = scan_task.await.expect("task run failed")?;
+    scan_task.await.expect("task run failed")?;
+
+    // TODO: should wait for the root item to be created.
+    let (root_item_id, item, parent_path, _, depth) = storage.get_root().await?;
+    assert_eq!(depth, 0, "root item depth should be 0.");
+    if let Some(path) = path {
+        match item.name() {
+            StorageItemNameRef::Name(name) => assert_eq!(
+                parent_path.join(name).as_path(),
+                path,
+                "root item parent path should match the scan path."
+            ),
+            StorageItemNameRef::ChunkSeq(_) => unreachable!(
+                "root item name should not be ChunkSeq, got: {:?}",
+                item.name()
+            ),
+        }
+    }
+
+    Ok(root_item_id)
+}
+
+async fn ndn_to_file_system<
+    S: Storage + 'static,
+    FFW: FileSystemFileWriter + 'static,
+    F: FileSystemWriter<FFW> + 'static,
+    R: NdnReader + 'static,
+>(
+    dir_path_root_obj_id: Option<(&Path, &ObjId)>, // None for continue
+    writer: F,
+    reader: R,
+    storage: S,
+) -> NdnResult<S::ItemId> {
+    let task_handle = {
+        let dir_path_root_obj_id = dir_path_root_obj_id
+            .as_ref()
+            .map(|(path, obj_id)| (path.to_path_buf(), *obj_id.clone()));
+        let storage = storage.clone();
+
+        let proc = async move || -> NdnResult<()> {
+            info!("start ndn to file system task...");
+
+            let create_new_item = async |parent_path: &Path,
+                                         obj_id: &ObjId,
+                                         parent_item_id: Option<S::ItemId>,
+                                         depth: u64|
+                   -> NdnResult<()> {
+                let obj_value = reader.get_object(obj_id).await?;
+                if obj_id.obj_type.as_str() == OBJ_TYPE_DIR {
+                    let dir_obj: DirObject = serde_json::from_value(obj_value).map_err(|err| {
+                        let msg = format!(
+                            "Failed to parse dir object from obj-id: {}, error: {}",
+                            obj_id, err
+                        );
+                        error!("{}", msg);
+                        crate::NdnError::DecodeError(msg)
+                    })?;
+                    info!("create dir: {}, obj id: {}", dir_obj.name, obj_id);
+                    let (item_id, _, _) = storage
+                        .create_new_item(
+                            &StorageItem::Dir(dir_obj),
+                            depth,
+                            parent_path,
+                            parent_item_id,
+                        )
+                        .await?;
+                    storage.begin_transfer(&item_id, obj_id).await?;
+                } else if obj_id.obj_type.as_str() == OBJ_TYPE_FILE {
+                    let file_obj: FileObject =
+                        serde_json::from_value(obj_value).map_err(|err| {
+                            let msg = format!(
+                                "Failed to parse file object from obj-id: {}, error: {:?}",
+                                obj_id, err
+                            );
+                            error!("{}", msg);
+                            crate::NdnError::DecodeError(msg)
+                        })?;
+
+                    info!("create file: {}, obj id: {}", file_obj.name, obj_id);
+
+                    let (item_id, _, _) = storage
+                        .create_new_item(
+                            &StorageItem::File(FileStorageItem {
+                                obj: file_obj,
+                                chunk_size: None,
+                            }),
+                            depth,
+                            parent_path,
+                            parent_item_id,
+                        )
+                        .await?;
+                    storage.begin_transfer(&item_id, obj_id).await?;
+                } else {
+                    unreachable!(
+                        "expect dir or file object, got: {}, obj id: {}",
+                        obj_id.obj_type, obj_id
+                    );
+                }
+
+                Ok(())
+            };
+
+            let transfer_item = async |item_id: &S::ItemId,
+                                       item: &StorageItem,
+                                       parent_path: &Path,
+                                       depth: u64|
+                   -> NdnResult<()> {
+                info!(
+                    "transfer item: {:?}, parent path: {}",
+                    item_id,
+                    parent_path.display()
+                );
+                match item {
+                    StorageItem::Dir(dir_obj) => {
+                        info!("transfer dir: {:?}", dir_obj.name);
+                        let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
+                        reader.get_container(&dir_obj_map_id).await?;
+                        let dir_obj_map = TrieObjectMap::open(
+                            &dir_obj_map_id,
+                            true,
+                            HashMethod::Sha256,
+                            Some(TrieObjectMapStorageType::JSONFile),
+                        )
+                        .await?;
+
+                        writer.create_dir(dir_obj, parent_path).await?;
+
+                        for (child_name, child_obj_id) in dir_obj_map.iter()? {
+                            create_new_item(
+                                &parent_path.join(dir_obj.name.as_str()).as_path(),
+                                &child_obj_id,
+                                Some(item_id.clone()),
+                                depth + 1,
+                            )
+                            .await?;
+                        }
+                        storage.complete(item_id).await?;
+                    }
+                    StorageItem::File(file_storage_item) => {
+                        info!("transfer file: {:?}", file_storage_item.obj.name);
+                        let file_chunk_list_id =
+                            ObjId::try_from(file_storage_item.obj.content.as_str())?;
+                        let chunk_list = reader.get_object(&file_chunk_list_id).await?;
+                        let chunk_list_body: ChunkListBody = serde_json::from_value(chunk_list)
+                            .map_err(|e| {
+                                let msg = format!("Failed to parse chunk list body: {}", e);
+                                error!("{}", msg);
+                                crate::NdnError::InvalidData(msg)
+                            })?;
+                        reader.get_container(&chunk_list_body.object_array).await?;
+                        let chunk_list: ChunkList = ChunkList::new(
+                            ChunkListMeta {
+                                total_size: chunk_list_body.total_size,
+                                fix_size: chunk_list_body.fix_size,
+                            },
+                            ObjectArray::open(&chunk_list_body.object_array, true).await?,
+                        );
+
+                        let file_writer = writer
+                            .open_file(&file_storage_item.obj, parent_path)
+                            .await?;
+                        let file_length = file_writer.length().await?;
+                        let (chunk_index, mut pos) = if file_length > 0 {
+                            let (chunk_index, chunk_pos) = chunk_list
+                                .get_chunk_index_by_offset(SeekFrom::Start(file_length - 1))?;
+                            let chunk_id = chunk_list
+                                .get_chunk(chunk_index as usize)?
+                                .expect("chunk id should exist");
+                            match chunk_pos
+                                .cmp(&chunk_id.get_length().expect("chunk id should have length"))
+                            {
+                                std::cmp::Ordering::Less => {
+                                    info!(
+                                        "chunk pos: {}, file pos: {}, chunk index: {}",
+                                        chunk_pos, file_length, chunk_index
+                                    );
+                                    (chunk_index, file_length - (chunk_pos + 1))
+                                }
+                                std::cmp::Ordering::Equal => {
+                                    info!(
+                                        "chunk pos: {}, file pos: {}, chunk index: {}",
+                                        chunk_pos, file_length, chunk_index
+                                    );
+                                    (chunk_index + 1, file_length)
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    unreachable!(
+                                        "chunk pos: {}, file pos: {}, chunk index: {}",
+                                        chunk_pos, file_length, chunk_index
+                                    );
+                                }
+                            }
+                        } else {
+                            (0, 0)
+                        };
+
+                        for chunk_index in (chunk_index as usize)..chunk_list.len() {
+                            let chunk_id = chunk_list
+                                .get_chunk(chunk_index)?
+                                .expect("chunk id should exist");
+                            let chunk_data = reader.get_chunk(&chunk_id).await?;
+                            assert_eq!(
+                                chunk_data.len() as u64,
+                                chunk_id.get_length().expect("chunk id should have length"),
+                                "chunk data length should match the chunk id length."
+                            );
+
+                            let hasher = ChunkHasher::new(None).expect("hash failed.");
+                            let hash = hasher.calc_from_bytes(chunk_data.as_slice());
+                            let calc_chunk_id = ChunkId::mix_from_hash_result(
+                                chunk_data.len() as u64,
+                                &hash,
+                                HashMethod::Sha256,
+                            );
+                            if calc_chunk_id != chunk_id {
+                                error!(
+                                    "chunk id mismatch, expected: {:?}, got: {:?}",
+                                    calc_chunk_id, chunk_id
+                                );
+                                return Err(NdnError::InvalidData("chunk id mismatch".to_string()));
+                            }
+
+                            file_writer
+                                .write_chunk(chunk_data.as_slice(), SeekFrom::Start(pos))
+                                .await?;
+                            pos += chunk_data.len() as u64;
+                        }
+
+                        storage.complete(item_id).await?;
+                    }
+                    StorageItem::Chunk(chunk_item) => {
+                        unreachable!(
+                            "should not have chunk item in dir transfer, got: {:?}",
+                            chunk_item.chunk_id
+                        );
+                    }
+                }
+                Ok(())
+            };
+
+            if let Some((path, root_obj_id)) = dir_path_root_obj_id {
+                info!(
+                    "scan path: {}, root obj id: {}",
+                    path.display(),
+                    root_obj_id
+                );
+                writer.create_dir_all(path.as_path()).await?;
+                create_new_item(path.as_path(), root_obj_id, None, 0).await?;
+            }
+
+            loop {
+                let items = storage.select_item_transfer(Some(0), Some(64)).await?;
+                if items.is_empty() {
+                    info!("no more items to transfer.");
+                    break;
+                }
+
+                for (item_id, item, parent_path, item_status, depth) in items {
+                    info!("transfer item: {:?}, status: {:?}", item_id, item_status);
+                    assert!(item_status.is_transfer());
+                    assert_eq!(depth, 0, "item depth should be 0 for root item transfer.");
+
+                    transfer_item(&item_id, &item, parent_path.as_path(), depth).await?;
+                }
+            }
+
+            Ok(())
+        };
+
+        tokio::spawn(async move { proc().await })
+    };
+
+    task_handle.await.expect("task abort")?;
+
+    // TODO: should wait for the root item to be created.
+    let (root_item_id, item, parent_path, _, depth) = storage.get_root().await?;
+    assert_eq!(depth, 0, "root item depth should be 0.");
+    if let Some((dir_path, _)) = dir_path_root_obj_id {
+        assert_eq!(
+            dir_path,
+            parent_path.as_path(),
+            "root item parent path should match the scan path."
+        );
+    }
 
     Ok(root_item_id)
 }
