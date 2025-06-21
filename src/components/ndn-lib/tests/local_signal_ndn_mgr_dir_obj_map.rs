@@ -1014,7 +1014,7 @@ async fn ndn_to_file_system<
     let task_handle = {
         let dir_path_root_obj_id = dir_path_root_obj_id
             .as_ref()
-            .map(|(path, obj_id)| (path.to_path_buf(), *obj_id.clone()));
+            .map(|(path, obj_id)| (path.to_path_buf(), (*obj_id).clone()));
         let storage = storage.clone();
 
         let proc = async move || -> NdnResult<()> {
@@ -1225,7 +1225,7 @@ async fn ndn_to_file_system<
                     root_obj_id
                 );
                 writer.create_dir_all(path.as_path()).await?;
-                create_new_item(path.as_path(), root_obj_id, None, 0).await?;
+                create_new_item(path.as_path(), &root_obj_id, None, 0).await?;
             }
 
             loop {
@@ -1302,6 +1302,115 @@ fn generate_random_chunk_list(count: usize, fix_size: Option<u64>) -> Vec<(Chunk
         chunk_list.push((chunk_id, chunk_data));
     }
     chunk_list
+}
+
+struct SimulateFile {
+    name: String,
+    content: Vec<u8>,
+}
+
+struct SimulateDir {
+    name: String,
+    children: HashMap<String, SimulateFsItem>,
+}
+
+enum SimulateFsItem {
+    File(SimulateFile),
+    Dir(SimulateDir),
+}
+
+fn gen_random_simulate_dir(
+    total_dir_count: usize,
+    total_file_count: usize,
+    chunk_size: u64,
+) -> SimulateFsItem {
+    let mut rng = rand::rng();
+
+    let mut left_file_count = total_file_count;
+
+    let max_child_dir_count = |dir_count: usize| {
+        std::cmp::min(
+            std::cmp::max(((dir_count as f32).sqrt() / 2.0) as usize, 1),
+            dir_count,
+        )
+    };
+
+    let max_child_file_count = |dir_count: usize, file_count: usize| {
+        std::cmp::min(std::cmp::max((file_count / dir_count) * 2, 1), file_count)
+    };
+
+    let total_dir_count = std::cmp::max(total_dir_count, 1);
+
+    let mut dir_list: Vec<SimulateDir> = (0..total_dir_count)
+        .map(|i| SimulateDir {
+            name: "".to_string(),
+            children: HashMap::new(),
+        })
+        .collect();
+
+    let mut free_pos = 1;
+
+    dir_list.last().unwrap().name = "0".to_string();
+
+    for pos in 0..total_dir_count {
+        let parent_name = dir_list[pos].name.clone();
+        let child_dir_count = rng.random_range(0..max_child_dir_count(total_dir_count - free_pos));
+        let child_file_count =
+            rng.random_range(0..max_child_file_count(total_dir_count - pos, left_file_count));
+        let select_child_dir_begin_pos = total_dir_count - free_pos - child_dir_count;
+        free_pos += child_dir_count;
+        left_file_count -= child_file_count;
+
+        for seq in 0..child_dir_count {
+            let dir_index = select_child_dir_begin_pos + seq;
+            let child_dir_name = format!("{}_{}", parent_name, seq);
+            dir_list[dir_index].name = child_dir_name;
+        }
+
+        for seq in 0..child_file_count {
+            let file_name = format!("{}_file_{}", parent_name, seq);
+            let file_content = generate_random_bytes(chunk_size);
+            dir_list[pos].children.insert(
+                file_name.clone(),
+                SimulateFsItem::File(SimulateFile {
+                    name: file_name,
+                    content: file_content,
+                }),
+            );
+        }
+    }
+
+    let mut root_dir = dir_list.pop().expect("should have root dir");
+    for dir in dir_list.into_iter().rev() {
+        let parent_paths = {
+            let mut dir_name = "".to_string();
+            let mut parent_paths = dir
+                .name
+                .split('_')
+                .map(|sub| {
+                    dir_name = format!("{}_{}", dir_name, sub);
+                    dir_name.clone()
+                })
+                .collect::<Vec<_>>();
+            parent_paths.pop().expect("should have parent path");
+            parent_paths
+        };
+        let mut parent_dir = &mut root_dir;
+        for parent_name in parent_paths {
+            parent_dir = match parent_dir.children.get_mut(&parent_name).unwrap() {
+                SimulateFsItem::File(simulate_file) => unreachable!(
+                    "parent dir should not be a file, got: {}",
+                    simulate_file.name
+                ),
+                SimulateFsItem::Dir(simulate_dir) => simulate_dir,
+            };
+        }
+        parent_dir
+            .children
+            .insert(dir.name.clone(), SimulateFsItem::Dir(dir));
+    }
+
+    SimulateFsItem::Dir(root_dir)
 }
 
 async fn write_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId, chunk_data: &[u8]) {
