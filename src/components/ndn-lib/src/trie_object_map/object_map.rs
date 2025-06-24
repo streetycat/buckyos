@@ -1,3 +1,4 @@
+pub use super::storage::TrieObjectMapProofVerifyResult;
 use super::storage::{
     TrieObjectMapInnerStorage, TrieObjectMapInnerStorageRef, TrieObjectMapProofVerifierRef,
     TrieObjectMapStorageType,
@@ -11,10 +12,8 @@ use bincode::de;
 use crypto_common::Key;
 use log::kv::value;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-
-pub use super::storage::TrieObjectMapProofVerifyResult;
-
 
 #[derive(Debug, Clone)]
 pub struct TrieObjectMapItemProof {
@@ -49,7 +48,6 @@ impl TrieObjectMapItemProof {
         ObjId::new_by_raw(OBJ_TYPE_MTREE.to_owned(), self.root_hash.clone())
     }
 }
-
 
 pub struct TrieObjectMap {
     hash_method: HashMethod,
@@ -102,12 +100,12 @@ impl TrieObjectMap {
         self.db.get_type()
     }
 
-    pub async fn get_root_hash(&self) -> Vec<u8> {
-        self.db.root().await
+    pub fn get_root_hash(&self) -> Vec<u8> {
+        self.db.root()
     }
 
-    pub async fn get_obj_id(&self) -> ObjId {
-        let root_hash = self.db.root().await;
+    pub fn get_obj_id(&self) -> ObjId {
+        let root_hash = self.db.root();
         ObjId::new_by_raw(OBJ_TYPE_OBJMAPT.to_owned(), root_hash)
     }
 
@@ -115,26 +113,45 @@ impl TrieObjectMap {
         self.hash_method
     }
 
-    pub async fn put_object(&mut self, key: &str, obj_id: &ObjId) -> NdnResult<()> {
-        self.db.put(key, &obj_id).await
+    pub fn put_object(&mut self, key: &str, obj_id: &ObjId) -> NdnResult<()> {
+        self.db.put(key, &obj_id)
     }
 
-    pub async fn get_object(&self, key: &str) -> NdnResult<Option<ObjId>> {
-        self.db.get(key).await
+    pub fn get_object(&self, key: &str) -> NdnResult<Option<ObjId>> {
+        self.db.get(key)
     }
 
-    pub async fn remove_object(&mut self, key: &str) -> NdnResult<Option<ObjId>> {
-        self.db.remove(key).await
+    pub fn remove_object(&mut self, key: &str) -> NdnResult<Option<ObjId>> {
+        self.db.remove(key)
     }
 
-    pub async fn is_object_exist(&self, key: &str) -> NdnResult<bool> {
-        self.db.is_exist(key).await
+    pub fn is_object_exist(&self, key: &str) -> NdnResult<bool> {
+        self.db.is_exist(key)
     }
 
     pub fn iter<'a>(&'a self) -> NdnResult<Box<dyn Iterator<Item = (String, ObjId)> + 'a>> {
         Ok(Box::new(self.db.iter()?))
     }
-    
+
+    pub fn traverse(
+        &self,
+        callback: &mut dyn FnMut(String, ObjId) -> NdnResult<()>,
+    ) -> NdnResult<()> {
+        self.db.traverse(callback)
+    }
+
+    pub fn get_storage_file_path(&self) -> Option<PathBuf> {
+        let id = self.get_obj_id();
+
+        if self.get_storage_type() == TrieObjectMapStorageType::Memory {
+            return None; // Memory storage does not have a file path
+        }
+
+        let factory = GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY.get().unwrap();
+        let file_path = factory.get_file_path_by_id(Some(&id), self.get_storage_type());
+        Some(file_path)
+    }
+
     // Should not call this function if in read-only mode
     pub async fn save(&mut self) -> NdnResult<()> {
         if self.is_read_only() {
@@ -143,7 +160,7 @@ impl TrieObjectMap {
             return Err(NdnError::PermissionDenied(msg));
         }
 
-        let obj_id = self.get_obj_id().await;
+        let obj_id = self.get_obj_id();
 
         GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY
             .get()
@@ -162,7 +179,7 @@ impl TrieObjectMap {
     }
 
     pub async fn clone(&self, read_only: bool) -> NdnResult<Self> {
-        let obj_id = self.get_obj_id().await;
+        let obj_id = self.get_obj_id();
 
         let mut new_storage = GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY
             .get()
@@ -183,12 +200,12 @@ impl TrieObjectMap {
         Ok(ret)
     }
 
-    pub async fn get_object_proof_path(
+    pub fn get_object_proof_path(
         &self,
         key: &str,
     ) -> NdnResult<Option<TrieObjectMapItemProof>> {
-        let proof_nodes = self.db.generate_proof(key).await?;
-        let root_hash = self.db.root().await;
+        let proof_nodes = self.db.generate_proof(key)?;
+        let root_hash = self.db.root();
 
         Ok(Some(TrieObjectMapItemProof {
             proof_nodes,

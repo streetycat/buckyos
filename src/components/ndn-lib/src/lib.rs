@@ -3,8 +3,7 @@
 mod chunk;
 mod object;
 mod link_obj;
-mod local_store;
-mod named_data_mgr;
+mod named_data;
 mod cyfs_http;
 mod ndn_client;
 mod fileobj;
@@ -16,9 +15,8 @@ mod object_array;
 
 pub use object::*;
 pub use chunk::*;
-pub use local_store::*;
 pub use link_obj::*;
-pub use named_data_mgr::*;
+pub use named_data::*;
 pub use cyfs_http::*;
 pub use ndn_client::*;
 pub use fileobj::*;
@@ -28,6 +26,7 @@ pub use object_map::*;
 pub use trie_object_map::*;
 pub use object_array::*;
 
+use reqwest::StatusCode;
 use thiserror::Error;
 
 #[macro_use]
@@ -76,6 +75,16 @@ pub enum NdnError {
 
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
+}
+
+impl NdnError {
+    pub fn from_http_status(code: StatusCode,info:String) -> Self {
+        match code {
+            StatusCode::NOT_FOUND => NdnError::NotFound(info),
+            StatusCode::INTERNAL_SERVER_ERROR => NdnError::Internal(info),
+            _ => NdnError::RemoteError(format!("HTTP error: {} for {}", code, info)),
+        }
+    }
 }
 
 

@@ -130,6 +130,13 @@ impl ChunkId {
         }
     }
 
+    pub fn from_sha256_result(hash_result: &[u8]) -> Self {
+        Self {
+            hash_type: HashMethod::Sha256.to_string(),
+            hash_result: hash_result.to_vec(),
+        }
+    }
+    
     // Create a new ChunkId with length encoding, in mix mode
     pub fn mix_from_hash_result(
         data_length: u64,
@@ -273,7 +280,7 @@ mod tests {
     #[test]
     fn test_var_length() {
         let mut buffer = vec![0u8; 2048];
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill(&mut buffer[..]);
 
         let mut length_buf = unsigned_varint::encode::u64_buffer();
