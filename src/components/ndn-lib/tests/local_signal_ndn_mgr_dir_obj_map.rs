@@ -1455,6 +1455,39 @@ impl SimulateFsItem {
         }
         Some(found)
     }
+
+    fn find_child_mut(&mut self, path: &Path) -> Option<&mut SimulateFsItem> {
+        let paths = path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        let mut found = self;
+        assert_eq!(
+            paths.get(0).expect("Path must have at least one component"),
+            found.name(),
+            "Path does not match the root item name"
+        );
+
+        for path in paths.as_slice()[1..].iter() {
+            match found {
+                SimulateFsItem::File(_) => {
+                    unreachable!("Expected a directory, but found a file at path: {}", path);
+                }
+                SimulateFsItem::Dir(dir) => {
+                    if let Some(child) = dir.children.get_mut(path) {
+                        found = child;
+                    } else {
+                        unreachable!(
+                            "Path component '{}' not found in directory '{}'",
+                            path, dir.name
+                        );
+                    }
+                }
+            }
+        }
+        Some(found)
+    }
 }
 
 fn gen_random_simulate_dir(
@@ -2558,6 +2591,94 @@ impl FileSystemFileReader for SimulateFileReader {
     }
 }
 
+#[async_trait::async_trait]
+impl FileSystemWriter<SimulateFileWriter> for Arc<tokio::sync::Mutex<SimulateFsItem>> {
+    async fn create_dir_all(&self, dir_path: &Path) -> NdnResult<()> {
+        let paths = dir_path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let mut root = self.lock().await;
+        let mut found = &mut *root;
+        for child_name in paths {
+            found = found
+                .check_dir_mut()
+                .children
+                .entry(child_name.clone())
+                .or_insert_with(|| {
+                    SimulateFsItem::Dir(SimulateDir {
+                        name: child_name,
+                        children: HashMap::new(),
+                    })
+                });
+        }
+        Ok(())
+    }
+
+    async fn create_dir(&self, dir: &DirObject, parent_path: &Path) -> NdnResult<()> {
+        let mut root = self.lock().await;
+        let parent_item = root
+            .find_child_mut(parent_path)
+            .expect("Parent path must exist");
+        parent_item.check_dir_mut().children.insert(
+            dir.name.clone(),
+            SimulateFsItem::Dir(SimulateDir {
+                name: dir.name.clone(),
+                children: HashMap::new(),
+            }),
+        );
+        Ok(())
+    }
+
+    async fn open_file(
+        &self,
+        file: &FileObject,
+        parent_path: &Path,
+    ) -> NdnResult<SimulateFileWriter> {
+        Ok(SimulateFileWriter {
+            root: self.clone(),
+            file_path: parent_path.join(file.name.as_str()),
+        })
+    }
+}
+
+struct SimulateFileWriter {
+    root: Arc<tokio::sync::Mutex<SimulateFsItem>>,
+    file_path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl FileSystemFileWriter for SimulateFileWriter {
+    async fn length(&self) -> NdnResult<u64> {
+        let root = self.root.lock().await;
+        let file = root
+            .find_child(self.file_path.as_path())
+            .expect("expect a file")
+            .check_file();
+        Ok(file.content.len() as u64)
+    }
+    async fn write_chunk(&self, chunk_data: &[u8], offset: SeekFrom) -> NdnResult<()> {
+        let mut root = self.root.lock().await;
+        let file = root
+            .find_child_mut(self.file_path.as_path())
+            .expect("expect a file")
+            .check_file_mut();
+        let pos = match offset {
+            SeekFrom::Start(pos) => pos,
+            SeekFrom::End(_) => unimplemented!(),
+            SeekFrom::Current(_) => unreachable!(),
+        };
+        if pos as usize > file.content.len() {
+            panic!("Write position out of bounds");
+        }
+        if pos as usize + chunk_data.len() > file.content.len() {
+            file.content.resize(pos as usize + chunk_data.len(), 0);
+        }
+        file.content[pos as usize..(pos as usize + chunk_data.len())].copy_from_slice(chunk_data);
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct Local2NdnWriter {
     local_named_mgr_id: String,
@@ -2729,6 +2850,25 @@ impl NdnWriter for Local2NdnWriter {
     }
 }
 
+struct LocalNdnReader {
+    ndn_mgr_id: String,
+}
+
+#[async_trait::async_trait]
+impl NdnReader for LocalNdnReader {
+    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value> {
+        NamedDataMgr::get_object(Some(self.ndn_mgr_id.as_str()), obj_id, None).await
+    }
+    async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
+        Ok(read_chunk(self.ndn_mgr_id.as_str(), chunk_id).await)
+    }
+    async fn get_container(&self, _container_id: &ObjId) -> NdnResult<()> {
+        // TODO: For object array or object map, we don't need to do anything here
+        // as they are not stored in the NDN server directly.
+        Ok(())
+    }
+}
+
 async fn check_simulate_fs_eq_object(
     fs_root_item: &SimulateFsItem,
     obj_id: &ObjId,
@@ -2832,10 +2972,23 @@ async fn check_simulate_fs_eq_object(
         let stack_top = traverse_stack
             .last_mut()
             .expect("Traverse stack must not be empty");
-        let next_obj_id = stack_top.1.clone();
+        let dir_obj_map_id = stack_top.1.clone();
         let next_children = stack_top.0.next();
         match next_children {
             Some((_child_name, child_item)) => {
+                let obj_map = TrieObjectMap::open(
+                    &dir_obj_map_id,
+                    true,
+                    HashMethod::Sha256,
+                    Some(TrieObjectMapStorageType::JSONFile),
+                )
+                .await
+                .expect("Failed to open dir object map");
+                let next_obj_id = obj_map
+                    .get_object(child_item.name())
+                    .expect("Child item must exist in object map")
+                    .expect("Child should exist in object map");
+
                 if let Some(next_children_obj_map_id) = check_item(
                     child_item,
                     &next_obj_id,
@@ -2859,6 +3012,58 @@ async fn check_simulate_fs_eq_object(
     }
 }
 
+async fn check_simulate_fs_eq(left: &SimulateFsItem, right: &SimulateFsItem) {
+    let mut traverse_stack = vec![];
+
+    let check_item = |left: &SimulateFsItem, right: &SimulateFsItem| -> bool {
+        match left {
+            SimulateFsItem::File(file) => {
+                let right = right.check_file();
+                assert_eq!(file.name, right.name, "File name mismatch");
+                assert_eq!(file.content, right.content, "File content mismatch");
+                false // No children to traverse
+            }
+            SimulateFsItem::Dir(dir) => {
+                let right = right.check_dir();
+                assert_eq!(dir.name, right.name, "Directory name mismatch");
+                assert_eq!(
+                    right.children.len(),
+                    dir.children.len(),
+                    "Directory children count mismatch"
+                );
+                true
+            }
+        }
+    };
+
+    if check_item(left, right) {
+        traverse_stack.push((left.check_dir().children.iter(), right));
+    }
+
+    while traverse_stack.len() > 0 {
+        let stack_top = traverse_stack
+            .last_mut()
+            .expect("Traverse stack must not be empty");
+        let right_dir = stack_top.1.check_dir();
+        let left_next_child = stack_top.0.next();
+        match left_next_child {
+            Some((_child_name, child_item)) => {
+                let right_child = right_dir
+                    .children
+                    .get(child_item.name())
+                    .expect("Child item must exist in right dir");
+                if check_item(child_item, right_child) {
+                    traverse_stack.push((child_item.check_dir().children.iter(), right_child));
+                }
+            }
+            None => {
+                traverse_stack.pop(); // Finished with this item, pop it from the stack
+                                      // No more children, continue with the next item in the stack
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn ndn_local_dir_trie_obj_map_build() {
     init_logging("ndn_local_dir_trie_obj_map_build", false);
@@ -2868,9 +3073,10 @@ async fn ndn_local_dir_trie_obj_map_build() {
     let obj_map_dir = init_obj_map_storage_factory().await;
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
     let (ndn_client, ndn_host) = init_ndn_server(ndn_mgr_id.as_str()).await;
-    let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (target_ndn_client, target_ndn_host) = init_ndn_server(target_ndn_mgr_id.as_str()).await;
+    let backup_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
+    let (backup_ndn_client, backup_ndn_host) = init_ndn_server(backup_ndn_mgr_id.as_str()).await;
 
+    // backup
     let simulate_dir = Arc::new(tokio::sync::Mutex::new(gen_random_simulate_dir(
         16,
         32,
@@ -2882,7 +3088,7 @@ async fn ndn_local_dir_trie_obj_map_build() {
         Some(root_path.as_path()),
         Local2NdnWriter {
             local_named_mgr_id: ndn_mgr_id.clone(),
-            target_named_mgr_id: target_ndn_mgr_id.clone(),
+            target_named_mgr_id: backup_ndn_mgr_id.clone(),
         },
         simulate_dir.clone(),
         storage.clone(),
@@ -2914,11 +3120,62 @@ async fn ndn_local_dir_trie_obj_map_build() {
     check_simulate_fs_eq_object(
         &*simulate_dir.lock().await,
         &root_obj_id,
-        target_ndn_mgr_id.as_str(),
-        &target_ndn_client,
-        &target_ndn_host,
+        backup_ndn_mgr_id.as_str(),
+        &backup_ndn_client,
+        &backup_ndn_host,
     )
     .await;
+
+    // restore
+    let restore_simulate_dir = Arc::new(tokio::sync::Mutex::new(gen_random_simulate_dir(1, 0, 0)));
+    let restore_storage = Arc::new(tokio::sync::Mutex::new(MemoryStorage::new()));
+    let restore_root_path = PathBuf::from(restore_simulate_dir.lock().await.name());
+    let root_item_id = ndn_to_file_system(
+        Some((restore_root_path.as_path(), &root_obj_id)),
+        restore_simulate_dir.clone(),
+        LocalNdnReader {
+            ndn_mgr_id: backup_ndn_mgr_id.clone(),
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("Failed to build NDN local dir trie object map");
+
+    let restore_root_obj_id = {
+        let storage_guard = storage.lock().await;
+        assert!(
+            storage_guard.items.contains_key(&root_item_id),
+            "Root item must exist"
+        );
+        let (root_item, _, status, depth, _children) = storage_guard
+            .items
+            .get(&root_item_id)
+            .expect("Root item must exist");
+        assert!(root_item.is_dir(), "Root item must be a directory");
+        assert_eq!(depth, &0, "Root item depth must be 0");
+        assert!(status.is_complete(), "Root item status must be Scanning");
+        status
+            .get_obj_id()
+            .expect("Root item must have an ObjId")
+            .clone()
+    };
+
+    assert_eq!(
+        restore_root_obj_id, root_obj_id,
+        "Restored root object ID must match the original"
+    );
+
+    {
+        let orignal_simulate_dir = simulate_dir.lock().await;
+        let restore_simulate_dir_guard = restore_simulate_dir.lock().await;
+        let restore_simulate_dir = restore_simulate_dir_guard
+            .check_dir()
+            .children
+            .get(orignal_simulate_dir.name())
+            .expect("Original simulate dir must exist");
+
+        check_simulate_fs_eq(&*orignal_simulate_dir, restore_simulate_dir);
+    }
 
     info!("ndn_local_dir_trie_obj_map_build test end.");
 }
