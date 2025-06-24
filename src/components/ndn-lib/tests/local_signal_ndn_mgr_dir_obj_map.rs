@@ -556,12 +556,12 @@ pub async fn file_system_to_ndn<
                                                 );
                                                 assert_eq!(
                                                     chunk_item.seq,
-                                                    chunk_list_builder.len() as u64
+                                                    chunk_list_builder.count() as u64
                                                 );
                                                 assert_eq!(
                                                     chunk_item.offset,
                                                     SeekFrom::Start(
-                                                        chunk_list_builder.len() as u64
+                                                        chunk_list_builder.count() as u64
                                                             * file_item.chunk_size.unwrap_or(0)
                                                     )
                                                 );
@@ -796,14 +796,12 @@ pub async fn file_system_to_ndn<
                                             "child dir item should be complete, got: {:?}",
                                             child_status
                                         );
-                                        dir_obj_map
-                                            .put_object(
-                                                dir_obj.name.as_str(),
-                                                child_status
-                                                    .get_obj_id()
-                                                    .expect("child dir item should have obj id."),
-                                            )
-                                            .await?;
+                                        dir_obj_map.put_object(
+                                            dir_obj.name.as_str(),
+                                            child_status
+                                                .get_obj_id()
+                                                .expect("child dir item should have obj id."),
+                                        )?;
                                     }
                                     StorageItem::File(file_item) => {
                                         assert!(
@@ -811,14 +809,12 @@ pub async fn file_system_to_ndn<
                                             "child file item should be complete, got: {:?}",
                                             child_status
                                         );
-                                        dir_obj_map
-                                            .put_object(
-                                                file_item.obj.name.as_str(),
-                                                child_status
-                                                    .get_obj_id()
-                                                    .expect("child file item should have obj id."),
-                                            )
-                                            .await?;
+                                        dir_obj_map.put_object(
+                                            file_item.obj.name.as_str(),
+                                            child_status
+                                                .get_obj_id()
+                                                .expect("child file item should have obj id."),
+                                        )?;
                                     }
                                     StorageItem::Chunk(_) => {
                                         unreachable!("should not have chunk item in dir hashing.");
@@ -831,7 +827,7 @@ pub async fn file_system_to_ndn<
                         }
 
                         dir_obj_map.save().await?;
-                        let dir_obj_map_id = dir_obj_map.get_obj_id().await;
+                        let dir_obj_map_id = dir_obj_map.get_obj_id();
                         dir_object.content = dir_obj_map_id.to_string();
                         let (dir_obj_id, dir_obj_str) = dir_object.gen_obj_id();
                         NamedDataMgr::put_object(

@@ -159,8 +159,8 @@ async fn init_ndn_server(ndn_mgr_id: &str) -> (NdnClient, NdnServerHost) {
 }
 
 async fn init_obj_map_storage_factory() -> PathBuf {
-    let data_path = std::env::temp_dir().join("test_ndn_obj_map_data");
-    if GLOBAL_OBJECT_MAP_STORAGE_FACTORY.get().is_some() {
+    let data_path = std::env::temp_dir().join("test_ndn_trie_obj_map_data");
+    if GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY.get().is_some() {
         info!("Object map storage factory already initialized");
         return data_path;
     }
@@ -170,10 +170,10 @@ async fn init_obj_map_storage_factory() -> PathBuf {
             .expect("create data path failed");
     }
 
-    GLOBAL_OBJECT_MAP_STORAGE_FACTORY
-        .set(ObjectMapStorageFactory::new(
-            &data_path,
-            Some(ObjectMapStorageType::JSONFile),
+    GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY
+        .set(TrieObjectMapStorageFactory::new(
+            data_path.clone(),
+            Some(TrieObjectMapStorageType::JSONFile),
         ))
         .map_err(|_| ())
         .expect("Object array storage factory already initialized");
@@ -221,7 +221,6 @@ async fn ndn_local_trie_obj_map_basic() {
     for (name, (chunk_id, chunk_data)) in chunks.iter() {
         obj_map
             .put_object(*name, &chunk_id.to_obj_id())
-            .await
             .expect(&format!("put {} to trie-obj-map failed", name));
     }
 
@@ -241,7 +240,6 @@ async fn ndn_local_trie_obj_map_basic() {
     for (name, (chunk_id, chunk_data)) in chunks.iter() {
         let obj_id = obj_map
             .get_object(*name)
-            .await
             .expect(&format!("get {} from trie-obj-map failed", name))
             .expect("object should be some");
         assert_eq!(
@@ -252,7 +250,6 @@ async fn ndn_local_trie_obj_map_basic() {
         );
         let proof = obj_map
             .get_object_proof_path(name)
-            .await
             .expect("get object with proof failed")
             .expect("object with proof should be some");
         assert_eq!(proof.root_id(), obj_id, "proof item object id check failed");
@@ -269,7 +266,6 @@ async fn ndn_local_trie_obj_map_basic() {
 
     let notexist_obj_id = obj_map
         .get_object("notexist")
-        .await
         .expect("get notexist from trie-obj-map failed");
     assert!(
         notexist_obj_id.is_none(),
@@ -277,7 +273,6 @@ async fn ndn_local_trie_obj_map_basic() {
     );
     let notexist_proof = obj_map
         .get_object_proof_path("notexist")
-        .await
         .expect("get object with proof failed");
     assert!(
         notexist_proof.is_none(),
@@ -287,7 +282,6 @@ async fn ndn_local_trie_obj_map_basic() {
     let new_chunk = generate_random_chunk(chunk_fix_size);
     let proof = obj_map
         .get_object_proof_path("chunk1")
-        .await
         .expect("get object with proof failed")
         .expect("object with proof should be some");
     let verify_ret = verifier
@@ -360,13 +354,12 @@ async fn ndn_local_trie_obj_map_ok() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
         obj_map
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to trie-obj-map failed");
     }
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id().await;
+    let obj_map_id = obj_map.get_obj_id();
 
     let mut got_obj_map = TrieObjectMap::open(
         &obj_map_id,
@@ -377,7 +370,7 @@ async fn ndn_local_trie_obj_map_ok() {
     .await
     .expect("open trie-obj-map from trie-obj-map id failed");
 
-    let got_obj_map_id = got_obj_map.get_obj_id().await;
+    let got_obj_map_id = got_obj_map.get_obj_id();
     assert_eq!(got_obj_map_id, obj_map_id, "trie-obj-map id check failed");
     assert_eq!(
         got_obj_map
@@ -392,13 +385,11 @@ async fn ndn_local_trie_obj_map_ok() {
     for (key, obj_id) in got_obj_map.iter().expect("iter trie-obj-map failed") {
         let expect_obj_id = obj_map
             .get_object(key.as_str())
-            .await
             .expect("get item from trie-obj-map failed")
             .expect("object should be some");
         assert_eq!(
             got_obj_map
                 .get_object(key.as_str())
-                .await
                 .expect("get item failed")
                 .expect("object should be some"),
             expect_obj_id,
@@ -459,13 +450,12 @@ async fn ndn_local_trie_obj_map_not_found() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
         obj_map
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to trie-obj-map failed");
     }
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id().await;
+    let obj_map_id = obj_map.get_obj_id();
 
     // delete the chunk list storage file
     let remove_json_ret = std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".json"));
@@ -513,13 +503,12 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
         obj_map
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to trie-obj-map failed");
     }
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id().await;
+    let obj_map_id = obj_map.get_obj_id();
 
     let (append_chunk_id, append_chunk_data) = generate_random_chunk(1024 * 1024);
     let mut append_obj_map = obj_map
@@ -532,13 +521,12 @@ async fn ndn_local_trie_obj_map_verify_failed() {
             append_chunk_id.to_string().as_str(),
             &append_chunk_id.to_obj_id(),
         )
-        .await
         .expect("put append chunk to trie-obj-map failed");
     append_obj_map
         .save()
         .await
         .expect("save append trie-obj-map failed");
-    let append_obj_map_id = append_obj_map.get_obj_id().await;
+    let append_obj_map_id = append_obj_map.get_obj_id();
     // instead the chunk list storage file
     let remove_json_ret = std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".json"));
     let copy_json_ret = std::fs::copy(
@@ -567,7 +555,7 @@ async fn ndn_local_trie_obj_map_verify_failed() {
     .await
     .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
     assert_eq!(
-        fake_obj_map.get_obj_id().await,
+        fake_obj_map.get_obj_id(),
         append_obj_map_id,
         "trie-obj-map id check failed after replace"
     );
@@ -576,13 +564,11 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         let key = chunk_id.to_string();
         let obj_id = obj_map
             .get_object(key.as_str())
-            .await
             .expect("get object from trie-obj-map failed")
             .expect("object should be some");
 
         let fake_chunk_id = fake_obj_map
             .get_object(key.as_str())
-            .await
             .expect("get object from fake trie-obj-map failed")
             .expect("object should be some");
 
@@ -594,7 +580,6 @@ async fn ndn_local_trie_obj_map_verify_failed() {
 
         let proof = obj_map
             .get_object_proof_path(key.as_str())
-            .await
             .expect("get_object_proof_path should success for chunk_list has been replaced")
             .expect("get_object_proof_path should return error");
         verifier
@@ -602,7 +587,6 @@ async fn ndn_local_trie_obj_map_verify_failed() {
             .expect_err("should failed for chunk_list has been replaced");
         let fake_proof = fake_obj_map
             .get_object_proof_path(key.as_str())
-            .await
             .expect("get_object_proof_path should success for chunk_list has been replaced")
             .expect("get_object_proof_path should return object");
         verifier
@@ -612,7 +596,6 @@ async fn ndn_local_trie_obj_map_verify_failed() {
 
     let mut fake_proof = fake_obj_map
         .get_object_proof_path(append_chunk_id.to_string().as_str())
-        .await
         .expect("get_object_proof_path should success for chunk_list has been replaced")
         .expect("get_object_proof_path should return object");
     let verify_ret = verifier

@@ -180,4 +180,8 @@ impl ChunkListBuilder {
 
         Ok(ret)
     }
+
+    pub fn count(&self) -> usize {
+        self.list.len()
+    }
 }
