@@ -1,9 +1,4 @@
-use std::{
-    collections::HashSet,
-    io::SeekFrom,
-    ops::Deref,
-    path::PathBuf,
-};
+use std::{collections::HashSet, io::SeekFrom, ops::Deref, path::PathBuf};
 
 use buckyos_kit::*;
 use cyfs_gateway_lib::*;
@@ -169,10 +164,7 @@ async fn init_obj_array_storage_factory() -> PathBuf {
             .expect("create data path failed");
     }
 
-    GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY
-        .set(ObjectArrayStorageFactory::new(&data_path))
-        .map_err(|_| ())
-        .expect("Object array storage factory already initialized");
+    GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY.set(ObjectArrayStorageFactory::new(&data_path));
     data_path
 }
 
@@ -952,12 +944,7 @@ async fn ndn_local_chunklist_basic_var_len() {
     assert_eq!(
         var_mix_chunk_list
             .get_chunk_index_by_offset(SeekFrom::End(
-                -((chunk_size1
-                    + chunk_size2
-                    + chunk_size3
-                    + chunk_size4
-                    + chunk_size5
-                    + chunk_size5) as i64)
+                -((chunk_size1 + chunk_size2 + chunk_size3 + chunk_size4 + chunk_size5) as i64)
             ))
             .expect("get chunk index by offset failed"),
         (0, 0),
@@ -981,7 +968,7 @@ async fn ndn_local_chunklist_basic_var_len() {
         .get_chunk_index_by_offset(SeekFrom::End(1))
         .expect_err("should fail for out of range");
 
-    let chunk_offset = rng.random_range(2..(chunk_size5 as i64) - 1);
+    let chunk_offset = rng.random_range(2..(chunk_size4 as i64) - 1);
     assert_eq!(
         var_mix_chunk_list
             .get_chunk_index_by_offset(SeekFrom::End(-(chunk_size5 as i64) - chunk_offset))
@@ -1249,7 +1236,7 @@ async fn ndn_local_chunklist_basic_var_no_mix_len() {
         .get_chunk_index_by_offset(SeekFrom::End(1))
         .expect_err("should fail for out of range");
 
-    let chunk_offset = rng.random_range(2..(chunk_size5 as i64) - 1);
+    let chunk_offset = rng.random_range(2..(chunk_size4 as i64) - 1);
     assert_eq!(
         var_mix_chunk_list
             .get_chunk_index_by_offset(SeekFrom::End(-(chunk_size5 as i64) - chunk_offset))
