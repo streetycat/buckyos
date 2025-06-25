@@ -1,11 +1,11 @@
-use super::file::{TrieObjectMapSqliteStorage, TrieObjectMapJSONFileStorage};
+use super::file::{TrieObjectMapJSONFileStorage, TrieObjectMapSqliteStorage};
 use super::hash::{Blake2s256Hasher, Keccak256Hasher, Sha256Hasher, Sha512Hasher};
-use super::inner_storage::{ TrieObjectMapInnerStorageWrapper};
+use super::inner_storage::TrieObjectMapInnerStorageWrapper;
 use super::storage::{
-    GenericTrieObjectMapProofVerifier, TrieObjectMapProofVerifier, HashFromSlice,
+    GenericTrieObjectMapProofVerifier, HashFromSlice, TrieObjectMapProofVerifier,
 };
 use super::storage::{TrieObjectMapInnerStorage, TrieObjectMapStorageType};
-use crate::{HashDBWithFile, HashMethod, NdnError, NdnResult, ObjId};
+use crate::{Base32Codec, HashDBWithFile, HashMethod, NdnError, NdnResult, ObjId};
 use hash_db::{HashDB, Hasher};
 use once_cell::sync::OnceCell;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,7 @@ impl TrieObjectMapStorageFactory {
 
     pub fn get_file_path_by_id(
         &self,
-        container_id: Option<&ObjId>,
+        root_hash: Option<&str>,
         storage_type: TrieObjectMapStorageType,
     ) -> PathBuf {
         let file_name = match storage_type {
@@ -37,15 +37,15 @@ impl TrieObjectMapStorageFactory {
                 unreachable!("Memory storage does not have a file path");
             }
             TrieObjectMapStorageType::SQLite => {
-                if let Some(id) = container_id {
-                    id.to_base32()
+                if let Some(id) = root_hash {
+                    id.to_string()
                 } else {
                     self.get_temp_file_name(storage_type)
                 }
             }
             TrieObjectMapStorageType::JSONFile => {
-                if let Some(id) = container_id {
-                    id.to_base32()
+                if let Some(id) = root_hash {
+                    id.to_string()
                 } else {
                     self.get_temp_file_name(storage_type)
                 }
@@ -74,26 +74,26 @@ impl TrieObjectMapStorageFactory {
 
     pub async fn open_by_hash_method(
         &self,
-        container_id: Option<&ObjId>,
+        root_hash: Option<&str>,
         read_only: bool,
         storage_type: Option<TrieObjectMapStorageType>,
         hash_method: HashMethod,
     ) -> NdnResult<Box<dyn TrieObjectMapInnerStorage>> {
         match hash_method {
             HashMethod::Sha256 => {
-                self.open::<Sha256Hasher>(container_id, read_only, storage_type)
+                self.open::<Sha256Hasher>(root_hash, read_only, storage_type)
                     .await
             }
             HashMethod::Sha512 => {
-                self.open::<Sha512Hasher>(container_id, read_only, storage_type)
+                self.open::<Sha512Hasher>(root_hash, read_only, storage_type)
                     .await
             }
             HashMethod::Blake2s256 => {
-                self.open::<Blake2s256Hasher>(container_id, read_only, storage_type)
+                self.open::<Blake2s256Hasher>(root_hash, read_only, storage_type)
                     .await
             }
             HashMethod::Keccak256 => {
-                self.open::<Keccak256Hasher>(container_id, read_only, storage_type)
+                self.open::<Keccak256Hasher>(root_hash, read_only, storage_type)
                     .await
             }
             HashMethod::QCID => {
@@ -106,7 +106,7 @@ impl TrieObjectMapStorageFactory {
 
     pub async fn open<H>(
         &self,
-        container_id: Option<&ObjId>,
+        root_hash: Option<&str>,
         read_only: bool,
         storage_type: Option<TrieObjectMapStorageType>,
     ) -> NdnResult<Box<dyn TrieObjectMapInnerStorage>>
@@ -127,6 +127,14 @@ impl TrieObjectMapStorageFactory {
         }
 
         let storage_type = storage_type.unwrap_or(self.default_storage_type);
+        let root: Option<<H as Hasher>::Out> = if let Some(id) = root_hash {
+            // Decode the root hash from string to the appropriate type.
+            let root_hash = Base32Codec::from_base32(id)?;
+            Some(H::Out::from_slice(root_hash.as_slice())?)
+        } else {
+            None
+        };
+
         match storage_type {
             TrieObjectMapStorageType::Memory => {
                 let msg = "Memory storage is not supported for open operation".to_string();
@@ -134,12 +142,17 @@ impl TrieObjectMapStorageFactory {
                 Err(NdnError::PermissionDenied(msg))
             }
             TrieObjectMapStorageType::SQLite => {
-                let file = self.get_file_path_by_id(container_id, storage_type);
+                let file = self.get_file_path_by_id(root_hash, storage_type);
+                info!(
+                    "Opening TrieObjectMap SQLite storage at: {}",
+                    file.display()
+                );
 
                 let db = TrieObjectMapSqliteStorage::<H>::new(file, read_only)?;
                 let storage = TrieObjectMapInnerStorageWrapper::<H>::new(
                     db.get_type(),
                     Box::new(db) as Box<dyn HashDBWithFile<H, Vec<u8>>>,
+                    root,
                     read_only,
                 );
                 let ret = Box::new(storage) as Box<dyn TrieObjectMapInnerStorage>;
@@ -147,12 +160,14 @@ impl TrieObjectMapStorageFactory {
                 Ok(ret)
             }
             TrieObjectMapStorageType::JSONFile => {
-                let file = self.get_file_path_by_id(container_id, storage_type);
+                let file = self.get_file_path_by_id(root_hash, storage_type);
+                info!("Opening TrieObjectMap JSON storage at: {}", file.display());
 
                 let db = TrieObjectMapJSONFileStorage::<H>::new(file, read_only)?;
                 let storage = TrieObjectMapInnerStorageWrapper::<H>::new(
                     db.get_type(),
                     Box::new(db) as Box<dyn HashDBWithFile<H, Vec<u8>>>,
+                    root,
                     read_only,
                 );
                 let ret = Box::new(storage) as Box<dyn TrieObjectMapInnerStorage>;
@@ -164,27 +179,27 @@ impl TrieObjectMapStorageFactory {
 
     pub async fn save(
         &self,
-        container_id: &ObjId,
+        root_hash: &str,
         storage: &mut dyn TrieObjectMapInnerStorage,
     ) -> NdnResult<()> {
-        let file = self.get_file_path_by_id(Some(container_id), storage.get_type());
+        let file = self.get_file_path_by_id(Some(root_hash), storage.get_type());
 
         storage.save(&file).await
     }
 
     pub async fn clone(
         &self,
-        container_id: &ObjId,
+        root_hash: &str,
         storage: &dyn TrieObjectMapInnerStorage,
         read_only: bool,
     ) -> NdnResult<Box<dyn TrieObjectMapInnerStorage>> {
         let file_name = if read_only {
-            container_id.to_base32()
+            root_hash.to_string()
         } else {
             let index = self.temp_file_index.fetch_add(1, Ordering::SeqCst);
             format!(
                 "clone_{}_{}_{}.{}",
-                container_id.to_base32(),
+                root_hash,
                 index,
                 chrono::Utc::now().timestamp(),
                 Self::get_file_ext(storage.get_type()),
