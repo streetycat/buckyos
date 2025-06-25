@@ -1,15 +1,9 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io::SeekFrom,
-    ops::{Deref, Index},
-    path::PathBuf,
-};
+use std::{collections::HashMap, io::SeekFrom, path::PathBuf};
 
 use buckyos_kit::*;
 use cyfs_gateway_lib::*;
 use cyfs_warp::*;
 use hex::ToHex;
-use jsonwebtoken::EncodingKey;
 use log::*;
 use ndn_lib::*;
 use rand::{Rng, RngCore};
@@ -71,7 +65,7 @@ async fn write_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId, chunk_data: &[u8]) {
         .expect("wait chunk writer complete failed.");
 }
 
-async fn read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
+async fn _read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
     let (mut chunk_reader, len) =
         NamedDataMgr::open_chunk_reader(Some(ndn_mgr_id), chunk_id, SeekFrom::Start(0), false)
             .await
@@ -170,13 +164,10 @@ async fn init_obj_map_storage_factory() -> PathBuf {
             .expect("create data path failed");
     }
 
-    GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY
-        .set(TrieObjectMapStorageFactory::new(
-            data_path.clone(),
-            Some(TrieObjectMapStorageType::JSONFile),
-        ))
-        .map_err(|_| ())
-        .expect("Object array storage factory already initialized");
+    let _ = GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY.set(TrieObjectMapStorageFactory::new(
+        data_path.clone(),
+        Some(TrieObjectMapStorageType::JSONFile),
+    ));
     data_path
 }
 
@@ -236,6 +227,8 @@ async fn ndn_local_trie_obj_map_basic() {
         "trie-obj-map total size check failed"
     );
 
+    let obj_map_root_hash = obj_map.get_root_hash();
+
     let verifier = TrieObjectMapProofVerifierHelper::new(HashMethod::Sha256);
     for (name, (chunk_id, chunk_data)) in chunks.iter() {
         let obj_id = obj_map
@@ -252,7 +245,11 @@ async fn ndn_local_trie_obj_map_basic() {
             .get_object_proof_path(name)
             .expect("get object with proof failed")
             .expect("object with proof should be some");
-        assert_eq!(proof.root_id(), obj_id, "proof item object id check failed");
+        assert_eq!(
+            proof.root_hash(),
+            obj_map_root_hash.as_slice(),
+            "proof item object id check failed"
+        );
         let verify_ret = verifier
             .verify_object(name, &obj_id, &proof)
             .expect("verify object map failed");
@@ -273,10 +270,15 @@ async fn ndn_local_trie_obj_map_basic() {
     );
     let notexist_proof = obj_map
         .get_object_proof_path("notexist")
-        .expect("get object with proof failed");
-    assert!(
-        notexist_proof.is_none(),
-        "trie-obj-map[notexist] proof should be none",
+        .expect("get object with proof failed")
+        .expect("proof for not exist item");
+    let ret = verifier
+        .verify("notexist", &[], &notexist_proof)
+        .expect("verify not exist item should success");
+    assert_eq!(
+        ret,
+        TrieObjectMapProofVerifyResult::Ok,
+        "verify not exist item should return Ok"
     );
 
     let new_chunk = generate_random_chunk(chunk_fix_size);
@@ -359,16 +361,17 @@ async fn ndn_local_trie_obj_map_ok() {
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id();
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
+    NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
+        .await
+        .expect("put obj-map failed");
+    let obj_map_json = NamedDataMgr::get_object(Some(ndn_mgr_id.as_str()), &obj_map_id, None)
+        .await
+        .expect("get obj-map failed");
 
-    let mut got_obj_map = TrieObjectMap::open(
-        &obj_map_id,
-        true,
-        HashMethod::Sha256,
-        Some(TrieObjectMapStorageType::JSONFile),
-    )
-    .await
-    .expect("open trie-obj-map from trie-obj-map id failed");
+    let got_obj_map = TrieObjectMap::open(obj_map_json, true)
+        .await
+        .expect("open trie-obj-map from trie-obj-map id failed");
 
     let got_obj_map_id = got_obj_map.get_obj_id();
     assert_eq!(got_obj_map_id, obj_map_id, "trie-obj-map id check failed");
@@ -408,7 +411,7 @@ async fn ndn_local_trie_obj_map_ok() {
         .await
         .expect("open chunk list reader from ndn-mgr failed.");
 
-        let (chunk_id, chunk_data) = chunks
+        let (_chunk_id, chunk_data) = chunks
             .iter()
             .find(|(id, _)| id.to_obj_id() == obj_id)
             .expect("should find chunk in chunks");
@@ -455,27 +458,39 @@ async fn ndn_local_trie_obj_map_not_found() {
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id();
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
+    let obj_map_hash = obj_map.get_root_hash_str();
+
+    NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
+        .await
+        .expect("put obj-map failed");
+    let obj_map_json = NamedDataMgr::get_object(Some(ndn_mgr_id.as_str()), &obj_map_id, None)
+        .await
+        .expect("get obj-map failed");
 
     // delete the chunk list storage file
-    let remove_json_ret = std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".json"));
-    let remove_arrow_ret =
-        std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".arrow"));
+    let remove_json_ret = std::fs::remove_file(
+        storage_dir
+            .join(obj_map_hash.as_str())
+            .with_extension("json"),
+    );
+    let remove_arrow_ret = std::fs::remove_file(
+        storage_dir
+            .join(obj_map_hash.as_str())
+            .with_extension("arrow"),
+    );
 
     assert!(
         remove_json_ret.is_ok() || remove_arrow_ret.is_ok(),
         "remove chunk list storage file failed"
     );
 
-    TrieObjectMap::open(
-        &obj_map_id,
-        true,
-        HashMethod::Sha256,
-        Some(TrieObjectMapStorageType::JSONFile),
-    )
-    .await
-    .map(|_| ())
-    .expect_err("open trie-obj-map from trie-obj-map id should failed for the storage is removed");
+    TrieObjectMap::open(obj_map_json, true)
+        .await
+        .map(|_| ())
+        .expect_err(
+            "open trie-obj-map from trie-obj-map id should failed for the storage is removed",
+        );
 
     info!("ndn_local_trie_obj_map_not_found test end.");
 }
@@ -492,7 +507,7 @@ async fn ndn_local_trie_obj_map_verify_failed() {
     let verifier = TrieObjectMapProofVerifierHelper::new(HashMethod::Sha256);
 
     let chunks = generate_random_chunk_list(5, None);
-    let total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
+    let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
     let mut obj_map =
         TrieObjectMap::new(HashMethod::Sha256, Some(TrieObjectMapStorageType::JSONFile))
@@ -508,7 +523,14 @@ async fn ndn_local_trie_obj_map_verify_failed() {
 
     obj_map.save().await.expect("save trie-obj-map failed");
 
-    let obj_map_id = obj_map.get_obj_id();
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
+    let obj_map_root_hash = obj_map.get_root_hash_str();
+    NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
+        .await
+        .expect("put obj-map failed");
+    let obj_map_json = NamedDataMgr::get_object(Some(ndn_mgr_id.as_str()), &obj_map_id, None)
+        .await
+        .expect("get obj-map failed");
 
     let (append_chunk_id, append_chunk_data) = generate_random_chunk(1024 * 1024);
     let mut append_obj_map = obj_map
@@ -526,18 +548,34 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         .save()
         .await
         .expect("save append trie-obj-map failed");
-    let append_obj_map_id = append_obj_map.get_obj_id();
+    let (append_obj_map_id, append_obj_map_str) = append_obj_map.calc_obj_id();
+    let append_obj_map_root_hash = append_obj_map.get_root_hash_str();
     // instead the chunk list storage file
-    let remove_json_ret = std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".json"));
-    let copy_json_ret = std::fs::copy(
-        storage_dir.join(append_obj_map_id.to_base32() + ".json"),
-        storage_dir.join(obj_map_id.to_base32() + ".json"),
+    let remove_json_ret = std::fs::remove_file(
+        storage_dir
+            .join(obj_map_root_hash.as_str())
+            .with_extension("json"),
     );
-    let remove_arrow_ret =
-        std::fs::remove_file(storage_dir.join(obj_map_id.to_base32() + ".arrow"));
+    let copy_json_ret = std::fs::copy(
+        storage_dir
+            .join(append_obj_map_root_hash.as_str())
+            .with_extension("json"),
+        storage_dir
+            .join(obj_map_root_hash.as_str())
+            .with_extension("json"),
+    );
+    let remove_arrow_ret = std::fs::remove_file(
+        storage_dir
+            .join(obj_map_root_hash.as_str())
+            .with_extension("arrow"),
+    );
     let copy_arrow_ret = std::fs::copy(
-        storage_dir.join(append_obj_map_id.to_base32() + ".arrow"),
-        storage_dir.join(obj_map_id.to_base32() + ".arrow"),
+        storage_dir
+            .join(append_obj_map_root_hash.as_str())
+            .with_extension("arrow"),
+        storage_dir
+            .join(obj_map_root_hash.as_str())
+            .with_extension("arrow"),
     );
 
     assert!(
@@ -546,19 +584,9 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         "instead append chunk list storage file failed, remove-json: {:?}, copy-json: {:?}, remove-arrow: {:?}, copy-arrow: {:?}", remove_json_ret, copy_json_ret, remove_arrow_ret, copy_arrow_ret
     );
 
-    let fake_obj_map = TrieObjectMap::open(
-        &obj_map_id,
-        true,
-        HashMethod::Sha256,
-        Some(TrieObjectMapStorageType::JSONFile),
-    )
-    .await
-    .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
-    assert_eq!(
-        fake_obj_map.get_obj_id(),
-        append_obj_map_id,
-        "trie-obj-map id check failed after replace"
-    );
+    let fake_obj_map = TrieObjectMap::open(obj_map_json, true)
+        .await
+        .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
 
     for (chunk_id, _chunk_data) in chunks.iter() {
         let key = chunk_id.to_string();
@@ -567,58 +595,126 @@ async fn ndn_local_trie_obj_map_verify_failed() {
             .expect("get object from trie-obj-map failed")
             .expect("object should be some");
 
-        let fake_chunk_id = fake_obj_map
-            .get_object(key.as_str())
-            .expect("get object from fake trie-obj-map failed")
-            .expect("object should be some");
-
-        assert_eq!(
-            fake_chunk_id, obj_id,
-            "trie-obj-map {} object check failed after replace",
-            key
+        let _fake_chunk_id = fake_obj_map.get_object(key.as_str()).expect_err(
+            "get object from fake trie-obj-map should be failed for root hash has been replaced",
         );
+
+        // assert_eq!(
+        //     fake_chunk_id, obj_id,
+        //     "trie-obj-map {} object check failed after replace",
+        //     key
+        // );
 
         let proof = obj_map
             .get_object_proof_path(key.as_str())
             .expect("get_object_proof_path should success for chunk_list has been replaced")
             .expect("get_object_proof_path should return error");
-        verifier
+        assert_eq!(
+            proof.root_hash,
+            obj_map.get_root_hash(),
+            "root-hash in proof should same with obj-map.root_hash"
+        );
+        let ret = verifier
             .verify_object(key.as_str(), &obj_id, &proof)
-            .expect_err("should failed for chunk_list has been replaced");
-        let fake_proof = fake_obj_map
+            .expect("should verify success");
+        assert_eq!(
+            ret,
+            TrieObjectMapProofVerifyResult::Ok,
+            "should verify success"
+        );
+        let _fake_proof = fake_obj_map
             .get_object_proof_path(key.as_str())
-            .expect("get_object_proof_path should success for chunk_list has been replaced")
-            .expect("get_object_proof_path should return object");
-        verifier
-            .verify_object(key.as_str(), &obj_id, &fake_proof)
-            .expect_err("should failed for chunk_list has been replaced");
+            .expect_err("get_object_proof_path should failed for root hash has been replaced");
+        // assert_eq!(
+        //     fake_proof.root_hash,
+        //     append_obj_map.get_root_hash(),
+        //     "root-hash in fake-proof should same with append obj-map.root_hash"
+        // );
+        // verifier
+        //     .verify_object(key.as_str(), &obj_id, &fake_proof)
+        //     .expect_err("should failed for chunk_list has been replaced");
     }
 
-    let mut fake_proof = fake_obj_map
+    let _fake_proof = fake_obj_map
         .get_object_proof_path(append_chunk_id.to_string().as_str())
-        .expect("get_object_proof_path should success for chunk_list has been replaced")
-        .expect("get_object_proof_path should return object");
-    let verify_ret = verifier
-        .verify_object(
-            append_chunk_id.to_string().as_str(),
-            &append_chunk_id.to_obj_id(),
-            &fake_proof,
-        )
-        .expect("should success for chunk_list has been replaced");
-    assert_ne!(
-        verify_ret,
-        TrieObjectMapProofVerifyResult::Ok,
-        "should success for item is in fake chunk_list"
-    );
+        .expect_err("get_object_proof_path should failed for root hash has been replaced");
+    // let verify_ret = verifier
+    //     .verify_object(
+    //         append_chunk_id.to_string().as_str(),
+    //         &append_chunk_id.to_obj_id(),
+    //         &fake_proof,
+    //     )
+    //     .expect("should success for chunk_list has been replaced");
+    // assert_ne!(
+    //     verify_ret,
+    //     TrieObjectMapProofVerifyResult::Ok,
+    //     "should success for item is in fake chunk_list"
+    // );
 
-    fake_proof.root_hash = obj_map_id.obj_hash.clone();
-    verifier
-        .verify_object(
-            append_chunk_id.to_string().as_str(),
-            &append_chunk_id.to_obj_id(),
-            &fake_proof,
-        )
-        .expect_err("should failed for chunk_list has been replaced");
+    let fake_proof = append_obj_map
+        .get_object_proof_path(append_chunk_id.to_string().as_str())
+        .expect("get_object_proof_path should success for append chunk in append obj-map")
+        .expect("get_object_proof_path should return error");
+    {
+        let ret = verifier
+            .verify_object(
+                append_chunk_id.to_string().as_str(),
+                &append_chunk_id.to_obj_id(),
+                &fake_proof,
+            )
+            .expect("should failed for chunk_list has been replaced");
+
+        assert_eq!(
+            ret,
+            TrieObjectMapProofVerifyResult::Ok,
+            "should verify success for fake root hash in proof"
+        );
+    }
+    {
+        let mut fake_proof = fake_proof.clone();
+        fake_proof.root_hash = obj_map_id.obj_hash.clone();
+        let ret = verifier
+            .verify_object(
+                append_chunk_id.to_string().as_str(),
+                &append_chunk_id.to_obj_id(),
+                &fake_proof,
+            )
+            .expect("should failed for chunk_list has been replaced");
+
+        assert_eq!(
+            ret,
+            TrieObjectMapProofVerifyResult::RootMismatch,
+            "should verify failed for fake root hash in proof"
+        );
+    }
+
+    {
+        let ret = verifier
+            .verify_object("fake-key", &append_chunk_id.to_obj_id(), &fake_proof)
+            .expect("should failed for chunk_list has been replaced");
+
+        assert_eq!(
+            ret,
+            TrieObjectMapProofVerifyResult::ValueMismatch,
+            "should verify failed for fake root hash in proof"
+        );
+    }
+
+    {
+        let ret = verifier
+            .verify_object(
+                append_chunk_id.to_string().as_str(),
+                &chunks.get(0).unwrap().0.to_obj_id(),
+                &fake_proof,
+            )
+            .expect("should failed for chunk_list has been replaced");
+
+        assert_eq!(
+            ret,
+            TrieObjectMapProofVerifyResult::ValueMismatch,
+            "should verify failed for fake root hash in proof"
+        );
+    }
 
     info!("ndn_local_trie_obj_map_verify_failed test end.");
 }

@@ -164,7 +164,7 @@ async fn init_obj_array_storage_factory() -> PathBuf {
             .expect("create data path failed");
     }
 
-    GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY.set(ObjectArrayStorageFactory::new(&data_path));
+    let _ = GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY.set(ObjectArrayStorageFactory::new(&data_path));
     data_path
 }
 

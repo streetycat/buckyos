@@ -307,7 +307,7 @@ pub trait NdnWriter: Send + Sync + Sized + Clone {
 pub trait NdnReader: Send + Sync + Sized {
     async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value>;
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>>;
-    async fn get_container(&self, container_id: &ObjId) -> NdnResult<()>;
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Value>;
 }
 
 pub async fn file_system_to_ndn<
@@ -1148,14 +1148,8 @@ async fn ndn_to_file_system<
                     StorageItem::Dir(dir_obj) => {
                         info!("transfer dir: {:?}", dir_obj.name);
                         let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
-                        reader.get_container(&dir_obj_map_id).await?;
-                        let dir_obj_map = TrieObjectMap::open(
-                            &dir_obj_map_id,
-                            true,
-                            HashMethod::Sha256,
-                            Some(TrieObjectMapStorageType::JSONFile),
-                        )
-                        .await?;
+                        let obj_map_json = reader.get_container(&dir_obj_map_id).await?;
+                        let dir_obj_map = TrieObjectMap::open(obj_map_json, true).await?;
 
                         writer.create_dir(dir_obj, parent_path).await?;
 
@@ -3117,65 +3111,65 @@ async fn ndn_local_dir_trie_obj_map_build() {
             .clone()
     };
 
-    // check_simulate_fs_eq_object(
-    //     &*simulate_dir.lock().await,
-    //     &root_obj_id,
-    //     backup_ndn_mgr_id.as_str(),
-    //     &backup_ndn_client,
-    //     &backup_ndn_host,
-    // )
-    // .await;
+    check_simulate_fs_eq_object(
+        &*simulate_dir.lock().await,
+        &root_obj_id,
+        backup_ndn_mgr_id.as_str(),
+        &backup_ndn_client,
+        &backup_ndn_host,
+    )
+    .await;
 
-    // // restore
-    // let restore_simulate_dir = Arc::new(tokio::sync::Mutex::new(gen_random_simulate_dir(1, 0, 0)));
-    // let restore_storage = Arc::new(tokio::sync::Mutex::new(MemoryStorage::new()));
-    // let restore_root_path = PathBuf::from(restore_simulate_dir.lock().await.name());
-    // let root_item_id = ndn_to_file_system(
-    //     Some((restore_root_path.as_path(), &root_obj_id)),
-    //     restore_simulate_dir.clone(),
-    //     LocalNdnReader {
-    //         ndn_mgr_id: backup_ndn_mgr_id.clone(),
-    //     },
-    //     storage.clone(),
-    // )
-    // .await
-    // .expect("Failed to build NDN local dir trie object map");
+    // restore
+    let restore_simulate_dir = Arc::new(tokio::sync::Mutex::new(gen_random_simulate_dir(1, 0, 0)));
+    let restore_storage = Arc::new(tokio::sync::Mutex::new(MemoryStorage::new()));
+    let restore_root_path = PathBuf::from(restore_simulate_dir.lock().await.name());
+    let root_item_id = ndn_to_file_system(
+        Some((restore_root_path.as_path(), &root_obj_id)),
+        restore_simulate_dir.clone(),
+        LocalNdnReader {
+            ndn_mgr_id: backup_ndn_mgr_id.clone(),
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("Failed to build NDN local dir trie object map");
 
-    // let restore_root_obj_id = {
-    //     let storage_guard = storage.lock().await;
-    //     assert!(
-    //         storage_guard.items.contains_key(&root_item_id),
-    //         "Root item must exist"
-    //     );
-    //     let (root_item, _, status, depth, _children) = storage_guard
-    //         .items
-    //         .get(&root_item_id)
-    //         .expect("Root item must exist");
-    //     assert!(root_item.is_dir(), "Root item must be a directory");
-    //     assert_eq!(depth, &0, "Root item depth must be 0");
-    //     assert!(status.is_complete(), "Root item status must be Scanning");
-    //     status
-    //         .get_obj_id()
-    //         .expect("Root item must have an ObjId")
-    //         .clone()
-    // };
+    let restore_root_obj_id = {
+        let storage_guard = storage.lock().await;
+        assert!(
+            storage_guard.items.contains_key(&root_item_id),
+            "Root item must exist"
+        );
+        let (root_item, _, status, depth, _children) = storage_guard
+            .items
+            .get(&root_item_id)
+            .expect("Root item must exist");
+        assert!(root_item.is_dir(), "Root item must be a directory");
+        assert_eq!(depth, &0, "Root item depth must be 0");
+        assert!(status.is_complete(), "Root item status must be Scanning");
+        status
+            .get_obj_id()
+            .expect("Root item must have an ObjId")
+            .clone()
+    };
 
-    // assert_eq!(
-    //     restore_root_obj_id, root_obj_id,
-    //     "Restored root object ID must match the original"
-    // );
+    assert_eq!(
+        restore_root_obj_id, root_obj_id,
+        "Restored root object ID must match the original"
+    );
 
-    // {
-    //     let orignal_simulate_dir = simulate_dir.lock().await;
-    //     let restore_simulate_dir_guard = restore_simulate_dir.lock().await;
-    //     let restore_simulate_dir = restore_simulate_dir_guard
-    //         .check_dir()
-    //         .children
-    //         .get(orignal_simulate_dir.name())
-    //         .expect("Original simulate dir must exist");
+    {
+        let orignal_simulate_dir = simulate_dir.lock().await;
+        let restore_simulate_dir_guard = restore_simulate_dir.lock().await;
+        let restore_simulate_dir = restore_simulate_dir_guard
+            .check_dir()
+            .children
+            .get(orignal_simulate_dir.name())
+            .expect("Original simulate dir must exist");
 
-    //     check_simulate_fs_eq(&*orignal_simulate_dir, restore_simulate_dir);
-    // }
+        check_simulate_fs_eq(&*orignal_simulate_dir, restore_simulate_dir);
+    }
 
     info!("ndn_local_dir_trie_obj_map_build test end.");
 }
