@@ -10,7 +10,7 @@ use crate::{
     hash::{HashHelper, HashMethod},
     NdnError, NdnResult,
 };
-use crate::{Base32Codec, MerkleTreeProofPathVerifier, OBJ_TYPE_OBJMAP};
+use crate::{Base32Codec, MerkleTreeProofPathVerifier, ObjectMapStorageOpenMode, OBJ_TYPE_OBJMAP};
 use core::hash;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -94,7 +94,12 @@ impl ObjectMap {
         let mut storage = GLOBAL_OBJECT_MAP_STORAGE_FACTORY
             .get()
             .unwrap()
-            .open(None, false, storage_type)
+            .open(
+                None,
+                false,
+                storage_type,
+                ObjectMapStorageOpenMode::CreateNew,
+            )
             .await
             .map_err(|e| {
                 let msg = format!("Error opening object map storage: {}", e);
@@ -122,10 +127,7 @@ impl ObjectMap {
     // Load object map from storage
     pub async fn open(obj_data: serde_json::Value, read_only: bool) -> NdnResult<Self> {
         // First calc obj id with body
-        let (obj_id, _) = build_named_object_by_json(
-            OBJ_TYPE_OBJMAP,
-            &obj_data,
-        );
+        let (obj_id, _) = build_named_object_by_json(OBJ_TYPE_OBJMAP, &obj_data);
 
         let body: ObjectMapBody = serde_json::from_value(obj_data).map_err(|e| {
             let msg = format!("Error decoding object map body: {} {}", e, obj_id);
@@ -136,7 +138,12 @@ impl ObjectMap {
         let storage = GLOBAL_OBJECT_MAP_STORAGE_FACTORY
             .get()
             .unwrap()
-            .open(Some(&body.root_hash), read_only, Some(body.storage_type))
+            .open(
+                Some(&body.root_hash),
+                read_only,
+                Some(body.storage_type),
+                ObjectMapStorageOpenMode::OpenExisting,
+            )
             .await
             .map_err(|e| {
                 let msg = format!(
@@ -172,8 +179,6 @@ impl ObjectMap {
             None
         };
 
-        
-
         let mut map = Self {
             hash_method: body.hash_method,
             is_dirty: false,
@@ -190,7 +195,7 @@ impl ObjectMap {
     }
 
     // If mtree exists, return the current obj id, otherwise return None
-    // If mtree is dirty, then should call flush/calc_obj_id to regenerate the mtree first
+    // If mtree is dirty, then should call flush_mtree/calc_obj_id to regenerate the mtree first
     pub fn get_obj_id(&self) -> Option<ObjId> {
         self.obj_id.clone()
     }
@@ -262,7 +267,7 @@ impl ObjectMap {
         }
 
         if self.is_dirty {
-            let msg = "Object map is dirty, should call flush at first".to_string();
+            let msg = "Object map is dirty, should call flush_mtree at first".to_string();
             error!("{}", msg);
             return Err(NdnError::InvalidState(msg));
         }
@@ -443,7 +448,7 @@ impl ObjectMap {
     }
 
     // Regenerate the merkle tree and object id if the mtree is dirty
-    pub async fn flush(&mut self) -> NdnResult<()> {
+    pub async fn flush_mtree(&mut self) -> NdnResult<()> {
         if !self.is_dirty && !self.mtree.is_none() {
             return Ok(());
         }
@@ -490,7 +495,7 @@ impl ObjectMap {
             return Err(NdnError::PermissionDenied(msg));
         }
 
-        self.flush().await?;
+        self.flush_mtree().await?;
 
         let root_hash = self.get_root_hash_str();
         if root_hash.is_none() {
@@ -519,7 +524,7 @@ impl ObjectMap {
 
     pub async fn clone(&self, read_only: bool) -> NdnResult<Self> {
         if self.is_dirty || self.mtree.is_none() {
-            let msg = "Object map is dirty, should call flush at first".to_string();
+            let msg = "Object map is dirty, should call flush_mtree at first".to_string();
             error!("{}", msg);
             return Err(NdnError::InvalidState(msg));
         }
