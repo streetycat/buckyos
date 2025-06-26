@@ -307,7 +307,7 @@ pub trait NdnWriter: Send + Sync + Sized + Clone {
 pub trait NdnReader: Send + Sync + Sized {
     async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value>;
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>>;
-    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Value>;
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Option<Value>>;
 }
 
 pub async fn file_system_to_ndn<
@@ -827,7 +827,15 @@ pub async fn file_system_to_ndn<
                         }
 
                         dir_obj_map.save().await?;
-                        let dir_obj_map_id = dir_obj_map.get_obj_id();
+                        let (dir_obj_map_id, dir_obj_map_str) = dir_obj_map.calc_obj_id();
+
+                        NamedDataMgr::put_object(
+                            Some(ndn_mgr_id),
+                            &dir_obj_map_id,
+                            dir_obj_map_str.as_str(),
+                        )
+                        .await?;
+
                         dir_object.content = dir_obj_map_id.to_string();
                         let (dir_obj_id, dir_obj_str) = dir_object.gen_obj_id();
                         NamedDataMgr::put_object(
@@ -1148,7 +1156,17 @@ async fn ndn_to_file_system<
                     StorageItem::Dir(dir_obj) => {
                         info!("transfer dir: {:?}", dir_obj.name);
                         let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
-                        let obj_map_json = reader.get_container(&dir_obj_map_id).await?;
+                        let obj_map_json = reader
+                            .get_container(&dir_obj_map_id)
+                            .await?
+                            .ok_or_else(|| {
+                                let msg = format!(
+                                    "Failed to get object map for dir: {}, obj id: {}",
+                                    dir_obj.name, dir_obj_map_id
+                                );
+                                error!("{}", msg);
+                                NdnError::NotFound(msg)
+                            })?;
                         let dir_obj_map = TrieObjectMap::open(obj_map_json, true).await?;
 
                         writer.create_dir(dir_obj, parent_path).await?;
@@ -2694,12 +2712,15 @@ impl NdnWriter for Local2NdnWriter {
                     OBJ_TYPE_CHUNK_LIST,
                     "Chunk list id must be of type ChunkList"
                 );
-                let lost_obj =
-                    NamedDataMgr::get_object(Some(self.target_named_mgr_id.as_str()), obj_id, None)
-                        .await;
+                let lost_obj = NamedDataMgr::get_object(
+                    Some(self.target_named_mgr_id.as_str()),
+                    &chunk_list_id,
+                    None,
+                )
+                .await;
                 match lost_obj {
                     Ok(_) => {
-                        info!("Object already exists, skipping push: {}", obj_id);
+                        info!("Object already exists, skipping push: {}", chunk_list_id);
                         NamedDataMgr::put_object(
                             Some(self.target_named_mgr_id.as_str()),
                             obj_id,
@@ -2711,8 +2732,8 @@ impl NdnWriter for Local2NdnWriter {
                     }
                     Err(e) => match e {
                         NdnError::NotFound(_) => {
-                            info!("Object not found, pushing new object: {}", obj_id);
-                            return Ok(vec![obj_id.clone()]);
+                            info!("Object not found, pushing new object: {}", chunk_list_id);
+                            return Ok(vec![chunk_list_id.clone()]);
                         }
                         _ => {
                             panic!("Failed to get object: {}", e);
@@ -2725,20 +2746,48 @@ impl NdnWriter for Local2NdnWriter {
                 let dir_obj_map_id =
                     ObjId::try_from(dir_obj.content.as_str()).expect("Invalid dir object map id");
 
-                // todo: should check from target_named_mgr_id, but now it's global, so it will success always
-                let obj_map = TrieObjectMap::open(
+                let lost_obj_map = NamedDataMgr::get_object(
+                    Some(self.target_named_mgr_id.as_str()),
                     &dir_obj_map_id,
-                    true,
-                    HashMethod::Sha256,
-                    Some(TrieObjectMapStorageType::JSONFile),
+                    None,
                 )
-                .await
-                .expect("Failed to open dir object map");
+                .await;
+                let err = match lost_obj_map {
+                    Ok(obj_map_json) => {
+                        info!("Object already exists, check body: {}", dir_obj_map_id);
 
-                NamedDataMgr::put_object(Some(self.target_named_mgr_id.as_str()), obj_id, obj_str)
-                    .await
-                    .expect("Failed to put dir object");
-                return Ok(vec![]);
+                        // todo: should check from target_named_mgr_id, but now it's global, so it will success always
+                        let obj_map = TrieObjectMap::open(obj_map_json, true).await;
+                        match obj_map {
+                            Ok(_) => {
+                                info!(
+                                    "Object map already exists, skipping push: {}",
+                                    dir_obj_map_id
+                                );
+                                NamedDataMgr::put_object(
+                                    Some(self.target_named_mgr_id.as_str()),
+                                    obj_id,
+                                    obj_str,
+                                )
+                                .await
+                                .expect("Failed to put dir object");
+                                return Ok(vec![]);
+                            }
+                            Err(e) => e,
+                        }
+                    }
+                    Err(e) => e,
+                };
+
+                match err {
+                    NdnError::NotFound(_) => {
+                        info!("Object not found, pushing new object: {}", dir_obj_map_id);
+                        return Ok(vec![dir_obj_map_id.clone()]);
+                    }
+                    _ => {
+                        panic!("Failed to get object: {}", err);
+                    }
+                }
             }
             OBJ_TYPE_CHUNK_LIST => {
                 let chunk_list_obj: ChunkListBody =
@@ -2746,7 +2795,7 @@ impl NdnWriter for Local2NdnWriter {
                 let chunk_list_array = &chunk_list_obj.object_array;
 
                 // todo: should check from target_named_mgr_id, but now it's global, so it will success always
-                let obj_array = ObjectArray::open(chunk_list_array, true)
+                let _obj_array = ObjectArray::open(chunk_list_array, true)
                     .await
                     .expect("Failed to open dir object map");
 
@@ -2797,15 +2846,26 @@ impl NdnWriter for Local2NdnWriter {
 
                 Ok(lost_child_obj_ids)
             }
-            OBJ_TYPE_OBJMAPT => {
-                let obj_map = TrieObjectMap::open(
-                    &container_id,
-                    true,
-                    HashMethod::Sha256,
-                    Some(TrieObjectMapStorageType::JSONFile),
+            OBJ_TYPE_TRIE => {
+                let obj_map_json = NamedDataMgr::get_object(
+                    Some(self.local_named_mgr_id.as_str()),
+                    container_id,
+                    None,
                 )
                 .await
-                .expect("Failed to open object map");
+                .expect("Failed to get object map from local named manager");
+
+                let (got_obj_map_id, obj_map_str) =
+                    build_named_object_by_json(OBJ_TYPE_TRIE, &obj_map_json);
+                assert_eq!(
+                    got_obj_map_id, *container_id,
+                    "Object map ID mismatch: expected {}, got {}",
+                    container_id, got_obj_map_id
+                );
+
+                let obj_map = TrieObjectMap::open(obj_map_json, true)
+                    .await
+                    .expect("Failed to open object map");
                 let all_obj_ids = obj_map
                     .iter()
                     .expect("Failed to iterate object map")
@@ -2836,6 +2896,16 @@ impl NdnWriter for Local2NdnWriter {
                 }
 
                 // todo: should push object map to target_named_mgr_id, but now it's global, so it's no useable
+                if lost_child_obj_ids.is_empty() {
+                    info!("No new objects to push for object map: {}", container_id);
+                    NamedDataMgr::put_object(
+                        Some(self.target_named_mgr_id.as_str()),
+                        container_id,
+                        obj_map_str.as_str(),
+                    )
+                    .await
+                    .expect("Failed to put object map");
+                }
 
                 Ok(lost_child_obj_ids)
             }
@@ -2856,10 +2926,21 @@ impl NdnReader for LocalNdnReader {
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
         Ok(read_chunk(self.ndn_mgr_id.as_str(), chunk_id).await)
     }
-    async fn get_container(&self, _container_id: &ObjId) -> NdnResult<()> {
-        // TODO: For object array or object map, we don't need to do anything here
-        // as they are not stored in the NDN server directly.
-        Ok(())
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Option<Value>> {
+        match container_id.obj_type.as_str() {
+            OBJ_TYPE_LIST => {
+                // todo: no stub in NDN manager for object array, so we use local named manager to get object array
+                return Ok(None);
+            }
+            OBJ_TYPE_TRIE => {
+                let obj_map_json =
+                    NamedDataMgr::get_object(Some(self.ndn_mgr_id.as_str()), container_id, None)
+                        .await
+                        .expect("Failed to get object map from NDN manager");
+                return Ok(Some(obj_map_json));
+            }
+            _ => unreachable!("Unsupported object type: {}", container_id.obj_type),
+        }
     }
 }
 
@@ -2931,14 +3012,15 @@ async fn check_simulate_fs_eq_object(
                 assert_eq!(dir.name, dir_obj.name, "Directory name mismatch");
                 let children_obj_map_id =
                     ObjId::try_from(dir_obj.content.as_str()).expect("Invalid dir object map id");
-                let obj_map = TrieObjectMap::open(
-                    &children_obj_map_id,
-                    true,
-                    HashMethod::Sha256,
-                    Some(TrieObjectMapStorageType::JSONFile),
-                )
-                .await
-                .expect("Failed to open dir object map");
+
+                let children_obj_map_json =
+                    NamedDataMgr::get_object(Some(ndn_mgr_id), &children_obj_map_id, None)
+                        .await
+                        .expect("Failed to get children object map");
+
+                let obj_map = TrieObjectMap::open(children_obj_map_json, true)
+                    .await
+                    .expect("Failed to open dir object map");
                 assert_eq!(
                     obj_map
                         .iter()
@@ -2970,14 +3052,14 @@ async fn check_simulate_fs_eq_object(
         let next_children = stack_top.0.next();
         match next_children {
             Some((_child_name, child_item)) => {
-                let obj_map = TrieObjectMap::open(
-                    &dir_obj_map_id,
-                    true,
-                    HashMethod::Sha256,
-                    Some(TrieObjectMapStorageType::JSONFile),
-                )
-                .await
-                .expect("Failed to open dir object map");
+                let children_obj_map_json =
+                    NamedDataMgr::get_object(Some(ndn_mgr_id), &dir_obj_map_id, None)
+                        .await
+                        .expect("Failed to get children object map");
+
+                let obj_map = TrieObjectMap::open(children_obj_map_json, true)
+                    .await
+                    .expect("Failed to open dir object map");
                 let next_obj_id = obj_map
                     .get_object(child_item.name())
                     .expect("Child item must exist in object map")
