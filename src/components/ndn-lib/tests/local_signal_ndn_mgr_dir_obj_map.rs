@@ -1,23 +1,18 @@
 use std::{
-    collections::{vec_deque, HashMap, HashSet},
+    collections::HashMap,
     io::SeekFrom,
-    ops::{Deref, Index},
     path::{Path, PathBuf},
-    process::Child,
     sync::Arc,
-    u64,
+    u64, vec,
 };
 
-use base64::write;
 use buckyos_kit::*;
-use chrono::{format::Item, offset};
 use cyfs_gateway_lib::*;
 use cyfs_warp::*;
 use hex::ToHex;
-use jsonwebtoken::EncodingKey;
 use log::*;
 use ndn_lib::*;
-use rand::{random_range, Rng, RngCore};
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::{
@@ -519,6 +514,11 @@ pub async fn file_system_to_ndn<
                                         chunk_list_builder.with_fixed_size(chunk_size);
                                 }
 
+                                let chunk_size = file_item
+                                    .chunk_size
+                                    .expect("chunk size should be fix for file");
+                                let chunk_count =
+                                    (file_item.obj.size + chunk_size - 1) / chunk_size;
                                 let mut batch_count = 0;
                                 let batch_limit = 64;
                                 loop {
@@ -532,6 +532,7 @@ pub async fn file_system_to_ndn<
                                     batch_count += 1;
                                     let is_file_ready = (chunk_items.len() as u64) < batch_limit;
                                     for (_, chunk_item, chunk_status, chunk_depth) in chunk_items {
+                                        let chunk_seq = chunk_item.check_chunk().seq;
                                         assert_eq!(
                                             chunk_depth,
                                             depth + 1,
@@ -546,13 +547,17 @@ pub async fn file_system_to_ndn<
                                         match chunk_item {
                                             StorageItem::Chunk(chunk_item) => {
                                                 assert!(
-                                                    chunk_item
-                                                        .chunk_id
-                                                        .get_length()
-                                                        .expect("chunk id should fix size")
-                                                        < file_item.chunk_size.expect(
-                                                            "chunk size should be fix for file"
-                                                        )
+                                                    (chunk_seq == chunk_count - 1
+                                                        && chunk_item
+                                                            .chunk_id
+                                                            .get_length()
+                                                            .expect("chunk id should fix size")
+                                                            == file_item.obj.size % chunk_size)
+                                                        || chunk_item
+                                                            .chunk_id
+                                                            .get_length()
+                                                            .expect("chunk id should fix size")
+                                                            == chunk_size
                                                 );
                                                 assert_eq!(
                                                     chunk_item.seq,
@@ -638,7 +643,7 @@ pub async fn file_system_to_ndn<
                                 )
                                 .await?;
                                 let (chunk_list_id, chunk_list_str) = build_named_object_by_json(
-                                    OBJ_TYPE_CHUNK_LIST,
+                                    file_chunk_list_id.obj_type.as_str(),
                                     &chunk_list_json_value,
                                 );
                                 assert_eq!(
@@ -757,7 +762,7 @@ pub async fn file_system_to_ndn<
                         let dir_children_batch_limit = 64;
 
                         loop {
-                            let (children, parent_path) = storage
+                            let (children, _parent_path) = storage
                                 .list_children_order_by_name(
                                     &item_id,
                                     Some(dir_children_batch_index * dir_children_batch_limit),
@@ -877,17 +882,9 @@ pub async fn file_system_to_ndn<
                 .await?;
             let is_depth_finish = (dir_items.len() as u64) < scan_batch_limit;
             scan_batch_index += 1;
-            if is_depth_finish {
-                if scan_batch_index == 0 && dir_items.is_empty() {
-                    info!("no more dir with more depth.");
-                    break;
-                }
-                scan_depth += 1;
-                new_complete_count = 0;
-                scan_batch_index = 0;
-            }
+            let find_count = dir_items.len();
 
-            for (item_id, dir_item, parent_path, item_status, depth) in dir_items {
+            for (item_id, _dir_item, _parent_path, item_status, depth) in dir_items {
                 info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
                 assert!(item_status.is_transfer());
                 assert_eq!(
@@ -940,21 +937,43 @@ pub async fn file_system_to_ndn<
                     }
 
                     if lost_children.is_empty() {
+                        let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
+                        assert_eq!(lost_obj_ids.len(), 0, "dir object map has pushed");
                         storage.complete(&item_id).await?;
-                        new_complete_count += 1;
+                        if !is_depth_finish {
+                            new_complete_count += 1;
+                        }
                     }
                 } else {
                     storage.complete(&item_id).await?;
-                    new_complete_count += 1;
+                    if !is_depth_finish {
+                        new_complete_count += 1;
+                    }
                 }
 
                 info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
             }
+
+            if is_depth_finish {
+                if scan_batch_index == 1 && find_count == 0 {
+                    info!("no more dir with more depth.");
+                    break;
+                }
+                scan_depth += 1;
+                new_complete_count = 0;
+                scan_batch_index = 0;
+            }
         }
 
         new_complete_count = 0;
+        scan_batch_index = 0;
         while scan_depth > 0 {
             scan_depth -= 1;
+
+            if scan_depth == 0 {
+                debug!("transfer root.");
+            }
+
             let dir_items = storage
                 .select_dir_transfer(
                     Some(scan_depth),
@@ -964,13 +983,8 @@ pub async fn file_system_to_ndn<
                 .await?;
             let is_depth_finish = (dir_items.len() as u64) < scan_batch_limit;
             scan_batch_index += 1;
-            if is_depth_finish {
-                scan_depth -= 1;
-                scan_batch_index = 0;
-                new_complete_count = 0;
-            }
 
-            for (item_id, dir_item, parent_path, item_status, depth) in dir_items {
+            for (item_id, _dir_item, _parent_path, item_status, depth) in dir_items {
                 info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
                 assert!(item_status.is_transfer());
                 assert_eq!(
@@ -978,7 +992,18 @@ pub async fn file_system_to_ndn<
                     "dir item depth should match the scan depth."
                 );
 
-                let (dir_obj_id, dir_obj_str) = dir_item.gen_obj_id();
+                let dir_obj_id = item_status
+                    .get_obj_id()
+                    .expect("dir item status should have obj id for transfer.");
+                let dir_obj = NamedDataMgr::get_object(Some(ndn_mgr_id), &dir_obj_id, None).await?;
+                let (dir_obj_id, dir_obj_str) = build_named_object_by_json(OBJ_TYPE_DIR, &dir_obj);
+                assert_eq!(
+                    &dir_obj_id,
+                    item_status
+                        .get_obj_id()
+                        .expect("dir item should have obj id."),
+                    "dir object id should match the item status obj id."
+                );
                 let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
                 if let Some(lost_obj_map_id) = lost_obj_ids.get(0) {
                     debug!(
@@ -986,17 +1011,31 @@ pub async fn file_system_to_ndn<
                         dir_obj_id, lost_obj_map_id
                     );
                     let lost_children = writer.push_container(&lost_obj_map_id).await?;
-                    if lost_children.is_empty() {
+                    if !lost_children.is_empty() {
                         panic!(
                             "all children should exist in remote, item_id: {:?}, lost: {:?}",
                             item_id, lost_children
                         );
                     }
+                    let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
+                    assert_eq!(
+                        lost_obj_ids.len(),
+                        0,
+                        "lost object ids should be empty after push object."
+                    );
                 }
                 storage.complete(&item_id).await?;
-                new_complete_count += 1;
+                if !is_depth_finish {
+                    new_complete_count += 1;
+                }
 
                 info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
+            }
+
+            if is_depth_finish && scan_depth > 0 {
+                scan_depth -= 1;
+                scan_batch_index = 0;
+                new_complete_count = 0;
             }
         }
 
@@ -1472,9 +1511,9 @@ fn gen_random_simulate_dir(
 
     let mut left_file_count = total_file_count;
 
-    let max_child_dir_count = |dir_count: usize| {
+    let avg_child_dir_count = |dir_count: usize| {
         std::cmp::min(
-            std::cmp::max(((dir_count as f32).sqrt() / 2.0) as usize, 1),
+            std::cmp::max((dir_count as f32).sqrt() as usize, 1),
             dir_count,
         )
     };
@@ -1496,14 +1535,37 @@ fn gen_random_simulate_dir(
 
     dir_list.last_mut().unwrap().name = "0".to_string();
 
+    let mut leaf_count = 1;
     for pos in 0..total_dir_count {
-        let parent_name = dir_list[pos].name.clone();
-        let child_dir_count = rng.random_range(0..max_child_dir_count(total_dir_count - free_pos));
+        let parent_name = dir_list[total_dir_count - pos - 1].name.clone();
+        let child_dir_count = {
+            let max_child_dir_count = total_dir_count - free_pos;
+            let avg_child_dir_count = avg_child_dir_count(max_child_dir_count);
+            if leaf_count == 1 {
+                if max_child_dir_count <= 1 {
+                    max_child_dir_count
+                } else if avg_child_dir_count <= 1 {
+                    1
+                } else {
+                    rng.random_range(1..avg_child_dir_count)
+                }
+            } else if leaf_count == 0 {
+                assert_eq!(pos, 0, "should be last dir");
+                0
+            } else {
+                if max_child_dir_count == 0 {
+                    0
+                } else {
+                    rng.random_range(0..avg_child_dir_count)
+                }
+            }
+        };
         let child_file_count =
             rng.random_range(0..max_child_file_count(total_dir_count - pos, left_file_count));
         let select_child_dir_begin_pos = total_dir_count - free_pos - child_dir_count;
         free_pos += child_dir_count;
         left_file_count -= child_file_count;
+        leaf_count += child_dir_count;
 
         for seq in 0..child_dir_count {
             let dir_index = select_child_dir_begin_pos + seq;
@@ -1515,7 +1577,7 @@ fn gen_random_simulate_dir(
             let file_name = format!("{}_file_{}", parent_name, seq);
             let file_size = rng.random_range(0..max_file_size);
             let file_content = generate_random_bytes(file_size);
-            dir_list[pos].children.insert(
+            dir_list[total_dir_count - pos - 1].children.insert(
                 file_name.clone(),
                 SimulateFsItem::File(SimulateFile {
                     name: file_name,
@@ -1523,31 +1585,43 @@ fn gen_random_simulate_dir(
                 }),
             );
         }
+        leaf_count -= 1;
     }
 
     let mut root_dir = dir_list.pop().expect("should have root dir");
     for dir in dir_list.into_iter().rev() {
         let parent_paths = {
-            let mut dir_name = "".to_string();
-            let mut parent_paths = dir
-                .name
-                .split('_')
-                .map(|sub| {
-                    dir_name = format!("{}_{}", dir_name, sub);
-                    dir_name.clone()
-                })
-                .collect::<Vec<_>>();
-            parent_paths.pop().expect("should have parent path");
+            let paths = dir.name.split('_').collect::<Vec<_>>();
+            let mut count = 1;
+            let mut pos = 0;
+            let mut parent_paths = vec![];
+            while count < paths.len() {
+                let dir_name = paths[0..count].join("_");
+                pos += count;
+                count += 1;
+                parent_paths.push(dir_name.clone());
+            }
             parent_paths
         };
         let mut parent_dir = &mut root_dir;
-        for parent_name in parent_paths {
-            parent_dir = match parent_dir.children.get_mut(&parent_name).unwrap() {
+        assert_eq!(
+            parent_dir.name.as_str(),
+            parent_paths.get(0).expect("should have root name")
+        );
+        for parent_name in parent_paths.as_slice()[1..].iter() {
+            parent_dir = match parent_dir.children.get_mut(parent_name).unwrap() {
                 SimulateFsItem::File(simulate_file) => unreachable!(
                     "parent dir should not be a file, got: {}",
                     simulate_file.name
                 ),
-                SimulateFsItem::Dir(simulate_dir) => simulate_dir,
+                SimulateFsItem::Dir(simulate_dir) => {
+                    assert_eq!(
+                        simulate_dir.name.as_str(),
+                        parent_name,
+                        "parent dir name should match the path"
+                    );
+                    simulate_dir
+                }
             };
         }
         parent_dir
@@ -2138,8 +2212,11 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         }
     }
     async fn complete(&self, item_id: &Self::ItemId) -> NdnResult<()> {
-        let mut storage = self.lock().await;
-        if let Some((item, parent_path, status, depth, children)) = storage.items.get_mut(item_id) {
+        let mut storage_guard = self.lock().await;
+        let storage = &mut *storage_guard;
+        if let Some((_item, _parent_path, status, _depth, _children)) =
+            storage.items.get_mut(item_id)
+        {
             assert!(
                 status.is_transfer() || status.is_complete(),
                 "item must be in Transfer | Complete status"
@@ -2162,7 +2239,8 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
     async fn get_root(
         &self,
     ) -> NdnResult<(Self::ItemId, StorageItem, PathBuf, ItemStatus, PathDepth)> {
-        let storage = self.lock().await;
+        let storage_guard = self.lock().await;
+        let storage = &*storage_guard;
         if storage.items.is_empty() {
             unreachable!("Storage is empty, no root item available");
         }
@@ -2187,15 +2265,33 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
     ) -> NdnResult<Vec<Self::ItemId>> {
         let mut storage = self.lock().await;
         let mut select_children_id = vec![];
-        if let Some((item, parent_path, status, depth, children)) = storage.items.get(item_id) {
-            assert!(
-                status.is_hashing() || status.is_transfer(),
-                "item must be in Hashing | Transfer status"
-            );
-            for child_id in children.iter() {
-                let child_obj_id = status.get_obj_id();
-                if child_obj_id.is_none() || !exclude_item_obj_ids.contains(child_obj_id.unwrap()) {
-                    select_children_id.push(child_id.clone());
+        if let Some((_item, _parent_path, status, _depth, children)) = storage.items.get(item_id) {
+            match status {
+                ItemStatus::Complete(_) => {
+                    // already complete, nothing to do
+                    return Ok(vec![]);
+                }
+                _ => {
+                    assert!(
+                        status.is_hashing() || status.is_transfer(),
+                        "item must be in Hashing | Transfer status {:?}",
+                        status
+                    );
+                    for child_id in children.iter() {
+                        let child_status = storage
+                            .items
+                            .get(child_id)
+                            .map(|(_, _, status, _, _)| status)
+                            .expect("Child item must exist in storage");
+                        if !child_status.is_complete() {
+                            let child_obj_id = child_status.get_obj_id();
+                            if child_obj_id.is_none()
+                                || !exclude_item_obj_ids.contains(child_obj_id.unwrap())
+                            {
+                                select_children_id.push(child_id.clone());
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -2309,31 +2405,27 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         // to transfer dir
         let storage = self.lock().await;
         let mut result = vec![];
-        let mut found_count = 0;
         for (item_id, (item, parent_path, status, item_depth, _)) in storage.items.iter() {
             if item.is_dir()
                 && status.is_transfer()
                 && (depth.is_none() || item_depth == depth.as_ref().unwrap())
             {
-                found_count += 1;
-
-                if offset.as_ref().is_none_or(|offset| found_count > *offset) {
-                    result.push((
-                        *item_id,
-                        item.clone().check_dir().clone(),
-                        parent_path.to_path_buf(),
-                        status.clone(),
-                        *item_depth,
-                    ));
-                    if let Some(limit) = limit {
-                        if result.len() as u64 >= limit {
-                            break;
-                        }
-                    }
-                }
+                result.push((
+                    *item_id,
+                    item.clone().check_dir().clone(),
+                    parent_path.to_path_buf(),
+                    status.clone(),
+                    *item_depth,
+                ));
             }
         }
-        Ok(result)
+
+        result.sort_by(|l, r| l.0.cmp(&r.0));
+
+        let offset = offset.unwrap_or(0);
+        let limit = std::cmp::min(limit.unwrap_or(usize::MAX as u64), result.len() as u64);
+        let end_pos = std::cmp::min(offset + limit, result.len() as u64);
+        Ok(result.as_slice()[offset as usize..end_pos as usize].to_vec())
     }
 
     async fn select_item_transfer(
@@ -2381,7 +2473,7 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
             let mut children = children.clone();
             children.sort();
             for child_id in children.as_slice()[offset.unwrap_or(0) as usize..].iter() {
-                let (item, parent_path, status, depth, _) =
+                let (item, _parent_path, status, depth, _) =
                     storage.items.get(child_id).expect("Child item must exist");
                 result.push((*child_id, item.clone(), status.clone(), *depth));
                 if let Some(limit) = limit {
@@ -2400,18 +2492,29 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         chunk_ids: &[ChunkId],
     ) -> NdnResult<Vec<(Self::ItemId, ChunkItem, PathBuf, ItemStatus, PathDepth)>> {
         let storage = self.lock().await;
-        let mut result = vec![];
+        let mut result = HashMap::new();
         for (item_id, (item, parent_path, status, depth, _)) in storage.items.iter() {
-            if item.is_chunk() && chunk_ids.contains(&item.check_chunk().chunk_id) {
-                result.push((
-                    *item_id,
-                    item.clone().check_chunk().clone(),
-                    parent_path.to_path_buf(),
-                    status.clone(),
-                    *depth,
-                ));
+            if let StorageItem::Chunk(item) = item {
+                let chunk_id = item.chunk_id.clone();
+                if chunk_ids.contains(&chunk_id) {
+                    result.insert(
+                        chunk_id,
+                        (
+                            *item_id,
+                            item.clone(),
+                            parent_path.to_path_buf(),
+                            status.clone(),
+                            *depth,
+                        ),
+                    );
+                }
             }
         }
+
+        let result = chunk_ids
+            .iter()
+            .map(|chunk_id| result.remove(&chunk_id).expect("Chunk ID must exist"))
+            .collect::<Vec<_>>();
         Ok(result)
     }
 }
@@ -2484,10 +2587,15 @@ impl FileSystemDirReader for SimulateDirReader {
         });
         let next_pos = match last_name_pos {
             Some(pos) => pos + 1,
-            None => unreachable!(
-                "Last child name not found in the directory: {:?}",
-                self.last_child_name
-            ),
+            None => {
+                assert_eq!(
+                    child_names.len(),
+                    0,
+                    "Last child name not found in the directory: {:?}",
+                    self.last_child_name
+                );
+                return Ok(vec![]);
+            }
         };
         let select_child_names = &child_names.as_slice()[next_pos
             ..std::cmp::min(
@@ -2665,9 +2773,9 @@ impl NdnWriter for Local2NdnWriter {
                     serde_json::from_str(obj_str).expect("Invalid file object");
                 let chunk_list_id =
                     ObjId::try_from(file_obj.content.as_str()).expect("Invalid chunk list id");
-                assert_eq!(
-                    chunk_list_id.obj_type.as_str(),
-                    OBJ_TYPE_CHUNK_LIST,
+                assert!(
+                    chunk_list_id.obj_type.as_str() == OBJ_TYPE_CHUNK_LIST_FIX_SIZE
+                        || chunk_list_id.obj_type.as_str() == OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE,
                     "Chunk list id must be of type ChunkList"
                 );
                 let lost_obj = NamedDataMgr::get_object(
@@ -2757,7 +2865,7 @@ impl NdnWriter for Local2NdnWriter {
     async fn push_container(&self, container_id: &ObjId) -> NdnResult<Vec<ObjId>> {
         // lost child-obj-list
         match container_id.obj_type.as_str() {
-            OBJ_TYPE_CHUNK_LIST => {
+            OBJ_TYPE_CHUNK_LIST_FIX_SIZE | OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE => {
                 let chunk_list_json = NamedDataMgr::get_object(
                     Some(self.local_named_mgr_id.as_str()),
                     container_id,
@@ -2776,10 +2884,11 @@ impl NdnWriter for Local2NdnWriter {
                 let mut lost_child_obj_ids = vec![];
                 for item in chunk_list.iter() {
                     let obj_id = item.to_obj_id();
-                    let ret = NamedDataMgr::get_object(
+                    let ret = NamedDataMgr::open_chunk_reader(
                         Some(self.target_named_mgr_id.as_str()),
-                        &obj_id,
-                        None,
+                        &item,
+                        SeekFrom::Start(0),
+                        false,
                     )
                     .await;
                     match ret {
@@ -2799,7 +2908,7 @@ impl NdnWriter for Local2NdnWriter {
                 }
 
                 let (recalc_container_id, container_str) =
-                    build_named_object_by_json(OBJ_TYPE_CHUNK_LIST, &chunk_list_json);
+                    build_named_object_by_json(container_id.obj_type.as_str(), &chunk_list_json);
                 assert_eq!(
                     recalc_container_id, *container_id,
                     "Chunk list ID mismatch: expected {}, got {}",
@@ -2901,7 +3010,7 @@ impl NdnReader for LocalNdnReader {
     }
     async fn get_container(&self, container_id: &ObjId) -> NdnResult<Value> {
         match container_id.obj_type.as_str() {
-            OBJ_TYPE_CHUNK_LIST => {
+            OBJ_TYPE_CHUNK_LIST_FIX_SIZE | OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE => {
                 let chunk_list_json =
                     NamedDataMgr::get_object(Some(self.ndn_mgr_id.as_str()), container_id, None)
                         .await
@@ -2982,7 +3091,7 @@ async fn check_simulate_fs_eq_object(
             SimulateFsItem::Dir(dir) => {
                 let obj_json = NamedDataMgr::get_object(Some(ndn_mgr_id), obj_id, None)
                     .await
-                    .expect("Failed to get object");
+                    .expect("Failed to get dir object");
                 let dir_obj =
                     serde_json::from_value::<DirObject>(obj_json).expect("Invalid dir object");
                 assert_eq!(dir.name, dir_obj.name, "Directory name mismatch");
@@ -3162,7 +3271,11 @@ async fn ndn_local_dir_trie_obj_map_build() {
             .expect("Root item must exist");
         assert!(root_item.is_dir(), "Root item must be a directory");
         assert_eq!(depth, &0, "Root item depth must be 0");
-        assert!(status.is_complete(), "Root item status must be Scanning");
+        assert!(
+            status.is_complete(),
+            "Root item status must be complete, {:?}",
+            status
+        );
         status
             .get_obj_id()
             .expect("Root item must have an ObjId")
