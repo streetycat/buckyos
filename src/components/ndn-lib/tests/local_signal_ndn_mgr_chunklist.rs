@@ -65,7 +65,7 @@ async fn write_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId, chunk_data: &[u8]) {
         .expect("wait chunk writer complete failed.");
 }
 
-async fn read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
+async fn _read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
     let (mut chunk_reader, len) =
         NamedDataMgr::open_chunk_reader(Some(ndn_mgr_id), chunk_id, SeekFrom::Start(0), false)
             .await
@@ -179,19 +179,19 @@ async fn ndn_local_chunklist_basic_fix_len() {
     let chunk_fix_size: u64 = 1024 * 1024 + 513; // 1MB + x bytes
 
     let chunk_size1: u64 = chunk_fix_size;
-    let (chunk_id1, chunk_data1) = generate_random_chunk_mix(chunk_fix_size);
+    let (chunk_id1, _chunk_data1) = generate_random_chunk_mix(chunk_fix_size);
 
     let chunk_size2: u64 = chunk_fix_size;
-    let (chunk_id2, chunk_data2) = generate_random_chunk_mix(chunk_fix_size);
+    let (chunk_id2, _chunk_data2) = generate_random_chunk_mix(chunk_fix_size);
 
     let chunk_size3: u64 = chunk_fix_size;
-    let (chunk_id3, chunk_data3) = generate_random_chunk_mix(chunk_fix_size);
+    let (chunk_id3, _chunk_data3) = generate_random_chunk_mix(chunk_fix_size);
 
     let chunk_size4: u64 = chunk_fix_size;
-    let (chunk_id4, chunk_data4) = generate_random_chunk_mix(chunk_fix_size);
+    let (chunk_id4, _chunk_data4) = generate_random_chunk_mix(chunk_fix_size);
 
     let chunk_size5: u64 = chunk_fix_size;
-    let (chunk_id5, chunk_data5) = generate_random_chunk_mix(chunk_fix_size);
+    let (chunk_id5, _chunk_data5) = generate_random_chunk_mix(chunk_fix_size);
 
     let mut fix_mix_chunk_list_builder = ChunkListBuilder::new(HashMethod::Sha256, None)
         .with_total_size(chunk_size1 + chunk_size2 + chunk_size3 + chunk_size4 + chunk_size5)
@@ -417,9 +417,12 @@ async fn ndn_local_chunklist_basic_fix_len() {
 
     // verify
     let chunk_array = fix_mix_chunk_list.deref();
-    let chunk_array_id = chunk_array
+    let _chunk_array_id = chunk_array
         .get_obj_id()
         .expect("id for obj-array of chunklist should calc complete");
+    let chunk_array_root_hash = chunk_array
+        .get_root_hash_str()
+        .expect("root hash should be some");
     let verifier = ObjectArrayProofVerifier::new(HashMethod::Sha256);
     for idx in 0..chunk_array.len() {
         // TODO: why mut needed?
@@ -444,7 +447,7 @@ async fn ndn_local_chunklist_basic_fix_len() {
             "proof[0].0 should be the index of list"
         );
         let is_ok = verifier
-            .verify(&chunk_array_id, &item.obj_id, &item.proof)
+            .verify(chunk_array_root_hash.as_str(), &item.obj_id, &item.proof)
             .expect("verify chunk list failed");
         assert!(is_ok, "verify chunk list failed for object {}", idx);
     }
@@ -467,7 +470,11 @@ async fn ndn_local_chunklist_basic_fix_len() {
         .expect("get object with proof failed")
         .expect("object with proof should be some");
     let is_ok = verifier
-        .verify(&chunk_array_id, &new_chunk.0.to_obj_id(), &item.proof)
+        .verify(
+            chunk_array_root_hash.as_str(),
+            &new_chunk.0.to_obj_id(),
+            &item.proof,
+        )
         .expect("verify chunk list should success for exclude object");
     assert!(!is_ok, "verify chunk list should fail for exclude object");
 
@@ -487,7 +494,7 @@ async fn ndn_local_chunklist_basic_fix_len() {
                 .0 = fake_index as u64; // set the first proof item index to fake
             let is_ok = verifier
                 .verify(
-                    &chunk_array_id,
+                    chunk_array_root_hash.as_str(),
                     &fake_0_proof_item.obj_id,
                     &fake_0_proof_item.proof,
                 )
@@ -553,7 +560,7 @@ async fn ndn_local_chunklist_basic_fix_len() {
                         chunk_pos
                     );
                     let is_ok = verifier
-                        .verify(&chunk_array_id, &item.obj_id, &item.proof)
+                        .verify(chunk_array_root_hash.as_str(), &item.obj_id, &item.proof)
                         .expect("verify chunk list failed");
                     assert!(is_ok, "verify chunk list failed for object {}", chunk_pos);
                 }
@@ -646,7 +653,7 @@ async fn ndn_local_chunklist_basic_fix_len() {
                     chunk_pos
                 );
                 let is_ok = verifier
-                    .verify(&chunk_array_id, &item.obj_id, &item.proof)
+                    .verify(chunk_array_root_hash.as_str(), &item.obj_id, &item.proof)
                     .expect("verify chunk list failed");
                 assert!(is_ok, "verify chunk list failed for object {}", chunk_pos);
             }
@@ -726,19 +733,19 @@ async fn ndn_local_chunklist_basic_var_len() {
     let mut rng = rand::rng();
 
     let chunk_size1: u64 = 1024 * 1024 + 513;
-    let (chunk_id1, chunk_data1) = generate_random_chunk_mix(chunk_size1);
+    let (chunk_id1, _chunk_data1) = generate_random_chunk_mix(chunk_size1);
 
     let chunk_size2: u64 = 1024 * 1024 * 3 + 5;
-    let (chunk_id2, chunk_data2) = generate_random_chunk_mix(chunk_size2);
+    let (chunk_id2, _chunk_data2) = generate_random_chunk_mix(chunk_size2);
 
     let chunk_size3: u64 = 1024 + 13;
-    let (chunk_id3, chunk_data3) = generate_random_chunk_mix(chunk_size3);
+    let (chunk_id3, _chunk_data3) = generate_random_chunk_mix(chunk_size3);
 
     let chunk_size4: u64 = 1024 * 2 + 113;
-    let (chunk_id4, chunk_data4) = generate_random_chunk_mix(chunk_size4);
+    let (chunk_id4, _chunk_data4) = generate_random_chunk_mix(chunk_size4);
 
     let chunk_size5: u64 = 1024 * 1024 * 2 + 53;
-    let (chunk_id5, chunk_data5) = generate_random_chunk_mix(chunk_size5);
+    let (chunk_id5, _chunk_data5) = generate_random_chunk_mix(chunk_size5);
 
     let mut var_mix_chunk_list_builder = ChunkListBuilder::new(HashMethod::Sha256, None)
         .with_total_size(chunk_size1 + chunk_size2 + chunk_size3 + chunk_size4 + chunk_size5)
@@ -994,19 +1001,19 @@ async fn ndn_local_chunklist_basic_var_no_mix_len() {
     let mut rng = rand::rng();
 
     let chunk_size1: u64 = 1024 * 1024 + 513;
-    let (chunk_id1, chunk_data1) = generate_random_chunk_mix(chunk_size1);
+    let (chunk_id1, _chunk_data1) = generate_random_chunk_mix(chunk_size1);
 
     let chunk_size2: u64 = 1024 * 1024 * 3 + 5;
-    let (chunk_id2, chunk_data2) = generate_random_chunk_mix(chunk_size2);
+    let (chunk_id2, _chunk_data2) = generate_random_chunk_mix(chunk_size2);
 
     let chunk_size3: u64 = 1024 + 13;
-    let (chunk_id3, chunk_data3) = generate_random_chunk(chunk_size3);
+    let (chunk_id3, _chunk_data3) = generate_random_chunk(chunk_size3);
 
     let chunk_size4: u64 = 1024 * 2 + 113;
-    let (chunk_id4, chunk_data4) = generate_random_chunk_mix(chunk_size4);
+    let (chunk_id4, _chunk_data4) = generate_random_chunk_mix(chunk_size4);
 
     let chunk_size5: u64 = 1024 * 1024 * 2 + 53;
-    let (chunk_id5, chunk_data5) = generate_random_chunk_mix(chunk_size5);
+    let (chunk_id5, _chunk_data5) = generate_random_chunk_mix(chunk_size5);
 
     let mut var_mix_chunk_list_builder = ChunkListBuilder::new(HashMethod::Sha256, None)
         .with_total_size(chunk_size1 + chunk_size2 + chunk_size3 + chunk_size4 + chunk_size5)
@@ -1495,6 +1502,9 @@ async fn ndn_local_chunklist_verify_failed() {
         .deref()
         .get_obj_id()
         .expect("should calc obj-array id");
+    let chunk_array_root_hash = chunk_list
+        .get_root_hash_str()
+        .expect("root hash should be some");
 
     let (append_chunk_id, append_chunk_data) = generate_random_chunk(1024 * 1024);
     let mut append_chunk_list_builder = ChunkListBuilder::from_chunk_list(&chunk_list)
@@ -1506,11 +1516,14 @@ async fn ndn_local_chunklist_verify_failed() {
         .build()
         .await
         .expect("build append chunk list failed");
-    let (append_chunk_list_id, append_chunk_list_str) = append_chunk_list.calc_obj_id();
+    let (_append_chunk_list_id, _append_chunk_list_str) = append_chunk_list.calc_obj_id();
     let append_chunk_array_id = append_chunk_list
         .deref()
         .get_obj_id()
         .expect("id of ObjectArray for append chunk list should exist");
+    let append_chunk_array_root_hash = append_chunk_list
+        .get_root_hash_str()
+        .expect("root hash should be some");
     // instead the chunk list storage file
     let remove_json_ret =
         std::fs::remove_file(storage_dir.join(chunk_array_id.to_base32() + ".json"));
@@ -1565,7 +1578,11 @@ async fn ndn_local_chunklist_verify_failed() {
             .expect("get_object_with_proof should fail for chunk_list has been replaced")
             .expect("get_object_with_proof should return error");
         let is_ok = verifier
-            .verify(&chunk_array_id, &fake_chunk_id.to_obj_id(), &item.proof)
+            .verify(
+                chunk_array_root_hash.as_str(),
+                &fake_chunk_id.to_obj_id(),
+                &item.proof,
+            )
             .expect("should success for chunk_list has been replaced");
         assert!(is_ok, "should success for item is not in fake chunk_list");
         let fake_item = fake_chunk_list
@@ -1575,7 +1592,7 @@ async fn ndn_local_chunklist_verify_failed() {
             .expect("get_object_with_proof should return object");
         let is_ok = verifier
             .verify(
-                &append_chunk_array_id,
+                append_chunk_array_root_hash.as_str(),
                 &fake_chunk_id.to_obj_id(),
                 &fake_item.proof,
             )
@@ -1594,7 +1611,7 @@ async fn ndn_local_chunklist_verify_failed() {
         .expect("get_object_with_proof should return object");
     let is_ok = verifier
         .verify(
-            &append_chunk_array_id,
+            append_chunk_array_root_hash.as_str(),
             &fake_chunk_id.to_obj_id(),
             &fake_item.proof,
         )
@@ -1603,7 +1620,7 @@ async fn ndn_local_chunklist_verify_failed() {
 
     let is_ok = verifier
         .verify(
-            &chunk_array_id,
+            chunk_array_root_hash.as_str(),
             &fake_chunk_id.to_obj_id(),
             &fake_item.proof,
         )

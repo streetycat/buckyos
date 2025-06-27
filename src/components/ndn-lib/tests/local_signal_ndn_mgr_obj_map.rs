@@ -13,7 +13,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-const is_ignore: bool = true;
+// const is_ignore: bool = false;
 
 fn generate_random_bytes(size: u64) -> Vec<u8> {
     let mut rng = rand::rng();
@@ -67,7 +67,7 @@ async fn write_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId, chunk_data: &[u8]) {
         .expect("wait chunk writer complete failed.");
 }
 
-async fn read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
+async fn _read_chunk(ndn_mgr_id: &str, chunk_id: &ChunkId) -> Vec<u8> {
     let (mut chunk_reader, len) =
         NamedDataMgr::open_chunk_reader(Some(ndn_mgr_id), chunk_id, SeekFrom::Start(0), false)
             .await
@@ -180,22 +180,22 @@ async fn ndn_local_obj_map_basic() {
     info!("ndn_local_obj_map_basic test start...");
     init_obj_map_storage_factory().await;
 
-    let rng = rand::rng();
+    let _rng = rand::rng();
     let chunk_fix_size: u64 = 1024 * 1024 + 513; // 1MB + x bytes
 
-    let chunk_size1: u64 = chunk_fix_size;
+    let _chunk_size1: u64 = chunk_fix_size;
     let (chunk_id1, chunk_data1) = generate_random_chunk_mix(chunk_fix_size);
 
-    let chunk_size2: u64 = chunk_fix_size;
+    let _chunk_size2: u64 = chunk_fix_size;
     let (chunk_id2, chunk_data2) = generate_random_chunk_mix(chunk_fix_size);
 
-    let chunk_size3: u64 = chunk_fix_size;
+    let _chunk_size3: u64 = chunk_fix_size;
     let (chunk_id3, chunk_data3) = generate_random_chunk_mix(chunk_fix_size);
 
-    let chunk_size4: u64 = chunk_fix_size;
+    let _chunk_size4: u64 = chunk_fix_size;
     let (chunk_id4, chunk_data4) = generate_random_chunk_mix(chunk_fix_size);
 
-    let chunk_size5: u64 = chunk_fix_size;
+    let _chunk_size5: u64 = chunk_fix_size;
     let (chunk_id5, chunk_data5) = generate_random_chunk_mix(chunk_fix_size);
 
     let chunks = HashMap::from([
@@ -210,14 +210,14 @@ async fn ndn_local_obj_map_basic() {
         .await
         .expect("create ObjectMap failed");
 
-    for (name, (chunk_id, chunk_data)) in chunks.iter() {
+    for (name, (chunk_id, _chunk_data)) in chunks.iter() {
         obj_map
             .put_object(*name, &chunk_id.to_obj_id())
             .await
             .expect(&format!("put {} to obj-map failed", name));
     }
 
-    obj_map.flush().await.expect("flush obj-map failed");
+    obj_map.flush_mtree().await.expect("flush obj-map failed");
 
     assert_eq!(
         obj_map.len().await.expect("get obj-map len failed"),
@@ -229,7 +229,7 @@ async fn ndn_local_obj_map_basic() {
         .get_root_hash_str()
         .expect("obj-map id should be calc finish");
     let verifier = ObjectMapProofVerifier::new(HashMethod::Sha256);
-    for (name, (chunk_id, chunk_data)) in chunks.iter() {
+    for (name, (chunk_id, _chunk_data)) in chunks.iter() {
         let obj_id = obj_map
             .get_object(*name)
             .await
@@ -363,12 +363,10 @@ async fn ndn_local_obj_map_ok() {
         .await
         .expect("open obj-map from obj-map id failed");
 
-    if is_ignore {
-        got_obj_map
-            .flush()
-            .await
-            .expect("todo: why need flush for exist object");
-    }
+    got_obj_map
+        .flush_mtree()
+        .await
+        .expect("todo: why need flush for exist object");
 
     let (got_obj_map_id, got_obj_map_str) = got_obj_map
         .calc_obj_id()
@@ -443,7 +441,7 @@ async fn ndn_local_obj_map_not_found() {
     init_logging("ndn_local_obj_map_not_found", false);
 
     info!("ndn_local_obj_map_not_found test start...");
-    let storage_dir = init_obj_map_storage_factory().await;
+    let _storage_dir = init_obj_map_storage_factory().await;
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
     let _ndn_client = init_ndn_server(ndn_mgr_id.as_str()).await;
 
@@ -468,25 +466,21 @@ async fn ndn_local_obj_map_not_found() {
         .calc_obj_id()
         .expect("obj-map id should be calc finish");
 
-    let obj_map_root_hash = obj_map
+    let _obj_map_root_hash = obj_map
         .get_root_hash_str()
         .expect("obj-map root hash should calc finish");
 
     // delete the chunk list storage file
-    let remove_json_ret = std::fs::remove_file(
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("json"),
+    let remove_ret = std::fs::remove_file(
+        obj_map
+            .get_storage_file_path()
+            .expect("get obj-map storage file path failed")
+            .as_path(),
     );
-    let remove_arrow_ret = std::fs::remove_file(
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("arrow"),
-    );
-
     assert!(
-        remove_json_ret.is_ok() || remove_arrow_ret.is_ok(),
-        "remove chunk list storage file failed"
+        remove_ret.is_ok(),
+        "remove chunk list storage file failed, remove: {:?}",
+        remove_ret
     );
 
     NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
@@ -496,12 +490,10 @@ async fn ndn_local_obj_map_not_found() {
         .await
         .expect("get obj-map from ndn-mgr failed");
 
-    if !is_ignore {
-        ObjectMap::open(obj_map_json, true)
-            .await
-            .map(|_| ())
-            .expect_err("open obj-map from obj-map id should failed for the storage is removed");
-    }
+    ObjectMap::open(obj_map_json, true)
+        .await
+        .map(|_| ())
+        .expect_err("open obj-map from obj-map id should failed for the storage is removed");
 
     info!("ndn_local_obj_map_not_found test end.");
 }
@@ -511,14 +503,14 @@ async fn ndn_local_obj_map_verify_failed() {
     init_logging("ndn_local_obj_map_verify_failed", false);
 
     info!("ndn_local_obj_map_verify_failed test start...");
-    let storage_dir = init_obj_map_storage_factory().await;
+    let _storage_dir = init_obj_map_storage_factory().await;
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
     let _ndn_client = init_ndn_server(ndn_mgr_id.as_str()).await;
 
     let verifier = ObjectMapProofVerifier::new(HashMethod::Sha256);
 
     let chunks = generate_random_chunk_list(5, None);
-    let total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
+    let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
     let mut obj_map = ObjectMap::new(HashMethod::Sha256, Some(ObjectMapStorageType::JSONFile))
         .await
@@ -569,48 +561,32 @@ async fn ndn_local_obj_map_verify_failed() {
         .get_obj_id()
         .expect("append obj-map id should be calc finish");
     // instead the chunk list storage file
-    let remove_json_ret = std::fs::remove_file(
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("json"),
-    );
-    let copy_json_ret = std::fs::copy(
-        storage_dir
-            .join(append_obj_map_root_hash.as_str())
-            .with_extension("json"),
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("json"),
-    );
-    let remove_arrow_ret = std::fs::remove_file(
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("arrow"),
-    );
-    let copy_arrow_ret = std::fs::copy(
-        storage_dir
-            .join(append_obj_map_root_hash.as_str())
-            .with_extension("arrow"),
-        storage_dir
-            .join(obj_map_root_hash.as_str())
-            .with_extension("arrow"),
+    let obj_map_storage_file_path = obj_map
+        .get_storage_file_path()
+        .expect("get obj-map storage file path failed");
+    let append_obj_map_storage_file_path = append_obj_map
+        .get_storage_file_path()
+        .expect("get append obj-map storage file path failed");
+    let remove_ret = std::fs::remove_file(obj_map_storage_file_path.as_path());
+    let copy_ret = std::fs::copy(
+        append_obj_map_storage_file_path.as_path(),
+        obj_map_storage_file_path.as_path(),
     );
 
     assert!(
-        copy_json_ret.is_ok()
-            || copy_arrow_ret.is_ok(),
-        "instead append chunk list storage file failed, remove-json: {:?}, copy-json: {:?}, remove-arrow: {:?}, copy-arrow: {:?}", remove_json_ret, copy_json_ret, remove_arrow_ret, copy_arrow_ret
+        copy_ret.is_ok(),
+        "instead append chunk list storage file failed, remove: {:?}, copy: {:?}",
+        remove_ret,
+        copy_ret
     );
 
     let mut fake_obj_map = ObjectMap::open(obj_map_json.clone(), true)
         .await
         .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
-    if is_ignore {
-        fake_obj_map
-            .flush()
-            .await
-            .expect("todo: why need flush for exist object");
-    }
+    fake_obj_map
+        .flush_mtree()
+        .await
+        .expect("todo: why need flush for exist object");
 
     assert_eq!(
         fake_obj_map

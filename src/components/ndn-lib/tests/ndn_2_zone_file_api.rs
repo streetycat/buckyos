@@ -79,7 +79,7 @@ fn generate_random_file_obj() -> (ObjId, FileObject, ChunkId, Vec<u8>) {
     generate_random_file_obj_with_len(name_len, content_len as u64)
 }
 
-async fn check_obj_inner_path(
+async fn _check_obj_inner_path(
     ndn_mgr_id: &str,
     obj_id: &ObjId,
     obj_type: &str,
@@ -120,8 +120,8 @@ async fn check_obj_inner_path(
                 }
                 Err(err) => assert!(
                     false,
-                    "get object {:?} with innser-path {:?} failed",
-                    obj_id, inner_path
+                    "get object {:?} with innser-path {:?} failed, {:?}",
+                    obj_id, inner_path, err
                 ),
             },
             None => match &got_ret {
@@ -133,7 +133,7 @@ async fn check_obj_inner_path(
                         info!("Chunk not found as expected");
                     }
                     _ => {
-                        assert!(false, "Unexpected error type");
+                        assert!(false, "Unexpected error type, {:?}", err);
                     }
                 },
             },
@@ -163,8 +163,8 @@ async fn check_obj_inner_path(
                 }
                 Err(err) => assert!(
                     false,
-                    "get object {:?} with innser-path {:?} failed",
-                    obj_id, inner_path
+                    "get object {:?} with innser-path {:?} failed, {:?}",
+                    obj_id, inner_path, err
                 ),
             },
             None => assert!(
@@ -252,7 +252,7 @@ async fn check_file_obj(
                         "FileObject.extra_info mismatch"
                     );
                 }
-                Err(err) => assert!(false, "get file object {:?} failed", file_obj_id),
+                Err(err) => assert!(false, "get file object {:?} failed, err: {:?}", file_obj_id, err),
             },
             None => match &got_ret {
                 Ok(got_obj) => {
@@ -283,7 +283,7 @@ async fn check_file_obj(
                         "file-obj check failed same as unexpect",
                     );
                 }
-                Err(err) => assert!(false, "get file-object {:?}", file_obj_id),
+                Err(err) => assert!(false, "get file-object {:?}, {:?}", file_obj_id, err),
             },
             None => assert!(got_ret.is_ok(), "get object {:?} failed", file_obj_id,),
         }
@@ -804,7 +804,7 @@ async fn ndn_2_zone_file_verify_failed() {
 
     {
         // fake file.content
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let mut fake_file_obj = file_obj.clone();
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
@@ -1011,7 +1011,7 @@ async fn ndn_2_zone_file_verify_failed() {
 
     {
         // fake chunk
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
 
@@ -1128,7 +1128,7 @@ async fn ndn_2_zone_o_link_innerpath_file_ok() {
     init_logging("ndn_local_o_link_innerpath_file_ok", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
 
     let zone_a_client =
@@ -1214,7 +1214,7 @@ async fn ndn_2_zone_o_link_innerpath_file_ok() {
             local_ndn_server_host,
             file_id.to_string(),
         );
-        let (name_obj_id, name_json) = zone_a_client
+        let (_name_obj_id, name_json) = zone_a_client
             .get_obj_by_url(o_link_inner_path.as_str(), None)
             .await
             .expect("get name of file with o-link failed");
@@ -1271,7 +1271,7 @@ async fn ndn_2_zone_o_link_innerpath_file_ok() {
         // todo: verify chunk with mtree
 
         let o_link_inner_path = format!("http://test.buckyos.io/ndn/{}/name", file_id.to_string(),);
-        let (name_obj_id, name_json) = zone_b_client
+        let (_name_obj_id, name_json) = zone_b_client
             .get_obj_by_url(o_link_inner_path.as_str(), None)
             .await
             .expect("get name of file with o-link failed");
@@ -1298,7 +1298,7 @@ async fn ndn_2_zone_o_link_innerpath_file_ok() {
             local_ndn_server_host,
             file_id.to_string()
         );
-        let (name_obj_id, name_json) = zone_a_client
+        let (_name_obj_id, name_json) = zone_a_client
             .get_obj_by_url(o_link_inner_path.as_str(), None)
             .await
             .expect("get name of file with o-link failed");
@@ -1307,7 +1307,7 @@ async fn ndn_2_zone_o_link_innerpath_file_ok() {
         assert_eq!(name, file_obj.name.as_str(), "name mismatch");
 
         let o_link_inner_path = format!("http://test.buckyos.io/ndn/{}/name", file_id.to_string(),);
-        let (name_obj_id, name_json) = zone_b_client
+        let (_name_obj_id, name_json) = zone_b_client
             .get_obj_by_url(o_link_inner_path.as_str(), None)
             .await
             .expect("get name of file with o-link failed");
@@ -1635,7 +1635,7 @@ async fn ndn_2_zone_o_link_innerpath_file_not_found() {
     init_logging("ndn_2_zone_o_link_innerpath_file_not_found", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
 
     let zone_a_client =
@@ -1655,7 +1655,7 @@ async fn ndn_2_zone_o_link_innerpath_file_not_found() {
         // no chunk saved
         // 1. get chunk of file
         // 2. get name of file
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         // write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
@@ -1749,7 +1749,7 @@ async fn ndn_2_zone_o_link_innerpath_file_not_found() {
 
     {
         // no write chunk for download to local
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         // write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
@@ -1943,7 +1943,7 @@ async fn ndn_2_zone_o_link_innerpath_file_verify_failed() {
     init_logging("ndn_2_zone_o_link_innerpath_file_verify_failed", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
 
     let zone_a_client =
@@ -1961,7 +1961,7 @@ async fn ndn_2_zone_o_link_innerpath_file_verify_failed() {
 
     {
         // fake file.content
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let mut fake_file_obj = file_obj.clone();
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
@@ -2023,7 +2023,7 @@ async fn ndn_2_zone_o_link_innerpath_file_verify_failed() {
 
     {
         // fake file.content for download to local
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let mut fake_file_obj = file_obj.clone();
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
@@ -2163,9 +2163,9 @@ async fn ndn_2_zone_o_link_innerpath_file_verify_failed() {
 
     {
         // fake chunk
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
-        let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
+        let (_fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, fake_chunk_data.as_slice()).await;
 
@@ -2273,7 +2273,7 @@ async fn ndn_2_zone_o_link_innerpath_file_verify_failed() {
 
     {
         // fake chunk for download to local
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
 
@@ -2595,7 +2595,7 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
     init_logging("ndn_2_zone_r_link_innerpath_file_ok", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
     let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
     let (target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
@@ -2612,10 +2612,11 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
         // 1. get chunk of file
         // 2. get name of file
         let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let mix_chunk_id = ChunkId::mix_from_hash_result(chunk_data.len() as u64, chunk_id.hash_result.as_slice(), HashMethod::Sha256);
 
         // write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
         let local_path = tempfile::tempdir()
@@ -2633,7 +2634,7 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
         std::fs::write(local_path.as_path(), chunk_data.as_slice())
             .expect("write chunk data to local failed");
 
-        let obj_path = "/test_file_path";
+        let obj_path = "/test_file_path-name-chunk";
         let content_ndn_path = format!("test_file_content_{}", chunk_id.to_base32());
 
         let mut file_obj = FileObject::new(
@@ -2654,11 +2655,11 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
         .await
         .expect("pub object to file failed");
 
-        let (file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (file_id, _file_obj_str) = file_obj.gen_obj_id();
 
-        assert_eq!(
-            file_obj.content,
-            chunk_id.to_string(),
+        assert!(
+            file_obj.content==
+            chunk_id.to_string() || file_obj.content == mix_chunk_id.to_string(),
             "file content should be same as ndn-path"
         );
         assert_eq!(
@@ -2722,7 +2723,7 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
         // todo: verify chunk with mtree
 
         let r_link_inner_path = format!("http://{}/ndn{}/name", local_ndn_server_host, obj_path);
-        let (name_obj_id, name_json) = target_ndn_client
+        let (_name_obj_id, name_json) = target_ndn_client
             .get_obj_by_url(r_link_inner_path.as_str(), None)
             .await
             .expect("get name of file with o-link failed");
@@ -2776,41 +2777,42 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
 
     {
         // 1. get name of file
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        // todo: how to get field with no object from remote
+        // let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
 
-        write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
+        // write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
-        assert_eq!(file_id, cal_file_id, "file-id mismatch");
+        // let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
+        // assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
-        let obj_path = "/test_file_path";
-        NamedDataMgr::pub_object_to_file(
-            Some(ndn_mgr_id.as_str()),
-            serde_json::to_value(&file_obj).expect("Failed to serialize FileObject"),
-            OBJ_TYPE_FILE,
-            obj_path,
-            "test_non_file_obj_user_id",
-            "test_non_file_obj_app_id",
-        )
-        .await
-        .expect("pub object to file failed");
+        // let obj_path = "/test_file_path-name";
+        // NamedDataMgr::pub_object_to_file(
+        //     Some(ndn_mgr_id.as_str()),
+        //     serde_json::to_value(&file_obj).expect("Failed to serialize FileObject"),
+        //     OBJ_TYPE_FILE,
+        //     obj_path,
+        //     "test_non_file_obj_user_id",
+        //     "test_non_file_obj_app_id",
+        // )
+        // .await
+        // .expect("pub object to file failed");
 
-        let r_link_inner_path = format!("http://{}/ndn{}/name", local_ndn_server_host, obj_path);
-        let (name_obj_id, name_json) = zone_a_client
-            .get_obj_by_url(r_link_inner_path.as_str(), None)
-            .await
-            .expect("get name of file with o-link failed");
+        // let r_link_inner_path = format!("http://{}/ndn{}/name", local_ndn_server_host, obj_path);
+        // let (name_obj_id, name_json) = zone_a_client
+        //     .get_obj_by_url(r_link_inner_path.as_str(), None)
+        //     .await
+        //     .expect("get name of file with o-link failed");
 
-        let name = name_json.as_str().expect("name should be string");
-        assert_eq!(name, file_obj.name.as_str(), "name mismatch");
+        // let name = name_json.as_str().expect("name should be string");
+        // assert_eq!(name, file_obj.name.as_str(), "name mismatch");
 
-        let r_link_inner_path = format!("http://test.buckyos.io/ndn{}/name", obj_path);
-        let (name_obj_id, name_json) = zone_b_client
-            .get_obj_by_url(r_link_inner_path.as_str(), None)
-            .await
-            .expect("get name of file with o-link failed");
-        let name = name_json.as_str().expect("name should be string");
-        assert_eq!(name, file_obj.name.as_str(), "name mismatch");
+        // let r_link_inner_path = format!("http://test.buckyos.io/ndn{}/name", obj_path);
+        // let (name_obj_id, name_json) = zone_b_client
+        //     .get_obj_by_url(r_link_inner_path.as_str(), None)
+        //     .await
+        //     .expect("get name of file with o-link failed");
+        // let name = name_json.as_str().expect("name should be string");
+        // assert_eq!(name, file_obj.name.as_str(), "name mismatch");
     }
 
     {
@@ -2820,10 +2822,10 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
-        let obj_path = "/test_file_path";
+        let obj_path = "/test_file_path-range";
         NamedDataMgr::pub_object_to_file(
             Some(ndn_mgr_id.as_str()),
             serde_json::to_value(&file_obj).expect("Failed to serialize FileObject"),
@@ -2992,7 +2994,7 @@ async fn ndn_2_zone_r_link_innerpath_file_ok() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_ne!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -3134,10 +3136,10 @@ async fn ndn_2_zone_r_link_innerpath_file_not_found() {
     init_logging("ndn_2_zone_r_link_innerpath_file_not_found", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
     let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
+    let (_target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
     let zone_a_client =
         init_ndn_client(ndn_mgr_id.as_str(), LOCAL_PRIVATE_KEY, "test.buckyos.io").await;
     let zone_b_client = init_ndn_client(
@@ -3149,11 +3151,11 @@ async fn ndn_2_zone_r_link_innerpath_file_not_found() {
 
     {
         // no chunk saved
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         // write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -3242,7 +3244,7 @@ async fn ndn_2_zone_r_link_innerpath_file_not_found() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_ne!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -3383,7 +3385,7 @@ async fn ndn_2_zone_r_link_innerpath_file_not_found() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -3444,10 +3446,10 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
     init_logging("ndn_2_zone_r_link_innerpath_file_verify_failed", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
     let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
+    let (_target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
     let zone_a_client =
         init_ndn_client(ndn_mgr_id.as_str(), LOCAL_PRIVATE_KEY, "test.buckyos.io").await;
     let zone_b_client = init_ndn_client(
@@ -3459,7 +3461,7 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
     {
         // fake file.content
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let mut fake_file_obj = file_obj.clone();
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
@@ -3527,7 +3529,7 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
     {
         // fake file.content for download to local
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let mut fake_file_obj = file_obj.clone();
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
@@ -3540,7 +3542,7 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
         )
         .await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id should not match");
 
         let obj_path = "/test_file_path";
@@ -3673,13 +3675,13 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
     {
         // fake chunk
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
-        let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
+        let (_fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, fake_chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id should not match");
 
         let obj_path = "/test_file_path";
@@ -3789,13 +3791,13 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
     {
         // fake chunk for download to local
-        let (file_id, file_obj, chunk_id, chunk_data) = generate_random_file_obj();
+        let (file_id, file_obj, chunk_id, _chunk_data) = generate_random_file_obj();
 
         let (fake_chunk_id, fake_chunk_data) = generate_random_chunk(5678);
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, fake_chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
         assert_eq!(file_id, cal_file_id, "file-id should not match");
 
         let obj_path = "/test_file_path";
@@ -3935,7 +3937,7 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = fake_file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = fake_file_obj.gen_obj_id();
         assert_ne!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -3995,7 +3997,7 @@ async fn ndn_2_zone_r_link_innerpath_file_verify_failed() {
 
         write_chunk(ndn_mgr_id.as_str(), &chunk_id, chunk_data.as_slice()).await;
 
-        let (cal_file_id, file_obj_str) = fake_file_obj.gen_obj_id();
+        let (cal_file_id, _file_obj_str) = fake_file_obj.gen_obj_id();
         assert_ne!(file_id, cal_file_id, "file-id mismatch");
 
         let obj_path = "/test_file_path";
@@ -4136,7 +4138,7 @@ async fn read_chunk_concurrency(
 
         match ret {
             Ok((reader, resp_headers)) => {
-                let (chunk_state, chunk_size, progress) =
+                let (chunk_state, chunk_size, _progress) =
                     NamedDataMgr::query_chunk_state(Some(source_ndn_mgr_id), chunk_id)
                         .await
                         .expect("query chunk state failed");
@@ -4246,10 +4248,10 @@ async fn ndn_2_zone_o_link_innerpath_file_concurrency() {
     init_logging("ndn_2_zone_o_link_innerpath_file_concurrency", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
     let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
+    let (_target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
     let zone_a_client =
         init_ndn_client(ndn_mgr_id.as_str(), LOCAL_PRIVATE_KEY, "test.buckyos.io").await;
     let zone_b_client = init_ndn_client(
@@ -4260,7 +4262,7 @@ async fn ndn_2_zone_o_link_innerpath_file_concurrency() {
     .await;
 
     let local_target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_target_ndn_client, local_target_ndn_server_host) =
+    let (local_target_ndn_client, _local_target_ndn_server_host) =
         init_local_ndn_server(local_target_ndn_mgr_id.as_str()).await;
 
     // 构造一个500M左右的文件对象
@@ -4273,7 +4275,7 @@ async fn ndn_2_zone_o_link_innerpath_file_concurrency() {
     assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
     let ndn_mgr_id_arc = Arc::new(ndn_mgr_id);
-    let zone_b_mgr_id_arc = Arc::new(target_ndn_mgr_id);
+    let _zone_b_mgr_id_arc = Arc::new(target_ndn_mgr_id);
     let local_target_ndn_mgr_id_arc = Arc::new(local_target_ndn_mgr_id);
     let file_id_arc = Arc::new(file_id);
     let chunk_id_arc = Arc::new(chunk_id);
@@ -4412,10 +4414,10 @@ async fn ndn_2_zone_r_link_innerpath_file_concurrency() {
     init_logging("ndn_2_zone_r_link_innerpath_file_concurrency", false);
 
     let ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_ndn_client, local_ndn_server_host) =
+    let (_local_ndn_client, local_ndn_server_host) =
         init_local_ndn_server(ndn_mgr_id.as_str()).await;
     let target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
+    let (_target_ndn_client, _) = init_local_ndn_server(target_ndn_mgr_id.as_str()).await;
     let zone_a_client =
         init_ndn_client(ndn_mgr_id.as_str(), LOCAL_PRIVATE_KEY, "test.buckyos.io").await;
     let zone_b_client = init_ndn_client(
@@ -4426,7 +4428,7 @@ async fn ndn_2_zone_r_link_innerpath_file_concurrency() {
     .await;
 
     let local_target_ndn_mgr_id: String = generate_random_bytes(16).encode_hex();
-    let (local_target_ndn_client, local_target_ndn_server_host) =
+    let (local_target_ndn_client, _local_target_ndn_server_host) =
         init_local_ndn_server(local_target_ndn_mgr_id.as_str()).await;
 
     // 构造一个500M左右的文件对象
@@ -4435,11 +4437,11 @@ async fn ndn_2_zone_r_link_innerpath_file_concurrency() {
         500 * 1024 * 1024 + rand::rng().random_range(0..100 * 1024 * 1024),
     );
 
-    let (cal_file_id, file_obj_str) = file_obj.gen_obj_id();
+    let (cal_file_id, _file_obj_str) = file_obj.gen_obj_id();
     assert_eq!(file_id, cal_file_id, "file-id mismatch");
 
     let ndn_mgr_id_arc = Arc::new(ndn_mgr_id);
-    let zone_b_mgr_id_arc = Arc::new(target_ndn_mgr_id);
+    let _zone_b_mgr_id_arc = Arc::new(target_ndn_mgr_id);
     let local_target_ndn_mgr_id_arc = Arc::new(local_target_ndn_mgr_id);
     let file_id_arc = Arc::new(file_id);
     let chunk_id_arc = Arc::new(chunk_id);

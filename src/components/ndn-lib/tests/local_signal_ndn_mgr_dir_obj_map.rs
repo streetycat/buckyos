@@ -307,7 +307,7 @@ pub trait NdnWriter: Send + Sync + Sized + Clone {
 pub trait NdnReader: Send + Sync + Sized {
     async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Value>;
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>>;
-    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Option<Value>>;
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Value>;
 }
 
 pub async fn file_system_to_ndn<
@@ -667,72 +667,56 @@ pub async fn file_system_to_ndn<
                                 file_obj_id, lost_obj_ids
                             );
                             assert_eq!(lost_obj_id, &file_chunk_list_id);
-                            let (lost_obj_ids) = writer
-                                .push_object(&file_chunk_list_id, file_chunk_list_str.as_str())
-                                .await?;
-                            if let Some(lost_obj_id) = lost_obj_ids.get(0) {
-                                debug!(
-                                    "lost child objects when push chunk list object: {}, lost: {:?}",
-                                    file_chunk_list_id, lost_obj_ids
-                                );
-                                let lost_chunk_ids = writer.push_container(lost_obj_id).await?;
-                                let limit = 16;
-                                for i in 0..(lost_chunk_ids.len() + limit - 1) / limit {
-                                    let chunk_ids = &lost_chunk_ids[i * limit
-                                        ..std::cmp::min((i + 1) * limit, lost_chunk_ids.len())];
-                                    let chunk_ids = chunk_ids
-                                        .iter()
-                                        .map(|id| ChunkId::from_obj_id(id))
-                                        .collect::<Vec<_>>();
-                                    let chunk_items = storage
-                                        .list_chunks_by_chunk_id(chunk_ids.as_slice())
-                                        .await?;
-                                    assert_eq!(
-                                        chunk_items.len(),
-                                        chunk_ids.len(),
-                                        "chunk items should match the chunk ids."
-                                    );
-                                    for ((_, chunk_item, chunk_file_path, _, _), chunk_id) in
-                                        chunk_items.iter().zip(chunk_ids.iter())
-                                    {
-                                        assert_eq!(
-                                            chunk_file_path, &file_path,
-                                            "chunk file path should match the file path."
-                                        );
-                                        assert_eq!(
-                                            chunk_item.chunk_id, *chunk_id,
-                                            "chunk item id should match the chunk id."
-                                        );
-                                        let chunk_reader =
-                                            reader.open_file(file_path.as_path()).await?;
-                                        let chunk_data = chunk_reader
-                                            .read_chunk(
-                                                chunk_item.offset,
-                                                Some(
-                                                    chunk_item
-                                                        .chunk_id
-                                                        .get_length()
-                                                        .expect("chunk id should have length"),
-                                                ),
-                                            )
-                                            .await?;
-                                        writer.push_chunk(chunk_id, chunk_data.as_slice()).await?;
-                                    }
-                                }
-                                if lost_chunk_ids.len() > 0 {
-                                    let lost_chunk_ids =
-                                        writer.push_container(&lost_obj_id).await?;
-                                    assert!(
-                                        lost_chunk_ids.is_empty(),
-                                        "lost chunk ids should be empty after push container."
-                                    );
-                                }
-                                let lost_obj_container = writer
-                                    .push_object(&file_chunk_list_id, &file_chunk_list_str)
+                            let lost_chunk_ids = writer.push_container(&file_chunk_list_id).await?;
+                            let limit = 16;
+                            for i in 0..(lost_chunk_ids.len() + limit - 1) / limit {
+                                let chunk_ids = &lost_chunk_ids[i * limit
+                                    ..std::cmp::min((i + 1) * limit, lost_chunk_ids.len())];
+                                let chunk_ids = chunk_ids
+                                    .iter()
+                                    .map(|id| ChunkId::from_obj_id(id))
+                                    .collect::<Vec<_>>();
+                                let chunk_items = storage
+                                    .list_chunks_by_chunk_id(chunk_ids.as_slice())
                                     .await?;
+                                assert_eq!(
+                                    chunk_items.len(),
+                                    chunk_ids.len(),
+                                    "chunk items should match the chunk ids."
+                                );
+                                for ((_, chunk_item, chunk_file_path, _, _), chunk_id) in
+                                    chunk_items.iter().zip(chunk_ids.iter())
+                                {
+                                    assert_eq!(
+                                        chunk_file_path, &file_path,
+                                        "chunk file path should match the file path."
+                                    );
+                                    assert_eq!(
+                                        chunk_item.chunk_id, *chunk_id,
+                                        "chunk item id should match the chunk id."
+                                    );
+                                    let chunk_reader =
+                                        reader.open_file(file_path.as_path()).await?;
+                                    let chunk_data = chunk_reader
+                                        .read_chunk(
+                                            chunk_item.offset,
+                                            Some(
+                                                chunk_item
+                                                    .chunk_id
+                                                    .get_length()
+                                                    .expect("chunk id should have length"),
+                                            ),
+                                        )
+                                        .await?;
+                                    writer.push_chunk(chunk_id, chunk_data.as_slice()).await?;
+                                }
+                            }
+                            if lost_chunk_ids.len() > 0 {
+                                let lost_chunk_ids =
+                                    writer.push_container(&file_chunk_list_id).await?;
                                 assert!(
-                                    lost_obj_container.is_empty(),
-                                    "lost object container should be empty after push object."
+                                    lost_chunk_ids.is_empty(),
+                                    "lost chunk ids should be empty after push container."
                                 );
                             }
                             let lost_chunk_list =
@@ -1156,17 +1140,7 @@ async fn ndn_to_file_system<
                     StorageItem::Dir(dir_obj) => {
                         info!("transfer dir: {:?}", dir_obj.name);
                         let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
-                        let obj_map_json = reader
-                            .get_container(&dir_obj_map_id)
-                            .await?
-                            .ok_or_else(|| {
-                                let msg = format!(
-                                    "Failed to get object map for dir: {}, obj id: {}",
-                                    dir_obj.name, dir_obj_map_id
-                                );
-                                error!("{}", msg);
-                                NdnError::NotFound(msg)
-                            })?;
+                        let obj_map_json = reader.get_container(&dir_obj_map_id).await?;
                         let dir_obj_map = TrieObjectMap::open(obj_map_json, true).await?;
 
                         writer.create_dir(dir_obj, parent_path).await?;
@@ -1190,21 +1164,8 @@ async fn ndn_to_file_system<
                         info!("transfer file: {:?}", file_storage_item.obj.name);
                         let file_chunk_list_id =
                             ObjId::try_from(file_storage_item.obj.content.as_str())?;
-                        let chunk_list = reader.get_object(&file_chunk_list_id).await?;
-                        let chunk_list_body: ChunkListBody = serde_json::from_value(chunk_list)
-                            .map_err(|e| {
-                                let msg = format!("Failed to parse chunk list body: {}", e);
-                                error!("{}", msg);
-                                crate::NdnError::InvalidData(msg)
-                            })?;
-                        reader.get_container(&chunk_list_body.object_array).await?;
-                        let chunk_list: ChunkList = ChunkList::new(
-                            ChunkListMeta {
-                                total_size: chunk_list_body.total_size,
-                                fix_size: chunk_list_body.fix_size,
-                            },
-                            ObjectArray::open(&chunk_list_body.object_array, true).await?,
-                        );
+                        let chunk_list = reader.get_container(&file_chunk_list_id).await?;
+                        let chunk_list = ChunkListBuilder::open(chunk_list).await?.build().await?;
 
                         let file_writer = writer
                             .open_file(&file_storage_item.obj, parent_path)
@@ -1996,10 +1957,7 @@ async fn init_obj_array_storage_factory() -> PathBuf {
             .expect("create data path failed");
     }
 
-    GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY
-        .set(ObjectArrayStorageFactory::new(&data_path))
-        .map_err(|_| ())
-        .expect("Object array storage factory already initialized");
+    let _ = GLOBAL_OBJECT_ARRAY_STORAGE_FACTORY.set(ObjectArrayStorageFactory::new(&data_path));
     data_path
 }
 
@@ -2789,21 +2747,6 @@ impl NdnWriter for Local2NdnWriter {
                     }
                 }
             }
-            OBJ_TYPE_CHUNK_LIST => {
-                let chunk_list_obj: ChunkListBody =
-                    serde_json::from_str(obj_str).expect("Invalid chunk list object");
-                let chunk_list_array = &chunk_list_obj.object_array;
-
-                // todo: should check from target_named_mgr_id, but now it's global, so it will success always
-                let _obj_array = ObjectArray::open(chunk_list_array, true)
-                    .await
-                    .expect("Failed to open dir object map");
-
-                NamedDataMgr::put_object(Some(self.target_named_mgr_id.as_str()), obj_id, obj_str)
-                    .await
-                    .expect("Failed to put dir object");
-                return Ok(vec![]);
-            }
             _ => unreachable!("Unsupported object type: {}", obj_id.obj_type),
         }
     }
@@ -2814,26 +2757,39 @@ impl NdnWriter for Local2NdnWriter {
     async fn push_container(&self, container_id: &ObjId) -> NdnResult<Vec<ObjId>> {
         // lost child-obj-list
         match container_id.obj_type.as_str() {
-            OBJ_TYPE_LIST => {
-                let obj_array = ObjectArray::open(&container_id, true)
+            OBJ_TYPE_CHUNK_LIST => {
+                let chunk_list_json = NamedDataMgr::get_object(
+                    Some(self.local_named_mgr_id.as_str()),
+                    container_id,
+                    None,
+                )
+                .await
+                .expect("Failed to get chunk list from local named manager");
+
+                let chunk_list = ChunkListBuilder::open(chunk_list_json.clone())
                     .await
-                    .expect("Failed to open object array");
+                    .expect("Failed to open chunk list")
+                    .build()
+                    .await
+                    .expect("Failed to build chunk list");
+
                 let mut lost_child_obj_ids = vec![];
-                for item in obj_array.iter() {
+                for item in chunk_list.iter() {
+                    let obj_id = item.to_obj_id();
                     let ret = NamedDataMgr::get_object(
                         Some(self.target_named_mgr_id.as_str()),
-                        &item,
+                        &obj_id,
                         None,
                     )
                     .await;
                     match ret {
                         Ok(_) => {
-                            info!("Object already exists, skipping push: {}", item);
+                            info!("Object already exists, skipping push: {:?}", item);
                         }
                         Err(e) => match e {
                             NdnError::NotFound(_) => {
-                                info!("Object not found, pushing new object: {}", item);
-                                lost_child_obj_ids.push(item.clone());
+                                info!("Object not found, pushing new object: {:?}", item);
+                                lost_child_obj_ids.push(obj_id);
                             }
                             _ => {
                                 panic!("Failed to get object: {}", e);
@@ -2842,7 +2798,24 @@ impl NdnWriter for Local2NdnWriter {
                     }
                 }
 
-                // todo: should push object array to target_named_mgr_id, but now it's global, so it's no useable
+                let (recalc_container_id, container_str) =
+                    build_named_object_by_json(OBJ_TYPE_CHUNK_LIST, &chunk_list_json);
+                assert_eq!(
+                    recalc_container_id, *container_id,
+                    "Chunk list ID mismatch: expected {}, got {}",
+                    container_id, recalc_container_id
+                );
+                if !lost_child_obj_ids.is_empty() {
+                    info!("No new objects to push for chunk list: {}", container_id);
+                    NamedDataMgr::put_object(
+                        Some(self.target_named_mgr_id.as_str()),
+                        container_id,
+                        container_str.as_str(),
+                    )
+                    .await
+                    .expect("Failed to put chunk list");
+                    // todo: should push object array to target_named_mgr_id, but now it's global, so it's no useable
+                }
 
                 Ok(lost_child_obj_ids)
             }
@@ -2926,18 +2899,21 @@ impl NdnReader for LocalNdnReader {
     async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
         Ok(read_chunk(self.ndn_mgr_id.as_str(), chunk_id).await)
     }
-    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Option<Value>> {
+    async fn get_container(&self, container_id: &ObjId) -> NdnResult<Value> {
         match container_id.obj_type.as_str() {
-            OBJ_TYPE_LIST => {
-                // todo: no stub in NDN manager for object array, so we use local named manager to get object array
-                return Ok(None);
+            OBJ_TYPE_CHUNK_LIST => {
+                let chunk_list_json =
+                    NamedDataMgr::get_object(Some(self.ndn_mgr_id.as_str()), container_id, None)
+                        .await
+                        .expect("Failed to get chunk list from NDN manager");
+                return Ok(chunk_list_json);
             }
             OBJ_TYPE_TRIE => {
                 let obj_map_json =
                     NamedDataMgr::get_object(Some(self.ndn_mgr_id.as_str()), container_id, None)
                         .await
                         .expect("Failed to get object map from NDN manager");
-                return Ok(Some(obj_map_json));
+                return Ok(obj_map_json);
             }
             _ => unreachable!("Unsupported object type: {}", container_id.obj_type),
         }
