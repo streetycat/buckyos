@@ -206,10 +206,9 @@ async fn ndn_local_trie_obj_map_basic() {
         ("chunk5", (chunk_id5, chunk_data5)),
     ]);
 
-    let mut obj_map =
-        TrieObjectMap::new(HashMethod::Sha256, Some(TrieObjectMapStorageType::JSONFile))
-            .await
-            .expect("create ObjectMap failed");
+    let mut obj_map = TrieObjectMapBuilder::new(HashMethod::Sha256, None)
+        .await
+        .expect("create ObjectMap failed");
 
     for (name, (chunk_id, _chunk_data)) in chunks.iter() {
         obj_map
@@ -217,17 +216,9 @@ async fn ndn_local_trie_obj_map_basic() {
             .expect(&format!("put {} to trie-obj-map failed", name));
     }
 
-    obj_map.save().await.expect("save trie-obj-map failed");
+    let obj_map = obj_map.build().await.expect("build ObjectMap failed");
 
-    assert_eq!(
-        obj_map
-            .iter()
-            .expect("iter for TrieObjectMap failed")
-            .map(|_| 1)
-            .sum::<usize>(),
-        5,
-        "trie-obj-map total size check failed"
-    );
+    assert_eq!(obj_map.len(), 5, "trie-obj-map total size check failed");
 
     let obj_map_root_hash = obj_map.get_root_hash();
 
@@ -349,19 +340,21 @@ async fn ndn_local_trie_obj_map_ok() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map =
-        TrieObjectMap::new(HashMethod::Sha256, Some(TrieObjectMapStorageType::JSONFile))
-            .await
-            .expect("create ObjectMap failed");
+    let mut obj_map_builder = TrieObjectMapBuilder::new(HashMethod::Sha256, None)
+        .await
+        .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
             .expect("put chunk to trie-obj-map failed");
     }
 
-    obj_map.save().await.expect("save trie-obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
     let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
     NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
@@ -371,12 +364,12 @@ async fn ndn_local_trie_obj_map_ok() {
         .await
         .expect("get obj-map failed");
 
-    let got_obj_map = TrieObjectMap::open(obj_map_json, true)
+    let got_obj_map = TrieObjectMap::open(obj_map_json)
         .await
         .expect("open trie-obj-map from trie-obj-map id failed");
 
     let got_obj_map_id = got_obj_map.get_obj_id();
-    assert_eq!(got_obj_map_id, obj_map_id, "trie-obj-map id check failed");
+    assert_eq!(got_obj_map_id, &obj_map_id, "trie-obj-map id check failed");
     assert_eq!(
         got_obj_map
             .iter()
@@ -446,19 +439,21 @@ async fn ndn_local_trie_obj_map_not_found() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map =
-        TrieObjectMap::new(HashMethod::Sha256, Some(TrieObjectMapStorageType::JSONFile))
-            .await
-            .expect("create ObjectMap failed");
+    let mut obj_map_builder = TrieObjectMapBuilder::new(HashMethod::Sha256, None)
+        .await
+        .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
             .expect("put chunk to trie-obj-map failed");
     }
 
-    obj_map.save().await.expect("save trie-obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
     let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
     let _obj_map_hash = obj_map.get_root_hash_str();
@@ -483,7 +478,7 @@ async fn ndn_local_trie_obj_map_not_found() {
         remove_ret
     );
 
-    TrieObjectMap::open(obj_map_json, true)
+    TrieObjectMap::open(obj_map_json)
         .await
         .map(|_| ())
         .expect_err(
@@ -507,19 +502,21 @@ async fn ndn_local_trie_obj_map_verify_failed() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map =
-        TrieObjectMap::new(HashMethod::Sha256, Some(TrieObjectMapStorageType::JSONFile))
-            .await
-            .expect("create ObjectMap failed");
+    let mut obj_map_builder = TrieObjectMapBuilder::new(HashMethod::Sha256, None)
+        .await
+        .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
             .expect("put chunk to trie-obj-map failed");
     }
 
-    obj_map.save().await.expect("save trie-obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
     let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
     let _obj_map_root_hash = obj_map.get_root_hash_str();
@@ -531,21 +528,22 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         .expect("get obj-map failed");
 
     let (append_chunk_id, _append_chunk_data) = generate_random_chunk(1024 * 1024);
-    let mut append_obj_map = obj_map
-        .clone(false)
+    let mut append_obj_map_builder = TrieObjectMapBuilder::from_trie_object_map(&obj_map)
         .await
-        .expect("clone trie-obj-map failed");
+        .expect("create append ObjectMap failed");
 
-    append_obj_map
+    append_obj_map_builder
         .put_object(
             append_chunk_id.to_string().as_str(),
             &append_chunk_id.to_obj_id(),
         )
         .expect("put append chunk to trie-obj-map failed");
-    append_obj_map
-        .save()
+
+    let append_obj_map = append_obj_map_builder
+        .build()
         .await
-        .expect("save append trie-obj-map failed");
+        .expect("build append ObjectMap failed");
+
     let (_append_obj_map_id, _append_obj_map_str) = append_obj_map.calc_obj_id();
     let _append_obj_map_root_hash = append_obj_map.get_root_hash_str();
     let obj_map_storage_file_path = obj_map
@@ -556,6 +554,11 @@ async fn ndn_local_trie_obj_map_verify_failed() {
         .expect("get append storage file path failed");
     // instead the chunk list storage file
     let remove_ret = std::fs::remove_file(obj_map_storage_file_path.as_path());
+    assert!(
+        remove_ret.is_ok(),
+        "remove chunk list storage file failed: {:?}",
+        remove_ret
+    );
     let copy_ret = std::fs::copy(
         append_obj_map_storage_file_path.as_path(),
         obj_map_storage_file_path.as_path(),
@@ -563,14 +566,21 @@ async fn ndn_local_trie_obj_map_verify_failed() {
 
     assert!(
         copy_ret.is_ok(),
-        "instead append chunk list storage file failed, remove: {:?}, copy: {:?}",
+        "instead append chunk list storage file failed, remove: {:?}, copy: {:?}, {:?} -> {:?}",
         remove_ret,
-        copy_ret
+        copy_ret,
+        append_obj_map_storage_file_path,
+        obj_map_storage_file_path
     );
 
-    let fake_obj_map = TrieObjectMap::open(obj_map_json, true)
+    let fake_obj_map_builder = TrieObjectMapBuilder::open(obj_map_json)
         .await
         .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
+
+    let fake_obj_map = fake_obj_map_builder
+        .build()
+        .await
+        .expect("build fake ObjectMap failed");
 
     for (chunk_id, _chunk_data) in chunks.iter() {
         let key = chunk_id.to_string();

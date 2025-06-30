@@ -145,7 +145,7 @@ impl TrieObjectMap {
         self.storage.root()
     }
 
-    fn get_root_hash_str(&self) -> String {
+    pub fn get_root_hash_str(&self) -> String {
         Base32Codec::to_base32(&self.storage.root())
     }
 

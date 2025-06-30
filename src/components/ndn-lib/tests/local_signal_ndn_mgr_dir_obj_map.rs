@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     io::SeekFrom,
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,7 +21,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DirObject {
     pub name: String,
     pub content: String, //ObjectMapId
@@ -51,14 +52,20 @@ pub struct FileStorageItem {
     pub chunk_size: Option<u64>,
 }
 
-#[derive(Clone)]
+impl std::fmt::Debug for FileStorageItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FileStorageItem: {}", self.obj.name)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ChunkItem {
     pub seq: u64,          // sequence number in file
     pub offset: SeekFrom,  // offset in the file
     pub chunk_id: ChunkId, // chunk id
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum StorageItem {
     Dir(DirObject),
     File(FileStorageItem),
@@ -141,13 +148,25 @@ impl StorageItem {
 
 pub type PathDepth = u64;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum ItemStatus {
     New,
     Scanning,
     Hashing,
     Transfer(ObjId),
     Complete(ObjId),
+}
+
+impl std::fmt::Debug for ItemStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemStatus::New => write!(f, "New"),
+            ItemStatus::Scanning => write!(f, "Scanning"),
+            ItemStatus::Hashing => write!(f, "Hashing"),
+            ItemStatus::Transfer(obj_id) => write!(f, "Transfer({})", obj_id.to_string()),
+            ItemStatus::Complete(obj_id) => write!(f, "Complete({})", obj_id.to_string()),
+        }
+    }
 }
 
 impl ItemStatus {
@@ -257,6 +276,15 @@ pub trait Storage: Send + Sync + Sized + Clone {
 pub enum FileSystemItem {
     Dir(DirObject),
     File(FileObject),
+}
+
+impl FileSystemItem {
+    fn name(&self) -> &str {
+        match self {
+            FileSystemItem::Dir(dir_object) => dir_object.name.as_str(),
+            FileSystemItem::File(file_object) => file_object.name.as_str(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -501,14 +529,9 @@ pub async fn file_system_to_ndn<
                                     "file content should be empty for before hashing."
                                 );
 
-                                let mut chunk_list_builder = ChunkListBuilder::new(
-                                    HashMethod::Sha256,
-                                    file_item.chunk_size.map(|chunk_size| {
-                                        ((file_item.obj.size + chunk_size - 1) / chunk_size)
-                                            as usize
-                                    }),
-                                )
-                                .with_total_size(file_item.obj.size);
+                                let mut chunk_list_builder =
+                                    ChunkListBuilder::new(HashMethod::Sha256)
+                                        .with_total_size(file_item.obj.size);
                                 if let Some(chunk_size) = file_item.chunk_size {
                                     chunk_list_builder =
                                         chunk_list_builder.with_fixed_size(chunk_size);
@@ -752,11 +775,8 @@ pub async fn file_system_to_ndn<
                         info!("hashing dir: {:?}, status: {:?}", item_id, item_status);
                         assert!(item_status.is_hashing());
 
-                        let mut dir_obj_map = TrieObjectMap::new(
-                            HashMethod::Sha256,
-                            Some(TrieObjectMapStorageType::JSONFile),
-                        )
-                        .await?;
+                        let mut dir_obj_map_builder =
+                            TrieObjectMapBuilder::new(HashMethod::Sha256, None).await?;
 
                         let mut dir_children_batch_index = 0;
                         let dir_children_batch_limit = 64;
@@ -785,7 +805,7 @@ pub async fn file_system_to_ndn<
                                             "child dir item should be complete, got: {:?}",
                                             child_status
                                         );
-                                        dir_obj_map.put_object(
+                                        dir_obj_map_builder.put_object(
                                             dir_obj.name.as_str(),
                                             child_status
                                                 .get_obj_id()
@@ -798,7 +818,7 @@ pub async fn file_system_to_ndn<
                                             "child file item should be complete, got: {:?}",
                                             child_status
                                         );
-                                        dir_obj_map.put_object(
+                                        dir_obj_map_builder.put_object(
                                             file_item.obj.name.as_str(),
                                             child_status
                                                 .get_obj_id()
@@ -815,7 +835,7 @@ pub async fn file_system_to_ndn<
                             }
                         }
 
-                        dir_obj_map.save().await?;
+                        let dir_obj_map = dir_obj_map_builder.build().await?;
                         let (dir_obj_map_id, dir_obj_map_str) = dir_obj_map.calc_obj_id();
 
                         NamedDataMgr::put_object(
@@ -955,11 +975,11 @@ pub async fn file_system_to_ndn<
             }
 
             if is_depth_finish {
+                scan_depth += 1;
                 if scan_batch_index == 1 && find_count == 0 {
-                    info!("no more dir with more depth.");
+                    info!("no more dir with more depth {}.", scan_depth);
                     break;
                 }
-                scan_depth += 1;
                 new_complete_count = 0;
                 scan_batch_index = 0;
             }
@@ -967,9 +987,8 @@ pub async fn file_system_to_ndn<
 
         new_complete_count = 0;
         scan_batch_index = 0;
-        while scan_depth > 0 {
-            scan_depth -= 1;
-
+        scan_depth -= 1;
+        loop {
             if scan_depth == 0 {
                 debug!("transfer root.");
             }
@@ -1014,7 +1033,11 @@ pub async fn file_system_to_ndn<
                     if !lost_children.is_empty() {
                         panic!(
                             "all children should exist in remote, item_id: {:?}, lost: {:?}",
-                            item_id, lost_children
+                            item_id,
+                            lost_children
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
                         );
                     }
                     let lost_obj_ids = writer.push_object(&dir_obj_id, &dir_obj_str).await?;
@@ -1032,10 +1055,15 @@ pub async fn file_system_to_ndn<
                 info!("transfer dir: {:?}, status: {:?}", item_id, item_status);
             }
 
-            if is_depth_finish && scan_depth > 0 {
-                scan_depth -= 1;
-                scan_batch_index = 0;
-                new_complete_count = 0;
+            if is_depth_finish {
+                if scan_depth > 0 {
+                    scan_depth -= 1;
+                    scan_batch_index = 0;
+                    new_complete_count = 0;
+                } else {
+                    info!("no more dir with depth 0, transfer finished.");
+                    break;
+                }
             }
         }
 
@@ -1180,7 +1208,7 @@ async fn ndn_to_file_system<
                         info!("transfer dir: {:?}", dir_obj.name);
                         let dir_obj_map_id = ObjId::try_from(dir_obj.content.as_str())?;
                         let obj_map_json = reader.get_container(&dir_obj_map_id).await?;
-                        let dir_obj_map = TrieObjectMap::open(obj_map_json, true).await?;
+                        let dir_obj_map = TrieObjectMap::open(obj_map_json).await?;
 
                         writer.create_dir(dir_obj, parent_path).await?;
 
@@ -1244,7 +1272,8 @@ async fn ndn_to_file_system<
                             (0, 0)
                         };
 
-                        for chunk_index in (chunk_index as usize)..chunk_list.len() {
+                        for chunk_index in chunk_index..chunk_list.len() {
+                            let chunk_index = chunk_index as usize;
                             let chunk_id = chunk_list
                                 .get_chunk(chunk_index)?
                                 .expect("chunk id should exist");
@@ -1380,13 +1409,21 @@ struct SimulateFile {
     content: Vec<u8>,
 }
 
-#[derive(Clone)]
+impl std::fmt::Debug for SimulateFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulateFile")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct SimulateDir {
     name: String,
     children: HashMap<String, SimulateFsItem>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum SimulateFsItem {
     File(SimulateFile),
     Dir(SimulateDir),
@@ -2136,6 +2173,12 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
             assert_eq!(depth, 0, "root item depth must be 0");
             assert_eq!(item_id, 0, "root item is the first item");
         }
+
+        info!(
+            "create new item: {:?}, depth: {}, parent_path: {:?}",
+            item, depth, parent_path
+        );
+
         storage.items.insert(
             item_id,
             (
@@ -2153,6 +2196,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
     async fn remove_dir(&self, item_id: &Self::ItemId) -> NdnResult<u64> {
         let mut storage = self.lock().await;
         if let Some((item, parent_path, status, depth, children)) = storage.items.remove(item_id) {
+            info!(
+                "remove dir: {:?}, parent_path: {:?}, depth: {}",
+                item, parent_path, depth
+            );
             assert!(item.is_dir(), "item must be a directory");
             assert!(children.is_empty(), "directory must be empty");
             Ok(1)
@@ -2162,16 +2209,29 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
     }
     async fn remove_children(&self, item_id: &Self::ItemId) -> NdnResult<u64> {
         let mut storage = self.lock().await;
-        if let Some((item, parent_path, status, depth, children)) = storage.items.remove(item_id) {
+        let remove_children = if let Some((item, _parent_path, _status, _depth, children)) =
+            storage.items.get_mut(item_id)
+        {
             assert!(!item.is_chunk(), "item must not be a chunk");
-            let children_count = children.len();
-            for child_id in children {
-                storage.items.remove(&child_id);
-            }
-            Ok(children_count as u64)
+            let mut remove_children = vec![];
+            std::mem::swap(children, &mut remove_children);
+            remove_children
         } else {
             unreachable!("Item not found in storage");
+        };
+
+        let children_count = remove_children.len();
+        for child_id in remove_children {
+            if let Some(child) = storage.items.remove(&child_id) {
+                info!(
+                    "remove child item: {:?}, parent_path: {:?}, depth: {}, parent_id: {}",
+                    child.0, child.1, child.3, item_id
+                );
+            } else {
+                unreachable!("Child item not found in storage");
+            }
         }
+        Ok(children_count as u64)
     }
     async fn begin_hash(&self, item_id: &Self::ItemId) -> NdnResult<()> {
         let mut storage = self.lock().await;
@@ -2183,6 +2243,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
             assert!(
                 item.is_dir() || item.is_file(),
                 "item must be a directory or file"
+            );
+            info!(
+                "begin hashing item: {:?}, parent_path: {:?}, depth: {}, old_status: {:?}",
+                item, parent_path, depth, status
             );
             *status = ItemStatus::Hashing;
             Ok(())
@@ -2205,6 +2269,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 );
             }
 
+            info!(
+                "begin transfer item: {:?}, parent_path: {:?}, depth: {}, old_status: {:?}, content: {}",
+                item, parent_path, depth, status, content
+            );
             *status = ItemStatus::Transfer(content.clone());
             Ok(())
         } else {
@@ -2230,6 +2298,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 }
                 _ => unreachable!("item status must be Transfer or Complete"),
             };
+            info!(
+                "complete item: {:?}, parent_path: {:?}, depth: {}, old_status: {:?}, content: {}",
+                _item, _parent_path, _depth, status, content
+            );
             *status = ItemStatus::Complete(content);
             Ok(())
         } else {
@@ -2247,6 +2319,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         let root_item_id = 0; // assuming root item is always the first item
         if let Some((item, parent_path, status, depth, _)) = storage.items.get(&root_item_id) {
             assert_eq!(depth, &0, "Root item depth should be 0");
+            info!(
+                "get root item: {:?}, parent_path: {:?}, depth: {}, status: {:?}",
+                item, parent_path, depth, status
+            );
             Ok((
                 root_item_id,
                 item.clone(),
@@ -2269,6 +2345,7 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
             match status {
                 ItemStatus::Complete(_) => {
                     // already complete, nothing to do
+                    assert!(false, "Item already complete");
                     return Ok(vec![]);
                 }
                 _ => {
@@ -2299,7 +2376,13 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         }
 
         for child_id in select_children_id.iter() {
-            if let Some((_, _, status, _, _)) = storage.items.get_mut(child_id) {
+            if let Some((_child, _parent_path, status, _depth, _children)) =
+                storage.items.get_mut(child_id)
+            {
+                info!(
+                    "complete child item: {:?}, old_status: {:?}, parent_path: {:?}, depth :{}",
+                    _child, status, _parent_path, _depth
+                );
                 *status = ItemStatus::Complete(
                     status
                         .get_obj_id()
@@ -2332,6 +2415,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         let storage = self.lock().await;
         for (item_id, (item, parent_path, status, depth, _)) in storage.items.iter() {
             if item.is_dir() && (status.is_scanning() || status.is_new()) {
+                info!(
+                    "select dir for scan or new: {:?}, parent_path: {:?}, depth: {}, status: {:?}",
+                    item, parent_path, depth, status
+                );
                 return Ok(Some((
                     *item_id,
                     item.clone().check_dir().clone(),
@@ -2341,6 +2428,8 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 )));
             }
         }
+
+        info!("No directory found for scanning or new creation");
         Ok(None)
     }
     async fn select_file_hashing_or_transfer(
@@ -2358,6 +2447,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         let storage = self.lock().await;
         for (item_id, (item, parent_path, status, depth, _)) in storage.items.iter() {
             if item.is_file() && (status.is_hashing() || status.is_transfer()) {
+                info!(
+                    "select file for hashing or transfer: {:?}, parent_path: {:?}, depth: {}, status: {:?}",
+                    item, parent_path, depth, status
+                );
                 return Ok(Some((
                     *item_id,
                     item.clone().check_file().clone(),
@@ -2367,6 +2460,7 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 )));
             }
         }
+        info!("No file found for hashing or transfer");
         Ok(None)
     }
     async fn select_dir_hashing_with_all_child_dir_transfer_and_file_complete(
@@ -2377,7 +2471,7 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         for (item_id, (item, parent_path, status, depth, children)) in storage.items.iter() {
             if item.is_dir()
                 && status.is_hashing()
-                && children.iter().all(|(child_id)| {
+                && children.iter().all(|child_id| {
                     let (item, _, status, _, _) =
                         storage.items.get(child_id).expect("child item must exist");
                     item.is_file() && status.is_complete() || {
@@ -2385,6 +2479,10 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                     }
                 })
             {
+                info!(
+                    "select dir for hashing with all child dir transfer and file complete: {:?}, parent_path: {:?}, depth: {}, status: {:?}",
+                    item, parent_path, depth, status
+                );
                 return Ok(Some((
                     *item_id,
                     item.clone().check_dir().clone(),
@@ -2394,6 +2492,7 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 )));
             }
         }
+        info!("No directory found for hashing with all child dir transfer and file complete");
         Ok(None)
     }
     async fn select_dir_transfer(
@@ -2425,7 +2524,19 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
         let offset = offset.unwrap_or(0);
         let limit = std::cmp::min(limit.unwrap_or(usize::MAX as u64), result.len() as u64);
         let end_pos = std::cmp::min(offset + limit, result.len() as u64);
-        Ok(result.as_slice()[offset as usize..end_pos as usize].to_vec())
+        let result = result.as_slice()[offset as usize..end_pos as usize].to_vec();
+
+        info!(
+            "select dir for transfer: found {:?} items, offset: {}, limit: {}, depth: {:?}",
+            result
+                .iter()
+                .map(|(item_id, _, _, _, _)| item_id)
+                .collect::<Vec<&u64>>(),
+            offset,
+            limit,
+            depth
+        );
+        Ok(result)
     }
 
     async fn select_item_transfer(
@@ -2456,6 +2567,16 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                 }
             }
         }
+
+        info!(
+            "select item for transfer: found {:?} items, offset: {:?}, limit: {:?}",
+            result
+                .iter()
+                .map(|(item_id, _, _, _, _)| item_id)
+                .collect::<Vec<&u64>>(),
+            offset,
+            limit
+        );
         Ok(result)
     }
     async fn list_children_order_by_name(
@@ -2482,6 +2603,17 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
                     }
                 }
             }
+
+            info!(
+                "list children for item: {}, found {:?} items, offset: {:?}, limit: {:?}",
+                item_id,
+                result
+                    .iter()
+                    .map(|(item_id, _, _, _)| item_id)
+                    .collect::<Vec<&u64>>(),
+                offset,
+                limit
+            );
             Ok((result, parent_path.to_path_buf()))
         } else {
             unreachable!("Item not found in storage");
@@ -2515,6 +2647,13 @@ impl Storage for Arc<tokio::sync::Mutex<MemoryStorage>> {
             .iter()
             .map(|chunk_id| result.remove(&chunk_id).expect("Chunk ID must exist"))
             .collect::<Vec<_>>();
+        info!(
+            "list chunks by chunk_id: found {:?} items",
+            result
+                .iter()
+                .map(|(item_id, _, _, _, _)| item_id)
+                .collect::<Vec<&u64>>()
+        );
         Ok(result)
     }
 }
@@ -2580,23 +2719,26 @@ impl FileSystemDirReader for SimulateDirReader {
         let mut child_names = parent.check_dir().children.keys().collect::<Vec<_>>();
         child_names.sort();
         let mut last_child_name = self.last_child_name.lock().await;
-        let last_name_pos = child_names.iter().position(|name| {
-            last_child_name
-                .as_ref()
-                .map_or(true, |last_name| *name == last_name)
-        });
-        let next_pos = match last_name_pos {
-            Some(pos) => pos + 1,
-            None => {
-                assert_eq!(
-                    child_names.len(),
-                    0,
-                    "Last child name not found in the directory: {:?}",
-                    self.last_child_name
-                );
-                return Ok(vec![]);
+        let next_pos = match &*last_child_name {
+            Some(last_child_name) => {
+                child_names
+                    .iter()
+                    .position(|name| last_child_name == *name)
+                    .expect("last_child lost")
+                    + 1
             }
+            None => 0,
         };
+
+        if next_pos >= child_names.len() {
+            // No more children to select
+            info!(
+                "No more children to select in directory: {}",
+                self.parent_path.display()
+            );
+            return Ok(vec![]);
+        }
+
         let select_child_names = &child_names.as_slice()[next_pos
             ..std::cmp::min(
                 child_names.len(),
@@ -2604,6 +2746,10 @@ impl FileSystemDirReader for SimulateDirReader {
             )];
 
         if select_child_names.is_empty() {
+            info!(
+                "No more children to select in directory: {}",
+                self.parent_path.display()
+            );
             return Ok(vec![]);
         }
 
@@ -2636,6 +2782,14 @@ impl FileSystemDirReader for SimulateDirReader {
                 }
             })
             .collect::<Vec<_>>();
+
+        info!(
+            "Selected children from directory: {}, found: {:?}, last_child_name: {:?}, limit: {:?}",
+            self.parent_path.display(),
+            childs.iter().map(|child| child.name()).collect::<Vec<_>>(),
+            *last_child_name,
+            limit
+        );
 
         Ok(childs)
     }
@@ -2684,6 +2838,7 @@ impl FileSystemWriter<SimulateFileWriter> for Arc<tokio::sync::Mutex<SimulateFsI
                 .children
                 .entry(child_name.clone())
                 .or_insert_with(|| {
+                    info!("Creating directory: {}", child_name);
                     SimulateFsItem::Dir(SimulateDir {
                         name: child_name,
                         children: HashMap::new(),
@@ -2698,13 +2853,21 @@ impl FileSystemWriter<SimulateFileWriter> for Arc<tokio::sync::Mutex<SimulateFsI
         let parent_item = root
             .find_child_mut(parent_path)
             .expect("Parent path must exist");
-        parent_item.check_dir_mut().children.insert(
-            dir.name.clone(),
-            SimulateFsItem::Dir(SimulateDir {
-                name: dir.name.clone(),
-                children: HashMap::new(),
-            }),
-        );
+        parent_item
+            .check_dir_mut()
+            .children
+            .entry(dir.name.clone())
+            .or_insert_with(|| {
+                info!(
+                    "Creating directory: {}, parent: {:?}",
+                    dir.name, parent_path
+                );
+                // Create a new SimulateDir with the name from DirObject
+                SimulateFsItem::Dir(SimulateDir {
+                    name: dir.name.clone(),
+                    children: HashMap::new(),
+                })
+            });
         Ok(())
     }
 
@@ -2713,6 +2876,21 @@ impl FileSystemWriter<SimulateFileWriter> for Arc<tokio::sync::Mutex<SimulateFsI
         file: &FileObject,
         parent_path: &Path,
     ) -> NdnResult<SimulateFileWriter> {
+        let mut root = self.lock().await;
+        let parent_item = root
+            .find_child_mut(parent_path)
+            .expect("Parent path must exist");
+        parent_item
+            .check_dir_mut()
+            .children
+            .entry(file.name.clone())
+            .or_insert_with(|| {
+                info!("Creating file: {}, parent: {:?}", file.name, parent_path);
+                SimulateFsItem::File(SimulateFile {
+                    name: file.name.clone(),
+                    content: vec![],
+                })
+            });
         Ok(SimulateFileWriter {
             root: self.clone(),
             file_path: parent_path.join(file.name.as_str()),
@@ -2786,7 +2964,11 @@ impl NdnWriter for Local2NdnWriter {
                 .await;
                 match lost_obj {
                     Ok(_) => {
-                        info!("Object already exists, skipping push: {}", chunk_list_id);
+                        info!(
+                            "Chunklist {} already exists, push file-obj: {}",
+                            chunk_list_id.to_string(),
+                            obj_id.to_string()
+                        );
                         NamedDataMgr::put_object(
                             Some(self.target_named_mgr_id.as_str()),
                             obj_id,
@@ -2798,7 +2980,11 @@ impl NdnWriter for Local2NdnWriter {
                     }
                     Err(e) => match e {
                         NdnError::NotFound(_) => {
-                            info!("Object not found, pushing new object: {}", chunk_list_id);
+                            info!(
+                                "Chunklist {} for file {} not found, please push it first",
+                                chunk_list_id.to_string(),
+                                obj_id.to_string()
+                            );
                             return Ok(vec![chunk_list_id.clone()]);
                         }
                         _ => {
@@ -2820,15 +3006,14 @@ impl NdnWriter for Local2NdnWriter {
                 .await;
                 let err = match lost_obj_map {
                     Ok(obj_map_json) => {
-                        info!("Object already exists, check body: {}", dir_obj_map_id);
-
                         // todo: should check from target_named_mgr_id, but now it's global, so it will success always
-                        let obj_map = TrieObjectMap::open(obj_map_json, true).await;
+                        let obj_map = TrieObjectMap::open(obj_map_json).await;
                         match obj_map {
                             Ok(_) => {
                                 info!(
-                                    "Object map already exists, skipping push: {}",
-                                    dir_obj_map_id
+                                    "ObjectMap {} already exists, push directory {}",
+                                    dir_obj_map_id.to_string(),
+                                    obj_id.to_string()
                                 );
                                 NamedDataMgr::put_object(
                                     Some(self.target_named_mgr_id.as_str()),
@@ -2847,7 +3032,10 @@ impl NdnWriter for Local2NdnWriter {
 
                 match err {
                     NdnError::NotFound(_) => {
-                        info!("Object not found, pushing new object: {}", dir_obj_map_id);
+                        info!(
+                            "ObjectMap {} for directory {} not found, please push it first",
+                            dir_obj_map_id, obj_id
+                        );
                         return Ok(vec![dir_obj_map_id.clone()]);
                     }
                     _ => {
@@ -2893,11 +3081,17 @@ impl NdnWriter for Local2NdnWriter {
                     .await;
                     match ret {
                         Ok(_) => {
-                            info!("Object already exists, skipping push: {:?}", item);
+                            info!(
+                                "Object already exists, skipping push: {:?}",
+                                item.to_string()
+                            );
                         }
                         Err(e) => match e {
                             NdnError::NotFound(_) => {
-                                info!("Object not found, pushing new object: {:?}", item);
+                                info!(
+                                    "Object not found, pushing new object: {:?}",
+                                    obj_id.to_string()
+                                );
                                 lost_child_obj_ids.push(obj_id);
                             }
                             _ => {
@@ -2907,15 +3101,22 @@ impl NdnWriter for Local2NdnWriter {
                     }
                 }
 
-                let (recalc_container_id, container_str) =
-                    build_named_object_by_json(container_id.obj_type.as_str(), &chunk_list_json);
-                assert_eq!(
-                    recalc_container_id, *container_id,
-                    "Chunk list ID mismatch: expected {}, got {}",
-                    container_id, recalc_container_id
-                );
-                if !lost_child_obj_ids.is_empty() {
-                    info!("No new objects to push for chunk list: {}", container_id);
+                if lost_child_obj_ids.is_empty() {
+                    info!(
+                        "all chunks for {} already exist, push it",
+                        container_id.to_string()
+                    );
+                    let (recalc_container_id, container_str) = build_named_object_by_json(
+                        container_id.obj_type.as_str(),
+                        &chunk_list_json,
+                    );
+                    assert_eq!(
+                        recalc_container_id,
+                        *container_id,
+                        "Chunk list ID mismatch: expected {}, got {}",
+                        container_id.to_string(),
+                        recalc_container_id.to_string()
+                    );
                     NamedDataMgr::put_object(
                         Some(self.target_named_mgr_id.as_str()),
                         container_id,
@@ -2924,11 +3125,21 @@ impl NdnWriter for Local2NdnWriter {
                     .await
                     .expect("Failed to put chunk list");
                     // todo: should push object array to target_named_mgr_id, but now it's global, so it's no useable
+                } else {
+                    info!(
+                        "{} chunk for {} lost, please push them first, {:?}",
+                        lost_child_obj_ids.len(),
+                        container_id.to_string(),
+                        lost_child_obj_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                    );
                 }
 
                 Ok(lost_child_obj_ids)
             }
-            OBJ_TYPE_TRIE => {
+            OBJ_TYPE_TRIE | OBJ_TYPE_TRIE_SIMPLE => {
                 let obj_map_json = NamedDataMgr::get_object(
                     Some(self.local_named_mgr_id.as_str()),
                     container_id,
@@ -2938,14 +3149,16 @@ impl NdnWriter for Local2NdnWriter {
                 .expect("Failed to get object map from local named manager");
 
                 let (got_obj_map_id, obj_map_str) =
-                    build_named_object_by_json(OBJ_TYPE_TRIE, &obj_map_json);
+                    build_named_object_by_json(container_id.obj_type.as_str(), &obj_map_json);
                 assert_eq!(
-                    got_obj_map_id, *container_id,
+                    got_obj_map_id,
+                    *container_id,
                     "Object map ID mismatch: expected {}, got {}",
-                    container_id, got_obj_map_id
+                    container_id.to_string(),
+                    got_obj_map_id.to_string()
                 );
 
-                let obj_map = TrieObjectMap::open(obj_map_json, true)
+                let obj_map = TrieObjectMap::open(obj_map_json)
                     .await
                     .expect("Failed to open object map");
                 let all_obj_ids = obj_map
@@ -2963,11 +3176,11 @@ impl NdnWriter for Local2NdnWriter {
                     .await;
                     match ret {
                         Ok(_) => {
-                            info!("Object already exists, skipping push: {}", item);
+                            info!("Object already exists, skipping push: {}", item.to_string());
                         }
                         Err(e) => match e {
                             NdnError::NotFound(_) => {
-                                info!("Object not found, pushing new object: {}", item);
+                                info!("Object not found, pushing new object: {}", item.to_string());
                                 lost_child_obj_ids.push(item);
                             }
                             _ => {
@@ -2979,7 +3192,10 @@ impl NdnWriter for Local2NdnWriter {
 
                 // todo: should push object map to target_named_mgr_id, but now it's global, so it's no useable
                 if lost_child_obj_ids.is_empty() {
-                    info!("No new objects to push for object map: {}", container_id);
+                    info!(
+                        "No new objects to push for object map: {}, push it",
+                        container_id
+                    );
                     NamedDataMgr::put_object(
                         Some(self.target_named_mgr_id.as_str()),
                         container_id,
@@ -2987,6 +3203,16 @@ impl NdnWriter for Local2NdnWriter {
                     )
                     .await
                     .expect("Failed to put object map");
+                } else {
+                    info!(
+                        "{} sub-obj for {} lost, please push them first, {:?}",
+                        lost_child_obj_ids.len(),
+                        container_id,
+                        lost_child_obj_ids
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>()
+                    );
                 }
 
                 Ok(lost_child_obj_ids)
@@ -3044,6 +3270,11 @@ async fn check_simulate_fs_eq_object(
                             ndn_client: &NdnClient,
                             obj_host_url: &str|
            -> Option<ObjId> {
+        info!(
+            "check item: {}, obj_id: {}",
+            item.name(),
+            obj_id.to_string()
+        );
         match item {
             SimulateFsItem::File(file) => {
                 let obj_json = NamedDataMgr::get_object(Some(ndn_mgr_id), obj_id, None)
@@ -3103,7 +3334,7 @@ async fn check_simulate_fs_eq_object(
                         .await
                         .expect("Failed to get children object map");
 
-                let obj_map = TrieObjectMap::open(children_obj_map_json, true)
+                let obj_map = TrieObjectMap::open(children_obj_map_json)
                     .await
                     .expect("Failed to open dir object map");
                 assert_eq!(
@@ -3142,7 +3373,7 @@ async fn check_simulate_fs_eq_object(
                         .await
                         .expect("Failed to get children object map");
 
-                let obj_map = TrieObjectMap::open(children_obj_map_json, true)
+                let obj_map = TrieObjectMap::open(children_obj_map_json)
                     .await
                     .expect("Failed to open dir object map");
                 let next_obj_id = obj_map
@@ -3238,11 +3469,11 @@ async fn ndn_local_dir_trie_obj_map_build() {
     let (backup_ndn_client, backup_ndn_host) = init_ndn_server(backup_ndn_mgr_id.as_str()).await;
 
     // backup
-    let simulate_dir = Arc::new(tokio::sync::Mutex::new(gen_random_simulate_dir(
-        16,
-        32,
-        1000 * 1000,
-    )));
+    let simulate_dir = gen_random_simulate_dir(4, 4, 1000 * 1000);
+
+    info!("Simulate dir: {:?}", simulate_dir);
+
+    let simulate_dir = Arc::new(tokio::sync::Mutex::new(simulate_dir));
     let storage = Arc::new(tokio::sync::Mutex::new(MemoryStorage::new()));
     let root_path = PathBuf::from(simulate_dir.lock().await.name());
     let root_item_id = file_system_to_ndn(
@@ -3301,7 +3532,7 @@ async fn ndn_local_dir_trie_obj_map_build() {
         LocalNdnReader {
             ndn_mgr_id: backup_ndn_mgr_id.clone(),
         },
-        storage.clone(),
+        restore_storage.clone(),
     )
     .await
     .expect("Failed to build NDN local dir trie object map");

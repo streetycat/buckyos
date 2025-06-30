@@ -141,6 +141,6 @@ impl ChunkListBuilder {
     }
 
     pub fn count(&self) -> usize {
-        self.list.len()
+        self.array_builder.len()
     }
 }

@@ -79,7 +79,7 @@ impl ChunkIdHashHelper {
 
 //We support 3 types of chunktype:qcid, sha256, mix at this time
 //单个
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ChunkId {
     pub hash_type: String,
     pub hash_result: Vec<u8>,

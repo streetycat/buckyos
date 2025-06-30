@@ -201,7 +201,7 @@ async fn ndn_local_file_chunklist_rechunk_split() {
     info!("file0_id: {}", file0_id.to_string());
 
     let mut chunk_list_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(total_size);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(total_size);
 
     chunk_list_builder
         .append(chunk0_id.clone())
@@ -306,7 +306,7 @@ async fn ndn_local_file_chunklist_rechunk_split() {
         })
         .collect::<Vec<_>>();
     let mut chunk_list_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(chunk0_data.len() as u64);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(chunk0_data.len() as u64);
 
     for (_idx, chunk_id) in part_chunks.iter().enumerate() {
         chunk_list_builder
@@ -535,7 +535,7 @@ async fn ndn_local_file_chunklist_rechunk_combine() {
     let total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
     let mut chunk_list_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(total_size);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(total_size);
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
@@ -649,7 +649,7 @@ async fn ndn_local_file_chunklist_rechunk_combine() {
 
     // File([chunk0 + chunk1 + ... + chunk9]) -> file0
     let mut chunk_list_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(total_size);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(total_size);
 
     chunk_list_builder
         .append(combine_chunk_id.clone())
@@ -782,8 +782,8 @@ async fn ndn_local_file_chunklist_delta() {
         .expect("put file0 to ndn-mgr failed");
 
     // File1(chunks_3_6) -> File0
-    let mut chunk_list_3_6_builder = ChunkListBuilder::new(HashMethod::Sha256, None)
-        .with_total_size(combine_chunks_3_6.len() as u64);
+    let mut chunk_list_3_6_builder =
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(combine_chunks_3_6.len() as u64);
     for (chunk_id, _chunk_data) in chunks_3_6.iter() {
         chunk_list_3_6_builder
             .append(chunk_id.clone())
@@ -870,7 +870,7 @@ async fn ndn_local_file_chunklist_delta() {
     let file2_len = chunks_0_3.iter().map(|(_, d)| d.len() as u64).sum::<u64>()
         + chunks_3_6.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
     let mut chunk_list_0_6_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(file2_len);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(file2_len);
     for (chunk_id, chunk_data) in chunks_0_3.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
         chunk_list_0_6_builder
@@ -978,7 +978,7 @@ async fn ndn_local_file_chunklist_delta() {
         + chunks_3_6.iter().map(|(_, d)| d.len() as u64).sum::<u64>()
         + chunks_9_12.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
     let mut chunk_list_0_6_9_12_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(file3_len);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(file3_len);
     for (chunk_id, _chunk_data) in chunks_0_3.iter() {
         chunk_list_0_6_9_12_builder
             .append(chunk_id.clone())
@@ -1096,7 +1096,7 @@ async fn ndn_local_file_chunklist_delta() {
         + chunks_6_9.iter().map(|(_, d)| d.len() as u64).sum::<u64>()
         + chunks_9_12.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
     let mut chunk_list_0_12_builder =
-        ChunkListBuilder::new(HashMethod::Sha256, None).with_total_size(file4_len);
+        ChunkListBuilder::new(HashMethod::Sha256).with_total_size(file4_len);
     for (chunk_id, _chunk_data) in chunks_0_3.iter() {
         chunk_list_0_12_builder
             .append(chunk_id.clone())

@@ -206,33 +206,28 @@ async fn ndn_local_obj_map_basic() {
         ("chunk5", (chunk_id5, chunk_data5)),
     ]);
 
-    let mut obj_map = ObjectMap::new(HashMethod::Sha256, Some(ObjectMapStorageType::JSONFile))
+    let mut obj_map_builder = ObjectMapBuilder::new(HashMethod::Sha256, None)
         .await
         .expect("create ObjectMap failed");
 
     for (name, (chunk_id, _chunk_data)) in chunks.iter() {
-        obj_map
-            .put_object(*name, &chunk_id.to_obj_id())
-            .await
-            .expect(&format!("put {} to obj-map failed", name));
+        obj_map_builder.put_object(*name, &chunk_id.to_obj_id());
     }
 
-    obj_map.flush_mtree().await.expect("flush obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
-    assert_eq!(
-        obj_map.len().await.expect("get obj-map len failed"),
-        5,
-        "obj-map total size check failed"
-    );
+    assert_eq!(obj_map.len(), 5, "obj-map total size check failed");
 
     let root_hash = obj_map
-        .get_root_hash_str()
+        .get_root_hash()
         .expect("obj-map id should be calc finish");
     let verifier = ObjectMapProofVerifier::new(HashMethod::Sha256);
     for (name, (chunk_id, _chunk_data)) in chunks.iter() {
         let obj_id = obj_map
             .get_object(*name)
-            .await
             .expect(&format!("get {} from obj-map failed", name))
             .expect("object should be some");
         assert_eq!(
@@ -259,7 +254,6 @@ async fn ndn_local_obj_map_basic() {
 
     let notexist_obj_id = obj_map
         .get_object("notexist")
-        .await
         .expect("get notexist from obj-map failed");
     assert!(
         notexist_obj_id.is_none(),
@@ -333,23 +327,23 @@ async fn ndn_local_obj_map_ok() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map = ObjectMap::new(HashMethod::Sha256, Some(ObjectMapStorageType::JSONFile))
+    let mut obj_map_builder = ObjectMapBuilder::new(HashMethod::Sha256, None)
         .await
         .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to obj-map failed");
     }
 
-    obj_map.save().await.expect("save obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
-    let (obj_map_id, obj_map_str) = obj_map
-        .calc_obj_id()
-        .expect("obj-map id should be calc finish");
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
 
     NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
         .await
@@ -359,23 +353,16 @@ async fn ndn_local_obj_map_ok() {
         .await
         .expect("get obj-map from ndn-mgr failed");
 
-    let mut got_obj_map = ObjectMap::open(obj_map_json, true)
+    let mut got_obj_map = ObjectMap::open(obj_map_json)
         .await
         .expect("open obj-map from obj-map id failed");
 
-    got_obj_map
-        .flush_mtree()
-        .await
-        .expect("todo: why need flush for exist object");
-
-    let (got_obj_map_id, got_obj_map_str) = got_obj_map
-        .calc_obj_id()
-        .expect("calc obj-map id failed for got obj-map");
+    let (got_obj_map_id, got_obj_map_str) = got_obj_map.calc_obj_id();
     assert_eq!(got_obj_map_id, obj_map_id, "obj-map id check failed");
     assert_eq!(got_obj_map_str, obj_map_str, "obj-map str check failed");
     assert_eq!(
-        got_obj_map.len().await.expect("get obj-map len failed"),
-        chunks.len(),
+        got_obj_map.len(),
+        chunks.len() as u64,
         "obj-map total size check failed"
     );
 
@@ -383,12 +370,10 @@ async fn ndn_local_obj_map_ok() {
         assert_eq!(
             got_obj_map
                 .get_object(key.as_str())
-                .await
                 .expect("get item failed")
                 .expect("object should be some"),
             obj_map
                 .get_object(key.as_str())
-                .await
                 .expect("get item from obj-map failed")
                 .expect("object should be some"),
             "item {} object check failed",
@@ -399,7 +384,6 @@ async fn ndn_local_obj_map_ok() {
             obj_id,
             obj_map
                 .get_object(key.as_str())
-                .await
                 .expect("get item from obj-map failed")
                 .expect("object should be some"),
             "item {} object check failed",
@@ -448,23 +432,23 @@ async fn ndn_local_obj_map_not_found() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map = ObjectMap::new(HashMethod::Sha256, Some(ObjectMapStorageType::JSONFile))
+    let mut obj_map_builder = ObjectMapBuilder::new(HashMethod::Sha256, None)
         .await
         .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to obj-map failed");
     }
 
-    obj_map.save().await.expect("save obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
 
-    let (obj_map_id, obj_map_str) = obj_map
-        .calc_obj_id()
-        .expect("obj-map id should be calc finish");
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
 
     let _obj_map_root_hash = obj_map
         .get_root_hash_str()
@@ -490,7 +474,7 @@ async fn ndn_local_obj_map_not_found() {
         .await
         .expect("get obj-map from ndn-mgr failed");
 
-    ObjectMap::open(obj_map_json, true)
+    ObjectMap::open(obj_map_json)
         .await
         .map(|_| ())
         .expect_err("open obj-map from obj-map id should failed for the storage is removed");
@@ -512,26 +496,27 @@ async fn ndn_local_obj_map_verify_failed() {
     let chunks = generate_random_chunk_list(5, None);
     let _total_size: u64 = chunks.iter().map(|c| c.1.len() as u64).sum();
 
-    let mut obj_map = ObjectMap::new(HashMethod::Sha256, Some(ObjectMapStorageType::JSONFile))
+    let mut obj_map_builder = ObjectMapBuilder::new(HashMethod::Sha256, None)
         .await
         .expect("create ObjectMap failed");
 
     for (chunk_id, chunk_data) in chunks.iter() {
         write_chunk(ndn_mgr_id.as_str(), chunk_id, chunk_data.as_slice()).await;
-        obj_map
+        obj_map_builder
             .put_object(chunk_id.to_string().as_str(), &chunk_id.to_obj_id())
-            .await
             .expect("put chunk to obj-map failed");
     }
 
-    obj_map.save().await.expect("save obj-map failed");
+    let obj_map = obj_map_builder
+        .build()
+        .await
+        .expect("build ObjectMap failed");
+
     let obj_map_root_hash = obj_map
         .get_root_hash_str()
         .expect("obj-map root hash should calc finish");
 
-    let (obj_map_id, obj_map_str) = obj_map
-        .calc_obj_id()
-        .expect("obj-map id should be calc finish");
+    let (obj_map_id, obj_map_str) = obj_map.calc_obj_id();
 
     NamedDataMgr::put_object(Some(ndn_mgr_id.as_str()), &obj_map_id, obj_map_str.as_str())
         .await
@@ -541,25 +526,25 @@ async fn ndn_local_obj_map_verify_failed() {
         .expect("get obj-map from ndn-mgr failed");
 
     let (append_chunk_id, _append_chunk_data) = generate_random_chunk(1024 * 1024);
-    let mut append_obj_map = obj_map.clone(false).await.expect("clone obj-map failed");
+    let mut append_obj_map_builder = ObjectMapBuilder::from_object_map(&obj_map)
+        .await
+        .expect("create append ObjectMap failed");
 
-    append_obj_map
+    append_obj_map_builder
         .put_object(
             append_chunk_id.to_string().as_str(),
             &append_chunk_id.to_obj_id(),
         )
-        .await
         .expect("put append chunk to obj-map failed");
-    append_obj_map
-        .save()
+    let append_obj_map = append_obj_map_builder
+        .build()
         .await
-        .expect("save append obj-map failed");
+        .expect("build append ObjectMap failed");
+
     let append_obj_map_root_hash = append_obj_map
         .get_root_hash_str()
         .expect("append obj-map root hash should calc finish");
-    let _append_obj_map_id = append_obj_map
-        .get_obj_id()
-        .expect("append obj-map id should be calc finish");
+    let _append_obj_map_id = append_obj_map.get_obj_id();
     // instead the chunk list storage file
     let obj_map_storage_file_path = obj_map
         .get_storage_file_path()
@@ -580,13 +565,9 @@ async fn ndn_local_obj_map_verify_failed() {
         copy_ret
     );
 
-    let mut fake_obj_map = ObjectMap::open(obj_map_json.clone(), true)
+    let mut fake_obj_map = ObjectMap::open(obj_map_json.clone())
         .await
         .expect("build chunk list from ndn-mgr should success for object-array has been replaced");
-    fake_obj_map
-        .flush_mtree()
-        .await
-        .expect("todo: why need flush for exist object");
 
     assert_eq!(
         fake_obj_map
@@ -600,13 +581,11 @@ async fn ndn_local_obj_map_verify_failed() {
         let key = chunk_id.to_string();
         let obj_id = obj_map
             .get_object(key.as_str())
-            .await
             .expect("get object from obj-map failed")
             .expect("object should be some");
 
         let fake_chunk_id = fake_obj_map
             .get_object(key.as_str())
-            .await
             .expect("get object from fake obj-map failed")
             .expect("object should be some");
 
