@@ -12,6 +12,7 @@ mod hash;
 mod object_map;
 mod trie_object_map;
 mod object_array;
+mod coll;
 
 pub use object::*;
 pub use chunk::*;
@@ -25,6 +26,7 @@ pub use mtree::*;
 pub use object_map::*;
 pub use trie_object_map::*;
 pub use object_array::*;
+pub use coll::*;
 
 use reqwest::StatusCode;
 use thiserror::Error;
@@ -95,10 +97,16 @@ pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
 pub const OBJ_TYPE_PATH: &str = "cypath";
 pub const OBJ_TYPE_MTREE: &str = "cytree";
-pub const OBJ_TYPE_OBJMAP: &str = "cymap"; // object map
-pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
 pub const OBJ_TYPE_PACK: &str = "cypack"; // object set
+
+pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
+pub const OBJ_TYPE_TRIE_SIMPLE: &str = "cytrie-s"; // simple trie object map
+
+pub const OBJ_TYPE_OBJMAP: &str = "cymap"; // object map
+pub const OBJ_TYPE_OBJMAP_SIMPLE: &str = "cymap-s"; // simple object map
+
 pub const OBJ_TYPE_LIST: &str = "cylist"; // object list
+pub const OBJ_TYPE_LIST_SIMPLE: &str = "cylist-s"; // simple object list
 
 pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
 pub const OBJ_TYPE_CHUNK_LIST_SIMPLE: &str = "cl-s"; // simple chunk list with variable size
