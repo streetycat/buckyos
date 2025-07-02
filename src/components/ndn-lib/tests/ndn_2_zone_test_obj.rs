@@ -857,8 +857,6 @@ async fn ndn_2_zone_r_link_innerpath_not_found() {
     init_logging("ndn_2_zone_r_link_innerpath_not_found", false);
 
     let ndn_mgr_id: String = "default".to_string();
-    let (_local_ndn_client, _local_ndn_server_host) =
-        init_local_ndn_server(ndn_mgr_id.as_str()).await;
 
     let _zone_a_client =
         init_ndn_client(ndn_mgr_id.as_str(), LOCAL_PRIVATE_KEY, "test.buckyos.io").await;
