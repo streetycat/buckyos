@@ -1,0 +1,12 @@
+[package]
+name = "backup-lib"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log = "*"
+serde = "*"
+serde_json = "*"
+
+buckyos-kit = { path = "../buckyos-kit" }
+ndn-lib = { path = "../ndn-lib" }

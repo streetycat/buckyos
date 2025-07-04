@@ -1,0 +1,36 @@
+[package]
+name = "backup-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+time = { version = "^0.3", features = ["formatting"] }
+async-trait = "*"
+log = "*"
+serde = "*"
+serde_json = "*"
+url = "*"
+tokio = { version = "*", features = ["full"] }
+lazy_static = "*"
+thiserror = "*"
+semver = "*"
+base64 = "*"
+ed25519-dalek = { version = "*", features = ["pkcs8", "pem"] } 
+jsonwebtoken = "*" 
+futures-util = "*"
+hex = "*"
+rusqlite =  { version = "*", features = ["bundled"] }
+sha2 = { version = ">=0.11.0-pre.4" }
+reqwest = {version = "*", features = ["json", "rustls-tls"]}
+
+ndn-lib = { path = "../../components/ndn-lib" }
+package-lib = { path = "../../components/package-lib" }
+name-lib = { path = "../../components/name-lib" }
+name-client = { path = "../../components/name-client" }
+cyfs-warp = { path = "../../cyfs_gateway/cyfs-warp" }
+cyfs-gateway-lib = { path = "../../cyfs_gateway/cyfs-gateway-lib" }
+buckyos-kit = { path = "../../components/buckyos-kit" }
+kRPC ={ path = "../../kernel/kRPC" }
+buckyos-api = { path = "../../kernel/buckyos-api" }
+backup-lib = { path = "../backup-lib" }
+

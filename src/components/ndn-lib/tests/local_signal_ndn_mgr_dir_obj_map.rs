@@ -380,7 +380,7 @@ pub async fn file_system_to_ndn<
                     let file_reader = reader
                         .open_file(parent_path.join(file_object.name.as_str()).as_path())
                         .await?;
-                    let (file_item_id, file_item, item_status) = storage
+                    let (file_item_id, file_item, _item_status) = storage
                         .create_new_item(
                             &StorageItem::File(FileStorageItem {
                                 obj: file_object,
@@ -519,10 +519,10 @@ pub async fn file_system_to_ndn<
             loop {
                 // hash files
                 match storage.select_file_hashing_or_transfer().await? {
-                    Some((item_id, mut file_item, parent_path, mut file_status, depth)) => {
+                    Some((item_id, mut file_item, parent_path, file_status, depth)) => {
                         info!("hashing file: {:?}, status: {:?}", item_id, file_status);
                         let file_path = parent_path.join(file_item.obj.name.as_str());
-                        let (file_obj_id, file_obj_str, file_chunk_list_id, file_chunk_list_str) =
+                        let (file_obj_id, file_obj_str, file_chunk_list_id, _file_chunk_list_str) =
                             if file_status.is_hashing() {
                                 assert!(
                                     file_item.obj.content.is_empty(),
@@ -771,7 +771,7 @@ pub async fn file_system_to_ndn<
                     .select_dir_hashing_with_all_child_dir_transfer_and_file_complete()
                     .await?
                 {
-                    Some((item_id, mut dir_object, parent_path, item_status, depth)) => {
+                    Some((item_id, mut dir_object, _parent_path, item_status, depth)) => {
                         info!("hashing dir: {:?}, status: {:?}", item_id, item_status);
                         assert!(item_status.is_hashing());
 

@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
 pub const CALC_HASH_PIECE_SIZE: u64 = 1024 * 1024;
 pub const QCID_HASH_PIECE_SIZE: u64 = 4096;
@@ -243,6 +244,26 @@ impl TryFrom<Vec<u8>> for ChunkId {
     }
 }
 
+impl Serialize for ChunkId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Serialize as a string using to_string()
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChunkId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ChunkId::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 pub struct ChunkIdRef<'a> {
     pub hash_type: &'a str,
     pub hash_result: &'a [u8],
@@ -276,6 +297,7 @@ impl<'a> ChunkIdRef<'a> {
 mod tests {
     use super::*;
     use rand::Rng;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[test]
     fn test_var_length() {
