@@ -59,3 +59,4 @@ rand = "*"
 cyfs-gateway-lib = { path = "../../cyfs_gateway/cyfs-gateway-lib" }
 cyfs-warp = { path = "../../cyfs_gateway/cyfs-warp" }
 kRPC = { path = "../../kernel/kRPC" }
+test_ndn = { path = "../../../test/test_ndn" }
