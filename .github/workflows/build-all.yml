@@ -21,24 +21,24 @@ jobs:
   build-windows:
     strategy:
       matrix:
-        arch: ["x86_64"]
+        arch: ["x86_64", "aarch64"]
     uses: ./.github/workflows/build-windows.yml
     with:
       version: ${{ inputs.version }}
       arch: ${{ matrix.arch }}
-  build-linux:
-    strategy:
-      matrix:
-        arch: ["x86_64", "aarch64"]
-    uses: ./.github/workflows/build-linux.yml
-    with:
-      version: ${{ inputs.version }}
-      arch: ${{ matrix.arch }}
-  build-macos:
-    strategy:
-      matrix:
-        arch: ["x86_64", "aarch64"]
-    uses: ./.github/workflows/build-macos.yml
-    with:
-      version: ${{ inputs.version }}
-      arch: ${{ matrix.arch }}
+  # build-linux:
+  #   strategy:
+  #     matrix:
+  #       arch: ["x86_64", "aarch64"]
+  #   uses: ./.github/workflows/build-linux.yml
+  #   with:
+  #     version: ${{ inputs.version }}
+  #     arch: ${{ matrix.arch }}
+  # build-macos:
+  #   strategy:
+  #     matrix:
+  #       arch: ["x86_64", "aarch64"]
+  #   uses: ./.github/workflows/build-macos.yml
+  #   with:
+  #     version: ${{ inputs.version }}
+  #     arch: ${{ matrix.arch }}
