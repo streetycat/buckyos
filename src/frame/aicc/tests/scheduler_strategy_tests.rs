@@ -509,13 +509,13 @@ fn sched_02_cost_priority_prefers_lower_cost_under_same_capability() {
 }
 
 #[test]
-fn sched_03_free_quota_priority_prefers_quota_provider_first() {
+fn sched_03_zero_cost_priority_prefers_zero_cost_provider_first() {
     let r = Registry::default();
     let c = ModelCatalog::default();
     add_llm(
         &r,
         &c,
-        "quota",
+        "zero-cost",
         "a",
         0.0,
         50,
@@ -547,7 +547,7 @@ fn sched_03_free_quota_priority_prefers_quota_provider_first() {
             &c,
         )
         .unwrap();
-    assert_eq!(selected.primary_instance_id, "quota");
+    assert_eq!(selected.primary_instance_id, "zero-cost");
 }
 
 #[test]

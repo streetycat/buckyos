@@ -563,6 +563,24 @@ impl SnAIProvider {
             (0.20, 1.25)
         } else if model.starts_with("gpt-5.4") {
             (2.50, 15.00)
+        } else if model.starts_with("gpt-5-pro") {
+            (15.00, 120.00)
+        } else if model.starts_with("gpt-5-mini") {
+            (0.25, 2.00)
+        } else if model.starts_with("gpt-5-nano") || model.starts_with("gpt-5-nono") {
+            (0.05, 0.40)
+        } else if model.starts_with("gpt-5") {
+            (1.25, 10.00)
+        } else if model.starts_with("gpt-4.1-mini") {
+            (0.40, 1.60)
+        } else if model.starts_with("gpt-4.1") {
+            (2.00, 8.00)
+        } else if model.starts_with("gpt-4o-mini") {
+            (0.15, 0.60)
+        } else if model.starts_with("gpt-4o") {
+            (2.50, 10.00)
+        } else if model.starts_with("gpt-3.5") {
+            (0.50, 1.50)
         } else {
             (1.00, 3.00)
         }

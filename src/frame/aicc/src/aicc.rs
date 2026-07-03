@@ -54,7 +54,6 @@ const REDACTED_BASE64_PLACEHOLDER: &str = "[redacted_base64]";
 const REDACTED_DATA_URL_BASE64_PREFIX: &str = "[redacted_data_url_base64";
 const REDACTED_LONG_BASE64_LIKE_PLACEHOLDER: &str = "[redacted_base64_like_string]";
 const LOG_BASE64_LIKE_MIN_CHARS: usize = 512;
-const SN_AI_PROVIDER_FREE_CREDIT_USD: f64 = 15.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct InvokeCtx {
@@ -279,80 +278,6 @@ impl From<CostEstimate> for CostEstimateOutput {
             quota_state: QuotaState::Unknown,
             confidence: 0.0,
             estimated_latency_ms: value.estimated_latency_ms,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct SnAIProviderBillingAdjustment {
-    raw_cost_usd: f64,
-    billed_cost_usd: f64,
-    credit_applied_usd: f64,
-    remaining_credit_usd: f64,
-}
-
-#[derive(Clone, Default)]
-struct SnAIProviderBillingLedger {
-    spent_raw_cost_usd: Arc<RwLock<HashMap<String, f64>>>,
-}
-
-impl SnAIProviderBillingLedger {
-    fn preview_billed_cost(
-        &self,
-        tenant_id: &str,
-        provider_driver: &str,
-        raw_cost_usd: f64,
-    ) -> Option<f64> {
-        let raw_cost_usd = raw_cost_usd.max(0.0);
-        if provider_driver != "sn-ai-provider" {
-            return Some(raw_cost_usd);
-        }
-
-        let spent_raw_cost_usd = self
-            .spent_raw_cost_usd
-            .read()
-            .ok()
-            .and_then(|items| items.get(tenant_id).copied())
-            .unwrap_or(0.0)
-            .max(0.0);
-        Some(
-            Self::adjust_from_spent(spent_raw_cost_usd, raw_cost_usd)
-                .billed_cost_usd
-                .max(0.0),
-        )
-    }
-
-    fn apply_charge(
-        &self,
-        tenant_id: &str,
-        provider_driver: &str,
-        raw_cost_usd: Option<f64>,
-    ) -> Option<SnAIProviderBillingAdjustment> {
-        if provider_driver != "sn-ai-provider" {
-            return None;
-        }
-
-        let raw_cost_usd = raw_cost_usd?.max(0.0);
-        let mut spent = self.spent_raw_cost_usd.write().ok()?;
-        let spent_raw_cost_usd = spent.get(tenant_id).copied().unwrap_or(0.0).max(0.0);
-        let adjustment = Self::adjust_from_spent(spent_raw_cost_usd, raw_cost_usd);
-        spent.insert(tenant_id.to_string(), spent_raw_cost_usd + raw_cost_usd);
-        Some(adjustment)
-    }
-
-    fn adjust_from_spent(
-        spent_raw_cost_usd: f64,
-        raw_cost_usd: f64,
-    ) -> SnAIProviderBillingAdjustment {
-        let remaining_credit_usd = (SN_AI_PROVIDER_FREE_CREDIT_USD - spent_raw_cost_usd).max(0.0);
-        let credit_applied_usd = raw_cost_usd.min(remaining_credit_usd).max(0.0);
-        let billed_cost_usd = (raw_cost_usd - credit_applied_usd).max(0.0);
-
-        SnAIProviderBillingAdjustment {
-            raw_cost_usd,
-            billed_cost_usd,
-            credit_applied_usd,
-            remaining_credit_usd: (remaining_credit_usd - credit_applied_usd).max(0.0),
         }
     }
 }
@@ -1612,18 +1537,17 @@ impl Router {
         route_cfg: &RouteConfig,
         model_catalog: &ModelCatalog,
     ) -> std::result::Result<RouteDecision, RPCErrors> {
-        self.route_with_billing(
+        self.route_inner(
             tenant_id,
             req,
             snapshot,
             registry,
             route_cfg,
             model_catalog,
-            None,
         )
     }
 
-    fn route_with_billing(
+    fn route_inner(
         &self,
         tenant_id: &str,
         req: &AiMethodRequest,
@@ -1631,7 +1555,6 @@ impl Router {
         registry: &Registry,
         route_cfg: &RouteConfig,
         model_catalog: &ModelCatalog,
-        sn_ai_provider_billing: Option<&SnAIProviderBillingLedger>,
     ) -> std::result::Result<RouteDecision, RPCErrors> {
         if snapshot.candidates.is_empty() {
             return Err(reason_error(
@@ -1708,11 +1631,7 @@ impl Router {
                 request_features: req.requirements.effective_feature_names(),
             });
             let compat_estimate = CostEstimate::from(&estimate);
-            let effective_estimated_cost = compat_estimate.estimated_cost_usd.and_then(|cost| {
-                sn_ai_provider_billing
-                    .and_then(|billing| billing.preview_billed_cost(tenant_id, provider_type, cost))
-                    .or(Some(cost))
-            });
+            let effective_estimated_cost = compat_estimate.estimated_cost_usd;
             if let Some(max_cost) = request_policy.max_estimated_cost_usd {
                 if let Some(estimated_cost) = effective_estimated_cost {
                     if estimated_cost > max_cost {
@@ -2827,7 +2746,6 @@ struct TaskBinding {
 pub struct AIComputeCenter {
     registry: Registry,
     route_cfg: Arc<RwLock<RouteConfig>>,
-    sn_ai_provider_billing: SnAIProviderBillingLedger,
     model_catalog: ModelCatalog,
     model_registry: Arc<RwLock<ModelRegistry>>,
     session_config: Arc<RwLock<SessionConfig>>,
@@ -2941,7 +2859,6 @@ impl AIComputeCenter {
         Self {
             registry,
             route_cfg: Arc::new(RwLock::new(RouteConfig::default())),
-            sn_ai_provider_billing: SnAIProviderBillingLedger::default(),
             model_catalog,
             model_registry,
             session_config,
@@ -3371,7 +3288,7 @@ impl AIComputeCenter {
             })
             .unwrap_or_default();
         drop(registry);
-        self.apply_dynamic_cost_estimates(tenant_id, request, &mut resolution.candidates);
+        self.apply_dynamic_cost_estimates(request, &mut resolution.candidates);
         self.apply_dynamic_budget_filters(&mut resolution, &policy)
             .map_err(route_error_to_rpc)?;
 
@@ -3561,12 +3478,7 @@ impl AIComputeCenter {
         )
     }
 
-    fn apply_dynamic_cost_estimates(
-        &self,
-        tenant_id: &str,
-        request: &AiMethodRequest,
-        candidates: &mut [ModelCandidate],
-    ) {
+    fn apply_dynamic_cost_estimates(&self, request: &AiMethodRequest, candidates: &mut [ModelCandidate]) {
         let (input_tokens, output_tokens) = estimate_request_tokens(request);
         for candidate in candidates.iter_mut() {
             let Some(provider) = self
@@ -3583,22 +3495,10 @@ impl AIComputeCenter {
                 cached_input_tokens: None,
                 request_features: request.requirements.effective_feature_names(),
             });
-            let provider_driver = self
-                .registry
-                .inventory(candidate.provider_instance_name.as_str())
-                .map(|inventory| inventory.provider_driver)
-                .unwrap_or_default();
-            let effective_cost = self
-                .sn_ai_provider_billing
-                .preview_billed_cost(
-                    tenant_id,
-                    provider_driver.as_str(),
-                    estimate.estimated_cost_usd,
-                )
-                .unwrap_or(estimate.estimated_cost_usd);
-            candidate.metadata.pricing.estimated_cost_usd = Some(effective_cost.max(0.0));
+            let effective_cost = estimate.estimated_cost_usd.max(0.0);
+            candidate.metadata.pricing.estimated_cost_usd = Some(effective_cost);
             candidate.dynamic_cost_estimate = Some(CostEstimateOutput {
-                estimated_cost_usd: effective_cost.max(0.0),
+                estimated_cost_usd: effective_cost,
                 pricing_mode: estimate.pricing_mode,
                 quota_state: estimate.quota_state.clone(),
                 confidence: estimate.confidence,
@@ -3651,47 +3551,6 @@ impl AIComputeCenter {
         }
         resolution.trace.candidate_count_after_filter = resolution.candidates.len();
         Ok(())
-    }
-
-    fn apply_billing_to_summary(
-        &self,
-        ctx: &InvokeCtx,
-        provider_driver: &str,
-        summary: &mut AiResponse,
-    ) {
-        let Some(cost) = summary.cost.clone() else {
-            return;
-        };
-        let Some(adjustment) = self.sn_ai_provider_billing.apply_charge(
-            ctx.tenant_id.as_str(),
-            provider_driver,
-            Some(cost.amount),
-        ) else {
-            return;
-        };
-
-        summary.cost = Some(buckyos_api::AiCost {
-            amount: adjustment.billed_cost_usd,
-            currency: cost.currency,
-        });
-
-        let extra_value = summary
-            .extra
-            .get_or_insert_with(|| Value::Object(Map::new()));
-        if !extra_value.is_object() {
-            *extra_value = Value::Object(Map::new());
-        }
-        if let Value::Object(extra) = extra_value {
-            extra.insert(
-                "billing".to_string(),
-                json!({
-                    "raw_cost_usd": adjustment.raw_cost_usd,
-                    "billed_cost_usd": adjustment.billed_cost_usd,
-                    "sn_ai_provider_credit_applied_usd": adjustment.credit_applied_usd,
-                    "sn_ai_provider_credit_remaining_usd": adjustment.remaining_credit_usd,
-                }),
-            );
-        }
     }
 
     pub async fn complete(
@@ -4390,15 +4249,6 @@ impl AIComputeCenter {
             match result {
                 Ok(mut start_result) => {
                     if let ProviderStartResult::Immediate(summary) = &mut start_result {
-                        self.apply_billing_to_summary(
-                            ctx,
-                            self.registry
-                                .inventory(attempt.instance_id.as_str())
-                                .map(|inventory| inventory.provider_driver)
-                                .unwrap_or_default()
-                                .as_str(),
-                            summary,
-                        );
                         append_provider_audit_to_summary(summary, attempt);
                     }
                     self.registry
@@ -5780,9 +5630,6 @@ mod tests {
             }
         }
 
-        fn start_calls(&self) -> usize {
-            self.start_call_count.load(AtomicOrdering::Relaxed)
-        }
     }
 
     #[async_trait]
@@ -6493,135 +6340,6 @@ mod tests {
         );
         assert!(task.data.get("rootid").is_none());
         assert!(task.data.pointer("/aicc/rootid").is_none());
-    }
-
-    #[tokio::test]
-    async fn complete_prefers_sn_ai_provider_when_free_credit_covers_estimated_cost() {
-        let registry = Registry::default();
-        let catalog = ModelCatalog::default();
-        catalog.set_mapping(
-            Capability::Llm,
-            "llm.plan.default",
-            "sn-ai-provider",
-            "gpt-5-mini",
-        );
-        catalog.set_mapping(Capability::Llm, "llm.plan.default", "openai", "gpt-5-mini");
-
-        let sn_provider = Arc::new(MockProvider::new(
-            mock_instance("sn-ai-provider-1", "sn-ai-provider"),
-            cost(0.20, 80),
-            vec![Ok(ProviderStartResult::Started)],
-        ));
-        let paid_provider = Arc::new(MockProvider::new(
-            mock_instance("openai-1", "openai"),
-            cost(0.05, 20),
-            vec![Ok(ProviderStartResult::Started)],
-        ));
-        registry.add_provider(sn_provider.clone());
-        registry.add_provider(paid_provider.clone());
-
-        let center = center_with_taskmgr(registry, catalog);
-        center.update_route_config(RouteConfig {
-            global_weights: RouteWeights {
-                w_cost: 1.0,
-                w_latency: 0.0,
-                w_load: 0.0,
-                w_error: 0.0,
-            },
-            ..RouteConfig::default()
-        });
-
-        let mut request = base_request();
-        request.requirements.max_cost_usd = Some(0.10);
-        let response = center
-            .complete(request, RPCContext::default())
-            .await
-            .expect("complete should succeed");
-
-        assert_eq!(response.status, AiMethodStatus::Running);
-        assert_eq!(sn_provider.start_calls(), 1);
-        assert_eq!(paid_provider.start_calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn complete_applies_sn_ai_provider_free_credit_before_reporting_cost() {
-        let registry = Registry::default();
-        let catalog = ModelCatalog::default();
-        catalog.set_mapping(
-            Capability::Llm,
-            "llm.plan.default",
-            "sn-ai-provider",
-            "gpt-5-mini",
-        );
-
-        let provider = Arc::new(MockProvider::new(
-            mock_instance("sn-ai-provider-1", "sn-ai-provider"),
-            cost(2.0, 100),
-            vec![
-                Ok(ProviderStartResult::Immediate({
-                    let mut response = AiResponse::text("first");
-                    response.cost = Some(buckyos_api::AiCost {
-                        amount: 2.0,
-                        currency: "USD".to_string(),
-                    });
-                    response.finish_reason = Some("stop".to_string());
-                    response
-                })),
-                Ok(ProviderStartResult::Immediate({
-                    let mut response = AiResponse::text("second");
-                    response.cost = Some(buckyos_api::AiCost {
-                        amount: 14.0,
-                        currency: "USD".to_string(),
-                    });
-                    response.finish_reason = Some("stop".to_string());
-                    response
-                })),
-            ],
-        ));
-        registry.add_provider(provider);
-
-        let center = center_with_taskmgr(registry, catalog);
-
-        let mut first_request = base_request();
-        first_request.requirements.max_cost_usd = Some(20.0);
-        let first = center
-            .complete(first_request, RPCContext::default())
-            .await
-            .expect("first complete should succeed");
-        assert_eq!(first.status, AiMethodStatus::Succeeded);
-        assert_eq!(
-            first
-                .result
-                .as_ref()
-                .and_then(|summary| summary.cost.as_ref())
-                .map(|cost| cost.amount),
-            Some(0.0)
-        );
-        assert_eq!(
-            first
-                .result
-                .as_ref()
-                .and_then(|summary| summary.extra.as_ref())
-                .and_then(|extra| extra.pointer("/billing/sn_ai_provider_credit_applied_usd"))
-                .and_then(|value| value.as_f64()),
-            Some(2.0)
-        );
-
-        let mut second_request = base_request();
-        second_request.requirements.max_cost_usd = Some(20.0);
-        let second = center
-            .complete(second_request, RPCContext::default())
-            .await
-            .expect("second complete should succeed");
-        assert_eq!(second.status, AiMethodStatus::Succeeded);
-        assert_eq!(
-            second
-                .result
-                .as_ref()
-                .and_then(|summary| summary.cost.as_ref())
-                .map(|cost| cost.amount),
-            Some(1.0)
-        );
     }
 
     #[tokio::test]
