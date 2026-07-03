@@ -36,7 +36,6 @@ const DEFAULT_OOD_ID: &str = "ood1";
 const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 const DEFAULT_SN_AI_PROVIDER_MODELS: &[&str] =
     &["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro"];
-const DEFAULT_SN_AI_PROVIDER_IMAGE_MODELS: &[&str] = &["dall-e-3", "dall-e-2"];
 const SN_AI_PROVIDER_MODELS_API: &str = "https://sn.buckyos.ai/api/v1/ai/models";
 const SN_AI_PROVIDER_RESPONSES_API: &str = "https://sn.buckyos.ai/api/v1/ai/";
 
@@ -723,61 +722,53 @@ fn build_aicc_settings_with_sn_models(
 ) -> Value {
     const DEFAULT_PROVIDER_TIMEOUT_MS: u64 = 600_000;
     let mut settings = serde_json::Map::new();
-    let mut openai_alias_map = serde_json::Map::new();
     let mut openai_instances = Vec::<Value>::new();
-    let mut sn_ai_provider_alias_map = serde_json::Map::new();
     let mut sn_ai_provider_instances = Vec::<Value>::new();
-    let openai_api_token =
-        trim_to_option(config.ai_provider_config.openai_api_token.as_str()).unwrap_or_default();
 
-    if !openai_api_token.is_empty() {
-        openai_alias_map.insert("gpt-fast".to_string(), json!("gpt-5-mini"));
-        openai_alias_map.insert("gpt-plan".to_string(), json!("gpt-5"));
+    if let Some(api_token) = trim_to_option(config.ai_provider_config.openai_api_token.as_str()) {
         openai_instances.push(json!({
-            "instance_id": "openai-default",
-            "provider_type": "openai",
+            "provider_instance_name": "openai-default",
+            "provider_type": "cloud_api",
+            "provider_driver": "openai",
+            "api_token": api_token,
             "base_url": "https://api.openai.com/v1",
-            "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
-            "models": ["gpt-5", "gpt-5-mini", "gpt-5-nono", "gpt-5-pro"],
-            "default_model": "gpt-5-mini",
-            "image_models": ["dall-e-3", "dall-e-2"],
-            "default_image_model": "dall-e-3",
-            "features": ["plan", "json_output", "tool_calling", "web_search"]
+            "auth_mode": "bearer",
+            "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS
+        }));
+    }
+
+    if let Some(api_token) = trim_to_option(config.ai_provider_config.openrouter_api_token.as_str()) {
+        openai_instances.push(json!({
+            "provider_instance_name": "openrouter-main",
+            "provider_type": "cloud_api",
+            "provider_driver": "openrouter",
+            "api_token": api_token,
+            "base_url": "https://openrouter.ai/api/v1",
+            "auth_mode": "bearer",
+            "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS
+        }));
+    }
+
+    if let Some(api_token) = trim_to_option(config.ai_provider_config.glm_api_token.as_str()) {
+        openai_instances.push(json!({
+            "provider_instance_name": "zai",
+            "provider_type": "cloud_api",
+            "provider_driver": "openai",
+            "api_token": api_token,
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "auth_mode": "bearer",
+            "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS
         }));
     }
 
     if config.llm_router_enabled() {
-        let sn_model_settings = build_sn_ai_provider_model_settings(sn_ai_provider_models);
-        if !sn_ai_provider_alias_map.contains_key("llm.default") {
-            sn_ai_provider_alias_map.insert(
-                "llm.default".to_string(),
-                json!(sn_model_settings.default_model.as_str()),
-            );
-        }
-        if !sn_ai_provider_alias_map.contains_key("llm.plan.default") {
-            sn_ai_provider_alias_map.insert(
-                "llm.plan.default".to_string(),
-                json!(sn_model_settings.plan_default_model.as_str()),
-            );
-        }
-        if !sn_ai_provider_alias_map.contains_key("llm.code.default") {
-            sn_ai_provider_alias_map.insert(
-                "llm.code.default".to_string(),
-                json!(sn_model_settings.default_model.as_str()),
-            );
-        }
-
+        let sn_models = build_sn_ai_provider_models(sn_ai_provider_models);
         sn_ai_provider_instances.push(json!({
             "provider_instance_name": "sn-ai-provider-default",
             "provider_type": "cloud_api",
-            "provider_driver": "sn-ai-provider",
             "base_url": SN_AI_PROVIDER_RESPONSES_API,
             "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
-            "models": sn_model_settings.models,
-            "default_model": sn_model_settings.default_model,
-            "image_models": sn_model_settings.image_models,
-            "default_image_model": sn_model_settings.default_image_model,
-            "features": ["plan", "json_output", "tool_calling", "web_search"],
+            "models": sn_models,
             "auth_mode": "device_jwt"
         }));
     }
@@ -787,8 +778,6 @@ fn build_aicc_settings_with_sn_models(
             "openai".to_string(),
             json!({
                 "enabled": true,
-                "api_token": openai_api_token,
-                "alias_map": Value::Object(openai_alias_map),
                 "instances": openai_instances
             }),
         );
@@ -799,8 +788,6 @@ fn build_aicc_settings_with_sn_models(
             "sn-ai-provider".to_string(),
             json!({
                 "enabled": true,
-                "api_token": "",
-                "alias_map": Value::Object(sn_ai_provider_alias_map),
                 "instances": sn_ai_provider_instances
             }),
         );
@@ -811,14 +798,12 @@ fn build_aicc_settings_with_sn_models(
             "google".to_string(),
             json!({
                 "enabled": true,
-                "api_token": api_token,
-                "alias_map": {
-                    "gemini-ops": "gemini-2.5-flash"
-                },
                 "instances": [
                     {
-                        "instance_id": "google-gemini-default",
-                        "provider_type": "google-gemini",
+                        "provider_instance_name": "google-gemini-default",
+                        "provider_type": "cloud_api",
+                        "provider_driver": "google-gemini",
+                        "api_token": api_token,
                         "base_url": "https://generativelanguage.googleapis.com/v1beta",
                         "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
                         "models": ["gemini-2.5-flash", "gemini-2.5-pro"],
@@ -840,14 +825,12 @@ fn build_aicc_settings_with_sn_models(
             "claude".to_string(),
             json!({
                 "enabled": true,
-                "api_token": api_token,
-                "alias_map": {
-                    "claude-reasoning": "claude-3-7-sonnet-20250219"
-                },
                 "instances": [
                     {
-                        "instance_id": "claude-default",
-                        "provider_type": "claude",
+                        "provider_instance_name": "claude-default",
+                        "provider_type": "cloud_api",
+                        "provider_driver": "claude",
+                        "api_token": api_token,
                         "base_url": "https://api.anthropic.com/v1",
                         "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
                         "models": ["claude-3-7-sonnet-20250219", "claude-3-5-haiku-20241022"],
@@ -863,8 +846,6 @@ fn build_aicc_settings_with_sn_models(
         json!({
             "openai": {
                 "enabled": false,
-                "api_token": "",
-                "alias_map": {},
                 "instances": []
             }
         })
@@ -873,18 +854,7 @@ fn build_aicc_settings_with_sn_models(
     }
 }
 
-#[derive(Debug)]
-struct SnAIProviderModelSettings {
-    models: Vec<String>,
-    default_model: String,
-    plan_default_model: String,
-    image_models: Vec<String>,
-    default_image_model: String,
-}
-
-fn build_sn_ai_provider_model_settings(
-    sn_ai_provider_models: Option<&[String]>,
-) -> SnAIProviderModelSettings {
+fn build_sn_ai_provider_models(sn_ai_provider_models: Option<&[String]>) -> Vec<String> {
     let mut models = sn_ai_provider_models
         .unwrap_or(&[])
         .iter()
@@ -899,50 +869,7 @@ fn build_sn_ai_provider_model_settings(
             .collect::<Vec<_>>();
     }
 
-    let default_model = pick_preferred_model(models.as_slice(), &["gpt-5.4-mini", "gpt-5.4"])
-        .unwrap_or_else(|| models[0].clone());
-    let plan_default_model = pick_preferred_model(models.as_slice(), &["gpt-5.4", "gpt-5.4-mini"])
-        .unwrap_or_else(|| default_model.clone());
-
-    let mut image_models = models
-        .iter()
-        .filter(|item| is_image_model(item.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if image_models.is_empty() {
-        image_models = DEFAULT_SN_AI_PROVIDER_IMAGE_MODELS
-            .iter()
-            .map(|item| item.to_string())
-            .collect::<Vec<_>>();
-    }
-    let default_image_model =
-        pick_preferred_model(image_models.as_slice(), &["dall-e-3", "gpt-image-1"])
-            .unwrap_or_else(|| image_models[0].clone());
-
-    SnAIProviderModelSettings {
-        models,
-        default_model,
-        plan_default_model,
-        image_models,
-        default_image_model,
-    }
-}
-
-fn pick_preferred_model(models: &[String], preferred: &[&str]) -> Option<String> {
-    for target in preferred.iter() {
-        if let Some(matched) = models.iter().find(|item| item == target) {
-            return Some(matched.clone());
-        }
-    }
-    None
-}
-
-fn is_image_model(model_id: &str) -> bool {
-    let value = model_id.to_ascii_lowercase();
-    value.contains("dall-e")
-        || value.contains("gpt-image")
-        || value.contains("image")
-        || value.contains("vision")
+    models
 }
 
 async fn fetch_sn_ai_provider_models(user_name: &str) -> Option<Vec<String>> {
@@ -1334,6 +1261,8 @@ mod tests {
             "zone_name": "did:web:alice.example.com",
             "ai_provider_config": {
                 "openai_api_token": "sk-openai",
+                "openrouter_api_token": "sk-openrouter",
+                "glm_api_token": "glm-token",
                 "google_api_token": "google-token",
                 "claude_api_token": "claude-token"
             }
@@ -1342,27 +1271,59 @@ mod tests {
 
         let settings = build_aicc_settings(&summary);
 
-        assert_eq!(settings["openai"]["api_token"], "sk-openai");
-        assert_eq!(settings["openai"]["alias_map"]["gpt-fast"], "gpt-5-mini");
+        assert!(settings["openai"]["api_token"].is_null());
+        assert_eq!(settings["openai"]["instances"][0]["api_token"], "sk-openai");
         assert_eq!(
-            settings["openai"]["instances"][0]["default_model"],
-            "gpt-5-mini"
+            settings["openai"]["instances"][0]["provider_type"],
+            "cloud_api"
+        );
+        assert_eq!(
+            settings["openai"]["instances"][0]["provider_driver"],
+            "openai"
+        );
+        assert_eq!(
+            settings["openai"]["instances"][1]["provider_instance_name"],
+            "openrouter-main"
+        );
+        assert_eq!(
+            settings["openai"]["instances"][1]["provider_driver"],
+            "openrouter"
+        );
+        assert_eq!(
+            settings["openai"]["instances"][2]["provider_instance_name"],
+            "zai"
         );
         assert_eq!(settings["openai"]["instances"][0]["timeout_ms"], 600000);
-        assert_eq!(settings["google"]["api_token"], "google-token");
+        assert!(settings["google"]["api_token"].is_null());
         assert_eq!(
-            settings["google"]["alias_map"]["gemini-ops"],
-            "gemini-2.5-flash"
+            settings["google"]["instances"][0]["api_token"],
+            "google-token"
+        );
+        assert_eq!(
+            settings["google"]["instances"][0]["provider_instance_name"],
+            "google-gemini-default"
         );
         assert_eq!(
             settings["google"]["instances"][0]["provider_type"],
+            "cloud_api"
+        );
+        assert_eq!(
+            settings["google"]["instances"][0]["provider_driver"],
             "google-gemini"
         );
         assert_eq!(settings["google"]["instances"][0]["timeout_ms"], 600000);
-        assert_eq!(settings["claude"]["api_token"], "claude-token");
+        assert!(settings["claude"]["api_token"].is_null());
         assert_eq!(
-            settings["claude"]["alias_map"]["claude-reasoning"],
-            "claude-3-7-sonnet-20250219"
+            settings["claude"]["instances"][0]["api_token"],
+            "claude-token"
+        );
+        assert_eq!(
+            settings["claude"]["instances"][0]["provider_type"],
+            "cloud_api"
+        );
+        assert_eq!(
+            settings["claude"]["instances"][0]["provider_driver"],
+            "claude"
         );
         assert_eq!(
             settings["claude"]["instances"][0]["default_model"],
@@ -1396,10 +1357,7 @@ mod tests {
             settings["sn-ai-provider"]["instances"][0]["provider_type"],
             "cloud_api"
         );
-        assert_eq!(
-            settings["sn-ai-provider"]["instances"][0]["provider_driver"],
-            "sn-ai-provider"
-        );
+        assert!(settings["sn-ai-provider"]["instances"][0]["provider_driver"].is_null());
         assert_eq!(
             settings["sn-ai-provider"]["instances"][0]["base_url"],
             "https://sn.buckyos.ai/api/v1/ai/"
@@ -1408,10 +1366,12 @@ mod tests {
             settings["sn-ai-provider"]["instances"][0]["auth_mode"],
             "device_jwt"
         );
-        assert_eq!(
-            settings["sn-ai-provider"]["alias_map"]["llm.plan.default"],
-            "gpt-5.4"
-        );
+        assert!(settings["sn-ai-provider"]["instances"][0]["default_model"].is_null());
+        assert!(settings["sn-ai-provider"]["instances"][0]["image_models"].is_null());
+        assert!(settings["sn-ai-provider"]["instances"][0]["default_image_model"].is_null());
+        assert!(settings["sn-ai-provider"]["instances"][0]["features"].is_null());
+        assert!(settings["sn-ai-provider"]["api_token"].is_null());
+        assert!(settings["sn-ai-provider"]["alias_map"].is_null());
     }
 
     #[test]
@@ -1484,10 +1444,7 @@ mod tests {
             settings["sn-ai-provider"]["instances"][0]["models"],
             json!(["gpt-5", "gpt-5-mini", "gpt-image-1"])
         );
-        assert_eq!(
-            settings["sn-ai-provider"]["instances"][0]["default_image_model"],
-            "gpt-image-1"
-        );
+        assert!(settings["sn-ai-provider"]["instances"][0]["default_image_model"].is_null());
     }
 
     #[test]

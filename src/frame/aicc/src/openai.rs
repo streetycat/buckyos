@@ -88,6 +88,7 @@ const OPENAI_IMAGE_EDIT_OPTION_ALLOWLIST: &[&str] = &[
 pub struct OpenAIInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
+    pub provider_driver: String,
     pub api_token: String,
     pub base_url: String,
     pub auth_mode: String,
@@ -147,10 +148,14 @@ impl OpenAIProvider {
 
         let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
         let provider_instance_name = cfg.provider_instance_name.clone();
-        let provider_driver = default_provider_driver_for_instance(
-            cfg.provider_instance_name.as_str(),
-            cfg.base_url.as_str(),
-        );
+        let provider_driver = if cfg.provider_driver.trim().is_empty() {
+            default_provider_driver_for_instance(
+                cfg.provider_instance_name.as_str(),
+                cfg.base_url.as_str(),
+            )
+        } else {
+            cfg.provider_driver.trim().to_string()
+        };
         let instance = ProviderInstance {
             provider_instance_name: provider_instance_name.clone(),
             provider_type: provider_type.clone(),
@@ -3273,6 +3278,8 @@ struct SettingsOpenAIInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
+    #[serde(default)]
+    provider_driver: String,
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
     #[serde(default = "default_base_url")]
@@ -3452,6 +3459,7 @@ fn build_openai_instances(settings: &OpenAISettings) -> Result<Vec<OpenAIInstanc
         vec![SettingsOpenAIInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
+            provider_driver: String::new(),
             api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             auth_mode: default_auth_mode(),
@@ -3466,6 +3474,7 @@ fn build_openai_instances(settings: &OpenAISettings) -> Result<Vec<OpenAIInstanc
         instances.push(OpenAIInstanceConfig {
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
+            provider_driver: raw_instance.provider_driver,
             api_token: if raw_instance.api_token.trim().is_empty() {
                 settings.api_token.clone()
             } else {
@@ -4135,6 +4144,7 @@ data: [DONE]
             instances: vec![SettingsOpenAIInstanceConfig {
                 provider_instance_name: "openai-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: String::new(),
                 base_url: default_base_url(),
                 auth_mode: default_auth_mode(),
@@ -4149,6 +4159,29 @@ data: [DONE]
     }
 
     #[test]
+    fn build_openai_instances_keeps_configured_provider_driver() {
+        let settings = OpenAISettings {
+            enabled: true,
+            api_token: "token".to_string(),
+            instances: vec![SettingsOpenAIInstanceConfig {
+                provider_instance_name: "openrouter-main".to_string(),
+                provider_type: "cloud_api".to_string(),
+                provider_driver: "openrouter".to_string(),
+                api_token: String::new(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                auth_mode: default_auth_mode(),
+                timeout_ms: default_timeout_ms(),
+            }],
+        };
+
+        let instances = build_openai_instances(&settings).expect("instances should be built");
+        let provider = OpenAIProvider::new(instances[0].clone(), "token")
+            .expect("provider should be built");
+
+        assert_eq!(provider.inventory().provider_driver, "openrouter");
+    }
+
+    #[test]
     fn build_openai_instances_allows_runtime_session_without_static_auth_fields() {
         let settings = OpenAISettings {
             enabled: true,
@@ -4156,6 +4189,7 @@ data: [DONE]
             instances: vec![SettingsOpenAIInstanceConfig {
                 provider_instance_name: "sn-ai-provider-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: String::new(),
                 base_url: "https://sn.buckyos.ai/v1".to_string(),
                 auth_mode: RUNTIME_SESSION_AUTH_MODE.to_string(),
@@ -4174,6 +4208,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "sn-ai-provider-1".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: "token".to_string(),
                 base_url: "https://sn.buckyos.ai/api/v1/ai/chat/completions".to_string(),
                 auth_mode: "bearer".to_string(),
@@ -4191,6 +4226,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
@@ -4305,6 +4341,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
@@ -4513,6 +4550,7 @@ data: [DONE]
             OpenAIInstanceConfig {
                 provider_instance_name: "openai-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
+                provider_driver: String::new(),
                 api_token: "token".to_string(),
                 base_url: default_base_url(),
                 auth_mode: "bearer".to_string(),
