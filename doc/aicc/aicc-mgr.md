@@ -95,7 +95,7 @@ services/control_panel/ai_models/provider_secrets
 
 | Provider type | settings section | instance 字段 |
 | --- | --- | --- |
-| `sn_router` | `sn-ai-provider` | `provider_instance_name`, `provider_type`, `api_token`, `base_url`, `auth_mode`, `timeout_ms` |
+| `sn_router` | `sn-ai-provider` | `provider_instance_name`, `provider_type`, `base_url`, `auth_mode` (`device_jwt`), `timeout_ms`, `models` |
 | `openai` / `openrouter` / `custom` | `openai` | `provider_instance_name`, `provider_type`, `api_token`, `base_url`, `auth_mode`, `timeout_ms` |
 | `google` | `google` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `image_models`, `default_image_model`, `features`, `alias_map` |
 | `anthropic` | `claude` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `features`, `alias_map` |

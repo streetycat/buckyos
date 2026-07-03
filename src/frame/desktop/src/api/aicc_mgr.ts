@@ -1414,6 +1414,7 @@ function toProviderView(inventory: ProviderInventory): ProviderView {
     provider_runtime_type: inventory.provider_type,
     provider_driver: inventory.provider_driver,
     provider_origin: inventory.provider_origin,
+    auth_mode: providerType === 'sn_router' ? 'device_jwt' : 'api_key',
     auto_sync_models: true,
     created_at: new Date(0).toISOString(),
   }
@@ -1869,7 +1870,7 @@ function inferDriverFromInstance(instanceName: string): string {
 }
 
 function providerDisplayName(providerType: ProviderType, instanceName: string): string {
-  if (providerType === 'sn_router') return 'SN Router'
+  if (providerType === 'sn_router') return 'SN AI Provider'
   if (providerType === 'openai') return 'OpenAI'
   if (providerType === 'anthropic') return 'Anthropic'
   if (providerType === 'google') return 'Google'

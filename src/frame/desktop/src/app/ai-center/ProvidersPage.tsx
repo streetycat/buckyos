@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
 import { useMediaQuery } from '@mui/material'
 import { useI18n } from '../../i18n/provider'
-import { useProviders, useGlobalRoutingView } from './hooks/use-aicc-store'
+import { useAICCStore, useProviders, useGlobalRoutingView } from './hooks/use-aicc-store'
 import { ProviderList } from './components/providers/ProviderList'
 import { ProviderDetailPanel } from './components/providers/ProviderDetailPanel'
 import { EmptyState } from './components/shared/EmptyState'
 import { Plug } from 'lucide-react'
 import type { AICenterPage } from './components/layout/Sidebar'
+import type { SnProviderAvailability } from './components/providers/ProviderCard'
+import type { ProviderView, ValidationResult, WizardDraft } from '../../api/aicc_mgr'
 
 interface ProvidersPageProps {
   navigate: (page: AICenterPage) => void
@@ -14,6 +16,7 @@ interface ProvidersPageProps {
 
 export function ProvidersPage({ navigate }: ProvidersPageProps) {
   const { t } = useI18n()
+  const store = useAICCStore()
   const providers = useProviders()
   const routingView = useGlobalRoutingView()
   const isMobile = useMediaQuery('(max-width: 767px)')
@@ -25,8 +28,54 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
   const [showMobileDetail, setShowMobileDetail] = useState(false)
   const mobileListRef = useRef<HTMLDivElement | null>(null)
   const mobileListScrollTop = useRef(0)
+  const [snAvailabilityById, setSnAvailabilityById] = useState<Record<string, SnProviderAvailability>>({})
 
   const selectedProvider = providers.find((p) => p.config.id === selectedId)
+
+  useEffect(() => {
+    const snProviders = providers.filter((provider) => provider.config.provider_type === 'sn_router')
+    if (snProviders.length === 0) {
+      setSnAvailabilityById({})
+      return
+    }
+
+    let cancelled = false
+    setSnAvailabilityById((current) => {
+      const next: Record<string, SnProviderAvailability> = {}
+      for (const provider of snProviders) {
+        next[provider.config.id] = current[provider.config.id] ?? {
+          status: 'checking',
+          reason: t('aiCenter.providers.snCheckingModels', 'Checking SN /models permission.'),
+        }
+      }
+      return next
+    })
+
+    snProviders.forEach((provider) => {
+      void store.validateConnection(snProviderValidationDraft(provider)).then((result) => {
+        if (cancelled) return
+        setSnAvailabilityById((current) => ({
+          ...current,
+          [provider.config.id]: snAvailabilityFromValidation(result, t),
+        }))
+      }).catch((error) => {
+        if (cancelled) return
+        setSnAvailabilityById((current) => ({
+          ...current,
+          [provider.config.id]: {
+            status: 'unknown',
+            reason: error instanceof Error
+              ? error.message
+              : t('aiCenter.providers.snCheckFailed', 'SN /models availability check failed.'),
+          },
+        }))
+      })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [providers, store, t])
 
   useEffect(() => {
     if (!isMobile || showMobileDetail) return
@@ -76,6 +125,7 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
             setShowMobileDetail(true)
           }}
           onAdd={() => navigate('providers/add')}
+          snAvailabilityById={snAvailabilityById}
         />
       </div>
     )
@@ -93,6 +143,7 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
           selectedId={selectedId}
           onSelect={setSelectedId}
           onAdd={() => navigate('providers/add')}
+          snAvailabilityById={snAvailabilityById}
         />
       </div>
       <div className="flex-1 py-6 px-6 overflow-y-auto">
@@ -113,4 +164,49 @@ export function ProvidersPage({ navigate }: ProvidersPageProps) {
       </div>
     </div>
   )
+}
+
+function snProviderValidationDraft(provider: ProviderView): WizardDraft {
+  return {
+    provider_instance_name: provider.config.provider_instance_name,
+    provider_type: 'sn_router',
+    name: provider.config.name,
+    endpoint: provider.config.endpoint ?? '',
+    protocol_type: null,
+    api_key: '',
+    auto_sync_models: provider.config.auto_sync_models,
+  }
+}
+
+function validationReason(result: ValidationResult, kind: 'endpoint' | 'auth' | 'models'): string | undefined {
+  return result.error_details?.find((item) => item.kind === kind)?.message
+}
+
+function snAvailabilityFromValidation(
+  result: ValidationResult,
+  t: ReturnType<typeof useI18n>['t'],
+): SnProviderAvailability {
+  if (!result.auth_valid) {
+    return {
+      status: 'unavailable',
+      reason: validationReason(result, 'auth')
+        ?? result.errors[0]
+        ?? t('aiCenter.providers.snAuthUnavailable', 'SN /models permission denied. SN relay traffic mode and invite-code activation are required.'),
+    }
+  }
+  if (!result.endpoint_reachable || result.errors.length > 0) {
+    return {
+      status: 'unknown',
+      reason: validationReason(result, 'endpoint')
+        ?? validationReason(result, 'models')
+        ?? result.errors[0]
+        ?? t('aiCenter.providers.snCheckFailed', 'SN /models availability check failed.'),
+    }
+  }
+  return {
+    status: 'available',
+    reason: t('aiCenter.providers.snModelsAvailable', '{{count}} models listed by /models.', {
+      count: result.models_discovered.length,
+    }),
+  }
 }

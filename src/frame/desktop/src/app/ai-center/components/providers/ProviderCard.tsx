@@ -26,12 +26,42 @@ interface ProviderCardProps {
   provider: ProviderView
   selected: boolean
   onClick: () => void
+  snAvailability?: SnProviderAvailability
 }
 
-export function ProviderCard({ provider, selected, onClick }: ProviderCardProps) {
+export type SnProviderAvailability = {
+  status: 'checking' | 'available' | 'unavailable' | 'unknown'
+  reason?: string
+}
+
+export function ProviderCard({ provider, selected, onClick, snAvailability }: ProviderCardProps) {
   const Icon = providerIcons[provider.config.provider_type] ?? Server
   const modelCount = provider.status.discovered_models.length
   const degradedCount = provider.status.discovered_models.filter((m) => m.health.status !== 'available').length
+  const isSnProvider = provider.config.provider_type === 'sn_router'
+  const availabilityStatus = isSnProvider ? snAvailability?.status : undefined
+  const badgeStatus =
+    availabilityStatus === 'unavailable'
+      ? 'error'
+      : availabilityStatus === 'available'
+        ? 'ok'
+        : availabilityStatus === 'checking'
+          ? 'unknown'
+          : authStatusToVariant(provider.status.auth_status)
+  const badgeLabel =
+    availabilityStatus === 'unavailable'
+      ? 'Auth failed'
+      : availabilityStatus === 'available'
+        ? '/models ok'
+        : availabilityStatus === 'checking'
+          ? 'Checking'
+          : undefined
+  const reasonColor =
+    availabilityStatus === 'unavailable'
+      ? 'var(--cp-danger)'
+      : availabilityStatus === 'unknown'
+        ? 'var(--cp-warning)'
+        : 'var(--cp-muted)'
 
   return (
     <button
@@ -51,9 +81,14 @@ export function ProviderCard({ provider, selected, onClick }: ProviderCardProps)
           tone="muted"
           copyable={false}
         />
+        {isSnProvider && snAvailability?.reason && availabilityStatus !== 'available' && (
+          <span className="text-[11px] leading-4" style={{ color: reasonColor }}>
+            {snAvailability.reason}
+          </span>
+        )}
       </div>
       <div className="flex shrink-0 flex-col items-end gap-1">
-        <StatusBadge status={authStatusToVariant(provider.status.auth_status)} />
+        <StatusBadge status={badgeStatus} label={badgeLabel} />
         <span className="text-[11px]" style={{ color: 'var(--cp-muted)' }}>
           {modelCount}{degradedCount > 0 ? `/${degradedCount}` : ''}
         </span>

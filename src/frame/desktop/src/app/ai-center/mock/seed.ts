@@ -276,7 +276,7 @@ function provider(
       provider_runtime_type: providerType === 'sn_router' ? 'proxy_unknown' : 'cloud_api',
       provider_driver: driver,
       provider_origin: providerType === 'sn_router' ? 'builtin' : 'user_config',
-      auth_mode: providerType === 'sn_router' ? 'oauth' : 'api_key',
+      auth_mode: providerType === 'sn_router' ? 'device_jwt' : 'api_key',
       endpoint: options.endpoint,
       auto_sync_models: true,
       created_at: '2026-05-20T08:00:00Z',
@@ -316,7 +316,7 @@ function provider(
 }
 
 const providers = [
-  provider('sn-router-1', 'SN Router', 'sn_router', 'sn-router', 'sn', snModels, {
+  provider('sn-router-1', 'SN AI Provider', 'sn_router', 'sn-router', 'sn', snModels, {
     balanceUnit: 'credit',
     balanceValue: 860,
     pricingMode: 'free_quota',

@@ -9,7 +9,7 @@ interface StepConnectionProps {
 }
 
 const defaultNames: Record<string, string> = {
-  sn_router: 'SN Router',
+  sn_router: 'SN AI Provider',
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   google: 'Google AI',
@@ -96,7 +96,7 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
         required={providerType === 'custom'}
       />
 
-      {/* SN Router: just show status */}
+      {/* SN AI Provider: Device JWT auth is handled by AICC */}
       {providerType === 'sn_router' && (
         <div
           className="rounded-lg px-4 py-3 text-sm"
@@ -105,11 +105,11 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
             color: 'var(--cp-success)',
           }}
         >
-          {t('aiCenter.wizard.snRouterHint', 'Account is activated')}
+          {t('aiCenter.wizard.snRouterHint', 'Uses local Device JWT authentication')}
         </div>
       )}
 
-      {/* API Key (not for sn_router) */}
+      {/* API Key (not for SN AI Provider) */}
       {providerType !== 'sn_router' && (
         <InputField
           label={t('aiCenter.wizard.apiKey', 'API Key')}

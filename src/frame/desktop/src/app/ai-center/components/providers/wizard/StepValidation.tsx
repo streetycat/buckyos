@@ -19,6 +19,7 @@ type CheckItem = {
 export function StepValidation({ draft, onResult }: StepValidationProps) {
   const { t } = useI18n()
   const store = useAICCStore()
+  const isSnProvider = draft.provider_type === 'sn_router'
   const [checks, setChecks] = useState<CheckItem[]>([
     { key: 'endpoint', label: t('aiCenter.wizard.checkEndpoint', 'Checking endpoint connectivity...'), status: 'pending' },
     { key: 'auth', label: t('aiCenter.wizard.checkAuth', 'Verifying authentication...'), status: 'pending' },
@@ -66,9 +67,16 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
           delay: 1200,
           update: (): CheckItem => ({
             key: 'models',
-            label: t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
+            label: isSnProvider
+              ? t('aiCenter.wizard.snModelsFound', '{{count}} SN AI models listed', { count: result.models_discovered.length })
+              : t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
             status: detailFor(result, 'models') ? 'error' as const : result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
-            detail: detailFor(result, 'models'),
+            detail: detailFor(result, 'models') ?? (isSnProvider
+              ? t(
+                'aiCenter.wizard.snModelsNote',
+                'Only the /models permission and catalog check was performed. This does not run inference or spend tokens.',
+              )
+              : undefined),
           }),
         },
         {
@@ -76,10 +84,18 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
           delay: 1500,
           update: (): CheckItem => ({
             key: 'balance',
-            label: result.balance_available
+            label: isSnProvider
+              ? t('aiCenter.wizard.snActivationCheck', 'No separate SN activation query is available')
+              : result.balance_available
               ? t('aiCenter.wizard.balanceOk', 'Balance query available')
               : t('aiCenter.wizard.balanceUnavailable', 'Balance query not available'),
-            status: result.balance_available ? 'ok' as const : 'warning' as const,
+            status: isSnProvider ? 'warning' as const : result.balance_available ? 'ok' as const : 'warning' as const,
+            detail: isSnProvider
+              ? t(
+                'aiCenter.wizard.snActivationNote',
+                'Until SN Provider exposes a no-cost status API, this wizard treats /models permission errors as unavailable and otherwise shows the model catalog as accessible.',
+              )
+              : undefined,
           }),
         },
       ]
@@ -147,6 +163,24 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
 
   return (
     <div className="flex flex-col gap-4 max-w-lg">
+      {isSnProvider && (
+        <div
+          className="flex items-start gap-2 rounded-lg p-3 text-xs leading-5"
+          style={{
+            background: 'color-mix(in srgb, var(--cp-warning) 10%, var(--cp-surface))',
+            border: '1px solid color-mix(in srgb, var(--cp-warning) 30%, var(--cp-border))',
+            color: 'var(--cp-text)',
+          }}
+        >
+          <AlertTriangle size={15} className="mt-0.5 shrink-0" style={{ color: 'var(--cp-warning)' }} />
+          <span>
+            {t(
+              'aiCenter.wizard.snActivationAwareness',
+              'SN AI Provider is usable only when this Zone is using SN relay traffic and the SN account/device has invite-code activation. This wizard does not run inference. It only calls /models; a permission error means the provider is unavailable, while a successful response means the model catalog is accessible.',
+            )}
+          </span>
+        </div>
+      )}
       {checks.map((check) => (
         <div key={check.key} className="flex items-start gap-3">
           <div className="pt-0.5">{statusIcon(check.status)}</div>
@@ -158,7 +192,16 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
               {check.label}
             </span>
             {check.detail && (
-              <span className="text-xs leading-5" style={{ color: 'var(--cp-danger)' }}>
+              <span
+                className="text-xs leading-5"
+                style={{
+                  color: check.status === 'error'
+                    ? 'var(--cp-danger)'
+                    : check.status === 'warning'
+                      ? 'var(--cp-warning)'
+                      : 'var(--cp-muted)',
+                }}
+              >
                 {check.detail}
               </span>
             )}

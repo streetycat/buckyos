@@ -10,7 +10,7 @@ interface StepReviewProps {
 }
 
 const defaultNames: Record<string, string> = {
-  sn_router: 'SN Router',
+  sn_router: 'SN AI Provider',
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   google: 'Google AI',
@@ -21,18 +21,24 @@ const defaultNames: Record<string, string> = {
 export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewProps) {
   const { t } = useI18n()
   const providerName = draft.name || defaultNames[draft.provider_type ?? ''] || draft.provider_instance_name || '-'
+  const isSnProvider = draft.provider_type === 'sn_router'
 
   const rows = [
     { label: t('aiCenter.providers.type', 'Type'), value: draft.provider_type ?? '-' },
     { label: t('aiCenter.wizard.providerName', 'Provider Name'), value: providerName },
     { label: t('aiCenter.providers.endpoint', 'Endpoint'), value: draft.endpoint || t('aiCenter.providers.default', 'Default') },
-    { label: t('aiCenter.providers.auth', 'Authentication'), value: draft.api_key ? 'API Key' : '-' },
+    {
+      label: t('aiCenter.providers.auth', 'Authentication'),
+      value: draft.provider_type === 'sn_router' ? 'Device JWT' : draft.api_key ? 'API Key' : '-',
+    },
     {
       label: 'Connection',
       value: (
         <span className="inline-flex items-center gap-1">
           <Check size={14} style={{ color: 'var(--cp-success)' }} />
-          {t('aiCenter.providers.connected', 'Connected')}
+          {isSnProvider
+            ? t('aiCenter.providers.snGatewayVerified', 'Gateway verified')
+            : t('aiCenter.providers.connected', 'Connected')}
         </span>
       ),
     },
@@ -78,6 +84,15 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
               />
             </button>
           </div>
+
+          {isSnProvider && (
+            <div className="text-xs leading-5" style={{ color: 'var(--cp-muted)' }}>
+              {t(
+                'aiCenter.providers.snActivationReview',
+                'Model discovery uses Device JWT on /models and does not run inference. If /models returns a permission error, this provider is treated as unavailable. A dedicated no-cost SN activation status API is still needed for a stronger check.',
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>

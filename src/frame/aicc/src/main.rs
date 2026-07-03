@@ -42,14 +42,14 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::aicc::{AIComputeCenter, NamedStoreResourceResolver};
+use crate::aicc::{AIComputeCenter, InvokeCtx, NamedStoreResourceResolver};
 use crate::aicc_usage_log_db::AiccUsageLogDb;
 use crate::claude::register_claude_providers;
 use crate::fal::register_fal_providers;
 use crate::gemini::register_google_gemini_providers;
 use crate::minimax::register_minimax_providers;
 use crate::openai::register_openai_llm_providers;
-use crate::sn_ai_provider::register_sn_ai_provider;
+use crate::sn_ai_provider::{build_sn_ai_provider_device_jwt, register_sn_ai_provider};
 
 const AICC_SERVICE_MAIN_PORT: u16 = 4040;
 const METHOD_RELOAD_SETTINGS: &str = "reload_settings";
@@ -272,6 +272,32 @@ fn param_bool(params: &Value, key: &str) -> Option<bool> {
     params.get(key).and_then(Value::as_bool)
 }
 
+fn invoke_ctx_from_rpc_request(req: &RPCRequest) -> InvokeCtx {
+    let session_token = req.token.clone();
+    let mut tenant_id = "anonymous".to_string();
+    let mut caller_app_id: Option<String> = None;
+
+    if let Some(token) = session_token.as_ref().filter(|token| !token.trim().is_empty()) {
+        if let Ok(parsed) = RPCSessionToken::from_string(token.as_str()) {
+            if let Ok((sub, appid)) = parsed.get_subs() {
+                tenant_id = sub;
+                caller_app_id = Some(appid);
+            } else {
+                tenant_id = token.clone();
+            }
+        } else {
+            tenant_id = token.clone();
+        }
+    }
+
+    InvokeCtx {
+        tenant_id,
+        caller_app_id,
+        session_token,
+        trace_id: req.trace_id.clone(),
+    }
+}
+
 fn validate_provider_instance_name(value: &str) -> std::result::Result<(), RPCErrors> {
     if value.trim().is_empty() {
         return Err(RPCErrors::ReasonError(
@@ -479,7 +505,7 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
         "auth_mode".to_string(),
         Value::String(
             if provider_type == "sn_router" {
-                "runtime_session"
+                "device_jwt"
             } else {
                 "bearer"
             }
@@ -569,6 +595,19 @@ fn discovery_http_issue(provider: &str, status: reqwest::StatusCode, body: Strin
     } else {
         "models"
     };
+    if provider == "sn-ai-provider"
+        && (status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN)
+    {
+        return validation_issue(
+            kind,
+            format!(
+                "SN AI Provider /models permission denied: status={} body={}. This provider is only available when SN relay traffic mode and invite-code activation are enabled for the current account/device.",
+                status.as_u16(),
+                truncate_error_body(body.as_str())
+            ),
+        );
+    }
     validation_issue(
         kind,
         format!(
@@ -617,6 +656,7 @@ fn collect_model_id_from_entry(entry: &Value) -> Option<String> {
         entry
             .get("id")
             .or_else(|| entry.get("name"))
+            .or_else(|| entry.get("model"))
             .or_else(|| entry.get("provider_model_id"))
             .or_else(|| entry.get("provider_actual_model_id"))
             .and_then(Value::as_str)
@@ -636,7 +676,7 @@ fn collect_model_id_from_entry(entry: &Value) -> Option<String> {
 fn collect_model_ids(body: &Value) -> Vec<String> {
     let mut ids = Vec::<String>::new();
     let mut seen = HashSet::<String>::new();
-    for key in ["data", "models"] {
+    for key in ["data", "models", "items"] {
         let Some(items) = body.get(key).and_then(Value::as_array) else {
             continue;
         };
@@ -685,6 +725,32 @@ async fn discover_openai_compatible_models(
         Err(validation_issue(
             "models",
             format!("{} model discovery returned no models", provider),
+        ))
+    } else {
+        Ok(ids)
+    }
+}
+
+async fn discover_sn_ai_provider_models(
+    client: &reqwest::Client,
+    endpoint: &str,
+    ctx: &crate::aicc::InvokeCtx,
+) -> std::result::Result<Vec<String>, Value> {
+    let token = build_sn_ai_provider_device_jwt(ctx)
+        .await
+        .map_err(|err| validation_issue("auth", err.to_string()))?;
+    let body = send_discovery_request(
+        "sn-ai-provider",
+        client
+            .get(openai_models_endpoint(endpoint).as_str())
+            .bearer_auth(token),
+    )
+    .await?;
+    let ids = collect_model_ids(&body);
+    if ids.is_empty() {
+        Err(validation_issue(
+            "models",
+            "sn-ai-provider model discovery returned no models",
         ))
     } else {
         Ok(ids)
@@ -923,10 +989,8 @@ impl AiccHttpServer {
         Ok(expected_fingerprint)
     }
 
-    async fn handle_provider_validate(
-        &self,
-        params: &Value,
-    ) -> std::result::Result<Value, RPCErrors> {
+    async fn handle_provider_validate(&self, req: &RPCRequest) -> std::result::Result<Value, RPCErrors> {
+        let params = &req.params;
         let validation_cache_key = provider_validation_cache_key(params);
         let validation_fingerprint =
             provider_validation_fingerprint(validation_cache_key.as_str());
@@ -966,7 +1030,7 @@ impl AiccHttpServer {
         }
 
         let mut models_discovered = Vec::<String>::new();
-        if issues.is_empty() && provider_type != "sn_router" {
+        if issues.is_empty() {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
@@ -974,6 +1038,14 @@ impl AiccHttpServer {
                     RPCErrors::ReasonError(format!("build discovery client failed: {}", err))
                 })?;
             let discovery = match provider_type.as_str() {
+                "sn_router" => {
+                    discover_sn_ai_provider_models(
+                        &client,
+                        endpoint.as_str(),
+                        &invoke_ctx_from_rpc_request(req),
+                    )
+                    .await
+                }
                 "openai" => {
                     discover_openai_compatible_models(
                         &client,
@@ -1060,7 +1132,7 @@ impl AiccHttpServer {
             "endpoint_reachable": endpoint_reachable,
             "auth_valid": auth_valid,
             "models_discovered": models_discovered,
-            "balance_available": provider_type != "custom" && auth_valid,
+            "balance_available": provider_type != "custom" && provider_type != "sn_router" && auth_valid,
             "errors": errors,
             "error_details": issues,
             "validation_fingerprint": validation_fingerprint,
@@ -1316,7 +1388,7 @@ impl RPCHandler for AiccHttpServer {
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_VALIDATE {
-            let result = self.handle_provider_validate(&req.params).await?;
+            let result = self.handle_provider_validate(&req).await?;
             return Ok(rpc_success(&req, result));
         }
         if req.method == METHOD_PROVIDER_ADD {
@@ -1379,6 +1451,12 @@ pub async fn start_aicc_service(mut center: AIComputeCenter) -> Result<()> {
         BuckyOSRuntimeType::KernelService,
     )
     .await?;
+    if let Err(err) = runtime.load_device_private_key() {
+        warn!(
+            "aicc load device private key failed; sn-ai-provider device_jwt auth will fail until local identity is available: {}",
+            err
+        );
+    }
     let login_result = runtime.login().await;
     if login_result.is_err() {
         error!(

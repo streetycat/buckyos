@@ -4,7 +4,7 @@ import { useI18n } from '../../../../../i18n/provider'
 import { useAICCStore } from '../../../hooks/use-aicc-store'
 import type { ProviderType, ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
 import { Stepper } from '../../shared/Stepper'
-import { StepChooseType } from './StepChooseType'
+import { StepChooseType, type SnChooseAvailability } from './StepChooseType'
 import { StepConnection } from './StepConnection'
 import { StepValidation } from './StepValidation'
 import { StepReview } from './StepReview'
@@ -34,6 +34,10 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [keyboardInset, setKeyboardInset] = useState(0)
+  const [snAvailability, setSnAvailability] = useState<SnChooseAvailability>({
+    status: 'checking',
+    reason: t('aiCenter.wizard.snCheckingModels', 'Checking SN /models permission.'),
+  })
 
   const steps = [
     t('aiCenter.wizard.step.chooseType', 'Choose Type'),
@@ -49,7 +53,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
 
   const canNext = () => {
     switch (step) {
-      case 0: return draft.provider_type !== null
+      case 0: return draft.provider_type !== null && !(draft.provider_type === 'sn_router' && snAvailability.status === 'unavailable')
       case 1: return isConnectionValid(draft)
       case 2: return validation !== null && !validation.errors.some((e) =>
         !e.includes('balance') // allow balance errors
@@ -99,6 +103,9 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   }
 
   const handleTypeSelect = (type: ProviderType) => {
+    if (type === 'sn_router' && snAvailability.status === 'unavailable') {
+      return
+    }
     updateDraft({
       provider_type: type,
       name: '',
@@ -127,6 +134,39 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     window.setTimeout(scrollFocusedTarget, 360)
     window.setTimeout(scrollFocusedTarget, 780)
   }
+
+  useEffect(() => {
+    let cancelled = false
+    setSnAvailability({
+      status: 'checking',
+      reason: t('aiCenter.wizard.snCheckingModels', 'Checking SN /models permission.'),
+    })
+    void store.validateConnection({
+      ...INITIAL_DRAFT,
+      provider_type: 'sn_router',
+    }).then((result) => {
+      if (cancelled) return
+      setSnAvailability(snAvailabilityFromValidation(result, t))
+    }).catch((error) => {
+      if (cancelled) return
+      setSnAvailability({
+        status: 'unknown',
+        reason: error instanceof Error
+          ? error.message
+          : t('aiCenter.wizard.snCheckFailed', 'SN /models availability check failed.'),
+      })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [store, t])
+
+  useEffect(() => {
+    if (draft.provider_type === 'sn_router' && snAvailability.status === 'unavailable') {
+      updateDraft({ provider_type: null })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snAvailability.status])
 
   useEffect(() => {
     const viewport = window.visualViewport
@@ -179,7 +219,11 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
         onFocusCapture={keepFocusedFieldVisible}
       >
         {step === 0 && (
-          <StepChooseType selected={draft.provider_type} onSelect={handleTypeSelect} />
+          <StepChooseType
+            selected={draft.provider_type}
+            onSelect={handleTypeSelect}
+            snAvailability={snAvailability}
+          />
         )}
         {step === 1 && (
           <StepConnection draft={draft} onUpdate={updateDraft} />
@@ -254,4 +298,37 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
       </div>
     </div>
   )
+}
+
+function validationReason(result: ValidationResult, kind: 'endpoint' | 'auth' | 'models'): string | undefined {
+  return result.error_details?.find((item) => item.kind === kind)?.message
+}
+
+function snAvailabilityFromValidation(
+  result: ValidationResult,
+  t: ReturnType<typeof useI18n>['t'],
+): SnChooseAvailability {
+  if (!result.auth_valid) {
+    return {
+      status: 'unavailable',
+      reason: validationReason(result, 'auth')
+        ?? result.errors[0]
+        ?? t('aiCenter.wizard.snAuthUnavailable', 'SN /models permission denied. SN relay traffic mode and invite-code activation are required.'),
+    }
+  }
+  if (!result.endpoint_reachable || result.errors.length > 0) {
+    return {
+      status: 'unknown',
+      reason: validationReason(result, 'endpoint')
+        ?? validationReason(result, 'models')
+        ?? result.errors[0]
+        ?? t('aiCenter.wizard.snCheckFailed', 'SN /models availability check failed.'),
+    }
+  }
+  return {
+    status: 'available',
+    reason: t('aiCenter.wizard.snModelsAvailable', '{{count}} models listed by /models.', {
+      count: result.models_discovered.length,
+    }),
+  }
 }

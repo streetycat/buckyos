@@ -2,7 +2,7 @@ import { BrainCircuit, Cloud, Cpu, Globe, Network, Zap } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 
 const providerPreviews = [
-  { label: 'SN Router', icon: Network },
+  { label: 'SN AI Provider', icon: Network },
   { label: 'OpenAI', icon: Zap },
   { label: 'Anthropic', icon: Cpu },
   { label: 'Google', icon: Globe },

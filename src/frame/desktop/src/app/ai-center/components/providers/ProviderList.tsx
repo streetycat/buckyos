@@ -1,6 +1,6 @@
 import { Plus } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
-import { ProviderCard } from './ProviderCard'
+import { ProviderCard, type SnProviderAvailability } from './ProviderCard'
 import type { ProviderView } from '../../../../api/aicc_mgr'
 
 interface ProviderListProps {
@@ -8,9 +8,10 @@ interface ProviderListProps {
   selectedId: string | null
   onSelect: (id: string) => void
   onAdd: () => void
+  snAvailabilityById?: Record<string, SnProviderAvailability>
 }
 
-export function ProviderList({ providers, selectedId, onSelect, onAdd }: ProviderListProps) {
+export function ProviderList({ providers, selectedId, onSelect, onAdd, snAvailabilityById = {} }: ProviderListProps) {
   const { t } = useI18n()
 
   return (
@@ -21,6 +22,7 @@ export function ProviderList({ providers, selectedId, onSelect, onAdd }: Provide
           provider={p}
           selected={selectedId === p.config.id}
           onClick={() => onSelect(p.config.id)}
+          snAvailability={snAvailabilityById[p.config.id]}
         />
       ))}
       <button
