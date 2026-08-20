@@ -822,10 +822,17 @@ async function makeIdentityFiles(
   targetDir: string,
   params: OODGroupParams,
   caDir: string,
+  writeLocalBootOverride: boolean,
 ): Promise<void> {
   const userDir = await buildUserEnv(params, ENV_ROOT_DIR);
   const nodeDir = path.join(userDir, params.node_name);
-  copyIdentityOutputs(userDir, nodeDir, targetDir, params);
+  const identity = copyIdentityOutputs(userDir, nodeDir, targetDir, params);
+  if (writeLocalBootOverride) {
+    writeJson(
+      path.join(targetDir, "etc", `${params.zone_id}.zone.json`),
+      identity.bootDocument,
+    );
+  }
 
   await generateTls(
     params.zone_id,
@@ -853,7 +860,7 @@ function applyDevBootTemplateOverride(
   targetDir: string,
   groupName: string,
 ): void {
-  if (groupName !== "dev" && groupName !== "devtest_ood1") {
+  if (!isLocalDevGroup(groupName)) {
     return;
   }
 
@@ -924,6 +931,10 @@ function applyDevBootTemplateOverride(
   console.log(
     `merge dev boot override into template: ${dstBootTemplate} (replaced=${replaced}, added=${added})`,
   );
+}
+
+function isLocalDevGroup(groupName: string): boolean {
+  return groupName === "dev" || groupName === "devtest_ood1";
 }
 
 // ============================================================================
@@ -1004,7 +1015,12 @@ export async function makeConfigByGroupName(
   if (params.preseed_identity === false) {
     makeUnactivatedIdentityConfig(targetDir);
   } else {
-    await makeIdentityFiles(targetDir, params, resolvedCaDir);
+    await makeIdentityFiles(
+      targetDir,
+      params,
+      resolvedCaDir,
+      isLocalDevGroup(groupName),
+    );
   }
   applyDevBootTemplateOverride(targetDir, groupName);
 

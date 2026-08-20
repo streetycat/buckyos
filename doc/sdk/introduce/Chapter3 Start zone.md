@@ -95,7 +95,7 @@ let node_identity = NodeIdentityConfig {
 
 `boot_resolve_zone_document()` 还提供了一个很实用的 debug 入口：
 
-- 如果存在 `./<zone_raw_host_name>.zone.json`，会优先从本地加载并解析
+- 如果存在 `$BUCKYOS_ROOT/etc/<zone_raw_host_name>.zone.json`，会优先从本地加载其中的最小 ZoneBootDocument；其内容应与 `start_config.json.boot_config_jwt` 的 payload 一致
 - 代码：`src/kernel/node_daemon/src/zone_boot_resolve.rs`
 
 这让你在离线环境里也能绕开 DNS/BNS/SN 的解析链路，直接验证后续 boot/scheduler 的行为。
