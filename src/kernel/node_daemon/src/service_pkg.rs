@@ -626,24 +626,55 @@ async fn stop_process_tree(pid: i32) -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let group_args = vec!["-TERM".to_string(), format!("-{pid}")];
-        let group_output = run_command(Path::new("kill"), &group_args, None, None).await?;
-        if group_output.status.success() || !is_pid_running(pid) {
-            return Ok(());
+        for target_pid in process_tree_pids(pid) {
+            let pid_args = terminate_process_args(target_pid);
+            let pid_output = run_command(Path::new("kill"), &pid_args, None, None).await?;
+            if !pid_output.status.success() && is_pid_running(target_pid) {
+                return Err(ServiceControlError::ReasonError(format!(
+                    "kill pid {} failed: {}",
+                    target_pid,
+                    format_command_failure(&pid_output)
+                )));
+            }
         }
-
-        let pid_args = vec!["-TERM".to_string(), pid.to_string()];
-        let pid_output = run_command(Path::new("kill"), &pid_args, None, None).await?;
-        if pid_output.status.success() || !is_pid_running(pid) {
-            return Ok(());
-        }
-
-        return Err(ServiceControlError::ReasonError(format!(
-            "kill pid {} failed: {}",
-            pid,
-            format_command_failure(&pid_output)
-        )));
+        return Ok(());
     }
+}
+
+fn terminate_process_args(pid: i32) -> Vec<String> {
+    vec!["-TERM".to_string(), "--".to_string(), pid.to_string()]
+}
+
+fn collect_process_tree_pids(root_pid: i32, parent_links: &[(i32, Option<i32>)]) -> Vec<i32> {
+    let mut tree = vec![root_pid];
+    let mut index = 0;
+    while index < tree.len() {
+        let parent_pid = tree[index];
+        for (pid, parent) in parent_links {
+            if *parent == Some(parent_pid) && !tree.contains(pid) {
+                tree.push(*pid);
+            }
+        }
+        index += 1;
+    }
+    tree.reverse();
+    tree
+}
+
+fn process_tree_pids(root_pid: i32) -> Vec<i32> {
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All);
+    let parent_links = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            (
+                pid.as_u32() as i32,
+                process.parent().map(|parent| parent.as_u32() as i32),
+            )
+        })
+        .collect::<Vec<_>>();
+    collect_process_tree_pids(root_pid, &parent_links)
 }
 
 fn is_pid_running(pid: i32) -> bool {
@@ -856,5 +887,34 @@ mod tests {
         assert!(!is_active_process_status(ProcessStatus::Dead));
         assert!(is_active_process_status(ProcessStatus::Run));
         assert!(is_active_process_status(ProcessStatus::Sleep));
+    }
+
+    #[test]
+    fn stop_uses_exact_pid_not_process_group() {
+        assert_eq!(terminate_process_args(1234), vec!["-TERM", "--", "1234"]);
+    }
+
+    #[test]
+    fn process_tree_is_terminated_child_first_without_unrelated_processes() {
+        let parent_links = vec![
+            (10, None),
+            (11, Some(10)),
+            (12, Some(11)),
+            (13, Some(10)),
+            (20, None),
+            (21, Some(20)),
+        ];
+
+        let tree = collect_process_tree_pids(10, &parent_links);
+        assert_eq!(tree.last(), Some(&10));
+        assert!(tree.contains(&11));
+        assert!(tree.contains(&12));
+        assert!(tree.contains(&13));
+        assert!(!tree.contains(&20));
+        assert!(!tree.contains(&21));
+        assert!(
+            tree.iter().position(|pid| *pid == 12).unwrap()
+                < tree.iter().position(|pid| *pid == 11).unwrap()
+        );
     }
 }
