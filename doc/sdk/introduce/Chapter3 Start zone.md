@@ -115,20 +115,21 @@ let node_identity = NodeIdentityConfig {
 - 服务端：`src/kernel/sys_config_service/src/main.rs`
 - 固定端口：3200（`SYSTEM_CONFIG_SERVICE_MAIN_PORT: 3200`）
 
-### 4.2. scheduler `--boot`：只在首次引导时运行一次
+### 4.2. scheduler `--boot`：完成首次引导或恢复被中断的引导
 
 首次启动时，scheduler 的 `--boot` 分支会负责生成初始化 KV，并写入 system-config：
 
 - 入口：`src/kernel/scheduler/src/main.rs`（`--boot` / `do_boot_scheduler()`）
-- 关键约束：如果 `boot/config` 已存在，`--boot` 会失败（避免覆盖已初始化的 Zone）
+- 关键约束：`system/boot_state=complete` 才表示首次引导完成；只有 `boot/config` 而没有完成状态时，`--boot` 会恢复首次调度且不会覆盖已有身份和密钥
 
 在 `doc/arch/02_boot_and_activation.md` 里，这条链路被总结为：
 
 1) 激活落盘（etc）
 2) node-daemon 启动，解析 ZoneBootConfig
 3) 启动 system-config
-4) 发现 `boot/config` 不存在，则运行 `scheduler --boot`
-5) `--boot` 渲染模板、生成 init_list，并通过 `SystemConfigBuilder` 写入一组核心 KV
+4) 发现 `system/boot_state` 尚未完成，则运行 `scheduler --boot`
+5) 首次执行时，`--boot` 渲染模板、生成 init_list，并通过一个事务写入整组核心 KV
+6) 完成首次调度和 trust keys 刷新后，写入 `system/boot_state=complete`
 
 ### 4.3. `boot/config` 不只是 Zone 信息，它还是 trust_keys 的依赖
 
@@ -141,7 +142,7 @@ let node_identity = NodeIdentityConfig {
 
 ## 5. 启动完成后的“常态”：调度收敛与访问入口
 
-当 `boot/config` 写入完成后，系统进入常态循环：
+当 `system/boot_state=complete` 写入后，系统进入常态循环：
 
 - scheduler 周期性 dump system-config → 推导调度动作 → 事务写回（`doc/arch/04_scheduler.md`，实现锚点 `src/kernel/scheduler/src/system_config_agent.rs`）
 - node-daemon 周期性读取 `nodes/<node>/config` 并收敛本机状态（安装/部署/启动/停止/升级）

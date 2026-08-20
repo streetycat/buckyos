@@ -1652,7 +1652,9 @@ pub async fn schedule_loop(is_boot: bool) -> Result<()> {
             break;
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        if !is_boot {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
         loop_step += 1;
         info!("schedule loop step:{}.", loop_step);
         let buckyos_api_runtime = get_buckyos_api_runtime().unwrap();

@@ -36,6 +36,13 @@ use system_config_builder::{StartConfigSummary, SystemConfigBuilder};
 
 const BUCKYOS_ZONE_DOC_ENV: &str = "BUCKYOS_ZONE_DOC";
 
+fn build_boot_init_actions(init_list: HashMap<String, String>) -> HashMap<String, KVAction> {
+    init_list
+        .into_iter()
+        .map(|(key, value)| (key, KVAction::Create(value)))
+        .collect()
+}
+
 fn boot_ood_names(zone_document: &ZoneDocument) -> Vec<String> {
     zone_document
         .oods
@@ -149,7 +156,6 @@ async fn create_init_list_by_template(
 }
 
 async fn do_boot_scheduler() -> Result<()> {
-    let mut init_list: HashMap<String, String> = HashMap::new();
     let zone_document_str = std::env::var(BUCKYOS_ZONE_DOC_ENV);
 
     if zone_document_str.is_err() {
@@ -172,38 +178,52 @@ async fn do_boot_scheduler() -> Result<()> {
 
     let rpc_session_token = rpc_session_token_str.unwrap();
     let system_config_client = SystemConfigClient::new(None, Some(rpc_session_token.as_str()));
+    match system_config_client.get(SYSTEM_BOOT_STATE_KEY).await {
+        Ok(state) if state.value == SYSTEM_BOOT_STATE_COMPLETE => {
+            return Err(anyhow::anyhow!("boot is already complete"));
+        }
+        Ok(state) => {
+            return Err(anyhow::anyhow!(
+                "invalid {} value: {}",
+                SYSTEM_BOOT_STATE_KEY,
+                state.value
+            ));
+        }
+        Err(SystemConfigError::KeyNotFound(_)) => {}
+        Err(err) => return Err(err.into()),
+    }
+
     let boot_config = system_config_client.get("boot/config").await;
-    if boot_config.is_ok() {
-        return Err(anyhow::anyhow!(
-            "boot/config already exists, boot scheduler failed"
-        ));
-    }
+    match boot_config {
+        Err(SystemConfigError::KeyNotFound(_)) => {
+            let init_list = create_init_list_by_template(
+                &zone_document,
+                &zone_document_str,
+                get_buckyos_root_dir().as_path(),
+            )
+            .await
+            .map_err(|e| {
+                error!("create_init_list_by_template failed: {:?}", e);
+                e
+            })?;
 
-    let mut init_list = create_init_list_by_template(
-        &zone_document,
-        &zone_document_str,
-        get_buckyos_root_dir().as_path(),
-    )
-    .await
-    .map_err(|e| {
-        error!("create_init_list_by_template failed: {:?}", e);
-        e
-    })?;
+            let boot_config_str = init_list
+                .get("boot/config")
+                .ok_or_else(|| anyhow::anyhow!("boot/config not found in init list"))?;
+            info!("after boot_config_str: {}", boot_config_str);
+            let _zone_config: ZoneConfig = serde_json::from_str(boot_config_str).map_err(|e| {
+                error!("load ZoneConfig from boot/config failed: {:?}", e);
+                e
+            })?;
 
-    let boot_config_str = init_list.get("boot/config");
-    if boot_config_str.is_none() {
-        return Err(anyhow::anyhow!("boot/config not found in init list"));
-    }
-    let boot_config_str = boot_config_str.unwrap();
-    info!("after boot_config_str: {}", boot_config_str);
-    let _zone_config: ZoneConfig = serde_json::from_str(boot_config_str.as_str()).map_err(|e| {
-        error!("load ZoneConfig from boot/config failed: {:?}", e);
-        e
-    })?;
-    //info!("use init list from template {} to do boot scheduler",template_type_str);
-    //write to system_config
-    for (key, value) in init_list.iter() {
-        system_config_client.create(key, value).await?;
+            let init_actions = build_boot_init_actions(init_list);
+            system_config_client.exec_tx(init_actions, None).await?;
+            info!("boot init config transaction committed");
+        }
+        Ok(_) => {
+            warn!("boot/config exists without a completed boot state, resume boot schedule");
+        }
+        Err(err) => return Err(err.into()),
     }
 
     info!("start boot schedule...");
@@ -217,6 +237,9 @@ async fn do_boot_scheduler() -> Result<()> {
     }
     system_config_client.refresh_trust_keys().await?;
     info!("system_config_service refresh trust keys success.");
+    system_config_client
+        .create(SYSTEM_BOOT_STATE_KEY, SYSTEM_BOOT_STATE_COMPLETE)
+        .await?;
 
     info!("do boot scheduler success!");
     return Ok(());
@@ -404,6 +427,7 @@ mod test {
         .expect("device info generation failed");
 
         assert!(init_map.contains_key("boot/config"));
+        assert!(!init_map.contains_key(SYSTEM_BOOT_STATE_KEY));
         assert!(init_map.contains_key("security/verify-hub/key"));
         assert!(!init_map.contains_key("system/verify-hub/key"));
         assert!(!init_map.contains_key(&format!("devices/{}/doc", TEST_DEVICE_NAME)));
@@ -416,6 +440,12 @@ mod test {
         assert!(init_map.contains_key("services/repo-service/pkg_list"));
         assert!(init_map.contains_key("services/aicc/spec"));
         assert!(init_map.contains_key("services/msg-center/spec"));
+        let init_actions = build_boot_init_actions(init_map.clone());
+        assert_eq!(init_actions.len(), init_map.len());
+        assert!(matches!(
+            init_actions.get("boot/config"),
+            Some(KVAction::Create(_))
+        ));
         //assert!(init_map.contains_key("services/smb-service/spec"));
         assert!(init_map.contains_key(&format!("users/{}/profile", TEST_USERNAME)));
         let user_settings: serde_json::Value = serde_json::from_str(

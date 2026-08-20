@@ -300,12 +300,17 @@ pub struct ServiceSpecConfig {
 ```text
 boot_scheduler():
   zone_doc_json = env[BUCKYOS_ZONE_DOC]
-  if system_config.get("boot/config") exists:
+  if system_config.get("system/boot_state") == "complete":
     fail("already booted")
 
-  init_map = build_init_list_by_template(zone_doc_json)
-  // includes: boot/config, services/*/spec, system/rbac/policy, verify-hub
-  system_config.exec_tx(init_map)
+  if system_config.get("boot/config") is missing:
+    init_map = build_init_list_by_template(zone_doc_json)
+    // includes: boot/config, services/*/spec, system/rbac/policy, verify-hub
+    system_config.exec_tx(init_map)
+
+  schedule_loop(boot=true)
+  refresh_trust_keys()
+  system_config.create("system/boot_state", "complete")
 ```
 
 ### 2) Scheduler Loop：读状态 → 推导动作 → 写回结果

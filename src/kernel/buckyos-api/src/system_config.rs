@@ -18,6 +18,8 @@ use tokio::sync::{OnceCell, RwLock};
 use crate::KVAction;
 
 const CONFIG_CACHE_TIME: u64 = 10; //10s
+pub const SYSTEM_BOOT_STATE_KEY: &str = "system/boot_state";
+pub const SYSTEM_BOOT_STATE_COMPLETE: &str = "complete";
 type ConfigCache = HashMap<String, (String, u64, u64)>;
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]

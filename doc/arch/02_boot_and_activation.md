@@ -92,7 +92,8 @@ Secure Boot 在 BuckyOS 中要解决的问题不是“单机镜像可信”，�
 这里不复述 notepad 的完整设计，只列出“能从代码直接读到的 gate / hard-fail 条件”，用于理解为什么系统会卡在 boot：
 
 - `BUCKYOS_ZONE_DOC` 必须存在：scheduler `--boot` 若读不到会直接失败退出（`src/kernel/scheduler/src/main.rs`）。
-- `boot/config` 只能在首次 boot/init 阶段创建：scheduler `--boot` 会先 `get("boot/config")`，存在则返回错误（`src/kernel/scheduler/src/main.rs`）。
+- 首次 boot/init 的初始化 KV（包括 `boot/config`）由 scheduler 通过一个事务创建；完成首次调度并刷新 trust keys 后，才写入 `system/boot_state=complete`（`src/kernel/scheduler/src/main.rs`）。
+- `boot/config` 存在但 `system/boot_state` 不存在表示上一次 boot 被中断；scheduler `--boot` 会保留已有身份和密钥数据并恢复首次调度。
 - trust_keys 的刷新依赖 `boot/config`：scheduler `--boot` 在写入完 KV 并完成一次 `schedule_loop(true)` 后，会调用 `system_config_client.refresh_trust_keys()`（`src/kernel/scheduler/src/main.rs`）；system-config 侧会在 `handle_refresh_trust_keys()` 中读取 `boot/config` 并把 owner key / verify-hub public key 加入信任列表（`src/kernel/sys_config_service/src/main.rs`）。
 
 从效果上看：`boot/config` 不是“单纯的 Zone 信息”，它还是 system-config 能否正确验证 session_token 的关键依赖（trust_keys 的来源之一）。
@@ -190,7 +191,7 @@ node_daemon_boot():                              // src/kernel/node_daemon/src/n
 
   start system-config (3200)
 
-  if system-config.get("boot/config") == KeyNotFound:
+  if system-config.get("system/boot_state") != "complete":
     setenv SCHEDULER_SESSION_TOKEN = device_session_token
     run scheduler --boot
 
@@ -198,25 +199,24 @@ scheduler --boot:                                 // src/kernel/scheduler/src/ma
   zone_document_json = env[BUCKYOS_ZONE_DOC]
   zone_document      = json_parse(zone_document_json)
 
-  assert system_config.get("boot/config") == KeyNotFound
-
-  init_list = render(/etc/scheduler/boot.template.toml, /etc/start_config.json)
-  builder   = SystemConfigBuilder(init_list)
-  builder.add_boot_config(start_config, verify_hub_public_key, zone_document_json)
-  ... add_verify_hub/add_scheduler/add_repo_service/add_control_panel/add_node ...
-  init_list = builder.build()
-
-  for (k, v) in init_list:
-    system_config.create(k, v)
+  if system_config.get("boot/config") == KeyNotFound:
+    init_list = render(/etc/scheduler/boot.template.toml, /etc/start_config.json)
+    builder   = SystemConfigBuilder(init_list)
+    builder.add_boot_config(start_config, verify_hub_public_key, zone_document_json)
+    ... add_verify_hub/add_scheduler/add_repo_service/add_control_panel/add_node ...
+    system_config.exec_tx(builder.build())
+  else:
+    resume_interrupted_boot_with_existing_identity()
 
   schedule_loop(boot=true)
   system_config.refresh_trust_keys()             // sys_refresh_trust_keys
+  system_config.create("system/boot_state", "complete")
 ```
 
 ### pitfalls / operational notes（短）
-- `boot/config` 已存在时，scheduler `--boot` 会失败：这通常意味着系统已经完成过一次 boot/init（或 KV 被恢复过旧数据），需要先解释“为什么存在”再处理（`src/kernel/scheduler/src/main.rs`）。
+- `system/boot_state=complete` 是 boot 成功完成的判据；不能再只用 `boot/config` 是否存在判断，因为该 key 在首次调度前就必须可读。
 - `boot/config` 与 trust_keys 强相关：即使 system-config 服务已启动，如果 `boot/config` 不完整/解析失败，会导致 `sys_refresh_trust_keys` 失败或 trust_keys 不全，从而引发大量 `NoPermission`/token 校验问题（`src/kernel/sys_config_service/src/main.rs`）。
-- 首次启动的循环行为是预期路径：node-daemon 在读不到 `boot/config` 时会进入 BOOT_INIT 并反复尝试拉起 scheduler `--boot`（`src/kernel/node_daemon/src/node_daemon.rs`）。
+- 首次启动或中断恢复时，node-daemon 在读不到 `system/boot_state=complete` 时会进入 BOOT_INIT 并反复尝试拉起 scheduler `--boot`（`src/kernel/node_daemon/src/node_daemon.rs`）。
 
 ## 与类似系统的差异点
 - BuckyOS 把“集群级别引导”前置到一个可验证对象（ZoneBootConfig），把家庭网络的不确定性作为默认假设。

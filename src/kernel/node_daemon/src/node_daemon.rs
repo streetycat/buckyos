@@ -1863,12 +1863,12 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         register_boot_device(device_doc_jwt.as_str(), &device_doc, &syc_cfg_client).await?;
 
         while boot_config_result_str.is_empty() {
-            let get_result = syc_cfg_client.get("boot/config").await;
-            match get_result {
+            let boot_state_result = syc_cfg_client.get(SYSTEM_BOOT_STATE_KEY).await;
+            match boot_state_result {
                 buckyos_api::SytemConfigResult::Err(SystemConfigError::KeyNotFound(_)) => {
                     if !this_is_first_ood {
                         warn!(
-                            "boot/config is not ready and this OOD {} is not first OOD {:?}; wait first OOD boot scheduler.",
+                            "boot is not complete and this OOD {} is not first OOD {:?}; wait first OOD boot scheduler.",
                             device_name.as_str(),
                             first_ood_name(&zone_document)
                         );
@@ -1908,13 +1908,36 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
                     }
                 }
                 buckyos_api::SytemConfigResult::Ok(r) => {
-                    boot_config_result_str = r.value.clone();
-                    info!("Load boot config OK, {}", boot_config_result_str.as_str());
+                    if r.value != SYSTEM_BOOT_STATE_COMPLETE {
+                        error!(
+                            "invalid {} value: {}, wait 5 sec to retry...",
+                            SYSTEM_BOOT_STATE_KEY, r.value
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+
+                    match syc_cfg_client.get("boot/config").await {
+                        buckyos_api::SytemConfigResult::Ok(config) => {
+                            boot_config_result_str = config.value;
+                            info!(
+                                "Load completed boot config OK, {}",
+                                boot_config_result_str.as_str()
+                            );
+                        }
+                        Err(err) => {
+                            error!(
+                                "boot state is complete but get boot/config failed: {}, wait 5 sec to retry...",
+                                err
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        }
+                    }
                 }
                 _ => {
                     error!(
-                        "get boot config failed! {},wait 5 sec to retry...",
-                        get_result.err().unwrap()
+                        "get boot state failed! {},wait 5 sec to retry...",
+                        boot_state_result.err().unwrap()
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }

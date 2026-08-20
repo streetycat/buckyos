@@ -18,7 +18,13 @@ system-config 是 Zone 内的 KV 真相源。value 在存储层是字符串，�
 | --- | --- | --- | --- |
 | `boot/config` | `ZoneConfig`，包含 Zone DID、Owner、OOD/SN 列表、verify-hub 公钥等启动身份信息。 | scheduler 首次启动初始化 | system-config、scheduler、DID resolver、verify-hub 信任刷新。是 Zone 身份与信任根之一。 |
 
-`boot/config` 是否存在也是 scheduler 判断是否需要首次初始化的标志。
+`boot/config` 是否存在用于判断初始化 KV 是否已经创建；完整引导的最终判据是 `system/boot_state=complete`。
+
+## system/boot_state
+
+| Key | 内容 | 主要写入方 | 主要读取方/意义 |
+| --- | --- | --- | --- |
+| `system/boot_state` | 当前固定值 `complete`。 | scheduler 在首次调度及 trust keys 刷新成功后写入 | node-daemon、scheduler；缺失时表示首次引导未完成，需要执行或恢复 boot scheduler。 |
 
 ## devices/
 
@@ -181,7 +187,7 @@ app instance id 当前按 `<app_id>@<user_id>@<node_id>` 组织；服务聚合 i
 
 ### 首次初始化
 
-scheduler 首次启动时，如果 `boot/config` 不存在，会合并 rootfs boot template 和启动配置，创建初始化 key：
+scheduler 首次启动时，如果 `boot/config` 不存在，会合并 rootfs boot template 和启动配置，并通过一个事务创建初始化 key：
 
 1. 写入 Zone 身份：`boot/config`。
 2. 写入管理员、OOD、内置 Agent：`users/*`、`devices/*`、`agents/*`。
@@ -189,6 +195,8 @@ scheduler 首次启动时，如果 `boot/config` 不存在，会合并 rootfs bo
 4. 根据 `system/install_settings.pre_install_apps` 创建预装 app spec。
 5. 写入初始 node target：`nodes/<ood>/config`、`nodes/<ood>/gateway_config`、`nodes/<ood>/gateway_info`。
 6. 写入安全和调度基础数据：`system/rbac/policy`、`security/verify-hub/key`、`system/system_pkgs`。
+
+初始化事务提交后，scheduler 执行一次 boot 调度、刷新 trust keys，最后创建 `system/boot_state=complete`。若进程在完成状态写入前退出，下一次 `--boot` 会保留已经提交的初始化数据并恢复调度。
 
 ### 调度循环
 
