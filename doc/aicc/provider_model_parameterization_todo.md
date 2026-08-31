@@ -173,7 +173,7 @@ resolved pricing
 
 ### P0-OAI-3 参数化 GPT 请求特判
 
-- [ ] 将 GPT-5 nano/nono 的 reasoning、verbosity 默认值迁移为解析后的 request defaults。
+- [ ] 将 GPT-5 nano 的 reasoning、verbosity 默认值迁移为解析后的 request defaults。
 - [ ] 将 GPT-5/Codex sampling 参数删除规则迁移为 resolved request rule。
 - [ ] OpenAI-compatible Provider 提供 Claude 模型时，不应用 GPT 规则，也不切换 Anthropic 协议。
 - [ ] 聚合 Provider 重命名 GPT 模型时，可以依据 `origin_model_id` 应用相同 OpenAI-wire 请求限制。
@@ -266,7 +266,7 @@ resolved pricing
 
 ## 6. P0：SN AI Provider
 
-- [ ] 将 `apply_sn_model_defaults()` 的 GPT nano/nono 名称特判迁移为 request defaults。
+- [ ] 将 `apply_sn_model_defaults()` 的 GPT nano 名称特判迁移为 request defaults。
 - [ ] 将 `strip_sn_sampling_options()` 的 GPT/Codex 规则迁移到公共规则执行器。
 - [ ] 删除按 `provider_model.contains("pro")` 估算视频价格。
 - [ ] endpoint 不再通过 base URL 是否以 `/responses` 结尾推导，改用显式 operation。

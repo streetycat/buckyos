@@ -855,7 +855,7 @@ fn build_aicc_settings_with_endpoints(
             "provider_type": "openai",
             "base_url": "https://api.openai.com/v1",
             "timeout_ms": DEFAULT_PROVIDER_TIMEOUT_MS,
-            "models": ["gpt-5", "gpt-5-mini", "gpt-5-nono", "gpt-5-pro"],
+            "models": ["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5-pro"],
             "default_model": "gpt-5-mini",
             "image_models": ["dall-e-3", "dall-e-2"],
             "default_image_model": "dall-e-3",

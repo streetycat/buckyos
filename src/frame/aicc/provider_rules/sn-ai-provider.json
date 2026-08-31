@@ -24,14 +24,6 @@
       ]
     },
     {
-      "pattern": "gpt-5-nono*",
-      "match_source": "origin_model_id",
-      "request_rules": [
-        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
-        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
-      ]
-    },
-    {
       "pattern": "gpt-5*codex*",
       "match_source": "origin_model_id",
       "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]

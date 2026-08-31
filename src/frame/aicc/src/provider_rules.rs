@@ -1241,7 +1241,7 @@ mod tests {
     fn legacy_gpt_request_rules(model: &str, mut value: Value) -> Value {
         let target = value.as_object_mut().unwrap();
         let model = model.trim().to_ascii_lowercase();
-        if model.starts_with("gpt-5-nano") || model.starts_with("gpt-5-nono") {
+        if model.starts_with("gpt-5-nano") {
             target
                 .entry("reasoning".to_string())
                 .or_insert_with(|| json!({"effort": "minimal"}));

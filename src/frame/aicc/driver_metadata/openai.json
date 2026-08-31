@@ -764,7 +764,7 @@
       "family": "gpt",
       "tier": "standard",
       "model_pattern": "gpt-*",
-      "exclude_tier_tokens": ["pro", "mini", "nano", "nono", "sol", "terra", "luna"],
+      "exclude_tier_tokens": ["pro", "mini", "nano", "sol", "terra", "luna"],
       "exclude_patterns": ["gpt-5.6"],
       "version_rank": { "prefix": "gpt" },
       "stability": {
@@ -850,7 +850,7 @@
       "family": "gpt",
       "tier": "nano",
       "model_pattern": "gpt-*",
-      "tier_tokens": ["nano", "nono", "luna"],
+      "tier_tokens": ["nano", "luna"],
       "version_rank": { "prefix": "gpt" },
       "stability": {
         "unstable_tokens": ["preview", "experimental", "beta"],
