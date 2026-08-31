@@ -29,13 +29,8 @@ impl ModelRegistry {
 
     pub fn apply_inventory_if_changed(
         &mut self,
-        mut inventory: ProviderInventory,
+        inventory: ProviderInventory,
     ) -> Result<bool, RouteError> {
-        for model in inventory.models.iter_mut() {
-            if model.model_driver.trim().is_empty() {
-                model.model_driver = inventory.provider_driver.clone();
-            }
-        }
         validate_inventory(&inventory)?;
         let provider_instance_name = inventory.provider_instance_name.clone();
         if let Some(current) = self.inventories.get(provider_instance_name.as_str()) {
@@ -378,6 +373,15 @@ fn validate_inventory(inventory: &ProviderInventory) -> Result<(), RouteError> {
 
     let mut seen = HashSet::<String>::new();
     for model in inventory.models.iter() {
+        if model.model_driver.trim().is_empty() {
+            return Err(RouteError::new(
+                RouteErrorCode::SessionConfigInvalid,
+                format!(
+                    "model '{}' must declare model_driver or use conservative fallback",
+                    model.provider_model_id
+                ),
+            ));
+        }
         let exact = ExactModelName::parse(model.exact_model.as_str())?;
         if exact.provider_instance_name != inventory.provider_instance_name {
             return Err(RouteError::new(
@@ -486,7 +490,8 @@ mod tests {
         ProviderInventory {
             provider_instance_name: provider.to_string(),
             provider_type: ProviderType::CloudApi,
-            provider_driver: "test".to_string(),
+            provider_profile_id: "test".to_string(),
+            protocol_adapter_id: "test".to_string(),
             provider_origin: Default::default(),
             provider_type_trusted_source: Default::default(),
             provider_type_revision: None,

@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 0,
-  "provider_driver": "claude",
+  "model_driver_id": "claude",
   "revision_seq": 1,
   "required_features": [],
   "models": [],
@@ -221,8 +221,7 @@
   "variants": [
     {
       "name": "reasoning.medium",
-      "mount_suffix": "reasoning-medium",
-      "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } }
+      "mount_suffix": "reasoning-medium"
     }
   ],
   "signature": null

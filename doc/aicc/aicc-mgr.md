@@ -96,10 +96,10 @@ services/control_panel/ai_models/provider_secrets
 | Provider type | settings section | instance 字段 |
 | --- | --- | --- |
 | `sn_router` | `sn-ai-provider` | `provider_instance_name`, `provider_type`, `base_url`, `login_url`, `user_name`, `timeout_ms` |
-| `openai` / `openrouter` / `custom` | `openai` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms` |
-| `google` | `google` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `image_models`, `default_image_model`, `features`, `alias_map` |
-| `anthropic` | `claude` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `features`, `alias_map` |
-| `minimax` | `minimax` | `provider_instance_name`, `provider_type`, `provider_driver`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `features`, `alias_map` |
+| `openai` / `openrouter` / `custom` | `openai` | `provider_instance_name`, `provider_type`, `provider_profile_id`, `api_token`, `base_url`, `timeout_ms` |
+| `google` | `google` | `provider_instance_name`, `provider_type`, `provider_profile_id`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `image_models`, `default_image_model`, `features`, `alias_map` |
+| `anthropic` | `claude` | `provider_instance_name`, `provider_type`, `provider_profile_id`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `features`, `alias_map` |
+| `minimax` | `minimax` | `provider_instance_name`, `provider_type`, `provider_profile_id`, `api_token`, `base_url`, `timeout_ms`, `models`, `default_model`, `features`, `alias_map` |
 | `fal` | `fal` | `provider_instance_name`, `provider_type`, `api_token`, `base_url`, `timeout_ms`, `image_upscale_models`, `image_bg_remove_models`, `audio_enhance_models`, `video_upscale_models` |
 
 `provider_instance_name` 是 UI 与后端之间的 Provider ID。前端当前也用 `inventory.provider_instance_name` 作为 `ProviderView.config.id`。UI 创建 provider 时必须传入全局唯一的 `provider_instance_name`；后端只提供默认命名建议并做冲突检查。
@@ -278,7 +278,7 @@ minimax    -> minimax
       {
         "provider_instance_name": "openai-work",
         "provider_type": "cloud_api",
-        "provider_driver": "openai",
+        "provider_profile_id": "openai",
         "api_token": "sk-...",
         "base_url": "https://api.openai.com/v1",
         "timeout_ms": 60000
@@ -288,10 +288,11 @@ minimax    -> minimax
 }
 ```
 
-`openrouter` 和 `custom` 第一版复用 `openai` adapter：
+`openrouter` 和 `custom` 复用 OpenAI-compatible Protocol Adapter：
 
-- OpenAI instance 支持显式配置 `provider_driver`。OpenAI 使用 `openai`，OpenRouter 使用 `openrouter`，自定义 OpenAI-compatible provider 使用与其 driver metadata 文件一致的 driver id。后端 inventory 会原样返回该值，并用它选择对应的模型 metadata。
-- `provider_type` 只表示部署类型（例如 `cloud_api`），不能代替 `provider_driver`。未配置 `provider_driver` 时回退为 `openai`；因此 OpenRouter 和 custom instance 应显式配置该字段。
+- `provider_profile_id` 标识渠道规则。OpenAI 使用 `openai`，OpenRouter 使用 `openrouter`，自定义 OpenAI-compatible Provider 使用 `custom` 或已注册的 Profile ID。
+- `protocol_adapter_id` 由 Provider Profile 确定并随 inventory 返回；OpenAI、OpenRouter 和 custom 当前均为 `openai-compatible`。
+- `provider_type` 只表示部署类型（例如 `cloud_api`），不能代替 `provider_profile_id`。新配置不读取旧 `provider_driver` 字段。
 
 `sn-ai-provider` 使用独立 adapter，不通过 `OpenAIProvider` 注册。它使用本机设备私钥签发 Device JWT，向配置的 `login_url` 调用 `/api/user/login_by_device_token` 换取 `sn-sso` session，再通过 SN 的 `/models` 刷新 inventory、通过 `/responses` 执行 `llm.chat`；配置中不接受普通 API key，也不透传 BuckyOS `verify-hub` session。`user_name` 是设备在 SN 注册时所属的 Zone 用户名。初始模型取独立 `sn-ai-provider` driver metadata 的 `models[].id` 中声明支持 LLM 的项目，随后由 `/models` 返回的真实 inventory 刷新。metadata 未描述的模型按该 metadata 中的最高价格估算。
 

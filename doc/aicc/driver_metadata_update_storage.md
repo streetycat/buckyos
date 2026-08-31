@@ -78,7 +78,7 @@ AICC 持久保存已验证的发布水位、provider metadata 对象和已提交
 
 ## 7. Extensibility Rules
 
-冻结：revision 比较、ObjId、provider_driver、activation 提交语义。可扩展：wrapper 中具有缺省行为的诊断字段。核心对象不提供任意 `extra`，避免未知字段被误认为安全语义。
+冻结：revision 比较、ObjId、model_driver_id、activation 提交语义。可扩展：wrapper 中具有缺省行为的诊断字段。核心对象不提供任意 `extra`，避免未知字段被误认为安全语义。
 
 ## 8. Query Patterns
 

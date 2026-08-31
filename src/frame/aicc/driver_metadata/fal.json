@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 0,
-  "provider_driver": "fal",
+  "model_driver_id": "fal",
   "revision_seq": 1,
   "required_features": [],
   "models": [

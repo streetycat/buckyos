@@ -179,7 +179,10 @@ export class MockDataStore {
         provider_type: providerType,
         provider_instance_name: instanceName,
         provider_runtime_type: 'cloud_api',
-        provider_driver: providerType,
+        provider_profile_id: providerType,
+        protocol_adapter_id: providerType === 'openrouter' || providerType === 'openai' || providerType === 'custom'
+          ? 'openai-compatible'
+          : providerType,
         provider_origin: 'user_config',
         auth_mode: draft.api_key ? 'api_key' : undefined,
         endpoint: draft.endpoint || undefined,
@@ -190,7 +193,10 @@ export class MockDataStore {
       inventory: {
         provider_instance_name: instanceName,
         provider_type: 'cloud_api',
-        provider_driver: providerType,
+        provider_profile_id: providerType,
+        protocol_adapter_id: providerType === 'openrouter' || providerType === 'openai' || providerType === 'custom'
+          ? 'openai-compatible'
+          : providerType,
         provider_origin: 'user_config',
         inventory_revision: `${instanceName}-rev-now`,
         version: 'mock',
@@ -223,7 +229,7 @@ export class MockDataStore {
   }
 
   deleteProvider(id: string): void {
-    if (this.providers.get(id)?.config.provider_driver === 'sn-ai-provider') {
+    if (this.providers.get(id)?.config.provider_profile_id === 'sn-ai-provider') {
       throw new Error('sn_router_is_system_managed')
     }
     this.providers.delete(id)

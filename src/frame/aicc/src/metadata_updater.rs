@@ -233,7 +233,7 @@ pub struct DriverMetadataManifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriverMetadataManifestFile {
-    pub provider_driver: String,
+    pub model_driver_id: String,
     pub path: String,
     pub schema_version: u32,
     pub revision_seq: u64,
@@ -242,7 +242,7 @@ pub struct DriverMetadataManifestFile {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DriverMetadataTombstone {
-    pub provider_driver: String,
+    pub model_driver_id: String,
     pub revision_seq: u64,
 }
 
@@ -400,7 +400,7 @@ impl DriverMetadataUpdater {
                     Some(&expected_obj_id),
                     MAX_METADATA_BYTES,
                     attempt,
-                    file.provider_driver.as_str(),
+                    file.model_driver_id.as_str(),
                 )
                 .await?;
             metadata_bytes = checked_manifest_metadata_bytes(metadata_bytes, bytes.len() as u64)?;
@@ -413,7 +413,7 @@ impl DriverMetadataUpdater {
             if self.store.load_valid_object(file).is_none() {
                 bail!(
                     "prepared metadata object for {} is unavailable",
-                    file.provider_driver
+                    file.model_driver_id
                 );
             }
         }
@@ -996,7 +996,7 @@ impl DriverMetadataStore {
 }
 
 pub(crate) fn load_active_remote_metadata(
-    provider_driver: &str,
+    model_driver_id: &str,
 ) -> (Option<DriverMetadataDocument>, u64) {
     let source_key_guard = match CONFIGURED_SOURCE_KEY
         .get_or_init(|| RwLock::new(None))
@@ -1021,7 +1021,7 @@ pub(crate) fn load_active_remote_metadata(
     };
     load_active_remote_metadata_for_source(
         source_store_root(source_key.as_str()).as_path(),
-        provider_driver,
+        model_driver_id,
         source_key.as_str(),
     )
 }
@@ -1043,7 +1043,7 @@ pub fn active_remote_metadata_revision(settings: &Value) -> Option<u64> {
 #[cfg(test)]
 fn load_active_remote_metadata_in(
     root: &Path,
-    provider_driver: &str,
+    model_driver_id: &str,
 ) -> Option<DriverMetadataDocument> {
     let store = DriverMetadataStore::new(root.to_path_buf());
     let activation = store.load_latest_activation_cached()?;
@@ -1051,7 +1051,7 @@ fn load_active_remote_metadata_in(
         .manifest
         .files
         .iter()
-        .find(|file| file.provider_driver == provider_driver)?;
+        .find(|file| file.model_driver_id == model_driver_id)?;
     if let Some(document) = store.load_valid_object(file) {
         return Some(document);
     }
@@ -1061,13 +1061,13 @@ fn load_active_remote_metadata_in(
         .manifest
         .files
         .iter()
-        .find(|file| file.provider_driver == provider_driver)?;
+        .find(|file| file.model_driver_id == model_driver_id)?;
     store.load_valid_object(file)
 }
 
 fn load_active_remote_metadata_for_source(
     root: &Path,
-    provider_driver: &str,
+    model_driver_id: &str,
     source_key: &str,
 ) -> (Option<DriverMetadataDocument>, u64) {
     let store = DriverMetadataStore::new(root.to_path_buf());
@@ -1079,7 +1079,7 @@ fn load_active_remote_metadata_for_source(
         .manifest
         .files
         .iter()
-        .find(|file| file.provider_driver == provider_driver)
+        .find(|file| file.model_driver_id == model_driver_id)
     else {
         return (None, generation);
     };
@@ -1095,7 +1095,7 @@ fn load_active_remote_metadata_for_source(
         .manifest
         .files
         .iter()
-        .find(|file| file.provider_driver == provider_driver)
+        .find(|file| file.model_driver_id == model_driver_id)
     else {
         return (None, generation);
     };
@@ -1233,9 +1233,9 @@ fn validate_manifest(manifest: &DriverMetadataManifest, track: &DriverMetadataTr
     }
     let mut identities = HashSet::new();
     for file in manifest.files.iter() {
-        validate_provider_driver(file.provider_driver.as_str())?;
-        if !identities.insert(file.provider_driver.as_str()) {
-            bail!("duplicate provider_driver in manifest");
+        validate_model_driver_id(file.model_driver_id.as_str())?;
+        if !identities.insert(file.model_driver_id.as_str()) {
+            bail!("duplicate model_driver_id in manifest");
         }
         if file.schema_version != METADATA_SCHEMA_VERSION {
             bail!("unsupported provider metadata schema version");
@@ -1246,7 +1246,7 @@ fn validate_manifest(manifest: &DriverMetadataManifest, track: &DriverMetadataTr
         validate_relative_path(file.path.as_str())?;
         let expected = format!(
             "v{}/providers/{}-{}.json",
-            PROTOCOL_VERSION, file.provider_driver, file.revision_seq
+            PROTOCOL_VERSION, file.model_driver_id, file.revision_seq
         );
         if file.path != expected {
             bail!("provider metadata uses a non-canonical path");
@@ -1255,11 +1255,11 @@ fn validate_manifest(manifest: &DriverMetadataManifest, track: &DriverMetadataTr
     }
     let mut tombstones = HashSet::new();
     for tombstone in manifest.tombstones.iter() {
-        validate_provider_driver(tombstone.provider_driver.as_str())?;
-        if identities.contains(tombstone.provider_driver.as_str())
-            || !tombstones.insert(tombstone.provider_driver.as_str())
+        validate_model_driver_id(tombstone.model_driver_id.as_str())?;
+        if identities.contains(tombstone.model_driver_id.as_str())
+            || !tombstones.insert(tombstone.model_driver_id.as_str())
         {
-            bail!("duplicate or active tombstone provider_driver");
+            bail!("duplicate or active tombstone model_driver_id");
         }
         if tombstone.revision_seq == 0 {
             bail!("provider tombstone revision must be positive");
@@ -1290,40 +1290,40 @@ fn validate_manifest_transition(
     let candidate_files = candidate
         .files
         .iter()
-        .map(|file| (file.provider_driver.as_str(), file))
+        .map(|file| (file.model_driver_id.as_str(), file))
         .collect::<HashMap<_, _>>();
     let candidate_tombstones = candidate
         .tombstones
         .iter()
-        .map(|item| (item.provider_driver.as_str(), item.revision_seq))
+        .map(|item| (item.model_driver_id.as_str(), item.revision_seq))
         .collect::<HashMap<_, _>>();
     let current_tombstones = current
         .manifest
         .tombstones
         .iter()
-        .map(|item| (item.provider_driver.as_str(), item.revision_seq))
+        .map(|item| (item.model_driver_id.as_str(), item.revision_seq))
         .collect::<HashMap<_, _>>();
 
     for old in current.manifest.files.iter() {
-        match candidate_files.get(old.provider_driver.as_str()) {
+        match candidate_files.get(old.model_driver_id.as_str()) {
             Some(next) if next.revision_seq < old.revision_seq => {
                 bail!(
                     "provider metadata revision rollback for {}",
-                    old.provider_driver
+                    old.model_driver_id
                 )
             }
             Some(next) if next.revision_seq == old.revision_seq && next.obj_id != old.obj_id => {
                 bail!(
                     "provider metadata revision conflict for {}",
-                    old.provider_driver
+                    old.model_driver_id
                 )
             }
             Some(_) => {}
-            None => match candidate_tombstones.get(old.provider_driver.as_str()) {
+            None => match candidate_tombstones.get(old.model_driver_id.as_str()) {
                 Some(revision) if *revision > old.revision_seq => {}
                 _ => bail!(
                     "provider {} disappeared without a newer tombstone",
-                    old.provider_driver
+                    old.model_driver_id
                 ),
             },
         }
@@ -1348,7 +1348,7 @@ fn validate_metadata_bytes(
         serde_json::from_slice(bytes).context("parse provider metadata")?;
     if document.format != "buckyos.aicc.provider-driver-metadata"
         || document.schema_version != file.schema_version
-        || document.provider_driver != file.provider_driver
+        || document.model_driver_id != file.model_driver_id
         || document.revision_seq != file.revision_seq
         || !document.required_features.is_empty()
     {
@@ -1358,14 +1358,14 @@ fn validate_metadata_bytes(
     Ok(document)
 }
 
-fn validate_provider_driver(value: &str) -> Result<()> {
+fn validate_model_driver_id(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 64
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
     {
-        bail!("invalid provider_driver");
+        bail!("invalid model_driver_id");
     }
     Ok(())
 }
@@ -1754,7 +1754,7 @@ mod tests {
 
     fn file(driver: &str, revision: u64, obj_id: &ObjId) -> DriverMetadataManifestFile {
         DriverMetadataManifestFile {
-            provider_driver: driver.to_string(),
+            model_driver_id: driver.to_string(),
             path: format!("v1/providers/{}-{}.json", driver, revision),
             schema_version: METADATA_SCHEMA_VERSION,
             revision_seq: revision,
@@ -1779,7 +1779,7 @@ mod tests {
             format: "buckyos.aicc.provider-driver-metadata".to_string(),
             schema_version: METADATA_SCHEMA_VERSION,
             schema_revision: 0,
-            provider_driver: driver.to_string(),
+            model_driver_id: driver.to_string(),
             revision_seq: revision,
             required_features: vec![],
             ..Default::default()
@@ -1798,7 +1798,7 @@ mod tests {
             vec![file("openai", 1, &openai_v1), file("claude", 1, &claude_v1)],
         );
         for entry in first.files.iter() {
-            let bytes = serde_json::to_vec(&document(&entry.provider_driver, 1)).unwrap();
+            let bytes = serde_json::to_vec(&document(&entry.model_driver_id, 1)).unwrap();
             store
                 .store_object(
                     &parse_obj_id(entry.obj_id.as_str()).unwrap(),
@@ -1929,7 +1929,7 @@ mod tests {
         assert!(validate_manifest_transition(Some(&current), &missing, &obj_id("m4")).is_err());
         let mut deleted = missing;
         deleted.tombstones.push(DriverMetadataTombstone {
-            provider_driver: "openai".to_string(),
+            model_driver_id: "openai".to_string(),
             revision_seq: 4,
         });
         validate_manifest_transition(Some(&current), &deleted, &obj_id("m4")).unwrap();
@@ -2109,7 +2109,7 @@ mod tests {
             "format": "buckyos.aicc.provider-driver-metadata",
             "schema_version": METADATA_SCHEMA_VERSION,
             "schema_revision": 0,
-            "provider_driver": "openai",
+            "model_driver_id": "openai",
             "revision_seq": 1,
             "required_features": [],
             "models": [
@@ -2381,7 +2381,7 @@ mod tests {
         assert_eq!(
             load_active_remote_metadata_in(temp.path(), "openai")
                 .unwrap()
-                .provider_driver,
+                .model_driver_id,
             "openai"
         );
         assert!(load_active_remote_metadata_in(temp.path(), "claude").is_none());

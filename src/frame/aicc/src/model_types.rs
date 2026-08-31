@@ -742,7 +742,9 @@ pub struct ProviderInventory {
     #[serde(default)]
     pub provider_type: ProviderType,
     #[serde(default)]
-    pub provider_driver: String,
+    pub provider_profile_id: String,
+    #[serde(default)]
+    pub protocol_adapter_id: String,
     #[serde(default)]
     pub provider_origin: ProviderOrigin,
     #[serde(default)]
@@ -1402,6 +1404,22 @@ pub struct RouteTrace {
     pub selected_provider_instance_name: Option<String>,
     #[serde(default)]
     pub selected_provider_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_origin_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_model_driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_operation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_protocol_adapter_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_request_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

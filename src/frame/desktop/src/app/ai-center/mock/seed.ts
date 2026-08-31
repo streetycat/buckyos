@@ -274,7 +274,10 @@ function provider(
       provider_type: providerType,
       provider_instance_name: instanceName,
       provider_runtime_type: 'cloud_api',
-      provider_driver: driver,
+      provider_profile_id: driver,
+      protocol_adapter_id: driver === 'openai' || driver === 'openrouter'
+        ? 'openai-compatible'
+        : driver,
       provider_origin: providerType === 'sn_router' ? 'system_config' : 'user_config',
       auth_mode: providerType === 'sn_router' ? undefined : 'api_key',
       endpoint: options.endpoint,
@@ -284,7 +287,10 @@ function provider(
     inventory: {
       provider_instance_name: instanceName,
       provider_type: 'cloud_api',
-      provider_driver: driver,
+      provider_profile_id: driver,
+      protocol_adapter_id: driver === 'openai' || driver === 'openrouter'
+        ? 'openai-compatible'
+        : driver,
       provider_origin: providerType === 'sn_router' ? 'system_config' : 'user_config',
       inventory_revision: `${instanceName}-rev-20260529`,
       version: '2026.05',

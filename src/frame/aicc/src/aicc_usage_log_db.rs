@@ -6,9 +6,9 @@
  * spec via `get_rdb_instance`. The pool is `Send + Sync + Clone`, so an
  * `Arc<AiccUsageLogDb>` can be shared without an outer lock.
  *
- * Only one table is managed in v1: `aicc_usage_event`. Aggregation happens in
- * Rust after selecting rows; SQL aggregation can come later when query volume
- * justifies it.
+ * Usage events, route traces, video continuation state, and provider inventory
+ * LKGS share the AICC RDB instance. Aggregation happens in Rust after selecting
+ * rows.
  */
 
 use std::collections::HashMap;
@@ -25,8 +25,11 @@ use buckyos_api::{
 use kRPC::RPCErrors;
 use log::info;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::any::{install_default_drivers, AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Executor, Row};
+
+use crate::model_types::ProviderInventory;
 
 static INSTALL_DRIVERS: Once = Once::new();
 
@@ -604,6 +607,116 @@ LIMIT ? OFFSET ?
             total_count: Some(total_count),
         })
     }
+    pub async fn upsert_provider_inventory_lkgs(
+        &self,
+        inventory: &ProviderInventory,
+    ) -> Result<(), RPCErrors> {
+        if inventory.provider_instance_name.trim().is_empty()
+            || inventory.provider_profile_id.trim().is_empty()
+            || inventory.protocol_adapter_id.trim().is_empty()
+        {
+            return Err(RPCErrors::ReasonError(
+                "provider inventory LKGS identity must be non-empty".to_string(),
+            ));
+        }
+        let snapshot_json = serde_json::to_string(inventory).map_err(|error| {
+            RPCErrors::ReasonError(format!("serialize provider inventory LKGS failed: {error}"))
+        })?;
+        let snapshot_sha256 = format!("{:x}", Sha256::digest(snapshot_json.as_bytes()));
+        let now_ms = current_time_ms();
+        let sql = self.render_sql(
+            r#"
+INSERT INTO aicc_provider_inventory_lkgs (
+    provider_instance_name, schema_version, provider_profile_id,
+    protocol_adapter_id, catalog_activation_revision, inventory_revision,
+    discovered_at_ms, snapshot_json, snapshot_sha256, created_at_ms, updated_at_ms
+) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(provider_instance_name) DO UPDATE SET
+    schema_version = 1,
+    provider_profile_id = excluded.provider_profile_id,
+    protocol_adapter_id = excluded.protocol_adapter_id,
+    catalog_activation_revision = excluded.catalog_activation_revision,
+    inventory_revision = excluded.inventory_revision,
+    discovered_at_ms = excluded.discovered_at_ms,
+    snapshot_json = excluded.snapshot_json,
+    snapshot_sha256 = excluded.snapshot_sha256,
+    updated_at_ms = excluded.updated_at_ms
+"#,
+        );
+        sqlx::query(sql.as_str())
+            .bind(inventory.provider_instance_name.as_str())
+            .bind(inventory.provider_profile_id.as_str())
+            .bind(inventory.protocol_adapter_id.as_str())
+            .bind(i64::try_from(inventory.driver_metadata_generation).unwrap_or(i64::MAX))
+            .bind(inventory.inventory_revision.as_deref())
+            .bind(now_ms)
+            .bind(snapshot_json)
+            .bind(snapshot_sha256)
+            .bind(now_ms)
+            .bind(now_ms)
+            .execute(self.pool())
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("upsert provider inventory LKGS failed: {error}"))
+            })?;
+        Ok(())
+    }
+
+    pub async fn load_provider_inventory_lkgs(
+        &self,
+        provider_instance_name: &str,
+        provider_profile_id: &str,
+        protocol_adapter_id: &str,
+    ) -> Result<Option<ProviderInventory>, RPCErrors> {
+        let sql = self.render_sql(
+            r#"
+SELECT schema_version, provider_profile_id, protocol_adapter_id,
+       snapshot_json, snapshot_sha256
+FROM aicc_provider_inventory_lkgs
+WHERE provider_instance_name = ?
+"#,
+        );
+        let Some(row) = sqlx::query(sql.as_str())
+            .bind(provider_instance_name)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("load provider inventory LKGS failed: {error}"))
+            })?
+        else {
+            return Ok(None);
+        };
+        let schema_version: i64 = row.try_get("schema_version").map_err(db_decode_error)?;
+        let stored_profile: String = row
+            .try_get("provider_profile_id")
+            .map_err(db_decode_error)?;
+        let stored_adapter: String = row
+            .try_get("protocol_adapter_id")
+            .map_err(db_decode_error)?;
+        if schema_version != 1
+            || stored_profile != provider_profile_id
+            || stored_adapter != protocol_adapter_id
+        {
+            return Ok(None);
+        }
+        let snapshot_json: String = row.try_get("snapshot_json").map_err(db_decode_error)?;
+        let snapshot_sha256: String = row.try_get("snapshot_sha256").map_err(db_decode_error)?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(snapshot_json.as_bytes()));
+        if actual_sha256 != snapshot_sha256 {
+            return Ok(None);
+        }
+        let inventory =
+            serde_json::from_str::<ProviderInventory>(snapshot_json.as_str()).map_err(|error| {
+                RPCErrors::ReasonError(format!("decode provider inventory LKGS failed: {error}"))
+            })?;
+        if inventory.provider_instance_name != provider_instance_name
+            || inventory.provider_profile_id != provider_profile_id
+            || inventory.protocol_adapter_id != protocol_adapter_id
+        {
+            return Ok(None);
+        }
+        Ok(Some(inventory))
+    }
 }
 
 fn push_trace_id_filter(sql: &mut String, binds: &mut Vec<String>, req: &QueryRouteTraceRequest) {
@@ -925,6 +1038,7 @@ fn decode_route_trace_row(row: &AnyRow) -> Result<Value, RPCErrors> {
         }
         object.insert("created_at_ms".to_string(), Value::from(created_at_ms));
     }
+
     Ok(value)
 }
 
@@ -1049,6 +1163,12 @@ fn current_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn db_decode_error(error: sqlx::Error) -> RPCErrors {
+    RPCErrors::ReasonError(format!(
+        "decode provider inventory LKGS row failed: {error}"
+    ))
+}
+
 fn to_sql_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
@@ -1122,6 +1242,7 @@ fn split_sql_statements(ddl: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_types::{ProviderOrigin, ProviderType, ProviderTypeTrustedSource};
     use buckyos_api::{UsageQueryFilters, UsageQueryGroup, UsageQueryTimeRange};
     use serde_json::json;
     use tempfile::tempdir;
@@ -1133,6 +1254,44 @@ mod tests {
         let conn = format!("sqlite:///{}?mode=rwc", db_path);
         let db = AiccUsageLogDb::open_default_sqlite(&conn).await.unwrap();
         (db, dir)
+    }
+
+    fn sample_inventory(revision: &str) -> ProviderInventory {
+        ProviderInventory {
+            provider_instance_name: "provider-main".to_string(),
+            provider_type: ProviderType::CloudApi,
+            provider_profile_id: "openai".to_string(),
+            protocol_adapter_id: "openai-compatible".to_string(),
+            provider_origin: ProviderOrigin::SystemConfig,
+            provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
+            provider_type_revision: None,
+            version: None,
+            inventory_revision: Some(revision.to_string()),
+            driver_metadata_generation: 7,
+            models: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_inventory_lkgs_is_atomic_and_identity_scoped() {
+        let (db, _dir) = setup().await;
+        db.upsert_provider_inventory_lkgs(&sample_inventory("r1"))
+            .await
+            .unwrap();
+        db.upsert_provider_inventory_lkgs(&sample_inventory("r2"))
+            .await
+            .unwrap();
+        let loaded = db
+            .load_provider_inventory_lkgs("provider-main", "openai", "openai-compatible")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.inventory_revision.as_deref(), Some("r2"));
+        assert!(db
+            .load_provider_inventory_lkgs("provider-main", "openrouter", "openai-compatible")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     fn sample_event(

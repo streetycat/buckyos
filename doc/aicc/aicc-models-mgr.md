@@ -122,11 +122,12 @@ Provider 不应该负责定义 `llm.plan`、`llm.chat` 这类逻辑目录，也�
 ```text
 provider_instance_name
 provider_type
-provider_driver
+provider_profile_id
+protocol_adapter_id
 models: Vec<ModelMetadata>
 ```
 
-其中 `provider_driver` 表示这个 provider 使用哪个 driver metadata 来解释模型名，例如 `openai`、`claude`、`google-gemini`、`fal`、`minimax`。
+其中 `provider_profile_id` 表示渠道规则，`protocol_adapter_id` 表示线上协议适配器。模型语义由 Provider Rules 选择的 `model_driver` 解释，三者不能复用同一字段。
 
 ### 3.3 模型驱动
 
@@ -432,10 +433,10 @@ Provider 自发现的最小输出应是 provider model id 列表，以及必要�
 从 AICC 视角，可以理解为：
 
 ```text
-provider_model_id + provider_driver + provider_instance_name
+provider_model_id + provider_profile_id + protocol_adapter_id + provider_instance_name
 ```
 
-其中 provider model id 先不是 AICC 的完整语义。AICC 会通过 driver metadata 生成：
+其中 provider model id 先不是 AICC 的完整语义。AICC 会先通过 Provider Rules 解析 origin、operation 和候选 Model Driver，再通过 Model Driver Metadata 生成：
 
 ```text
 ModelMetadata {

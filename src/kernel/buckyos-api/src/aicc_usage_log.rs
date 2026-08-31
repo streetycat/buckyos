@@ -26,7 +26,7 @@ use crate::rdb_mgr::{RdbBackend, RdbInstanceConfig};
 pub const AICC_USAGE_LOG_RDB_INSTANCE_ID: &str = "aicc-usage-log";
 
 /// Version of the usage-log schema. Bump whenever the DDL changes.
-pub const AICC_USAGE_LOG_RDB_SCHEMA_VERSION: u64 = 4;
+pub const AICC_USAGE_LOG_RDB_SCHEMA_VERSION: u64 = 5;
 
 /// Sqlite DDL for the usage-log database. The only required table in v1 is
 /// `aicc_usage_event`; summary tables can be added later when SQL aggregation
@@ -91,6 +91,23 @@ CREATE TABLE IF NOT EXISTS aicc_video_continuation_source (
 );
 CREATE INDEX IF NOT EXISTS idx_aicc_video_continuation_source_task
     ON aicc_video_continuation_source(source_task_id);
+CREATE TABLE IF NOT EXISTS aicc_provider_inventory_lkgs (
+    provider_instance_name       TEXT PRIMARY KEY,
+    schema_version               INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    provider_profile_id          TEXT NOT NULL,
+    protocol_adapter_id          TEXT NOT NULL,
+    catalog_activation_revision  INTEGER NOT NULL,
+    inventory_revision           TEXT,
+    discovered_at_ms             INTEGER NOT NULL,
+    snapshot_json                TEXT NOT NULL,
+    snapshot_sha256              TEXT NOT NULL,
+    created_at_ms                INTEGER NOT NULL,
+    updated_at_ms                INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aicc_provider_inventory_lkgs_updated
+    ON aicc_provider_inventory_lkgs(updated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_aicc_provider_inventory_lkgs_activation
+    ON aicc_provider_inventory_lkgs(catalog_activation_revision);
 "#;
 
 /// Postgres DDL mirroring the sqlite schema above.
@@ -154,6 +171,23 @@ CREATE TABLE IF NOT EXISTS aicc_video_continuation_source (
 );
 CREATE INDEX IF NOT EXISTS idx_aicc_video_continuation_source_task
     ON aicc_video_continuation_source(source_task_id);
+CREATE TABLE IF NOT EXISTS aicc_provider_inventory_lkgs (
+    provider_instance_name       TEXT PRIMARY KEY,
+    schema_version               BIGINT NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+    provider_profile_id          TEXT NOT NULL,
+    protocol_adapter_id          TEXT NOT NULL,
+    catalog_activation_revision  BIGINT NOT NULL,
+    inventory_revision           TEXT,
+    discovered_at_ms             BIGINT NOT NULL,
+    snapshot_json                TEXT NOT NULL,
+    snapshot_sha256              TEXT NOT NULL,
+    created_at_ms                BIGINT NOT NULL,
+    updated_at_ms                BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_aicc_provider_inventory_lkgs_updated
+    ON aicc_provider_inventory_lkgs(updated_at_ms);
+CREATE INDEX IF NOT EXISTS idx_aicc_provider_inventory_lkgs_activation
+    ON aicc_provider_inventory_lkgs(catalog_activation_revision);
 "#;
 
 /// Default rdb-instance config for the aicc usage-log. The scheduler drops

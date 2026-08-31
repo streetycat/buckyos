@@ -1,28 +1,33 @@
 use crate::aicc::{
+    emit_background_provider_result, provider_type_from_settings, redacted_json_log,
     AIComputeCenter, Provider, ProviderError, ProviderInstance, ProviderRefreshTask,
-    ProviderStartResult, ResolvedRequest, TaskEventSink, emit_background_provider_result,
-    provider_type_from_settings, redacted_json_log,
+    ProviderStartResult, ResolvedRequest, TaskEventSink,
 };
-use crate::metadata_resolver::{DriverModelResolveRequest, resolve_driver_inventory};
+use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
-    ProviderType, ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
+    ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
 };
-use anyhow::{Context, Result, anyhow};
+use crate::provider_rules::{
+    apply_builtin_provider_rules_to_inventory, load_builtin_provider_rules, resolve_provider_call,
+    resolve_provider_pricing, AdapterOperationRegistry, ProviderCallResolveInput,
+    ProviderDiscoveryRules, ResolvedProviderCall,
+};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use base64::Engine as _;
 use base64::engine::general_purpose;
+use base64::Engine as _;
 #[cfg(test)]
 use buckyos_api::Capability;
 use buckyos_api::{
-    AiArtifact, AiContent, AiCost, AiMessage, AiMethodRequest, AiResponse, AiRole, AiToolCall,
-    AiToolResultContent, AiToolSpec, AiUsage, Feature, ResourceRef, ai_methods, features,
-    value_to_object_map,
+    ai_methods, features, value_to_object_map, AiArtifact, AiContent, AiCost, AiMessage,
+    AiMethodRequest, AiResponse, AiRole, AiToolCall, AiToolResultContent, AiToolSpec, AiUsage,
+    Feature, ResourceRef,
 };
 use log::{info, warn};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -174,7 +179,7 @@ const GEMINI_VIDEO_CONSUMED_INPUT_KEYS: &[&str] = &[
 pub struct GoogleGeminiInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
-    pub provider_driver: String,
+    pub provider_profile_id: String,
     pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
@@ -197,7 +202,7 @@ pub struct GoogleGeminiProvider {
     api_token: String,
     base_url: String,
     provider_type: ProviderType,
-    provider_driver: String,
+    provider_profile_id: String,
     provider_instance_name: String,
     features: Vec<Feature>,
     refresh_task: Arc<Mutex<Option<Arc<ProviderRefreshTask>>>>,
@@ -298,11 +303,12 @@ impl GoogleGeminiProvider {
 
         let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
         let provider_instance_name = cfg.provider_instance_name.clone();
-        let provider_driver = cfg.provider_driver.clone();
+        let provider_profile_id = cfg.provider_profile_id.clone();
         let instance = ProviderInstance {
             provider_instance_name: provider_instance_name.clone(),
             provider_type: provider_type.clone(),
-            provider_driver: provider_driver.clone(),
+            provider_profile_id: provider_profile_id.clone(),
+            protocol_adapter_id: "google-generative-language".to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -310,12 +316,7 @@ impl GoogleGeminiProvider {
             plugin_key: None,
         };
         let buckets = GeminiModelBuckets {
-            llm: cfg
-                .models
-                .iter()
-                .filter(|model| !is_text2image_model_name(model))
-                .cloned()
-                .collect(),
+            llm: cfg.models.clone(),
             image: cfg.image_models.clone(),
             embedding: parse_csv_list(DEFAULT_GEMINI_EMBEDDING_MODELS),
             tts: parse_csv_list(DEFAULT_GEMINI_TTS_MODELS),
@@ -325,7 +326,7 @@ impl GoogleGeminiProvider {
         let inventory = Self::build_inventory_from_buckets(
             provider_instance_name.as_str(),
             provider_type.clone(),
-            provider_driver.as_str(),
+            provider_profile_id.as_str(),
             &buckets,
             cfg.features.as_slice(),
             Some("settings-v1".to_string()),
@@ -338,7 +339,7 @@ impl GoogleGeminiProvider {
             api_token,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             provider_type,
-            provider_driver,
+            provider_profile_id,
             provider_instance_name,
             features: cfg.features,
             refresh_task: Arc::new(Mutex::new(None)),
@@ -348,67 +349,58 @@ impl GoogleGeminiProvider {
     fn build_inventory_from_buckets(
         provider_instance_name: &str,
         provider_type: ProviderType,
-        provider_driver: &str,
+        provider_profile_id: &str,
         buckets: &GeminiModelBuckets,
         _features: &[Feature],
         inventory_revision: Option<String>,
     ) -> ProviderInventory {
         let mut requests = Vec::<DriverModelResolveRequest>::new();
         for model in buckets.llm.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
-                    .with_cost(Some(0.01))
-                    .with_latency(Some(1400)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::Llm],
+            ));
         }
         for model in buckets.image.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(
-                    model.clone(),
-                    vec![ApiType::ImageTextToImage, ApiType::ImageToImage],
-                )
-                .with_cost(Some(0.04))
-                .with_latency(Some(6000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::ImageTextToImage, ApiType::ImageToImage],
+            ));
         }
         for model in buckets.embedding.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Embedding])
-                    .with_cost(Some(0.0001))
-                    .with_latency(Some(800)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::Embedding],
+            ));
         }
         for model in buckets.tts.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioTts])
-                    .with_cost(Some(0.01))
-                    .with_latency(Some(3000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::AudioTts],
+            ));
         }
         for model in buckets.music.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::AudioMusic])
-                    .with_cost(Some(0.10))
-                    .with_latency(Some(60_000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::AudioMusic],
+            ));
         }
         for model in buckets.video.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(
-                    model.clone(),
-                    vec![ApiType::VideoTextToVideo, ApiType::VideoImageToVideo],
-                )
-                .with_cost(Some(0.50))
-                .with_latency(Some(120_000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model.clone(),
+                vec![ApiType::VideoTextToVideo, ApiType::VideoImageToVideo],
+            ));
         }
-        resolve_driver_inventory(
+        let mut inventory = resolve_driver_inventory(
             provider_instance_name,
             provider_type,
-            provider_driver,
+            provider_profile_id,
             requests.as_slice(),
             inventory_revision,
-        )
+        );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, "google-gemini")
+            .expect("builtin Google Gemini provider rules must apply");
+        inventory
     }
 
     fn model_supports_feature_combination(
@@ -622,6 +614,9 @@ impl GoogleGeminiProvider {
     }
 
     async fn refresh_inventory_once(&self) -> Result<ProviderInventory> {
+        let discovery_rules = load_builtin_provider_rules("google-gemini")
+            .ok_or_else(|| anyhow!("missing builtin Google Gemini provider rules"))?
+            .discovery;
         let mut buckets = GeminiModelBuckets::default();
         let mut llm_seen = HashSet::<String>::new();
         let mut image_seen = HashSet::<String>::new();
@@ -669,7 +664,12 @@ impl GoogleGeminiProvider {
                 if id.is_empty() {
                     continue;
                 }
-                if is_deprecated_gemini_entry(id, &entry.display_name, &entry.description) {
+                if is_deprecated_gemini_entry(
+                    id,
+                    &entry.display_name,
+                    &entry.description,
+                    &discovery_rules,
+                ) {
                     log::debug!(
                         "aicc.gemini.inventory.skip_deprecated id={} display_name={:?} description={:?}",
                         id,
@@ -743,12 +743,12 @@ impl GoogleGeminiProvider {
         // 和它的版本快照（`gemini-2.0-flash-lite-001`），两者底层是同一个模型，
         // 但 Google 弃用一般是先停版本快照、alias 再续命一段时间。如果两者并存
         // 就把版本快照丢掉，只信 alias，避免路由命中已被 Google 拒绝的快照。
-        prefer_alias_over_versioned(&mut buckets.llm);
-        prefer_alias_over_versioned(&mut buckets.image);
-        prefer_alias_over_versioned(&mut buckets.embedding);
-        prefer_alias_over_versioned(&mut buckets.tts);
-        prefer_alias_over_versioned(&mut buckets.music);
-        prefer_alias_over_versioned(&mut buckets.video);
+        prefer_alias_over_versioned(&mut buckets.llm, &discovery_rules);
+        prefer_alias_over_versioned(&mut buckets.image, &discovery_rules);
+        prefer_alias_over_versioned(&mut buckets.embedding, &discovery_rules);
+        prefer_alias_over_versioned(&mut buckets.tts, &discovery_rules);
+        prefer_alias_over_versioned(&mut buckets.music, &discovery_rules);
+        prefer_alias_over_versioned(&mut buckets.video, &discovery_rules);
 
         // Categories that the API never returns (lyria/veo are typically not
         // listed) fall back to defaults so we don't drop them on refresh.
@@ -769,7 +769,7 @@ impl GoogleGeminiProvider {
         let inventory = Self::build_inventory_from_buckets(
             self.provider_instance_name.as_str(),
             self.provider_type.clone(),
-            self.provider_driver.as_str(),
+            self.provider_profile_id.as_str(),
             &buckets,
             self.features.as_slice(),
             revision,
@@ -793,21 +793,6 @@ impl GoogleGeminiProvider {
             buckets.video.len(),
         );
         Ok(inventory)
-    }
-
-    fn price_per_1m_tokens(model: &str) -> (f64, f64) {
-        let lowered = model.to_ascii_lowercase();
-        if lowered.contains("2.5-pro") {
-            (1.25, 10.0)
-        } else if lowered.contains("2.5-flash") {
-            (0.30, 2.50)
-        } else if lowered.contains("1.5-pro") {
-            (1.25, 5.0)
-        } else if lowered.contains("1.5-flash") {
-            (0.075, 0.30)
-        } else {
-            (0.50, 2.0)
-        }
     }
 
     #[cfg(test)]
@@ -904,33 +889,39 @@ impl GoogleGeminiProvider {
             .max(1)
     }
 
-    fn estimate_text2image_cost(req: &AiMethodRequest, model: &str) -> Option<f64> {
-        let lowered = model.to_ascii_lowercase();
-        let per_image = if lowered.contains("2.5-flash-image") {
-            0.039
-        } else if lowered.contains("2.0-flash-exp-image-generation")
-            || lowered.contains("2.0-flash-preview-image-generation")
-        {
-            0.03
-        } else if lowered.contains("2.5") {
-            0.04
-        } else {
-            0.03
-        };
-        Some((Self::estimate_image_count(req) as f64) * per_image)
+    fn resolved_pricing_for_model(
+        &self,
+        model: &str,
+        options: &Value,
+    ) -> Option<crate::provider_rules::ResolvedPricing> {
+        let inventory = self.inventory.read().ok()?;
+        let metadata = inventory.models.iter().find(|metadata| {
+            metadata.provider_model_id == model
+                || metadata.provider_actual_model_id.as_deref() == Some(model)
+        })?;
+        let rules = load_builtin_provider_rules("google-gemini")?;
+        Some(resolve_provider_pricing(
+            metadata, &rules, options, None, None,
+        ))
+    }
+
+    fn estimate_text2image_cost(&self, req: &AiMethodRequest, model: &str) -> Option<f64> {
+        let pricing = self.resolved_pricing_for_model(model, &json!({}))?;
+        pricing
+            .matched_amount
+            .map(|amount| (Self::estimate_image_count(req) as f64) * amount)
     }
 
     fn estimate_cost_for_usage(&self, model: &str, usage: &AiUsage) -> Option<AiCost> {
         let input_tokens = usage.input_tokens? as f64;
         let output_tokens = usage.output_tokens? as f64;
-        let (input_per_m, output_per_m) = Self::price_per_1m_tokens(model);
-
-        let amount = ((input_tokens / 1_000_000.0) * input_per_m)
-            + ((output_tokens / 1_000_000.0) * output_per_m);
+        let pricing = self.resolved_pricing_for_model(model, &json!({}))?;
+        let amount = (input_tokens * pricing.definition.input_token?)
+            + (output_tokens * pricing.definition.output_token?);
 
         Some(AiCost {
             amount,
-            currency: "USD".to_string(),
+            currency: pricing.definition.currency,
         })
     }
 
@@ -1896,33 +1887,32 @@ impl GoogleGeminiProvider {
         let raw = value
             .as_str()
             .ok_or_else(|| ProviderError::fatal("google gemini image size must be a string"))?;
-        let normalized = match raw.trim().to_ascii_uppercase().as_str() {
-            "512" => "512",
-            "1K" => "1K",
-            "2K" => "2K",
-            "4K" => "4K",
-            _ => {
-                let dimensions =
-                    raw.trim()
-                        .to_ascii_lowercase()
-                        .split_once('x')
-                        .and_then(|(width, height)| {
+        let normalized =
+            match raw.trim().to_ascii_uppercase().as_str() {
+                "512" => "512",
+                "1K" => "1K",
+                "2K" => "2K",
+                "4K" => "4K",
+                _ => {
+                    let dimensions = raw.trim().to_ascii_lowercase().split_once('x').and_then(
+                        |(width, height)| {
                             Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
-                        });
-                match dimensions.map(|(width, height)| width.max(height)) {
-                    Some(512) => "512",
-                    Some(1024) => "1K",
-                    Some(2048) => "2K",
-                    Some(4096) => "4K",
-                    _ => {
-                        return Err(ProviderError::fatal(format!(
+                        },
+                    );
+                    match dimensions.map(|(width, height)| width.max(height)) {
+                        Some(512) => "512",
+                        Some(1024) => "1K",
+                        Some(2048) => "2K",
+                        Some(4096) => "4K",
+                        _ => {
+                            return Err(ProviderError::fatal(format!(
                             "google gemini image size must use a 512, 1K, 2K or 4K edge, got {}",
                             raw
                         )));
+                        }
                     }
                 }
-            }
-        };
+            };
         Ok(Value::String(normalized.to_string()))
     }
 
@@ -2584,15 +2574,6 @@ impl GoogleGeminiProvider {
                 obj_id
             ))),
         }
-    }
-
-    fn provider_protocol(req: &AiMethodRequest) -> Option<&str> {
-        req.payload
-            .options
-            .as_ref()
-            .and_then(|options| options.get("provider_options"))
-            .and_then(|options| options.get("protocol"))
-            .and_then(Value::as_str)
     }
 
     fn interactions_output_text(body: &Value) -> String {
@@ -3287,8 +3268,9 @@ impl GoogleGeminiProvider {
         );
 
         let (artifacts, text) = Self::parse_text2image_result(&body)?;
-        let estimated_cost =
-            Self::estimate_text2image_cost(req, provider_model).map(|amount| AiCost {
+        let estimated_cost = self
+            .estimate_text2image_cost(req, provider_model)
+            .map(|amount| AiCost {
                 amount,
                 currency: "USD".to_string(),
             });
@@ -3762,6 +3744,7 @@ impl GoogleGeminiProvider {
         &self,
         _ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
+        operation: &str,
         req: &AiMethodRequest,
     ) -> Result<ProviderStartResult, ProviderError> {
         let resource = req
@@ -3771,7 +3754,7 @@ impl GoogleGeminiProvider {
             .cloned()
             .or_else(|| Self::resource_from_input_json(req, &["audio"]))
             .ok_or_else(|| ProviderError::fatal("audio.asr requires an audio resource"))?;
-        if Self::provider_protocol(req) == Some("interactions") {
+        if operation == "google.interactions.create" {
             return self
                 .start_interactions_asr(provider_model, req, resource)
                 .await;
@@ -4085,6 +4068,7 @@ impl GoogleGeminiProvider {
         ctx: &crate::aicc::InvokeCtx,
         provider_model: &str,
         method: &str,
+        operation: &str,
         req: &AiMethodRequest,
         sink: Arc<dyn TaskEventSink>,
     ) -> Result<ProviderStartResult, ProviderError> {
@@ -4107,7 +4091,7 @@ impl GoogleGeminiProvider {
                 method
             )));
         }
-        if Self::provider_protocol(req) == Some("interactions") {
+        if operation == "google.interactions.create" {
             return self
                 .start_interactions_video(provider_model, method, req)
                 .await;
@@ -4346,7 +4330,10 @@ impl GoogleGeminiProvider {
             message: AiResponse::message_from_parts(None, vec![], vec![artifact]),
             usage: Some(AiUsage::request_units(1)),
             cost: Some(AiCost {
-                amount: 0.5,
+                amount: self
+                    .resolved_pricing_for_model(provider_model, &json!({}))
+                    .and_then(|pricing| pricing.matched_amount)
+                    .unwrap_or(0.5),
                 currency: "USD".to_string(),
             }),
             provider_task_ref: Some(operation_name),
@@ -4367,7 +4354,7 @@ impl Provider for GoogleGeminiProvider {
                 Self::build_inventory_from_buckets(
                     self.provider_instance_name.as_str(),
                     self.provider_type.clone(),
-                    self.provider_driver.as_str(),
+                    self.provider_profile_id.as_str(),
                     &GeminiModelBuckets::default(),
                     self.features.as_slice(),
                     Some("inventory-lock-poisoned".to_string()),
@@ -4379,6 +4366,30 @@ impl Provider for GoogleGeminiProvider {
         self.stop_inventory_refresh();
     }
 
+    fn resolve_call(
+        &self,
+        metadata: &ModelMetadata,
+        method: &str,
+        api_type: &ApiType,
+    ) -> std::result::Result<ResolvedProviderCall, ProviderError> {
+        let rules = load_builtin_provider_rules("google-gemini")
+            .ok_or_else(|| ProviderError::fatal("missing builtin Google Gemini provider rules"))?;
+        resolve_provider_call(ProviderCallResolveInput {
+            metadata,
+            rules: &rules,
+            method,
+            api_type,
+            request_options: metadata
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| json!({})),
+            adapter_operations: &gemini_adapter_operations(),
+            discovery_pricing: None,
+            instance_pricing: None,
+        })
+        .map_err(ProviderError::fatal)
+    }
+
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
         let provider_model = provider_model_from_exact(input.exact_model.as_str());
         if matches!(
@@ -4386,7 +4397,10 @@ impl Provider for GoogleGeminiProvider {
             ApiType::ImageTextToImage | ApiType::ImageToImage
         ) {
             return CostEstimateOutput {
-                estimated_cost_usd: 0.04,
+                estimated_cost_usd: self
+                    .resolved_pricing_for_model(provider_model, &json!({}))
+                    .and_then(|pricing| pricing.matched_amount)
+                    .unwrap_or(0.04),
                 pricing_mode: PricingMode::PerToken,
                 quota_state: QuotaState::Normal,
                 confidence: 0.5,
@@ -4401,7 +4415,10 @@ impl Provider for GoogleGeminiProvider {
                 | ApiType::VideoExtend
         ) {
             return CostEstimateOutput {
-                estimated_cost_usd: 0.5,
+                estimated_cost_usd: self
+                    .resolved_pricing_for_model(provider_model, &json!({}))
+                    .and_then(|pricing| pricing.matched_amount)
+                    .unwrap_or(0.5),
                 pricing_mode: PricingMode::Unknown,
                 quota_state: QuotaState::Normal,
                 confidence: 0.5,
@@ -4445,6 +4462,31 @@ impl Provider for GoogleGeminiProvider {
         req: ResolvedRequest,
         sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
+        let fallback_call = if req.provider_call.is_none() {
+            let api_type = crate::aicc::api_type_for_method(req.method.as_str())
+                .ok_or_else(|| ProviderError::fatal("unsupported Google Gemini method"))?;
+            let inventory = self
+                .inventory
+                .read()
+                .map_err(|_| ProviderError::fatal("Google Gemini inventory lock poisoned"))?;
+            let metadata = inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == provider_model)
+                .ok_or_else(|| {
+                    ProviderError::fatal("Google Gemini model is absent from inventory")
+                })?;
+            Some(self.resolve_call(metadata, req.method.as_str(), &api_type)?)
+        } else {
+            None
+        };
+        let operation = req
+            .provider_call
+            .as_ref()
+            .or(fallback_call.as_ref())
+            .map(|call| call.operation.as_str())
+            .ok_or_else(|| ProviderError::fatal("Google Gemini operation was not resolved"))?
+            .to_string();
         match req.method.as_str() {
             ai_methods::LLM_CHAT => {
                 self.start_llm(&ctx, provider_model.as_str(), &req.request)
@@ -4488,8 +4530,13 @@ impl Provider for GoogleGeminiProvider {
                 .await
             }
             ai_methods::AUDIO_ASR => {
-                self.start_asr(&ctx, provider_model.as_str(), &req.request)
-                    .await
+                self.start_asr(
+                    &ctx,
+                    provider_model.as_str(),
+                    operation.as_str(),
+                    &req.request,
+                )
+                .await
             }
             ai_methods::VIDEO_TXT2VIDEO
             | ai_methods::VIDEO_IMG2VIDEO
@@ -4499,6 +4546,7 @@ impl Provider for GoogleGeminiProvider {
                     &ctx,
                     provider_model.as_str(),
                     req.method.as_str(),
+                    operation.as_str(),
                     &req.request,
                     sink,
                 )
@@ -4526,6 +4574,41 @@ impl Drop for GoogleGeminiProvider {
     fn drop(&mut self) {
         self.stop_inventory_refresh();
     }
+}
+
+fn gemini_adapter_operations() -> AdapterOperationRegistry {
+    AdapterOperationRegistry::new(
+        [
+            "google.models.generateContent",
+            "google.models.embedContent",
+            "google.models.predictLongRunning",
+            "google.interactions.create",
+        ],
+        [
+            (ApiType::Llm, "google.models.generateContent"),
+            (ApiType::ImageTextToImage, "google.models.generateContent"),
+            (ApiType::ImageToImage, "google.models.generateContent"),
+            (ApiType::Embedding, "google.models.embedContent"),
+            (ApiType::EmbeddingMultimodal, "google.models.embedContent"),
+            (ApiType::VisionOcr, "google.models.generateContent"),
+            (ApiType::VisionCaption, "google.models.generateContent"),
+            (ApiType::VisionDetect, "google.models.generateContent"),
+            (ApiType::VisionSegment, "google.models.generateContent"),
+            (ApiType::AudioTts, "google.models.generateContent"),
+            (ApiType::AudioAsr, "google.models.generateContent"),
+            (ApiType::AudioMusic, "google.models.generateContent"),
+            (
+                ApiType::VideoTextToVideo,
+                "google.models.predictLongRunning",
+            ),
+            (
+                ApiType::VideoImageToVideo,
+                "google.models.predictLongRunning",
+            ),
+            (ApiType::VideoToVideo, "google.interactions.create"),
+            (ApiType::VideoExtend, "google.models.predictLongRunning"),
+        ],
+    )
 }
 
 fn provider_model_from_exact(exact_model: &str) -> &str {
@@ -4565,8 +4648,8 @@ struct SettingsGoogleGeminiInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
-    #[serde(default = "default_provider_driver")]
-    provider_driver: String,
+    #[serde(default = "default_provider_profile_id")]
+    provider_profile_id: String,
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
     #[serde(default = "default_base_url")]
@@ -4599,7 +4682,7 @@ fn default_provider_type() -> String {
     "cloud_api".to_string()
 }
 
-fn default_provider_driver() -> String {
+fn default_provider_profile_id() -> String {
     "google-gemini".to_string()
 }
 
@@ -4616,11 +4699,6 @@ fn default_features() -> Vec<String> {
         features::PLAN.to_string(),
         features::JSON_OUTPUT.to_string(),
     ]
-}
-
-fn is_text2image_model_name(model: &str) -> bool {
-    let lowered = model.trim().to_ascii_lowercase();
-    !lowered.contains("imagen") && (lowered.contains("image") || lowered.contains("nano-banana"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4647,13 +4725,13 @@ fn strip_gemini_model_prefix(name: &str) -> &str {
 /// 注意：只有在同一份模型列表里 alias **本身**也存在时才剔除版本号；如果只剩
 /// 版本号变体（比如 `gemini-embedding-001` 没 alias 兄弟），照样保留——它就是
 /// 这个模型在 Google 那边唯一的命名。
-fn prefer_alias_over_versioned(models: &mut Vec<String>) {
+fn prefer_alias_over_versioned(models: &mut Vec<String>, rules: &ProviderDiscoveryRules) {
     let aliases: HashSet<String> = models
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
     models.retain(|name| {
-        let Some(alias_part) = strip_numeric_version_suffix(name) else {
+        let Some(alias_part) = strip_numeric_version_suffix(name, rules) else {
             return true;
         };
         let alias_key = alias_part.to_ascii_lowercase();
@@ -4666,13 +4744,17 @@ fn prefer_alias_over_versioned(models: &mut Vec<String>) {
 /// 识别 `<base>-<digits>` 命名（如 `gemini-2.0-flash-001`），返回去掉 `-<digits>`
 /// 之后的 `<base>`。识别规则约束 2~4 位纯数字尾巴，避免误吃 `gpt-4o` 这种本身
 /// 名字里就带数字的情况。
-fn strip_numeric_version_suffix(name: &str) -> Option<&str> {
+fn strip_numeric_version_suffix<'a>(
+    name: &'a str,
+    rules: &ProviderDiscoveryRules,
+) -> Option<&'a str> {
+    let policy = rules.alias_numeric_suffix.as_ref()?;
     let bytes = name.as_bytes();
     let mut digits = 0usize;
     while digits < bytes.len() && bytes[bytes.len() - 1 - digits].is_ascii_digit() {
         digits += 1;
     }
-    if !(2..=4).contains(&digits) {
+    if !(policy.min_digits..=policy.max_digits).contains(&digits) {
         return None;
     }
     let split_at = bytes.len() - digits;
@@ -4690,71 +4772,64 @@ fn strip_numeric_version_suffix(name: &str) -> Option<&str> {
 ///
 /// 这只是描述文字层面的过滤；如果 Google 哪天没在文案里写明就停服，最终还是要
 /// 由运行期 health 反馈再降级一次（属于另外一条独立的链路）。
-fn is_deprecated_gemini_entry(id: &str, display_name: &str, description: &str) -> bool {
-    const SIGNALS: &[&str] = &[
-        "deprecat",   // deprecated / deprecation
-        "discontinu", // discontinued / discontinuation
-        "no longer",  // "no longer available", "no longer supported"
-        "retired",
-        "(legacy)", // 用 "(legacy)" 而非裸 "legacy"，避免误伤 "Gemini Legacy Workshop" 这种命名
-        "sunset",   // "sunset on ..."
-        "end of life",
-        "end-of-life",
-    ];
+fn is_deprecated_gemini_entry(
+    id: &str,
+    display_name: &str,
+    description: &str,
+    rules: &ProviderDiscoveryRules,
+) -> bool {
     let haystack = format!("{} {} {}", id, display_name, description).to_ascii_lowercase();
-    SIGNALS.iter().any(|signal| haystack.contains(signal))
+    rules
+        .deprecated_text_signals
+        .iter()
+        .any(|signal| haystack.contains(signal))
 }
 
 fn classify_gemini_model(id: &str, methods: &HashSet<String>) -> Option<GeminiModelKind> {
+    let fallback_api_types = if methods.contains("embedcontent") {
+        vec![ApiType::Embedding]
+    } else if methods.contains("predictlongrunning") {
+        vec![ApiType::VideoTextToVideo, ApiType::VideoImageToVideo]
+    } else if methods.contains("generatecontent") {
+        vec![ApiType::Llm]
+    } else {
+        Vec::new()
+    };
     let configured = resolve_driver_inventory(
         "gemini-classifier",
         ProviderType::CloudApi,
         "google-gemini",
         &[DriverModelResolveRequest::new(
             id.to_string(),
-            vec![ApiType::Llm],
+            fallback_api_types,
         )],
         None,
     );
-    if configured.models.first().is_some_and(|model| {
-        model.api_types.iter().any(|api_type| {
-            matches!(
-                api_type,
-                ApiType::VideoTextToVideo
-                    | ApiType::VideoImageToVideo
-                    | ApiType::VideoToVideo
-                    | ApiType::VideoExtend
-                    | ApiType::VideoUpscale
-            )
-        })
+    let api_types = configured.models.first()?.api_types.as_slice();
+    if api_types.iter().any(|api_type| {
+        matches!(
+            api_type,
+            ApiType::VideoTextToVideo
+                | ApiType::VideoImageToVideo
+                | ApiType::VideoToVideo
+                | ApiType::VideoExtend
+                | ApiType::VideoUpscale
+        )
     }) {
-        return Some(GeminiModelKind::Video);
+        Some(GeminiModelKind::Video)
+    } else if api_types.contains(&ApiType::ImageTextToImage) {
+        Some(GeminiModelKind::Image)
+    } else if api_types.contains(&ApiType::Embedding) {
+        Some(GeminiModelKind::Embedding)
+    } else if api_types.contains(&ApiType::AudioTts) {
+        Some(GeminiModelKind::Tts)
+    } else if api_types.contains(&ApiType::AudioMusic) {
+        Some(GeminiModelKind::Music)
+    } else if api_types.contains(&ApiType::Llm) {
+        Some(GeminiModelKind::Llm)
+    } else {
+        None
     }
-    let lowered = id.to_ascii_lowercase();
-
-    if lowered.contains("embedding") || methods.contains("embedcontent") {
-        return Some(GeminiModelKind::Embedding);
-    }
-    if lowered.contains("tts") {
-        return Some(GeminiModelKind::Tts);
-    }
-    if lowered.contains("lyria") {
-        return Some(GeminiModelKind::Music);
-    }
-    if lowered.contains("veo") {
-        return Some(GeminiModelKind::Video);
-    }
-    if is_text2image_model_name(id) {
-        return Some(GeminiModelKind::Image);
-    }
-    if methods.contains("generatecontent")
-        || (methods.is_empty()
-            && (lowered.starts_with("gemini")
-                || lowered.starts_with("gemma-")))
-    {
-        return Some(GeminiModelKind::Llm);
-    }
-    None
 }
 
 fn normalize_model_list(models: Vec<String>) -> Vec<String> {
@@ -4808,7 +4883,7 @@ fn build_gemini_instances(settings: &GeminiSettings) -> Result<Vec<GoogleGeminiI
         vec![SettingsGoogleGeminiInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
-            provider_driver: default_provider_driver(),
+            provider_profile_id: default_provider_profile_id(),
             api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
@@ -4838,23 +4913,25 @@ fn build_gemini_instances(settings: &GeminiSettings) -> Result<Vec<GoogleGeminiI
 
         let default_model = raw_instance
             .default_model
-            .or_else(|| {
-                models
-                    .iter()
-                    .find(|model| !is_text2image_model_name(model))
-                    .cloned()
-            })
             .or_else(|| models.first().cloned());
         let mut image_models = normalize_model_list(raw_instance.image_models);
         if image_models.is_empty() {
-            image_models = models
-                .iter()
-                .filter(|model| is_text2image_model_name(model))
-                .cloned()
-                .collect::<Vec<_>>();
-        }
-        if image_models.is_empty() {
-            image_models = normalize_model_list(parse_csv_list(DEFAULT_GEMINI_IMAGE_MODELS));
+            let mut regular_models = Vec::with_capacity(models.len());
+            let no_discovery_methods = HashSet::new();
+            for model in models {
+                if matches!(
+                    classify_gemini_model(model.as_str(), &no_discovery_methods),
+                    Some(GeminiModelKind::Image)
+                ) {
+                    image_models.push(model);
+                } else {
+                    regular_models.push(model);
+                }
+            }
+            models = regular_models;
+            if image_models.is_empty() {
+                image_models = normalize_model_list(parse_csv_list(DEFAULT_GEMINI_IMAGE_MODELS));
+            }
         }
         let default_image_model = raw_instance
             .default_image_model
@@ -4868,7 +4945,7 @@ fn build_gemini_instances(settings: &GeminiSettings) -> Result<Vec<GoogleGeminiI
         instances.push(GoogleGeminiInstanceConfig {
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
-            provider_driver: raw_instance.provider_driver,
+            provider_profile_id: raw_instance.provider_profile_id,
             api_token: if raw_instance.api_token.trim().is_empty() {
                 settings.api_token.clone()
             } else {
@@ -4898,9 +4975,6 @@ fn register_default_aliases(
     default_image_model: Option<&str>,
 ) {
     for model in models.iter() {
-        if is_text2image_model_name(model) {
-            continue;
-        }
         center.model_catalog().set_mapping(
             Capability::Llm,
             model.as_str(),
@@ -4916,7 +4990,7 @@ fn register_default_aliases(
         );
     }
 
-    if let Some(default_model) = default_model.filter(|model| !is_text2image_model_name(model)) {
+    if let Some(default_model) = default_model {
         for alias in ["llm.default", "llm.plan.default", "llm.code.default"] {
             center.model_catalog().set_mapping(
                 Capability::Llm,
@@ -5359,11 +5433,9 @@ mod tests {
             request.pointer("/generationConfig/responseJsonSchema"),
             Some(&schema)
         );
-        assert!(
-            request
-                .pointer("/generationConfig/responseSchema")
-                .is_none()
-        );
+        assert!(request
+            .pointer("/generationConfig/responseSchema")
+            .is_none());
         assert_eq!(
             request.pointer("/generationConfig/responseMimeType"),
             Some(&json!("application/json"))
@@ -5515,20 +5587,16 @@ mod tests {
 
         assert_eq!(&contents[0], body.pointer("/candidates/0/content").unwrap());
         assert!(contents[0].pointer("/parts/0/functionCall/id").is_none());
-        assert!(
-            contents[1]
-                .pointer("/parts/0/functionResponse/id")
-                .is_none()
-        );
+        assert!(contents[1]
+            .pointer("/parts/0/functionResponse/id")
+            .is_none());
         assert_eq!(
             contents[1].pointer("/parts/0/functionResponse/name"),
             Some(&json!("get_weather"))
         );
-        assert!(
-            !serde_json::to_string(&contents)
-                .unwrap()
-                .contains("gemini-no-id")
-        );
+        assert!(!serde_json::to_string(&contents)
+            .unwrap()
+            .contains("gemini-no-id"));
     }
 
     #[test]
@@ -5603,7 +5671,7 @@ mod tests {
     }
 
     #[test]
-    fn gemini_video_inventory_uses_configured_protocols() {
+    fn gemini_video_inventory_exposes_metadata_capabilities() {
         let inventory = GoogleGeminiProvider::build_inventory_from_buckets(
             "gemini-primary",
             ProviderType::CloudApi,
@@ -5627,23 +5695,15 @@ mod tests {
         assert!(veo.api_types.contains(&ApiType::VideoImageToVideo));
         assert!(!veo.api_types.contains(&ApiType::VideoToVideo));
         assert!(veo.api_types.contains(&ApiType::VideoExtend));
-        assert_eq!(
-            veo.provider_options
-                .as_ref()
-                .and_then(|options| options.get("protocol"))
-                .and_then(Value::as_str),
-            Some("predict_long_running")
-        );
-        assert!(
-            veo.logical_mounts
-                .iter()
-                .any(|mount| mount == "video.img2video")
-        );
-        assert!(
-            veo.logical_mounts
-                .iter()
-                .any(|mount| mount == "video.extend")
-        );
+        assert!(veo.provider_options.is_none());
+        assert!(veo
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "video.img2video"));
+        assert!(veo
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "video.extend"));
 
         let omni = inventory
             .models
@@ -5652,13 +5712,7 @@ mod tests {
             .expect("omni model should exist");
         assert!(omni.api_types.contains(&ApiType::VideoToVideo));
         assert!(!omni.api_types.contains(&ApiType::VideoExtend));
-        assert_eq!(
-            omni.provider_options
-                .as_ref()
-                .and_then(|options| options.get("protocol"))
-                .and_then(Value::as_str),
-            Some("interactions")
-        );
+        assert!(omni.provider_options.is_none());
     }
 
     #[test]
@@ -5847,12 +5901,10 @@ mod tests {
             .unwrap();
         assert_eq!(model.capabilities.max_output_tokens, Some(65_536));
         assert!(model.api_types.contains(&ApiType::AudioAsr));
-        assert!(
-            model
-                .logical_mounts
-                .iter()
-                .any(|mount| mount == "audio.asr")
-        );
+        assert!(model
+            .logical_mounts
+            .iter()
+            .any(|mount| mount == "audio.asr"));
     }
 
     #[test]
@@ -5898,14 +5950,7 @@ mod tests {
                 .unwrap();
             assert!(model.api_types.contains(&ApiType::AudioAsr), "{id}");
             if id == "gemini-3.5-transcribe" {
-                assert_eq!(
-                    model
-                        .provider_options
-                        .as_ref()
-                        .and_then(|options| options.get("protocol"))
-                        .and_then(Value::as_str),
-                    Some("interactions")
-                );
+                assert!(model.provider_options.is_none());
                 assert_eq!(model.api_types, vec![ApiType::AudioAsr]);
             }
         }
@@ -5983,30 +6028,22 @@ mod tests {
             &[],
             Some("test".to_string()),
         );
-        assert!(
-            inventory
-                .models
-                .iter()
-                .any(|model| model.provider_model_id == "gemini-2.5-flash-image")
-        );
-        assert!(
-            inventory
-                .models
-                .iter()
-                .any(|model| model.provider_model_id == "lyria-3-clip-preview")
-        );
-        assert!(
-            inventory
-                .models
-                .iter()
-                .any(|model| model.provider_model_id == "lyria-3-pro-preview")
-        );
-        assert!(
-            !inventory
-                .models
-                .iter()
-                .any(|model| model.provider_model_id.starts_with("imagen-"))
-        );
+        assert!(inventory
+            .models
+            .iter()
+            .any(|model| model.provider_model_id == "gemini-2.5-flash-image"));
+        assert!(inventory
+            .models
+            .iter()
+            .any(|model| model.provider_model_id == "lyria-3-clip-preview"));
+        assert!(inventory
+            .models
+            .iter()
+            .any(|model| model.provider_model_id == "lyria-3-pro-preview"));
+        assert!(!inventory
+            .models
+            .iter()
+            .any(|model| model.provider_model_id.starts_with("imagen-")));
     }
 
     #[test]
@@ -6099,7 +6136,7 @@ mod tests {
             GoogleGeminiInstanceConfig {
                 provider_instance_name: "gemini-primary".to_string(),
                 provider_type: "cloud_api".to_string(),
-                provider_driver: "google-gemini".to_string(),
+                provider_profile_id: "google-gemini".to_string(),
                 api_token: "token".to_string(),
                 base_url: default_base_url(),
                 timeout_ms: default_timeout_ms(),
@@ -6127,34 +6164,40 @@ mod tests {
 
     #[test]
     fn strip_numeric_version_suffix_matches_only_short_digit_tails() {
+        let rules = load_builtin_provider_rules("google-gemini")
+            .unwrap()
+            .discovery;
         assert_eq!(
-            strip_numeric_version_suffix("gemini-2.0-flash-001"),
+            strip_numeric_version_suffix("gemini-2.0-flash-001", &rules),
             Some("gemini-2.0-flash")
         );
         assert_eq!(
-            strip_numeric_version_suffix("gemini-2.5-flash-002"),
+            strip_numeric_version_suffix("gemini-2.5-flash-002", &rules),
             Some("gemini-2.5-flash")
         );
         // 4 位也算（保险一点，比如 -1234）
         assert_eq!(
-            strip_numeric_version_suffix("gemini-x-1234"),
+            strip_numeric_version_suffix("gemini-x-1234", &rules),
             Some("gemini-x")
         );
         // 1 位太短，可能是模型自带后缀，不算版本号
-        assert_eq!(strip_numeric_version_suffix("gpt-4"), None);
+        assert_eq!(strip_numeric_version_suffix("gpt-4", &rules), None);
         // 5 位以上不算（避免误吃像 claude-3-7-sonnet-20250219 这种 datestamp）
         assert_eq!(
-            strip_numeric_version_suffix("claude-3-7-sonnet-20250219"),
+            strip_numeric_version_suffix("claude-3-7-sonnet-20250219", &rules),
             None
         );
         // 没有 `-` 边界
-        assert_eq!(strip_numeric_version_suffix("gpt4o"), None);
+        assert_eq!(strip_numeric_version_suffix("gpt4o", &rules), None);
         // 名字本身是纯数字
-        assert_eq!(strip_numeric_version_suffix("123"), None);
+        assert_eq!(strip_numeric_version_suffix("123", &rules), None);
     }
 
     #[test]
     fn prefer_alias_over_versioned_drops_version_when_alias_present() {
+        let rules = load_builtin_provider_rules("google-gemini")
+            .unwrap()
+            .discovery;
         let mut models = vec![
             "gemini-2.0-flash".to_string(),
             "gemini-2.0-flash-001".to_string(),
@@ -6168,7 +6211,7 @@ mod tests {
             // claude-style datestamp（8 位）不被识别为版本号，原样保留
             "claude-3-7-sonnet-20250219".to_string(),
         ];
-        prefer_alias_over_versioned(&mut models);
+        prefer_alias_over_versioned(&mut models, &rules);
         assert_eq!(
             models,
             vec![
@@ -6184,12 +6227,15 @@ mod tests {
 
     #[test]
     fn prefer_alias_over_versioned_keeps_lonely_versioned() {
+        let rules = load_builtin_provider_rules("google-gemini")
+            .unwrap()
+            .discovery;
         // 只有版本快照、没有 alias 兄弟 → 保留
         let mut models = vec![
             "text-embedding-004".to_string(),
             "veo-3.1-generate-preview".to_string(),
         ];
-        prefer_alias_over_versioned(&mut models);
+        prefer_alias_over_versioned(&mut models, &rules);
         assert_eq!(
             models,
             vec![
@@ -6210,38 +6256,47 @@ mod tests {
 
     #[test]
     fn deprecated_gemini_entries_are_filtered() {
+        let rules = load_builtin_provider_rules("google-gemini")
+            .unwrap()
+            .discovery;
         // 描述里出现 deprecation 信号 → 必须过滤
         assert!(is_deprecated_gemini_entry(
             "gemini-2.0-flash-001",
             "Gemini 2.0 Flash (Discontinued)",
-            "Stable version of Gemini 2.0 Flash."
+            "Stable version of Gemini 2.0 Flash.",
+            &rules
         ));
         assert!(is_deprecated_gemini_entry(
             "gemini-1.5-pro-002",
             "Gemini 1.5 Pro",
-            "This model is deprecated. Please migrate to gemini-2.5-pro."
+            "This model is deprecated. Please migrate to gemini-2.5-pro.",
+            &rules
         ));
         assert!(is_deprecated_gemini_entry(
             "gemini-1.0-pro",
             "Gemini 1.0 Pro",
             "Legacy: gemini-1.0-pro is no longer available to new users.",
+            &rules,
         ));
         assert!(is_deprecated_gemini_entry(
             "gemini-2.0-flash-lite",
             "Gemini 2.0 Flash-Lite",
-            "Will be retired on 2026-01-01."
+            "Will be retired on 2026-01-01.",
+            &rules
         ));
 
         // 健康的当前模型不能误伤
         assert!(!is_deprecated_gemini_entry(
             "gemini-2.5-flash",
             "Gemini 2.5 Flash",
-            "Fast and versatile multimodal model."
+            "Fast and versatile multimodal model.",
+            &rules
         ));
         assert!(!is_deprecated_gemini_entry(
             "gemini-2.5-pro",
             "Gemini 2.5 Pro",
-            "Most capable Gemini model for complex reasoning tasks."
+            "Most capable Gemini model for complex reasoning tasks.",
+            &rules
         ));
     }
 
@@ -6254,7 +6309,7 @@ mod tests {
             instances: vec![SettingsGoogleGeminiInstanceConfig {
                 provider_instance_name: "gemini-1".to_string(),
                 provider_type: "cloud_api".to_string(),
-                provider_driver: "google-gemini".to_string(),
+                provider_profile_id: "google-gemini".to_string(),
                 api_token: String::new(),
                 base_url: default_base_url(),
                 timeout_ms: default_timeout_ms(),
@@ -6272,7 +6327,7 @@ mod tests {
 
         let instances = build_gemini_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].provider_driver, "google-gemini");
+        assert_eq!(instances[0].provider_profile_id, "google-gemini");
         assert_eq!(
             instances[0].default_model.as_deref(),
             Some("gemini-2.5-flash")
@@ -6295,7 +6350,7 @@ mod tests {
         let instances = build_gemini_instances(&settings).expect("instances should be built");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].provider_instance_name, "google-gemini-default");
-        assert_eq!(instances[0].provider_driver, "google-gemini");
+        assert_eq!(instances[0].provider_profile_id, "google-gemini");
         for model in [
             "gemini-3.7-flash",
             "gemini-3.6-flash",
@@ -6303,7 +6358,10 @@ mod tests {
             "gemini-2.5-pro",
             "gemini-3.5-transcribe",
         ] {
-            assert!(instances[0].models.iter().any(|item| item == model), "{model}");
+            assert!(
+                instances[0].models.iter().any(|item| item == model),
+                "{model}"
+            );
         }
         for model in ["gemini-3.1-flash-image", "gemini-2.5-flash-image"] {
             assert!(
@@ -6396,7 +6454,7 @@ mod tests {
                     {
                         "provider_instance_name": "google-gemini-default",
                         "provider_type": "cloud_api",
-                        "provider_driver": "google-gemini",
+                        "provider_profile_id": "google-gemini",
                         "base_url": "https://generativelanguage.googleapis.com/v1beta",
                         "models": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-3.1-pro-preview"],
                         "image_models": ["gemini-2.5-flash-image-preview"]
@@ -6411,17 +6469,13 @@ mod tests {
 
         let registry = center.model_registry().read().expect("model registry lock");
         let flash_items = registry.default_items_for_path("llm.gemini-flash");
-        assert!(
-            flash_items
-                .values()
-                .any(|item| { item.target == "gemini-2.5-flash@google-gemini-default" })
-        );
+        assert!(flash_items
+            .values()
+            .any(|item| { item.target == "gemini-2.5-flash@google-gemini-default" }));
         let pro_items = registry.default_items_for_path("llm.gemini-pro");
-        assert!(
-            pro_items
-                .values()
-                .any(|item| item.target == "gemini-2.5-pro@google-gemini-default")
-        );
+        assert!(pro_items
+            .values()
+            .any(|item| item.target == "gemini-2.5-pro@google-gemini-default"));
         let inventories = center.registry().inventories();
         let inventory = inventories
             .iter()
@@ -6446,18 +6500,14 @@ mod tests {
             .find(|model| model.provider_model_id == "gemini-3.1-pro-preview")
             .expect("Gemini 3 metadata");
         assert!(gemini_3.capabilities.web_search);
-        assert!(
-            gemini_3
-                .capabilities
-                .unsupported_feature_combinations
-                .is_empty()
-        );
+        assert!(gemini_3
+            .capabilities
+            .unsupported_feature_combinations
+            .is_empty());
         let image_items = registry.default_items_for_path("image.txt2img.gemini");
-        assert!(
-            image_items.values().any(|item| {
-                item.target == "gemini-2.5-flash-image-preview@google-gemini-default"
-            })
-        );
+        assert!(image_items
+            .values()
+            .any(|item| { item.target == "gemini-2.5-flash-image-preview@google-gemini-default" }));
         let split_model_items = registry.default_items_for_path("image.img2img.gemini-2");
         assert!(split_model_items.is_empty());
     }
@@ -6525,27 +6575,6 @@ mod tests {
 
         assert_eq!(code_alias.as_deref(), Some("gemini-2.5-flash"));
         assert!(removed_alias.is_none());
-    }
-
-    #[test]
-    fn estimate_text2image_cost_covers_current_image_models() {
-        let preview = build_text2image_request(Some(json!({ "n": 2 })));
-        assert_eq!(
-            GoogleGeminiProvider::estimate_text2image_cost(
-                &preview,
-                "gemini-2.5-flash-image-preview"
-            ),
-            Some(0.078)
-        );
-
-        let legacy = build_text2image_request(None);
-        assert_eq!(
-            GoogleGeminiProvider::estimate_text2image_cost(
-                &legacy,
-                "gemini-2.0-flash-exp-image-generation"
-            ),
-            Some(0.03)
-        );
     }
 
     #[test]

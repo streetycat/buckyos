@@ -16,6 +16,7 @@ pub mod model_session;
 pub mod model_types;
 pub mod openai;
 pub mod openai_protocol;
+pub mod provider_rules;
 pub mod sn_ai_provider;
 
 pub use self::aicc::*;

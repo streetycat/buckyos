@@ -16,6 +16,7 @@ mod model_session;
 mod model_types;
 mod openai;
 mod openai_protocol;
+mod provider_rules;
 mod sn_ai_provider;
 
 use ::kRPC::*;
@@ -59,6 +60,7 @@ use crate::metadata_updater::{
 };
 use crate::minimax::register_minimax_providers;
 use crate::openai::register_openai_llm_providers;
+use crate::provider_rules::{load_known_provider_profiles, KnownProviderProfile};
 use crate::sn_ai_provider::register_sn_ai_provider;
 
 const AICC_SERVICE_MAIN_PORT: u16 = 4040;
@@ -69,6 +71,7 @@ const METHOD_SERVICE_REALOAD_SETTINGS: &str = "service.reaload_settings";
 const METHOD_MODELS_LIST: &str = "models.list";
 const METHOD_SERVICE_MODELS_LIST: &str = "service.models.list";
 const METHOD_PROVIDER_VALIDATE: &str = "provider.validate";
+const METHOD_PROVIDER_CATALOG: &str = "provider.catalog";
 const METHOD_PROVIDER_ADD: &str = "provider.add";
 const METHOD_PROVIDER_DELETE: &str = "provider.delete";
 const METHOD_PROVIDER_REFRESH_MODELS: &str = "provider.refresh_models";
@@ -509,45 +512,21 @@ fn validate_provider_instance_name(value: &str) -> std::result::Result<(), RPCEr
     Ok(())
 }
 
-fn section_for_provider_type(provider_type: &str) -> std::result::Result<&'static str, RPCErrors> {
-    match provider_type {
-        "sn_router" => Ok("sn-ai-provider"),
-        "openai" | "openrouter" | "custom" => Ok("openai"),
-        "anthropic" => Ok("claude"),
-        "google" => Ok("google"),
-        "minimax" => Ok("minimax"),
-        "fal" => Ok("fal"),
-        _ => Err(RPCErrors::ReasonError(format!(
-            "unsupported provider_type: {}",
-            provider_type
-        ))),
-    }
+fn known_provider_profile(
+    provider_type: &str,
+) -> std::result::Result<KnownProviderProfile, RPCErrors> {
+    load_known_provider_profiles()
+        .into_iter()
+        .find(|profile| profile.provider_type == provider_type)
+        .ok_or_else(|| {
+            RPCErrors::ReasonError(format!("unsupported provider_type: {provider_type}"))
+        })
 }
 
-fn default_endpoint(provider_type: &str) -> &'static str {
-    match provider_type {
-        "sn_router" => "https://sn.buckyos.ai/api/v1/ai/",
-        "openai" | "custom" => "https://api.openai.com/v1",
-        "openrouter" => "https://openrouter.ai/api/v1",
-        "anthropic" => "https://api.anthropic.com/v1",
-        "google" => "https://generativelanguage.googleapis.com/v1beta",
-        "minimax" => "https://api.minimax.io/v1",
-        "fal" => "https://fal.run",
-        _ => "",
-    }
-}
-
-fn provider_driver_for_request(provider_type: &str) -> String {
-    match provider_type {
-        "sn_router" => "sn-ai-provider".to_string(),
-        "openrouter" => "openrouter".to_string(),
-        "anthropic" => "claude".to_string(),
-        "google" => "google-gemini".to_string(),
-        "minimax" => "minimax".to_string(),
-        "fal" => "fal".to_string(),
-        "custom" => "openai".to_string(),
-        _ => provider_type.to_string(),
-    }
+fn default_endpoint(provider_type: &str) -> String {
+    known_provider_profile(provider_type)
+        .map(|profile| profile.default_endpoint)
+        .unwrap_or_default()
 }
 
 fn settings_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -728,9 +707,10 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
     validate_provider_instance_name(provider_instance_name.as_str())?;
     let provider_type = param_string(params, "provider_type")
         .ok_or_else(|| RPCErrors::ReasonError("provider_type is required".to_string()))?;
-    let section = section_for_provider_type(provider_type.as_str())?;
-    let endpoint = param_string(params, "endpoint")
-        .unwrap_or_else(|| default_endpoint(provider_type.as_str()).to_string());
+    let profile = known_provider_profile(provider_type.as_str())?;
+    let section = profile.settings_section.clone();
+    let endpoint =
+        param_string(params, "endpoint").unwrap_or_else(|| profile.default_endpoint.clone());
     if provider_type == "custom" && endpoint.trim().is_empty() {
         return Err(RPCErrors::ReasonError(
             "endpoint is required for custom provider".to_string(),
@@ -752,8 +732,12 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
         Value::String("cloud_api".to_string()),
     );
     instance.insert(
-        "provider_driver".to_string(),
-        Value::String(provider_driver_for_request(provider_type.as_str())),
+        "provider_profile_id".to_string(),
+        Value::String(profile.provider_profile_id),
+    );
+    instance.insert(
+        "protocol_adapter_id".to_string(),
+        Value::String(profile.protocol_adapter_id),
     );
     if !api_key.trim().is_empty() {
         instance.insert("api_token".to_string(), Value::String(api_key));
@@ -772,14 +756,14 @@ fn build_provider_instance_settings(params: &Value) -> std::result::Result<Value
         instance.insert("auto_sync_models".to_string(), Value::Bool(auto_sync));
     }
     let mut wrapped = Map::new();
-    wrapped.insert("section".to_string(), Value::String(section.to_string()));
+    wrapped.insert("section".to_string(), Value::String(section));
     wrapped.insert("instance".to_string(), Value::Object(instance));
     Ok(Value::Object(wrapped))
 }
 
 fn normalized_endpoint_for_validation(provider_type: &str, params: &Value) -> String {
     param_string(params, "endpoint")
-        .unwrap_or_else(|| default_endpoint(provider_type).to_string())
+        .unwrap_or_else(|| default_endpoint(provider_type))
         .trim_end_matches('/')
         .to_string()
 }
@@ -2050,6 +2034,12 @@ impl RPCHandler for AiccHttpServer {
         if req.method == METHOD_MODELS_LIST || req.method == METHOD_SERVICE_MODELS_LIST {
             let result = self.handle_models_list(&req.params).await?;
             return Ok(rpc_success(&req, result));
+        }
+        if req.method == METHOD_PROVIDER_CATALOG {
+            return Ok(rpc_success(
+                &req,
+                json!({ "providers": load_known_provider_profiles() }),
+            ));
         }
         if req.method == METHOD_PROVIDER_VALIDATE {
             let result = self.handle_provider_validate(&req).await?;

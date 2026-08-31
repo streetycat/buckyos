@@ -20,10 +20,12 @@ P0 required:
   fal.rs
 
 P1 optional:
-  openrouter.rs
+  OpenRouter Provider Profile + OpenAI-compatible adapter strategy
 ```
 
-`openrouter.rs` 不进入 P0，因为它与 OpenAI、Claude、Google 的直连能力高度重叠；它只作为长尾模型、成本 fallback、临时 rerank 或模型试用入口。
+OpenRouter 不进入 P0，因为它与 OpenAI、Claude、Google 的直连能力高度重叠；它只作为长尾模型、成本 fallback、临时 rerank 或模型试用入口。当前实现使用独立的 `openrouter` Provider Profile 和专用策略对象，复用 OpenAI-compatible wire adapter，但不复用 OpenAI 官方渠道规则或 Model Driver。
+
+所有 Provider 均遵循同一分层：Provider Profile 决定渠道 discovery、origin mapping、operation、请求限制和价格；Model Driver Metadata 只解释模型固有能力、家族和语义 variant；Protocol Adapter 只实现已注册 operation 的认证、endpoint、wire 编解码及异步状态机。路由阶段产生 `ResolvedProviderCall`，执行阶段不得再按模型名称切换协议。
 
 `agent.computer_use` 不纳入本版 provider coverage。该能力涉及浏览器/桌面 runtime、沙箱、权限和审计，应单独规划。
 
@@ -198,12 +200,12 @@ video.upscale   -> fal-ai/video-upscaler@fal
 
 ## 5. OpenRouter 的位置
 
-`openrouter.rs` 不进入最小 P0 集合。
+OpenRouter Provider Profile 不进入最小 P0 集合。
 
 它可以作为 P1 optional provider，用于：
 
 ```text
-openrouter.rs
+openrouter Provider Profile
   + long-tail llm.chat       # DeepSeek / Qwen / Mistral / Llama / xAI 等
   + rerank                   # 若不想直连 Cohere
   + cost fallback

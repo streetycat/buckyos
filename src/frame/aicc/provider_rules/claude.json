@@ -1,0 +1,22 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "claude",
+  "metadata_drivers": ["claude"],
+  "patterns": [
+    { "pattern": "*:reasoning-medium", "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } } },
+    { "pattern": "*opus*", "match_source": "origin_model_id", "pricing": { "input_token": 0.000015, "output_token": 0.000075 } },
+    { "pattern": "*haiku*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000008, "output_token": 0.000004 } }
+  ],
+  "defaults": {
+    "operations": {
+      "llm": "anthropic.messages.create",
+      "vision.caption": "anthropic.messages.create",
+      "vision.ocr": "anthropic.messages.create"
+    },
+    "pricing": { "input_token": 0.000003, "output_token": 0.000015 },
+    "estimated_latency_ms": 1800
+  }
+}

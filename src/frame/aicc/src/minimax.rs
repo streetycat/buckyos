@@ -8,8 +8,12 @@ use crate::claude_protocol::{
 use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_registry::DEFAULT_INVENTORY_REFRESH_INTERVAL;
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
-    ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
+    ProviderOrigin, ProviderTypeTrustedSource, QuotaState,
+};
+use crate::provider_rules::{
+    apply_builtin_provider_rules_to_inventory, load_builtin_provider_rules, resolve_provider_call,
+    AdapterOperationRegistry, ProviderCallResolveInput, ResolvedProviderCall,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -36,7 +40,7 @@ const DEFAULT_MINIMAX_MODELS: &str =
 pub struct MiniMaxInstanceConfig {
     pub provider_instance_name: String,
     pub provider_type: String,
-    pub provider_driver: String,
+    pub provider_profile_id: String,
     pub api_token: String,
     pub base_url: String,
     pub timeout_ms: u64,
@@ -72,11 +76,12 @@ impl MiniMaxProvider {
 
         let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
         let provider_instance_name = cfg.provider_instance_name.clone();
-        let provider_driver = cfg.provider_driver.clone();
+        let provider_profile_id = cfg.provider_profile_id.clone();
         let instance = ProviderInstance {
             provider_instance_name: provider_instance_name.clone(),
             provider_type: provider_type.clone(),
-            provider_driver: provider_driver.clone(),
+            provider_profile_id: provider_profile_id.clone(),
+            protocol_adapter_id: "anthropic-messages".to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -86,19 +91,17 @@ impl MiniMaxProvider {
         let requests = cfg
             .models
             .iter()
-            .map(|model| {
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
-                    .with_cost(Some(0.01))
-                    .with_latency(Some(1400))
-            })
+            .map(|model| DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm]))
             .collect::<Vec<_>>();
-        let inventory = resolve_driver_inventory(
+        let mut inventory = resolve_driver_inventory(
             provider_instance_name.as_str(),
             provider_type,
-            provider_driver.as_str(),
+            provider_profile_id.as_str(),
             requests.as_slice(),
             Some("settings-v1".to_string()),
         );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, "minimax")
+            .expect("builtin MiniMax provider rules must apply");
 
         Ok(Self {
             instance,
@@ -237,7 +240,6 @@ impl MiniMaxProvider {
             .flatten()
             .filter_map(|item| item.get("id").and_then(Value::as_str))
             .map(str::trim)
-            .filter(|model| model.starts_with("MiniMax-M2"))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         let models = normalize_model_list(models);
@@ -248,35 +250,24 @@ impl MiniMaxProvider {
         }
         let requests = models
             .iter()
-            .map(|model| {
-                DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm])
-                    .with_cost(Some(0.01))
-                    .with_latency(Some(1400))
-            })
+            .map(|model| DriverModelResolveRequest::new(model.clone(), vec![ApiType::Llm]))
             .collect::<Vec<_>>();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         models.hash(&mut hasher);
-        let inventory = resolve_driver_inventory(
+        let mut inventory = resolve_driver_inventory(
             self.instance.provider_instance_name.as_str(),
             self.instance.provider_type.clone(),
-            self.instance.provider_driver.as_str(),
+            self.instance.provider_profile_id.as_str(),
             requests.as_slice(),
             Some(format!("models-{}-{:x}", models.len(), hasher.finish())),
         );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, "minimax")
+            .expect("builtin MiniMax provider rules must apply");
         *self
             .inventory
             .write()
             .map_err(|_| anyhow!("minimax inventory lock poisoned"))? = inventory.clone();
         Ok(inventory)
-    }
-
-    fn price_per_1m_tokens(model: &str) -> (f64, f64) {
-        let lowered = model.to_ascii_lowercase();
-        if lowered.contains("highspeed") {
-            (0.60, 2.40)
-        } else {
-            (0.30, 1.20)
-        }
     }
 
     #[cfg(test)]
@@ -320,14 +311,26 @@ impl MiniMaxProvider {
     fn estimate_cost_for_usage(&self, model: &str, usage: &AiUsage) -> Option<AiCost> {
         let input_tokens = usage.input_tokens? as f64;
         let output_tokens = usage.output_tokens? as f64;
-        let (input_per_m, output_per_m) = Self::price_per_1m_tokens(model);
-        let amount = ((input_tokens / 1_000_000.0) * input_per_m)
-            + ((output_tokens / 1_000_000.0) * output_per_m);
+        let (currency, input_per_token, output_per_token) = self
+            .inventory
+            .read()
+            .ok()?
+            .models
+            .iter()
+            .find(|metadata| {
+                metadata.provider_model_id == model
+                    || metadata.provider_actual_model_id.as_deref() == Some(model)
+            })
+            .map(|metadata| {
+                (
+                    metadata.pricing.currency.clone(),
+                    metadata.pricing.input_token,
+                    metadata.pricing.output_token,
+                )
+            })?;
+        let amount = (input_tokens * input_per_token?) + (output_tokens * output_per_token?);
 
-        Some(AiCost {
-            amount,
-            currency: "USD".to_string(),
-        })
+        Some(AiCost { amount, currency })
     }
 
     fn classify_api_error(status: StatusCode, message: String) -> ProviderError {
@@ -439,18 +442,49 @@ impl Provider for MiniMaxProvider {
             .read()
             .map(|inventory| inventory.clone())
             .unwrap_or_else(|_| {
-                resolve_driver_inventory(
+                let mut inventory = resolve_driver_inventory(
                     self.instance.provider_instance_name.as_str(),
                     self.instance.provider_type.clone(),
-                    self.instance.provider_driver.as_str(),
+                    self.instance.provider_profile_id.as_str(),
                     self.inventory_requests.as_slice(),
                     Some("settings-v1".to_string()),
-                )
+                );
+                apply_builtin_provider_rules_to_inventory(&mut inventory, "minimax")
+                    .expect("builtin MiniMax provider rules must apply");
+                inventory
             })
     }
 
     fn shutdown(&self) {
         self.stop_inventory_refresh();
+    }
+
+    fn resolve_call(
+        &self,
+        metadata: &ModelMetadata,
+        method: &str,
+        api_type: &ApiType,
+    ) -> std::result::Result<ResolvedProviderCall, ProviderError> {
+        let rules = load_builtin_provider_rules("minimax")
+            .ok_or_else(|| ProviderError::fatal("missing builtin MiniMax provider rules"))?;
+        let operations = AdapterOperationRegistry::new(
+            ["anthropic.messages.create"],
+            [(ApiType::Llm, "anthropic.messages.create")],
+        );
+        resolve_provider_call(ProviderCallResolveInput {
+            metadata,
+            rules: &rules,
+            method,
+            api_type,
+            request_options: metadata
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| json!({})),
+            adapter_operations: &operations,
+            discovery_pricing: None,
+            instance_pricing: None,
+        })
+        .map_err(ProviderError::fatal)
     }
 
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
@@ -548,8 +582,8 @@ struct SettingsMiniMaxInstanceConfig {
     provider_instance_name: String,
     #[serde(default = "default_provider_type")]
     provider_type: String,
-    #[serde(default = "default_provider_driver")]
-    provider_driver: String,
+    #[serde(default = "default_provider_profile_id")]
+    provider_profile_id: String,
     #[serde(default, alias = "api_key", alias = "apiKey")]
     api_token: String,
     #[serde(default = "default_base_url")]
@@ -576,7 +610,7 @@ fn default_provider_type() -> String {
     "cloud_api".to_string()
 }
 
-fn default_provider_driver() -> String {
+fn default_provider_profile_id() -> String {
     "minimax".to_string()
 }
 
@@ -645,7 +679,7 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
         vec![SettingsMiniMaxInstanceConfig {
             provider_instance_name: default_instance_id(),
             provider_type: default_provider_type(),
-            provider_driver: default_provider_driver(),
+            provider_profile_id: default_provider_profile_id(),
             api_token: settings.api_token.clone(),
             base_url: default_base_url(),
             timeout_ms: default_timeout_ms(),
@@ -676,7 +710,7 @@ fn build_minimax_instances(settings: &MiniMaxSettings) -> Result<Vec<MiniMaxInst
         instances.push(MiniMaxInstanceConfig {
             provider_instance_name: raw_instance.provider_instance_name,
             provider_type: raw_instance.provider_type,
-            provider_driver: raw_instance.provider_driver,
+            provider_profile_id: raw_instance.provider_profile_id,
             api_token: if raw_instance.api_token.trim().is_empty() {
                 settings.api_token.clone()
             } else {
@@ -833,7 +867,7 @@ mod tests {
         let instances = build_minimax_instances(&settings).expect("instances should build");
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].provider_type, "cloud_api");
-        assert_eq!(instances[0].provider_driver, "minimax");
+        assert_eq!(instances[0].provider_profile_id, "minimax");
         assert_eq!(instances[0].default_model.as_deref(), Some("MiniMax-M2.7"));
     }
 
@@ -848,7 +882,7 @@ mod tests {
                     {
                         "provider_instance_name": "minimax-main",
                         "provider_type": "cloud_api",
-                        "provider_driver": "minimax",
+                        "provider_profile_id": "minimax",
                         "base_url": "https://api.minimaxi.com/anthropic/v1",
                         "models": ["MiniMax-M2.5"],
                         "default_model": "MiniMax-M2.5"
@@ -877,7 +911,7 @@ mod tests {
                 MiniMaxInstanceConfig {
                     provider_instance_name: "minimax-refresh".to_string(),
                     provider_type: "cloud_api".to_string(),
-                    provider_driver: "minimax".to_string(),
+                    provider_profile_id: "minimax".to_string(),
                     api_token: "test-token".to_string(),
                     base_url,
                     timeout_ms: DEFAULT_MINIMAX_TIMEOUT_MS,
@@ -901,10 +935,10 @@ mod tests {
             .models
             .iter()
             .any(|model| model.provider_model_id == "MiniMax-M2.7"));
-        assert!(!inventory
+        assert!(inventory
             .models
             .iter()
-            .any(|model| model.provider_model_id.contains("Hailuo")));
+            .any(|model| model.provider_model_id == "MiniMax-Hailuo-2.3"));
         provider.shutdown();
         assert!(provider.refresh_task.lock().unwrap().is_none());
     }

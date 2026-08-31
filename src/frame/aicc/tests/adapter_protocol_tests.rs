@@ -51,7 +51,7 @@ fn openai_provider(base_url: String, timeout_ms: u64) -> OpenAIProvider {
         OpenAIInstanceConfig {
             provider_instance_name: "openai-test".to_string(),
             provider_type: "cloud_api".to_string(),
-            provider_driver: "openai".to_string(),
+            provider_profile_id: "openai".to_string(),
             api_token: "token".to_string(),
             base_url,
             timeout_ms,
@@ -875,13 +875,16 @@ fn gemini_provider(base_url: String, timeout_ms: u64) -> GoogleGeminiProvider {
         GoogleGeminiInstanceConfig {
             provider_instance_name: "gemini-test".to_string(),
             provider_type: "cloud_api".to_string(),
-            provider_driver: "google-gemini".to_string(),
+            provider_profile_id: "google-gemini".to_string(),
             api_token: "token".to_string(),
             base_url,
             timeout_ms,
             models: vec!["gemini-2.5-flash".to_string()],
             default_model: Some("gemini-2.5-flash".to_string()),
-            image_models: vec!["gemini-2.5-flash-image-preview".to_string()],
+            image_models: vec![
+                "gemini-2.5-flash-image-preview".to_string(),
+                "gemini-3-pro-image-preview".to_string(),
+            ],
             default_image_model: Some("gemini-2.5-flash-image-preview".to_string()),
             features: vec!["plan".to_string()],
             alias_map: HashMap::new(),
@@ -896,7 +899,7 @@ fn claude_provider(base_url: String, timeout_ms: u64) -> ClaudeProvider {
         ClaudeInstanceConfig {
             provider_instance_name: "claude-test".to_string(),
             provider_type: "cloud_api".to_string(),
-            provider_driver: "claude".to_string(),
+            provider_profile_id: "claude".to_string(),
             api_token: "token".to_string(),
             base_url,
             timeout_ms,

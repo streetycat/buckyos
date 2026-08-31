@@ -1,0 +1,15 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "custom-openai-compatible",
+  "metadata_drivers": [],
+  "defaults": {
+    "operations": {
+      "llm": "chat.completions.create",
+      "vision.ocr": "chat.completions.create",
+      "vision.caption": "chat.completions.create"
+    }
+  }
+}

@@ -18,6 +18,10 @@
 - `aicc-models-todo.md`：模型管理后续设计任务。
 - `driver_metadata_update_protocol.md`：provider-driver metadata 的 NDN 增量更新、验证、LKGS 与生效协议。
 - `driver_metadata_update_storage.md`：更新水位、不可变对象和 activation 的持久化兼容格式。
+- `provider_profile_schema.md`：专用 Provider 与配置型 Provider 的边界讨论稿；配置仅用于小型兼容 Provider，包含空配置、metadata 候选、模型映射、价格和 operation 示例。
+- `provider_model_parameterization_todo.md`：盘点 Provider Rust 实现中的模型名特判，并列出 call plan、operation、请求参数、价格和各 Provider 的参数化改造 TODO。
+- `provider_architecture_durable_data_schema.md`：Issue #579 新 Provider 架构的持久数据边界，定义四类 catalog、Provider Instance 外部真相源和实例级 inventory LKGS。
+- `provider_ui_backend_mapping.md`：Provider catalog、Instance、inventory、trace 的前后端字段映射、状态和性能边界。
 - `aicc-upgrade-todo.md`：新 API 与模型体系升级设计任务。
 - `aicc改进.md`：AICC 改进方案记录。
 - `provider-driver-cloud-update-design.md`：provider-driver metadata 云更新详细设计。

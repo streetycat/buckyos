@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 1,
-  "provider_driver": "openai",
+  "model_driver_id": "openai",
   "revision_seq": 4,
   "required_features": [],
   "models": [
@@ -666,116 +666,97 @@
     {
       "name": "reasoning.low.gpt-5",
       "model_pattern": "gpt-5",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5-snapshot",
       "model_pattern": "gpt-5-20*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5-mini",
       "model_pattern": "gpt-5-mini*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5-nano",
       "model_pattern": "gpt-5-nano*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5-search-api",
       "model_pattern": "gpt-5-search-api*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.1",
       "model_pattern": "gpt-5.1*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.2",
       "model_pattern": "gpt-5.2",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.2-snapshot",
       "model_pattern": "gpt-5.2-20*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.3-codex",
       "model_pattern": "gpt-5.3-codex*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.4",
       "model_pattern": "gpt-5.4",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.4-snapshot",
       "model_pattern": "gpt-5.4-20*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.4-mini",
       "model_pattern": "gpt-5.4-mini*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.4-nano",
       "model_pattern": "gpt-5.4-nano*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.5",
       "model_pattern": "gpt-5.5",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.5-snapshot",
       "model_pattern": "gpt-5.5-20*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.low.gpt-5.6",
       "model_pattern": "gpt-5.6*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.high",
       "model_pattern": "gpt-5*",
-      "mount_suffix": "reasoning-high",
-      "provider_options": { "reasoning": { "effort": "high" } }
+      "mount_suffix": "reasoning-high"
     },
     {
       "name": "reasoning.low.o-series",
       "model_pattern": "o*",
-      "mount_suffix": "reasoning-low",
-      "provider_options": { "reasoning": { "effort": "low" } }
+      "mount_suffix": "reasoning-low"
     },
     {
       "name": "reasoning.high.o-series",
       "model_pattern": "o*",
-      "mount_suffix": "reasoning-high",
-      "provider_options": { "reasoning": { "effort": "high" } }
+      "mount_suffix": "reasoning-high"
     }
   ],
   "version_rules": [

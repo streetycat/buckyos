@@ -11,6 +11,11 @@ use crate::model_types::{
     ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
     ProviderOrigin, ProviderType, ProviderTypeTrustedSource, QuotaState,
 };
+use crate::provider_rules::{
+    apply_builtin_provider_rules_to_inventory, apply_provider_request_rules_for_identity,
+    load_builtin_provider_rules, resolve_provider_call, resolve_provider_pricing,
+    AdapterOperationRegistry, ProviderCallResolveInput, ResolvedProviderCall,
+};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose;
@@ -37,7 +42,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time;
 
 const SN_AI_PROVIDER_SETTINGS_KEY: &str = "sn-ai-provider";
-const SN_AI_PROVIDER_DRIVER: &str = "sn-ai-provider";
+const SN_AI_PROVIDER_PROFILE_ID: &str = "sn-ai-provider";
 const DEFAULT_SN_AI_PROVIDER_BASE_URL: &str = "https://sn.buckyos.ai/api/v1/ai/";
 const DEFAULT_SN_AI_PROVIDER_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_INVENTORY_REFRESH_INTERVAL_SECS: u64 = 300;
@@ -485,30 +490,6 @@ fn merge_sn_llm_options(
     Ok(ignored)
 }
 
-fn apply_sn_model_defaults(target: &mut Map<String, Value>, provider_model: &str) {
-    let model = provider_model.trim().to_ascii_lowercase();
-    if !(model.starts_with("gpt-5-nano") || model.starts_with("gpt-5-nono")) {
-        return;
-    }
-    target
-        .entry("reasoning".to_string())
-        .or_insert_with(|| json!({ "effort": "minimal" }));
-    if target.contains_key("verbosity") {
-        return;
-    }
-    match target.entry("text".to_string()) {
-        serde_json::map::Entry::Vacant(entry) => {
-            entry.insert(json!({ "verbosity": "low" }));
-        }
-        serde_json::map::Entry::Occupied(mut entry) => {
-            if let Some(text) = entry.get_mut().as_object_mut() {
-                text.entry("verbosity".to_string())
-                    .or_insert_with(|| Value::String("low".to_string()));
-            }
-        }
-    }
-}
-
 fn merge_sn_required_response_format(target: &mut Map<String, Value>, req: &AiMethodRequest) {
     if has_sn_text_format(target) {
         return;
@@ -575,34 +556,6 @@ fn normalize_sn_web_search_reasoning(target: &mut Map<String, Value>) -> bool {
     }
     *effort = Value::String("low".to_string());
     true
-}
-
-fn strip_sn_sampling_options(target: &mut Map<String, Value>, provider_model: &str) -> Vec<String> {
-    let model = provider_model.trim().to_ascii_lowercase();
-    if !model.starts_with("gpt-5") {
-        return vec![];
-    }
-    let is_old_gpt5 = model == "gpt-5"
-        || model.starts_with("gpt-5-")
-        || model.starts_with("gpt-5-mini")
-        || model.starts_with("gpt-5-nano");
-    let is_codex = model.contains("codex");
-    let reasoning_effort = target
-        .get("reasoning")
-        .and_then(Value::as_object)
-        .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
-    if !is_old_gpt5 && !is_codex && reasoning_effort.as_deref() == Some("none") {
-        return vec![];
-    }
-    let mut removed = vec![];
-    for key in ["temperature", "top_p", "logprobs", "top_logprobs"] {
-        if target.remove(key).is_some() {
-            removed.push(key.to_string());
-        }
-    }
-    removed
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -702,7 +655,7 @@ fn normalize_model_list(models: Vec<String>) -> Vec<String> {
 fn configured_model_ids() -> Vec<String> {
     let mut models = Vec::new();
     for api_type in sn_supported_api_types() {
-        for model in driver_metadata_model_ids(SN_AI_PROVIDER_DRIVER, api_type) {
+        for model in driver_metadata_model_ids(SN_AI_PROVIDER_PROFILE_ID, api_type) {
             if !models.contains(&model) {
                 models.push(model);
             }
@@ -797,7 +750,8 @@ impl SnAIProvider {
         let instance = ProviderInstance {
             provider_instance_name: cfg.provider_instance_name.clone(),
             provider_type: provider_type.clone(),
-            provider_driver: SN_AI_PROVIDER_DRIVER.to_string(),
+            provider_profile_id: SN_AI_PROVIDER_PROFILE_ID.to_string(),
+            protocol_adapter_id: "sn-ai-provider".to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -938,15 +892,36 @@ impl SnAIProvider {
         let mut inventory = resolve_driver_inventory(
             provider_instance_name,
             provider_type,
-            SN_AI_PROVIDER_DRIVER,
+            SN_AI_PROVIDER_PROFILE_ID,
             requests.as_slice(),
             revision,
         );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, SN_AI_PROVIDER_PROFILE_ID)
+            .expect("builtin SN AI Provider rules must apply");
         for model in &mut inventory.models {
             model.api_types.retain(is_supported_sn_api_type);
         }
         inventory.models.retain(|model| !model.api_types.is_empty());
         inventory
+    }
+
+    fn resolved_pricing_for_model(
+        &self,
+        model: &str,
+    ) -> Option<crate::provider_rules::ResolvedPricing> {
+        let inventory = self.inventory.read().ok()?;
+        let metadata = inventory.models.iter().find(|metadata| {
+            metadata.provider_model_id == model
+                || metadata.provider_actual_model_id.as_deref() == Some(model)
+        })?;
+        let rules = load_builtin_provider_rules(SN_AI_PROVIDER_PROFILE_ID)?;
+        Some(resolve_provider_pricing(
+            metadata,
+            &rules,
+            &json!({}),
+            None,
+            None,
+        ))
     }
 
     fn model_supports_responses_image_generation(&self, provider_model: &str) -> bool {
@@ -1023,20 +998,11 @@ impl SnAIProvider {
     }
 
     fn models_endpoint(&self) -> String {
-        if self.base_url.to_ascii_lowercase().ends_with("/responses") {
-            if let Some((prefix, _)) = self.base_url.rsplit_once('/') {
-                return format!("{}/models", prefix.trim_end_matches('/'));
-            }
-        }
         format!("{}/models", self.base_url.trim_end_matches('/'))
     }
 
     fn responses_endpoint(&self) -> String {
-        if self.base_url.to_ascii_lowercase().ends_with("/responses") {
-            self.base_url.clone()
-        } else {
-            format!("{}/responses", self.base_url.trim_end_matches('/'))
-        }
+        format!("{}/responses", self.base_url.trim_end_matches('/'))
     }
 
     fn images_generations_endpoint(&self) -> String {
@@ -1044,15 +1010,7 @@ impl SnAIProvider {
     }
 
     fn litellm_endpoint(&self, path: &str) -> String {
-        let root = if self.base_url.to_ascii_lowercase().ends_with("/responses") {
-            self.base_url
-                .rsplit_once('/')
-                .map(|(prefix, _)| prefix)
-                .unwrap_or(self.base_url.as_str())
-        } else {
-            self.base_url.as_str()
-        }
-        .trim_end_matches('/');
+        let root = self.base_url.trim_end_matches('/');
         if root.to_ascii_lowercase().ends_with("/v1") {
             format!("{}/{}", root, path.trim_start_matches('/'))
         } else {
@@ -1572,7 +1530,7 @@ impl SnAIProvider {
                 })
             })
         });
-        if !driver_model_has_specific_metadata(SN_AI_PROVIDER_DRIVER, model) {
+        if !driver_model_has_specific_metadata(SN_AI_PROVIDER_PROFILE_ID, model) {
             return None;
         }
         if let Some((currency, Some(input_price), Some(output_price), _)) = pricing.as_ref() {
@@ -1635,7 +1593,7 @@ impl SnAIProvider {
                     .iter()
                     .filter_map(|block| match block {
                         AiContent::ProviderState { provider, value }
-                            if provider.eq_ignore_ascii_case(SN_AI_PROVIDER_DRIVER) =>
+                            if provider.eq_ignore_ascii_case(SN_AI_PROVIDER_PROFILE_ID) =>
                         {
                             Some(value.clone())
                         }
@@ -1971,7 +1929,7 @@ impl SnAIProvider {
                         .iter()
                         .cloned()
                         .map(|value| AiContent::ProviderState {
-                            provider: SN_AI_PROVIDER_DRIVER.to_string(),
+                            provider: SN_AI_PROVIDER_PROFILE_ID.to_string(),
                             value,
                         }),
                 );
@@ -1992,7 +1950,7 @@ impl SnAIProvider {
                         .iter()
                         .cloned()
                         .map(|value| AiContent::ProviderState {
-                            provider: SN_AI_PROVIDER_DRIVER.to_string(),
+                            provider: SN_AI_PROVIDER_PROFILE_ID.to_string(),
                             value,
                         }),
                 );
@@ -2061,6 +2019,7 @@ impl SnAIProvider {
         ctx: &InvokeCtx,
         provider_model: &str,
         req: &AiMethodRequest,
+        provider_call: Option<&ResolvedProviderCall>,
     ) -> Result<ProviderStartResult, ProviderError> {
         let mut request_obj = Map::new();
         request_obj.insert(
@@ -2079,8 +2038,22 @@ impl SnAIProvider {
         if let Some(options) = req.payload.options.as_ref() {
             ignored_options.extend(merge_sn_llm_options(&mut request_obj, options)?);
         }
-        apply_sn_model_defaults(&mut request_obj, provider_model);
-        let stripped_options = strip_sn_sampling_options(&mut request_obj, provider_model);
+        let rules = load_builtin_provider_rules(SN_AI_PROVIDER_PROFILE_ID)
+            .ok_or_else(|| ProviderError::fatal("missing builtin sn-ai-provider rules"))?;
+        let mut request_value = Value::Object(std::mem::take(&mut request_obj));
+        let stripped_options = apply_provider_request_rules_for_identity(
+            provider_call
+                .map(|call| call.provider_model_id.as_str())
+                .unwrap_or(provider_model),
+            provider_call.and_then(|call| call.origin_model_id.as_deref()),
+            &rules,
+            &mut request_value,
+        )
+        .map_err(ProviderError::fatal)?;
+        request_obj = request_value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| ProviderError::fatal("provider request rules must produce an object"))?;
         if !stripped_options.is_empty() {
             info!(
                 "aicc.sn_ai_provider omitted incompatible llm options: provider_instance_name={} model={} trace_id={:?} omitted={:?}",
@@ -2197,7 +2170,7 @@ impl SnAIProvider {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             extra: Some(json!({
-                "provider": SN_AI_PROVIDER_DRIVER,
+                "provider": SN_AI_PROVIDER_PROFILE_ID,
                 "model": provider_model,
                 "latency_ms": latency_ms,
                 "provider_io": {
@@ -2800,7 +2773,9 @@ impl SnAIProvider {
             ),
             ..req.clone()
         };
-        let mut result = self.start_llm(ctx, provider_model, &rerank_req).await?;
+        let mut result = self
+            .start_llm(ctx, provider_model, &rerank_req, None)
+            .await?;
         if let ProviderStartResult::Immediate(summary) = &mut result {
             let text = summary.text_content();
             let rerank = serde_json::from_str::<Value>(&text)
@@ -2893,7 +2868,7 @@ impl SnAIProvider {
             message: AiMessage::new(AiRole::Assistant, vec![artifact.into_content()]),
             finish_reason: Some("stop".to_string()),
             extra: Some(json!({
-                "provider": SN_AI_PROVIDER_DRIVER,
+                "provider": SN_AI_PROVIDER_PROFILE_ID,
                 "model": provider_model,
                 "latency_ms": latency_ms
             })),
@@ -3029,7 +3004,10 @@ impl SnAIProvider {
         vision_req.payload.resources.clear();
         vision_req.payload.input_json = None;
         vision_req.payload.options = None;
-        match self.start_llm(ctx, provider_model, &vision_req).await? {
+        match self
+            .start_llm(ctx, provider_model, &vision_req, None)
+            .await?
+        {
             ProviderStartResult::Immediate(mut response) => {
                 let key = if method == ai_methods::VISION_OCR {
                     "ocr"
@@ -3204,6 +3182,10 @@ impl SnAIProvider {
         let provider_model = provider_model.to_string();
         let method = method.to_string();
         let request = req.clone();
+        let video_cost = self
+            .resolved_pricing_for_model(provider_model.as_str())
+            .and_then(|pricing| pricing.matched_amount)
+            .unwrap_or(0.4);
         tokio::spawn(async move {
             let result = provider
                 .finish_video(
@@ -3213,6 +3195,7 @@ impl SnAIProvider {
                     &video_id,
                     job,
                     started_at,
+                    video_cost,
                 )
                 .await;
             emit_background_provider_result(sink, &task_id, &request, result).await;
@@ -3228,6 +3211,7 @@ impl SnAIProvider {
         video_id: &str,
         mut job: Value,
         started_at: std::time::Instant,
+        video_cost: f64,
     ) -> Result<AiResponse, ProviderError> {
         loop {
             match job
@@ -3294,17 +3278,13 @@ impl SnAIProvider {
             message: AiResponse::message_from_parts(None, vec![], vec![artifact]),
             usage: Some(AiUsage::request_units(1)),
             cost: Some(buckyos_api::AiCost {
-                amount: if provider_model.contains("pro") {
-                    1.2
-                } else {
-                    0.4
-                },
+                amount: video_cost,
                 currency: "USD".to_string(),
             }),
             finish_reason: Some("stop".to_string()),
             provider_task_ref: Some(video_id.to_string()),
             extra: Some(json!({
-                "provider": SN_AI_PROVIDER_DRIVER,
+                "provider": SN_AI_PROVIDER_PROFILE_ID,
                 "method": method,
                 "model": provider_model,
                 "latency_ms": started_at.elapsed().as_millis() as u64,
@@ -3389,7 +3369,7 @@ impl SnAIProvider {
             message: AiResponse::message_from_parts(None, vec![], artifacts),
             finish_reason: Some("stop".to_string()),
             extra: Some(json!({
-                "provider": SN_AI_PROVIDER_DRIVER,
+                "provider": SN_AI_PROVIDER_PROFILE_ID,
                 "model": provider_model,
                 "latency_ms": latency_ms,
                 "provider_io": { "output": body }
@@ -3546,7 +3526,7 @@ impl SnAIProvider {
                 .map(str::to_string),
             provider_task_ref: body.get("id").and_then(Value::as_str).map(str::to_string),
             extra: Some(json!({
-                "provider": SN_AI_PROVIDER_DRIVER,
+                "provider": SN_AI_PROVIDER_PROFILE_ID,
                 "model": provider_model,
                 "latency_ms": latency_ms,
                 "provider_io": {
@@ -3574,6 +3554,34 @@ fn inventory_revision(models: &[String]) -> String {
     format!("sn-ai-provider-{:x}", hasher.finish())
 }
 
+fn sn_adapter_operations() -> AdapterOperationRegistry {
+    AdapterOperationRegistry::new(
+        [
+            "responses.create",
+            "images.generate",
+            "images.edit",
+            "embeddings.create",
+            "audio.speech.create",
+            "audio.transcriptions.create",
+            "videos.create",
+        ],
+        [
+            (ApiType::Llm, "responses.create"),
+            (ApiType::VisionOcr, "responses.create"),
+            (ApiType::VisionCaption, "responses.create"),
+            (ApiType::Rerank, "responses.create"),
+            (ApiType::ImageTextToImage, "images.generate"),
+            (ApiType::ImageToImage, "images.edit"),
+            (ApiType::ImageInpaint, "images.edit"),
+            (ApiType::Embedding, "embeddings.create"),
+            (ApiType::AudioTts, "audio.speech.create"),
+            (ApiType::AudioAsr, "audio.transcriptions.create"),
+            (ApiType::VideoTextToVideo, "videos.create"),
+            (ApiType::VideoImageToVideo, "videos.create"),
+        ],
+    )
+}
+
 #[async_trait]
 impl Provider for SnAIProvider {
     fn inventory(&self) -> ProviderInventory {
@@ -3585,7 +3593,8 @@ impl Provider for SnAIProvider {
                 ProviderInventory {
                     provider_instance_name: self.instance.provider_instance_name.clone(),
                     provider_type: self.provider_type.clone(),
-                    provider_driver: SN_AI_PROVIDER_DRIVER.to_string(),
+                    provider_profile_id: SN_AI_PROVIDER_PROFILE_ID.to_string(),
+                    protocol_adapter_id: "sn-ai-provider".to_string(),
                     provider_origin: ProviderOrigin::SystemConfig,
                     provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
                     provider_type_revision: None,
@@ -3605,6 +3614,34 @@ impl Provider for SnAIProvider {
         self.stop_inventory_refresh();
     }
 
+    fn resolve_call(
+        &self,
+        metadata: &ModelMetadata,
+        method: &str,
+        api_type: &ApiType,
+    ) -> std::result::Result<ResolvedProviderCall, ProviderError> {
+        let mut rules = load_builtin_provider_rules(SN_AI_PROVIDER_PROFILE_ID)
+            .ok_or_else(|| ProviderError::fatal("missing builtin sn-ai-provider rules"))?;
+        rules.defaults.request_rules.clear();
+        for rule in rules.models.iter_mut().chain(rules.patterns.iter_mut()) {
+            rule.request_rules.clear();
+        }
+        resolve_provider_call(ProviderCallResolveInput {
+            metadata,
+            rules: &rules,
+            method,
+            api_type,
+            request_options: metadata
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| json!({})),
+            adapter_operations: &sn_adapter_operations(),
+            discovery_pricing: None,
+            instance_pricing: None,
+        })
+        .map_err(ProviderError::fatal)
+    }
+
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
         let usage = AiUsage {
             input_tokens: Some(input.input_tokens.max(1)),
@@ -3618,7 +3655,7 @@ impl Provider for SnAIProvider {
             .map(|cost| cost.amount)
             .or_else(|| {
                 max_driver_metadata_cost(
-                    SN_AI_PROVIDER_DRIVER,
+                    SN_AI_PROVIDER_PROFILE_ID,
                     &input.api_type,
                     usage.input_tokens.unwrap_or_default(),
                     usage.output_tokens.unwrap_or_default(),
@@ -3650,8 +3687,13 @@ impl Provider for SnAIProvider {
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
         match req.method.as_str() {
             ai_methods::LLM_CHAT => {
-                self.start_llm(&ctx, provider_model.as_str(), &req.request)
-                    .await
+                self.start_llm(
+                    &ctx,
+                    provider_model.as_str(),
+                    &req.request,
+                    req.provider_call.as_ref(),
+                )
+                .await
             }
             ai_methods::IMAGE_TXT2IMG => {
                 self.start_text2image(&ctx, provider_model.as_str(), &req.request)
@@ -3971,7 +4013,7 @@ mod tests {
             }))
             .expect("inventory");
 
-        assert_eq!(inventory.provider_driver, SN_AI_PROVIDER_DRIVER);
+        assert_eq!(inventory.provider_profile_id, SN_AI_PROVIDER_PROFILE_ID);
         assert!(inventory
             .models
             .iter()
@@ -4264,7 +4306,7 @@ mod tests {
             SnAIProvider::message_from_response_body(&body, Some("hello".to_string()), calls);
         assert!(message.content.iter().any(|content| matches!(
             content,
-            AiContent::ProviderState { provider, .. } if provider == SN_AI_PROVIDER_DRIVER
+            AiContent::ProviderState { provider, .. } if provider == SN_AI_PROVIDER_PROFILE_ID
         )));
 
         let request = AiMethodRequest::new(

@@ -1,0 +1,18 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "minimax",
+  "metadata_drivers": ["minimax"],
+  "patterns": [
+    { "pattern": "*:highspeed", "provider_options": { "latency_preference": "highspeed" } },
+    { "pattern": "*highspeed*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000006, "output_token": 0.0000024 } },
+    { "pattern": "MiniMax-M2*", "match_source": "origin_model_id", "operations": { "llm.chat": "anthropic.messages.create" }, "pricing": { "input_token": 0.0000003, "output_token": 0.0000012 } }
+  ],
+  "defaults": {
+    "operations": { "llm": "anthropic.messages.create" },
+    "pricing": { "input_token": 0.0000003, "output_token": 0.0000012 },
+    "estimated_latency_ms": 1400
+  }
+}

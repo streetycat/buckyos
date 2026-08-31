@@ -1708,7 +1708,9 @@ pub struct RouteResolveResponse {
     pub selected_exact_model: String,
     pub provider_instance_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_driver: Option<String>,
+    pub provider_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_adapter_id: Option<String>,
     pub provider_model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_options: Option<Value>,

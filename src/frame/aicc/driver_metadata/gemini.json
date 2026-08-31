@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 4,
-  "provider_driver": "google-gemini",
+  "model_driver_id": "google-gemini",
   "revision_seq": 7,
   "required_features": [],
   "models": [
@@ -80,9 +80,6 @@
     },
     {
       "id": "gemini-omni-flash-preview",
-      "provider_options": {
-        "protocol": "interactions"
-      },
       "api_types": [
         "video.txt2video",
         "video.img2video",
@@ -110,9 +107,6 @@
     },
     {
       "id": "veo-3.1-generate-preview",
-      "provider_options": {
-        "protocol": "predict_long_running"
-      },
       "api_types": [
         "video.txt2video",
         "video.img2video",
@@ -175,9 +169,6 @@
     },
     {
       "pattern": "gemini-omni-*",
-      "provider_options": {
-        "protocol": "interactions"
-      },
       "api_types": [
         "video.txt2video",
         "video.img2video",
@@ -300,9 +291,6 @@
     },
     {
       "pattern": "veo-3.1-*",
-      "provider_options": {
-        "protocol": "predict_long_running"
-      },
       "api_types": [
         "video.txt2video",
         "video.img2video",
@@ -398,9 +386,6 @@
     },
     {
       "pattern": "gemini-3.5-transcribe",
-      "provider_options": {
-        "protocol": "interactions"
-      },
       "api_types": [
         "audio.asr"
       ],

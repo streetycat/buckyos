@@ -31,7 +31,7 @@ AICC settings 中显式启用更新源：
 ```text
 /aicc/driver-metadata/index.json
 /aicc/driver-metadata/v1/manifest-<revision_seq>.json
-/aicc/driver-metadata/v1/providers/<provider_driver>-<revision_seq>.json
+/aicc/driver-metadata/v1/providers/<model_driver_id>-<revision_seq>.json
 ```
 
 发布目录由 `NdnDirServer` 扫描、对象化并签发 PathObject。发布顺序必须是 provider 文件、manifest、index；index 最后更新。
@@ -81,7 +81,7 @@ PathObject 的签名、host、path 和 `exp` 由 NDN SDK 验证，AICC 不另设
   "required_features": [],
   "files": [
     {
-      "provider_driver": "openai",
+      "model_driver_id": "openai",
       "path": "v1/providers/openai-18.json",
       "schema_version": 4,
       "revision_seq": 18,
@@ -90,14 +90,14 @@ PathObject 的签名、host、path 和 `exp` 由 NDN SDK 验证，AICC 不另设
   ],
   "tombstones": [
     {
-      "provider_driver": "removed-provider",
+      "model_driver_id": "removed-provider",
       "revision_seq": 7
     }
   ]
 }
 ```
 
-- `files` 是该 revision 的完整 active provider 集合，`provider_driver` 唯一。
+- `files` 是该 revision 的完整 active Model Driver 集合，`model_driver_id` 唯一。
 - 未变化文件的 `revision_seq` 和 `obj_id` 必须保持不变。
 - 新增 provider 只增加一项；修改 provider 只提高该项 revision 并更换 ObjId。
 - 删除必须从 `files` 移除并增加更高 revision 的 tombstone；无 tombstone 的缺失视为损坏 manifest。tombstone 集合是累积集合，不能在后续 manifest 中无故消失或降低 revision。
@@ -110,7 +110,7 @@ PathObject 的签名、host、path 和 `exp` 由 NDN SDK 验证，AICC 不另设
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 0,
-  "provider_driver": "openai",
+  "model_driver_id": "openai",
   "revision_seq": 18,
   "required_features": [],
   "models": [],
@@ -121,9 +121,9 @@ PathObject 的签名、host、path 和 `exp` 由 NDN SDK 验证，AICC 不另设
 }
 ```
 
-文件内 `provider_driver`、`schema_version`、`revision_seq` 必须与 manifest 项一致。未知字段以及无效的 model id/pattern、variant、mount、token limit、成本和质量值均 fail-closed。`schema_revision` 可以增加具有明确缺省语义的可选字段；需要新解释能力的变化必须同时加入 `required_features`。不兼容结构变化提升 `schema_version`。
+文件内 `model_driver_id`、`schema_version`、`revision_seq` 必须与 manifest 项一致。未知字段以及无效的 model id/pattern、variant、mount、token limit、成本和质量值均 fail-closed。`schema_revision` 可以增加具有明确缺省语义的可选字段；需要新解释能力的变化必须同时加入 `required_features`。不兼容结构变化提升 `schema_version`。
 
-协议不限制 `models`、`patterns`、`variants`、`version_rules`、`origin_mappings` 的条目数量，容量边界只由本协议的文件字节上限约束。客户端必须在进程内为 exact model 建立索引、复用已编译的 origin mapping，并避免在每个模型解析时复制完整 variants 或 version rules 集合；这些运行时索引属于可丢弃状态，不进入持久化格式。
+协议不限制 `models`、`patterns`、`variants`、`version_rules` 的条目数量，容量边界只由本协议的文件字节上限约束。客户端必须在进程内为 exact model 建立索引，并避免在每个模型解析时复制完整 variants 或 version rules 集合；这些运行时索引属于可丢弃状态，不进入持久化格式。Provider 渠道映射、operation、请求改写与价格规则属于 Provider Rules，不进入 Model Driver Metadata。
 
 ## 6. 严格下载
 

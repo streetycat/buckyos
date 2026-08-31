@@ -1,41 +1,39 @@
 import { Cloud, Cpu, Globe, Network, Zap, Server } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import type { ProviderType } from '../../../../../api/aicc_mgr'
+import type { KnownProviderProfile, ProviderType } from '../../../../../api/aicc_mgr'
 
-const PROVIDER_TYPES: {
-  type: ProviderType
-  name: string
-  desc: string
-  icon: typeof Network
-  recommended?: boolean
-}[] = [
-  { type: 'sn_router', name: 'SN Router', desc: 'System default AI router, suitable for most users', icon: Network, recommended: true },
-  { type: 'openai', name: 'OpenAI', desc: 'GPT series models', icon: Zap },
-  { type: 'anthropic', name: 'Anthropic', desc: 'Claude series models', icon: Cpu },
-  { type: 'google', name: 'Google', desc: 'Gemini series models', icon: Globe },
-  { type: 'openrouter', name: 'OpenRouter', desc: 'Multi-model aggregation router', icon: Cloud },
-  { type: 'custom', name: 'Custom', desc: 'Custom API endpoint, supports OpenAI/Anthropic/Google protocol', icon: Server },
-]
+const PROVIDER_ICONS: Record<ProviderType, typeof Network> = {
+  sn_router: Network,
+  openai: Zap,
+  anthropic: Cpu,
+  google: Globe,
+  openrouter: Cloud,
+  minimax: Cpu,
+  fal: Cloud,
+  custom: Server,
+}
 
 interface StepChooseTypeProps {
   selected: ProviderType | null
   onSelect: (type: ProviderType) => void
   hasManagedSnProvider: boolean
+  profiles: KnownProviderProfile[]
 }
 
-export function StepChooseType({ selected, onSelect, hasManagedSnProvider }: StepChooseTypeProps) {
+export function StepChooseType({ selected, onSelect, hasManagedSnProvider, profiles }: StepChooseTypeProps) {
   const { t } = useI18n()
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-      {PROVIDER_TYPES.map((item) => {
-        const active = selected === item.type
-        const isSnRouter = item.type === 'sn_router'
+      {profiles.map((profile) => {
+        const active = selected === profile.provider_type
+        const isSnRouter = profile.provider_type === 'sn_router'
+        const Icon = PROVIDER_ICONS[profile.provider_type]
         return (
           <button
-            key={item.type}
+            key={profile.provider_profile_id}
             type="button"
-            onClick={() => onSelect(item.type)}
+            onClick={() => onSelect(profile.provider_type)}
             disabled={isSnRouter && !hasManagedSnProvider}
             className="flex flex-col gap-2 p-4 rounded-xl text-left transition-all disabled:cursor-not-allowed"
             style={{
@@ -45,11 +43,11 @@ export function StepChooseType({ selected, onSelect, hasManagedSnProvider }: Ste
             }}
           >
             <div className="flex items-center gap-2">
-              <item.icon size={20} style={{ color: active ? 'var(--cp-accent)' : 'var(--cp-muted)' }} />
+              <Icon size={20} style={{ color: active ? 'var(--cp-accent)' : 'var(--cp-muted)' }} />
               <span className="text-sm font-medium" style={{ color: 'var(--cp-text)' }}>
-                {item.name}
+                {profile.display_name}
               </span>
-              {(item.recommended || isSnRouter) && (
+              {isSnRouter && (
                 <span
                   className="text-[10px] px-1.5 py-0.5 rounded font-medium"
                   style={{ background: 'var(--cp-accent)', color: '#fff' }}
@@ -58,7 +56,7 @@ export function StepChooseType({ selected, onSelect, hasManagedSnProvider }: Ste
                     ? hasManagedSnProvider
                       ? t('aiCenter.wizard.systemManaged', 'System managed')
                       : t('aiCenter.wizard.activationRequired', 'Activation required')
-                    : t('aiCenter.wizard.recommended', 'Recommended')}
+                    : ''}
                 </span>
               )}
             </div>
@@ -67,7 +65,7 @@ export function StepChooseType({ selected, onSelect, hasManagedSnProvider }: Ste
                 ? hasManagedSnProvider
                   ? t('aiCenter.wizard.snAlreadyManaged', 'Configured automatically from the current Zone SN settings.')
                   : t('aiCenter.wizard.snActivateFirst', 'Activate SN during BuckyOS setup to enable this system provider.')
-                : item.desc}
+                : `${profile.protocol_adapter_id} · ${profile.metadata_drivers.join(', ') || t('aiCenter.wizard.conservativeModels', 'Conservative model discovery')}`}
             </span>
           </button>
         )

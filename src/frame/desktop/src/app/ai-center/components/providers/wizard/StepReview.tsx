@@ -15,6 +15,8 @@ const defaultNames: Record<string, string> = {
   anthropic: 'Anthropic',
   google: 'Google AI',
   openrouter: 'OpenRouter',
+  minimax: 'MiniMax',
+  fal: 'fal.ai',
   custom: '',
 }
 

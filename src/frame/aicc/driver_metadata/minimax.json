@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-driver-metadata",
   "schema_version": 4,
   "schema_revision": 0,
-  "provider_driver": "minimax",
+  "model_driver_id": "minimax",
   "revision_seq": 1,
   "required_features": [],
   "models": [],
@@ -46,8 +46,7 @@
   "variants": [
     {
       "name": "highspeed",
-      "mount_suffix": "highspeed",
-      "provider_options": { "latency_preference": "highspeed" }
+      "mount_suffix": "highspeed"
     }
   ],
   "signature": null

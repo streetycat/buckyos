@@ -133,7 +133,8 @@ RouteResolveRequest
 RouteResolveResponse
   selected_exact_model
   provider_instance_name
-  provider_driver
+  provider_profile_id
+  protocol_adapter_id
   provider_model_id
   provider_options
   enabled_capabilities

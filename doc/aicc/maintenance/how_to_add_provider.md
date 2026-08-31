@@ -15,7 +15,8 @@ Provider 代码主要落在 `src/frame/aicc/src/`。每个 Provider 需要实现
 
 - `provider_instance_name`：实例唯一名，例如 `openai-primary`
 - `provider_type`：可信部署类型，例如 `cloud_api`、`local_inference`、`proxy_unknown`
-- `provider_driver`：厂商或适配器名，例如 `openai`、`claude`、`google-gemini`、`minimax`
+- `provider_profile_id`：Provider 渠道规则标识，例如 `openai`、`openrouter`、`claude`、`google-gemini`、`minimax`
+- `protocol_adapter_id`：线上协议适配器标识，例如 `openai-compatible`、`anthropic-messages`
 - `models[]`：该实例声明的实体模型清单
 
 每个模型必须能形成精确模型名：
@@ -55,7 +56,7 @@ claude-sonnet-4.5@claude-main
 ```rust
 provider_instance_name
 provider_type
-provider_driver
+provider_profile_id
 base_url
 timeout_ms
 models
@@ -76,10 +77,9 @@ base_url
 Settings 解析建议：
 
 - 支持 `enabled=false` 时返回 `Ok(0)` 或 `Ok(None)`
-- 支持 `api_key` / `api_token` 兼容别名
-- 支持 `instance_id` 作为 `provider_instance_name` 的旧字段兼容，但新文档和新配置统一写 `provider_instance_name`
+- 使用该 Provider settings schema 规定的凭据字段
 - 对空模型名、重复模型名做清洗
-- 不要把厂商名写进 `provider_type`；厂商名放 `provider_driver`
+- 不要把厂商名写进 `provider_type`；渠道规则放 `provider_profile_id`
 
 ### 步骤 2：构建 ProviderInventory
 
@@ -101,7 +101,7 @@ provider_model_metadata(
     provider_instance_name,
     provider_model_id,
     vec![ApiType::LlmChat],
-    llm_logical_mounts(provider_driver, provider_model_id),
+    llm_logical_mounts(model_driver_id, provider_model_id),
 )
 ```
 
@@ -115,9 +115,9 @@ provider_model_metadata(
 
 AICC 会把多个 Provider 的 inventory 汇入 `ModelRegistry`，同一个逻辑模型名可以产生多个候选。
 
-> **能力 metadata 优先走 driver metadata resolver，而不是 Provider 自声明。** Provider 自发现只需负责发现 `provider_model_id`（例如 OpenAI 通过 `/models` 报告模型列表）；`metadata_resolver.rs` 再按 driver metadata（`openai.json` / `claude.json` / `gemini.json` 对应的 gemini / `fal.json` / `minimax.json`）把 model id 转成最终 `ModelMetadata` 的 `capabilities` / `logical_mounts` / `variants`。匹配优先级：exact `models` → `patterns` → `defaults` → conservative fallback；override 链：builtin → remote cache → local override → system-config override。unknown model 保守对待，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 见 `doc/aicc/driver_metadata_schema.md`。新接入 Provider 应把按模型名细分能力的规则收编到 driver metadata（参考 `claude.rs` 的 classifier 收编路径），而不是写死在 adapter 里，也不再依赖 legacy `ProviderInstance.features`。
+> **能力 metadata 优先走 Model Driver resolver，而不是 Provider 自声明。** Provider 自发现只需负责发现 `provider_model_id`（例如 OpenAI 通过 `/models` 报告模型列表）；Provider Rules 先解析上游 origin 和候选 `model_driver_id`，`metadata_resolver.rs` 再按 Model Driver Metadata 把 model id 转成最终 `ModelMetadata` 的 `capabilities` / `logical_mounts` / `variants`。unknown model 保守对待，不默认声明 `tool_call` / `web_search` / `vision` / `json_schema`。schema 见 `doc/aicc/driver_metadata_schema.md`。
 >
-> reasoning effort 等档位用 driver metadata 的 `variants` 表达（展开成 `gpt-5.1:reasoning-high@instance` 这类带 variant 的精确模型 + 预置 `provider_options`），不要做成普通请求参数。
+> Provider 渠道映射、operation、请求改写、价格以及 reasoning effort 等 Provider 参数由 Provider Rules 表达，不能写入 Model Driver Metadata，也不能在 adapter 中按模型名前缀分支。
 
 ### 步骤 3：实现协议转换层
 
@@ -209,7 +209,7 @@ center
       {
         "provider_instance_name": "myprovider-primary",
         "provider_type": "cloud_api",
-        "provider_driver": "myprovider",
+        "provider_profile_id": "myprovider",
         "base_url": "https://api.example.com/v1",
         "timeout_ms": 60000,
         "models": ["model-a", "model-b"],
@@ -255,7 +255,7 @@ center
 - `api_token` / `api_key`
 - `instances[0].provider_instance_name`
 - `instances[0].provider_type`
-- `instances[0].provider_driver`
+- `instances[0].provider_profile_id`
 - `instances[0].base_url`
 - `instances[0].models`
 - `instances[0].default_model`

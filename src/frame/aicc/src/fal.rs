@@ -6,8 +6,13 @@ use crate::aicc::{
 use crate::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use crate::model_registry::DEFAULT_INVENTORY_REFRESH_INTERVAL;
 use crate::model_types::{
-    ApiType, CostEstimateInput, CostEstimateOutput, PricingMode, ProviderInventory, ProviderOrigin,
-    ProviderTypeTrustedSource, QuotaState,
+    ApiType, CostEstimateInput, CostEstimateOutput, ModelMetadata, PricingMode, ProviderInventory,
+    ProviderOrigin, ProviderTypeTrustedSource, QuotaState,
+};
+use crate::provider_rules::{
+    apply_builtin_provider_rules_to_inventory, builtin_provider_model_ids_for_method,
+    load_builtin_provider_rules, resolve_provider_call, AdapterOperationRegistry,
+    ProviderCallResolveInput, ResolvedProviderCall,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -29,12 +34,7 @@ use tokio::time;
 const FAL_PROVIDER_SETTINGS_KEY: &str = "fal";
 const DEFAULT_FAL_BASE_URL: &str = "https://fal.run";
 const DEFAULT_FAL_TIMEOUT_MS: u64 = 600_000;
-const FAL_PROVIDER_DRIVER: &str = "fal";
-
-const DEFAULT_IMAGE_UPSCALE_MODEL: &str = "fal-ai/esrgan";
-const DEFAULT_IMAGE_BG_REMOVE_MODEL: &str = "fal-ai/imageutils/rembg";
-const DEFAULT_AUDIO_ENHANCE_MODEL: &str = "fal-ai/deepfilternet3";
-const DEFAULT_VIDEO_UPSCALE_MODEL: &str = "fal-ai/video-upscaler";
+const FAL_PROVIDER_PROFILE_ID: &str = "fal";
 
 #[derive(Debug, Clone)]
 pub struct FalInstanceConfig {
@@ -75,12 +75,13 @@ impl FalProvider {
 
         let provider_type = provider_type_from_settings(cfg.provider_type.as_str());
         let provider_instance_name = cfg.provider_instance_name.clone();
-        let provider_driver = FAL_PROVIDER_DRIVER.to_string();
+        let provider_profile_id = FAL_PROVIDER_PROFILE_ID.to_string();
 
         let instance = ProviderInstance {
             provider_instance_name: provider_instance_name.clone(),
             provider_type: provider_type.clone(),
-            provider_driver: provider_driver.clone(),
+            provider_profile_id: provider_profile_id.clone(),
+            protocol_adapter_id: "fal".to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -90,41 +91,39 @@ impl FalProvider {
 
         let mut requests = Vec::<DriverModelResolveRequest>::new();
         for model_id in cfg.image_upscale_models.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageUpscale])
-                    .with_cost(Some(0.05))
-                    .with_latency(Some(8000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model_id.clone(),
+                vec![ApiType::ImageUpscale],
+            ));
         }
         for model_id in cfg.image_bg_remove_models.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::ImageBgRemove])
-                    .with_cost(Some(0.01))
-                    .with_latency(Some(4000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model_id.clone(),
+                vec![ApiType::ImageBgRemove],
+            ));
         }
         for model_id in cfg.audio_enhance_models.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::AudioEnhance])
-                    .with_cost(Some(0.02))
-                    .with_latency(Some(20_000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model_id.clone(),
+                vec![ApiType::AudioEnhance],
+            ));
         }
         for model_id in cfg.video_upscale_models.iter() {
-            requests.push(
-                DriverModelResolveRequest::new(model_id.clone(), vec![ApiType::VideoUpscale])
-                    .with_cost(Some(0.50))
-                    .with_latency(Some(120_000)),
-            );
+            requests.push(DriverModelResolveRequest::new(
+                model_id.clone(),
+                vec![ApiType::VideoUpscale],
+            ));
         }
 
-        let inventory = resolve_driver_inventory(
+        let mut inventory = resolve_driver_inventory(
             provider_instance_name.as_str(),
             provider_type,
-            provider_driver.as_str(),
+            provider_profile_id.as_str(),
             requests.as_slice(),
             Some("settings-v1".to_string()),
         );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, "fal")
+            .expect("builtin fal provider rules must apply");
 
         Ok(Self {
             instance,
@@ -238,13 +237,15 @@ impl FalProvider {
     }
 
     async fn refresh_inventory_once(&self) -> Result<ProviderInventory> {
-        let inventory = resolve_driver_inventory(
+        let mut inventory = resolve_driver_inventory(
             self.instance.provider_instance_name.as_str(),
             self.instance.provider_type.clone(),
-            self.instance.provider_driver.as_str(),
+            self.instance.provider_profile_id.as_str(),
             self.inventory_requests.as_slice(),
             Some("settings-v1".to_string()),
         );
+        apply_builtin_provider_rules_to_inventory(&mut inventory, "fal")
+            .expect("builtin fal provider rules must apply");
         *self
             .inventory
             .write()
@@ -343,7 +344,7 @@ impl FalProvider {
     }
 
     fn build_request_body(
-        method: &str,
+        operation: &str,
         req: &AiMethodRequest,
     ) -> Result<Map<String, Value>, ProviderError> {
         let mut body = Map::<String, Value>::new();
@@ -373,13 +374,13 @@ impl FalProvider {
             }
         }
 
-        let (input_key, canonical_key) = match method {
-            ai_methods::IMAGE_UPSCALE | ai_methods::IMAGE_BG_REMOVE => ("image_url", "image"),
-            ai_methods::AUDIO_ENHANCE => ("audio_url", "audio"),
-            ai_methods::VIDEO_UPSCALE => ("video_url", "video"),
+        let (input_key, canonical_key) = match operation {
+            "fal.image.upscale" | "fal.image.bg_remove" => ("image_url", "image"),
+            "fal.audio.enhance" => ("audio_url", "audio"),
+            "fal.video.upscale" => ("video_url", "video"),
             other => {
                 return Err(ProviderError::fatal(format!(
-                    "fal provider does not support method '{}'",
+                    "fal provider does not support operation '{}'",
                     other
                 )))
             }
@@ -401,7 +402,7 @@ impl FalProvider {
                 .ok_or_else(|| {
                     ProviderError::fatal(format!(
                         "fal {} requires canonical payload.input_json.{} or resources[0]",
-                        method, canonical_key
+                        operation, canonical_key
                     ))
                 })?;
             let url = resource_to_url(&resource).ok_or_else(|| {
@@ -418,6 +419,7 @@ impl FalProvider {
     async fn run_method(
         &self,
         ctx: &crate::aicc::InvokeCtx,
+        operation: &str,
         method: &str,
         provider_model: &str,
         req: &AiMethodRequest,
@@ -428,7 +430,7 @@ impl FalProvider {
             ));
         }
 
-        let body = Self::build_request_body(method, req)?;
+        let body = Self::build_request_body(operation, req)?;
         let url = format!(
             "{}/{}",
             self.base_url,
@@ -481,13 +483,21 @@ impl FalProvider {
             )));
         }
 
-        let cost_amount = match method {
-            ai_methods::IMAGE_UPSCALE => 0.05,
-            ai_methods::IMAGE_BG_REMOVE => 0.01,
-            ai_methods::AUDIO_ENHANCE => 0.02,
-            ai_methods::VIDEO_UPSCALE => 0.50,
-            _ => 0.0,
-        };
+        let cost_amount = self
+            .inventory
+            .read()
+            .ok()
+            .and_then(|inventory| {
+                inventory
+                    .models
+                    .iter()
+                    .find(|metadata| {
+                        metadata.provider_model_id == provider_model
+                            || metadata.provider_actual_model_id.as_deref() == Some(provider_model)
+                    })
+                    .and_then(|metadata| metadata.pricing.estimated_cost)
+            })
+            .unwrap_or_default();
         let cost = if cost_amount > 0.0 {
             Some(AiCost {
                 amount: cost_amount,
@@ -535,13 +545,16 @@ impl Provider for FalProvider {
             .read()
             .map(|inventory| inventory.clone())
             .unwrap_or_else(|_| {
-                resolve_driver_inventory(
+                let mut inventory = resolve_driver_inventory(
                     self.instance.provider_instance_name.as_str(),
                     self.instance.provider_type.clone(),
-                    self.instance.provider_driver.as_str(),
+                    self.instance.provider_profile_id.as_str(),
                     self.inventory_requests.as_slice(),
                     Some("settings-v1".to_string()),
-                )
+                );
+                apply_builtin_provider_rules_to_inventory(&mut inventory, "fal")
+                    .expect("builtin fal provider rules must apply");
+                inventory
             })
     }
 
@@ -553,14 +566,58 @@ impl Provider for FalProvider {
         self.stop_inventory_refresh();
     }
 
+    fn resolve_call(
+        &self,
+        metadata: &ModelMetadata,
+        method: &str,
+        api_type: &ApiType,
+    ) -> std::result::Result<ResolvedProviderCall, ProviderError> {
+        let rules = load_builtin_provider_rules("fal")
+            .ok_or_else(|| ProviderError::fatal("missing builtin fal provider rules"))?;
+        let operations = AdapterOperationRegistry::new(
+            [
+                "fal.image.upscale",
+                "fal.image.bg_remove",
+                "fal.audio.enhance",
+                "fal.video.upscale",
+            ],
+            [
+                (ApiType::ImageUpscale, "fal.image.upscale"),
+                (ApiType::ImageBgRemove, "fal.image.bg_remove"),
+                (ApiType::AudioEnhance, "fal.audio.enhance"),
+                (ApiType::VideoUpscale, "fal.video.upscale"),
+            ],
+        );
+        resolve_provider_call(ProviderCallResolveInput {
+            metadata,
+            rules: &rules,
+            method,
+            api_type,
+            request_options: metadata
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| json!({})),
+            adapter_operations: &operations,
+            discovery_pricing: None,
+            instance_pricing: None,
+        })
+        .map_err(ProviderError::fatal)
+    }
+
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput {
-        let (cost, latency) = match input.api_type {
-            ApiType::ImageUpscale => (0.05, 8_000),
-            ApiType::ImageBgRemove => (0.01, 4_000),
-            ApiType::AudioEnhance => (0.02, 20_000),
-            ApiType::VideoUpscale => (0.50, 120_000),
-            _ => (1.0, 5_000),
-        };
+        let pricing = self.inventory.read().ok().and_then(|inventory| {
+            inventory
+                .models
+                .iter()
+                .find(|model| model.exact_model == input.exact_model)
+                .map(|model| {
+                    (
+                        model.pricing.estimated_cost.unwrap_or(1.0),
+                        model.health.p50_latency_ms.unwrap_or(5_000),
+                    )
+                })
+        });
+        let (cost, latency) = pricing.unwrap_or((1.0, 5_000));
         CostEstimateOutput {
             estimated_cost_usd: cost,
             pricing_mode: PricingMode::PerToken,
@@ -583,17 +640,41 @@ impl Provider for FalProvider {
         req: ResolvedRequest,
         sink: Arc<dyn TaskEventSink>,
     ) -> std::result::Result<ProviderStartResult, ProviderError> {
-        match req.method.as_str() {
-            ai_methods::IMAGE_UPSCALE | ai_methods::IMAGE_BG_REMOVE | ai_methods::AUDIO_ENHANCE => {
+        let fallback_call = if req.provider_call.is_none() {
+            let api_type = crate::aicc::api_type_for_method(req.method.as_str())
+                .ok_or_else(|| ProviderError::fatal("unsupported fal method"))?;
+            let inventory = self
+                .inventory
+                .read()
+                .map_err(|_| ProviderError::fatal("fal inventory lock poisoned"))?;
+            let metadata = inventory
+                .models
+                .iter()
+                .find(|model| model.provider_model_id == provider_model)
+                .ok_or_else(|| ProviderError::fatal("fal model is absent from inventory"))?;
+            Some(self.resolve_call(metadata, req.method.as_str(), &api_type)?)
+        } else {
+            None
+        };
+        let operation = req
+            .provider_call
+            .as_ref()
+            .or(fallback_call.as_ref())
+            .map(|call| call.operation.as_str())
+            .ok_or_else(|| ProviderError::fatal("fal operation was not resolved"))?
+            .to_string();
+        match operation.as_str() {
+            "fal.image.upscale" | "fal.image.bg_remove" | "fal.audio.enhance" => {
                 self.run_method(
                     &ctx,
+                    operation.as_str(),
                     req.method.as_str(),
                     provider_model.as_str(),
                     &req.request,
                 )
                 .await
             }
-            ai_methods::VIDEO_UPSCALE => {
+            "fal.video.upscale" => {
                 let provider = self.clone();
                 let task_id = ctx
                     .task_id
@@ -604,6 +685,7 @@ impl Provider for FalProvider {
                     let result = match provider
                         .run_method(
                             &ctx,
+                            "fal.video.upscale",
                             ai_methods::VIDEO_UPSCALE,
                             provider_model.as_str(),
                             &request,
@@ -621,9 +703,9 @@ impl Provider for FalProvider {
                 });
                 Ok(ProviderStartResult::Started)
             }
-            method => Err(ProviderError::fatal(format!(
-                "fal provider does not support method '{}'",
-                method
+            operation => Err(ProviderError::fatal(format!(
+                "fal provider does not support operation '{}'",
+                operation
             ))),
         }
     }
@@ -834,19 +916,23 @@ fn build_fal_instances(settings: &FalSettings) -> Result<Vec<FalInstanceConfig>>
     for raw in raw_instances.into_iter() {
         let mut image_upscale_models = normalize_model_list(raw.image_upscale_models);
         if image_upscale_models.is_empty() {
-            image_upscale_models = vec![DEFAULT_IMAGE_UPSCALE_MODEL.to_string()];
+            image_upscale_models =
+                builtin_provider_model_ids_for_method("fal", ai_methods::IMAGE_UPSCALE);
         }
         let mut image_bg_remove_models = normalize_model_list(raw.image_bg_remove_models);
         if image_bg_remove_models.is_empty() {
-            image_bg_remove_models = vec![DEFAULT_IMAGE_BG_REMOVE_MODEL.to_string()];
+            image_bg_remove_models =
+                builtin_provider_model_ids_for_method("fal", ai_methods::IMAGE_BG_REMOVE);
         }
         let mut audio_enhance_models = normalize_model_list(raw.audio_enhance_models);
         if audio_enhance_models.is_empty() {
-            audio_enhance_models = vec![DEFAULT_AUDIO_ENHANCE_MODEL.to_string()];
+            audio_enhance_models =
+                builtin_provider_model_ids_for_method("fal", ai_methods::AUDIO_ENHANCE);
         }
         let mut video_upscale_models = normalize_model_list(raw.video_upscale_models);
         if video_upscale_models.is_empty() {
-            video_upscale_models = vec![DEFAULT_VIDEO_UPSCALE_MODEL.to_string()];
+            video_upscale_models =
+                builtin_provider_model_ids_for_method("fal", ai_methods::VIDEO_UPSCALE);
         }
 
         instances.push(FalInstanceConfig {
@@ -913,6 +999,13 @@ mod tests {
     use buckyos_api::Capability;
     use serde_json::json;
 
+    fn default_fal_model(method: &str) -> String {
+        builtin_provider_model_ids_for_method("fal", method)
+            .into_iter()
+            .next()
+            .expect("fal provider rules must define a default model")
+    }
+
     #[test]
     fn build_instances_uses_default_models_when_unspecified() {
         let settings = FalSettings {
@@ -924,19 +1017,19 @@ mod tests {
         assert_eq!(instances.len(), 1);
         assert_eq!(
             instances[0].image_upscale_models[0],
-            DEFAULT_IMAGE_UPSCALE_MODEL
+            default_fal_model(ai_methods::IMAGE_UPSCALE)
         );
         assert_eq!(
             instances[0].image_bg_remove_models[0],
-            DEFAULT_IMAGE_BG_REMOVE_MODEL
+            default_fal_model(ai_methods::IMAGE_BG_REMOVE)
         );
         assert_eq!(
             instances[0].audio_enhance_models[0],
-            DEFAULT_AUDIO_ENHANCE_MODEL
+            default_fal_model(ai_methods::AUDIO_ENHANCE)
         );
         assert_eq!(
             instances[0].video_upscale_models[0],
-            DEFAULT_VIDEO_UPSCALE_MODEL
+            default_fal_model(ai_methods::VIDEO_UPSCALE)
         );
     }
 
@@ -960,21 +1053,29 @@ mod tests {
 
         let registry = center.model_registry().read().expect("model registry lock");
         let upscale_items = registry.default_items_for_path("image.upscale");
-        assert!(upscale_items
-            .values()
-            .any(|item| item.target == format!("{}@fal-default", DEFAULT_IMAGE_UPSCALE_MODEL)));
+        assert!(upscale_items.values().any(|item| item.target
+            == format!(
+                "{}@fal-default",
+                default_fal_model(ai_methods::IMAGE_UPSCALE)
+            )));
         let bg_items = registry.default_items_for_path("image.bg_remove");
-        assert!(bg_items
-            .values()
-            .any(|item| item.target == format!("{}@fal-default", DEFAULT_IMAGE_BG_REMOVE_MODEL)));
+        assert!(bg_items.values().any(|item| item.target
+            == format!(
+                "{}@fal-default",
+                default_fal_model(ai_methods::IMAGE_BG_REMOVE)
+            )));
         let audio_items = registry.default_items_for_path("audio.enhance");
-        assert!(audio_items
-            .values()
-            .any(|item| item.target == format!("{}@fal-default", DEFAULT_AUDIO_ENHANCE_MODEL)));
+        assert!(audio_items.values().any(|item| item.target
+            == format!(
+                "{}@fal-default",
+                default_fal_model(ai_methods::AUDIO_ENHANCE)
+            )));
         let video_items = registry.default_items_for_path("video.upscale");
-        assert!(video_items
-            .values()
-            .any(|item| item.target == format!("{}@fal-default", DEFAULT_VIDEO_UPSCALE_MODEL)));
+        assert!(video_items.values().any(|item| item.target
+            == format!(
+                "{}@fal-default",
+                default_fal_model(ai_methods::VIDEO_UPSCALE)
+            )));
     }
 
     #[test]
@@ -992,9 +1093,11 @@ mod tests {
 
         let registry = center.model_registry().read().expect("model registry lock");
         let upscale_items = registry.default_items_for_path("image.upscale");
-        assert!(upscale_items
-            .values()
-            .any(|item| item.target == format!("{}@fal-default", DEFAULT_IMAGE_UPSCALE_MODEL)));
+        assert!(upscale_items.values().any(|item| item.target
+            == format!(
+                "{}@fal-default",
+                default_fal_model(ai_methods::IMAGE_UPSCALE)
+            )));
     }
 
     #[test]
@@ -1080,10 +1183,10 @@ mod tests {
                     api_token: "test-token".to_string(),
                     base_url: DEFAULT_FAL_BASE_URL.to_string(),
                     timeout_ms: DEFAULT_FAL_TIMEOUT_MS,
-                    image_upscale_models: vec![DEFAULT_IMAGE_UPSCALE_MODEL.to_string()],
-                    image_bg_remove_models: vec![DEFAULT_IMAGE_BG_REMOVE_MODEL.to_string()],
-                    audio_enhance_models: vec![DEFAULT_AUDIO_ENHANCE_MODEL.to_string()],
-                    video_upscale_models: vec![DEFAULT_VIDEO_UPSCALE_MODEL.to_string()],
+                    image_upscale_models: vec![default_fal_model(ai_methods::IMAGE_UPSCALE)],
+                    image_bg_remove_models: vec![default_fal_model(ai_methods::IMAGE_BG_REMOVE)],
+                    audio_enhance_models: vec![default_fal_model(ai_methods::AUDIO_ENHANCE)],
+                    video_upscale_models: vec![default_fal_model(ai_methods::VIDEO_UPSCALE)],
                 },
                 "test-token".to_string(),
             )
@@ -1116,7 +1219,7 @@ mod tests {
             url: "https://example.com/cat.png".to_string(),
             mime_hint: Some("image/png".to_string()),
         }];
-        let body = FalProvider::build_request_body(ai_methods::IMAGE_UPSCALE, &req).expect("body");
+        let body = FalProvider::build_request_body("fal.image.upscale", &req).expect("body");
         assert_eq!(
             body.get("image_url").and_then(|v| v.as_str()),
             Some("https://example.com/cat.png")

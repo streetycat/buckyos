@@ -409,7 +409,8 @@ function ProviderDetailPanelBody({ provider, routingWeight, onDeleted, onBack }:
         className="rounded-xl p-4 flex flex-col gap-3"
         style={{ background: 'var(--cp-surface)', border: '1px solid var(--cp-border)' }}
       >
-        <Row label={t('aiCenter.providers.driver', 'Driver')} value={config.provider_driver} copyValue={config.provider_driver} />
+        <Row label={t('aiCenter.providers.profile', 'Provider profile')} value={config.provider_profile_id} copyValue={config.provider_profile_id} />
+        <Row label={t('aiCenter.providers.adapter', 'Protocol adapter')} value={config.protocol_adapter_id} copyValue={config.protocol_adapter_id} />
         <Row label={t('aiCenter.providers.routingWeight', 'Routing Weight')} value={`${formatWeight(routingWeight)} / ${routingWeightLabel}`} />
         <Row label={t('aiCenter.providers.runtimeType', 'Runtime Type')} value={config.provider_runtime_type} copyValue={config.provider_runtime_type} />
         {!managedSn && <Row label={t('aiCenter.providers.endpoint', 'Endpoint')} value={config.endpoint || t('aiCenter.providers.default', 'Default')} copyValue={config.endpoint} expandable />}

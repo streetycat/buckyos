@@ -1,7 +1,7 @@
 // ========== Enums ==========
 
 export type ProviderType =
-  | 'sn_router' | 'openai' | 'anthropic' | 'google' | 'openrouter' | 'custom'
+  | 'sn_router' | 'openai' | 'anthropic' | 'google' | 'openrouter' | 'minimax' | 'fal' | 'custom'
 
 export type ProviderRuntimeType = 'local_inference' | 'cloud_api' | 'proxy_unknown'
 export type ProviderOrigin = 'system_config' | 'user_config' | 'builtin' | 'provider_claimed'
@@ -79,7 +79,8 @@ export interface ProviderInventory {
   provider_instance_name: string
   name?: string
   provider_type: ProviderRuntimeType
-  provider_driver: string
+  provider_profile_id: string
+  protocol_adapter_id: string
   provider_origin: ProviderOrigin
   version?: string
   inventory_revision?: string
@@ -94,7 +95,8 @@ export interface ProviderConfig {
   provider_type: ProviderType
   provider_instance_name: string
   provider_runtime_type: ProviderRuntimeType
-  provider_driver: string
+  provider_profile_id: string
+  protocol_adapter_id: string
   provider_origin: ProviderOrigin
   auth_mode?: AuthMode
   endpoint?: string
@@ -246,6 +248,13 @@ export interface RouteTrace {
   selected_exact_model?: string
   selected_provider_instance_name?: string
   selected_provider_model_id?: string
+  selected_origin_model_id?: string
+  selected_model_driver?: string
+  selected_operation?: string
+  selected_provider_profile_id?: string
+  selected_protocol_adapter_id?: string
+  provider_rules_revision?: number
+  pricing_source?: string
   provider_trace_id?: string
   pricing_snapshot?: {
     input_token_usd?: number
@@ -330,6 +339,17 @@ export interface WizardDraft {
   protocol_type: ProtocolType | null
   api_key: string
   auto_sync_models: boolean
+}
+
+export interface KnownProviderProfile {
+  provider_type: ProviderType
+  provider_profile_id: string
+  display_name: string
+  protocol_adapter_id: string
+  default_endpoint: string
+  settings_section: string
+  credential_required: boolean
+  metadata_drivers: string[]
 }
 
 export interface ValidationResult {

@@ -1,0 +1,14 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "fal",
+  "metadata_drivers": ["fal"],
+  "models": [
+    { "id": "fal-ai/esrgan", "operations": { "image.upscale": "fal.image.upscale" }, "pricing": { "unit": "request", "amount": 0.05 }, "estimated_latency_ms": 8000 },
+    { "id": "fal-ai/imageutils/rembg", "operations": { "image.bg_remove": "fal.image.bg_remove" }, "pricing": { "unit": "request", "amount": 0.01 }, "estimated_latency_ms": 4000 },
+    { "id": "fal-ai/deepfilternet3", "operations": { "audio.enhance": "fal.audio.enhance" }, "pricing": { "unit": "request", "amount": 0.02 }, "estimated_latency_ms": 20000 },
+    { "id": "fal-ai/video-upscaler", "operations": { "video.upscale": "fal.video.upscale" }, "pricing": { "unit": "request", "amount": 0.5 }, "estimated_latency_ms": 120000 }
+  ]
+}

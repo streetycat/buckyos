@@ -2,7 +2,7 @@ import { useEffect, useState, type FocusEvent } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
 import { useAICCStore, useProviders } from '../../../hooks/use-aicc-store'
-import type { ProviderType, ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
+import type { KnownProviderProfile, ProviderType, ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
 import { Stepper } from '../../shared/Stepper'
 import { StepChooseType } from './StepChooseType'
 import { StepConnection } from './StepConnection'
@@ -28,7 +28,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const { t } = useI18n()
   const store = useAICCStore()
   const providers = useProviders()
-  const hasManagedSnProvider = providers.some((provider) => provider.config.provider_driver === 'sn-ai-provider')
+  const hasManagedSnProvider = providers.some((provider) => provider.config.provider_profile_id === 'sn-ai-provider')
 
   const [step, setStep] = useState(0)
   const [draft, setDraft] = useState<WizardDraft>(INITIAL_DRAFT)
@@ -36,6 +36,8 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [keyboardInset, setKeyboardInset] = useState(0)
+  const [providerProfiles, setProviderProfiles] = useState<KnownProviderProfile[]>([])
+  const [catalogError, setCatalogError] = useState<string | null>(null)
 
   const steps = [
     t('aiCenter.wizard.step.chooseType', 'Choose Type'),
@@ -108,8 +110,8 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     updateDraft({
       provider_type: type,
       name: '',
-      endpoint: '',
-      protocol_type: null,
+      endpoint: providerProfiles.find((profile) => profile.provider_type === type)?.default_endpoint ?? '',
+      protocol_type: type === 'custom' ? 'openai_compatible' : null,
       api_key: '',
     })
   }
@@ -133,6 +135,18 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     window.setTimeout(scrollFocusedTarget, 360)
     window.setTimeout(scrollFocusedTarget, 780)
   }
+
+  useEffect(() => {
+    let active = true
+    store.getKnownProviderProfiles()
+      .then((profiles) => {
+        if (active) setProviderProfiles(profiles)
+      })
+      .catch(() => {
+        if (active) setCatalogError(t('aiCenter.wizard.catalogError', 'Provider catalog could not be loaded.'))
+      })
+    return () => { active = false }
+  }, [store, t])
 
   useEffect(() => {
     const viewport = window.visualViewport
@@ -185,11 +199,16 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
         onFocusCapture={keepFocusedFieldVisible}
       >
         {step === 0 && (
-          <StepChooseType
-            selected={draft.provider_type}
-            onSelect={handleTypeSelect}
-            hasManagedSnProvider={hasManagedSnProvider}
-          />
+          catalogError
+            ? <div className="text-sm" style={{ color: 'var(--cp-danger)' }}>{catalogError}</div>
+            : providerProfiles.length === 0
+              ? <div className="text-sm" style={{ color: 'var(--cp-muted)' }}>{t('common.loading', 'Loading...')}</div>
+              : <StepChooseType
+                  selected={draft.provider_type}
+                  onSelect={handleTypeSelect}
+                  hasManagedSnProvider={hasManagedSnProvider}
+                  profiles={providerProfiles}
+                />
         )}
         {step === 1 && (
           <StepConnection draft={draft} onUpdate={updateDraft} />

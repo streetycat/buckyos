@@ -482,33 +482,6 @@ pub(crate) fn merge_options(
     Ok(ignored)
 }
 
-pub(crate) fn apply_provider_model_defaults(target: &mut Map<String, Value>, provider_model: &str) {
-    let model = provider_model.trim().to_ascii_lowercase();
-    if !(model.starts_with("gpt-5-nano") || model.starts_with("gpt-5-nono")) {
-        return;
-    }
-
-    if !target.contains_key("reasoning") {
-        target.insert("reasoning".to_string(), json!({ "effort": "minimal" }));
-    }
-
-    if target.contains_key("verbosity") {
-        return;
-    }
-    match target.entry("text".to_string()) {
-        serde_json::map::Entry::Vacant(entry) => {
-            entry.insert(json!({ "verbosity": "low" }));
-        }
-        serde_json::map::Entry::Occupied(mut entry) => {
-            if let Some(text_obj) = entry.get_mut().as_object_mut() {
-                text_obj
-                    .entry("verbosity".to_string())
-                    .or_insert_with(|| Value::String("low".to_string()));
-            }
-        }
-    }
-}
-
 pub(crate) fn merge_requirements_response_format(
     target: &mut Map<String, Value>,
     req: &AiMethodRequest,
@@ -522,41 +495,6 @@ pub(crate) fn merge_requirements_response_format(
     if json_output_required {
         let _ = set_text_format(target, json!({ "type": "json_object" }));
     }
-}
-
-pub(crate) fn strip_incompatible_sampling_options(
-    target: &mut Map<String, Value>,
-    provider_model: &str,
-) -> Vec<String> {
-    let model = provider_model.trim().to_ascii_lowercase();
-    if !model.starts_with("gpt-5") {
-        return vec![];
-    }
-
-    let is_old_gpt5 = model == "gpt-5"
-        || model.starts_with("gpt-5-")
-        || model.starts_with("gpt-5-mini")
-        || model.starts_with("gpt-5-nano");
-    let is_codex = model.contains("codex");
-    let reasoning_effort = target
-        .get("reasoning")
-        .and_then(|value| value.as_object())
-        .and_then(|value| value.get("effort"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_ascii_lowercase());
-    let supports_sampling =
-        !is_old_gpt5 && !is_codex && reasoning_effort.as_deref() == Some("none");
-    if supports_sampling {
-        return vec![];
-    }
-
-    let mut removed = vec![];
-    for key in ["temperature", "top_p", "logprobs", "top_logprobs"] {
-        if target.remove(key).is_some() {
-            removed.push(key.to_string());
-        }
-    }
-    removed
 }
 
 #[cfg(test)]
@@ -753,63 +691,6 @@ mod tests {
         assert!(!target.contains_key("owner_session_id"));
         assert!(!target.contains_key("session_overlay"));
         assert_eq!(target.get("temperature"), Some(&json!(0.2)));
-    }
-
-    #[test]
-    fn apply_provider_model_defaults_sets_gpt5_nano_low_reasoning_defaults() {
-        let mut target = Map::new();
-
-        apply_provider_model_defaults(&mut target, "gpt-5-nano-2025-08-07");
-        let target_value = Value::Object(target);
-
-        assert_eq!(
-            target_value
-                .pointer("/reasoning/effort")
-                .and_then(|value| value.as_str()),
-            Some("minimal")
-        );
-        assert_eq!(
-            target_value
-                .pointer("/text/verbosity")
-                .and_then(|value| value.as_str()),
-            Some("low")
-        );
-    }
-
-    #[test]
-    fn apply_provider_model_defaults_preserves_explicit_gpt5_nano_options() {
-        let mut target = json!({
-            "reasoning": {"effort": "high"},
-            "text": {
-                "format": {"type": "json_object"},
-                "verbosity": "high"
-            }
-        })
-        .as_object()
-        .cloned()
-        .expect("object");
-
-        apply_provider_model_defaults(&mut target, "gpt-5-nano");
-        let target_value = Value::Object(target);
-
-        assert_eq!(
-            target_value
-                .pointer("/reasoning/effort")
-                .and_then(|value| value.as_str()),
-            Some("high")
-        );
-        assert_eq!(
-            target_value
-                .pointer("/text/verbosity")
-                .and_then(|value| value.as_str()),
-            Some("high")
-        );
-        assert_eq!(
-            target_value
-                .pointer("/text/format/type")
-                .and_then(Value::as_str),
-            Some("json_object")
-        );
     }
 
     #[test]
@@ -1018,42 +899,5 @@ mod tests {
                 }
             }))
         );
-    }
-
-    #[test]
-    fn strip_incompatible_sampling_options_removes_for_gpt5_codex() {
-        let mut target = json!({
-            "temperature": 0.2,
-            "top_p": 0.9,
-            "logprobs": true,
-            "top_logprobs": 5
-        })
-        .as_object()
-        .cloned()
-        .expect("object");
-
-        let removed = strip_incompatible_sampling_options(&mut target, "gpt-5.2-codex");
-        assert_eq!(removed.len(), 4);
-        assert!(!target.contains_key("temperature"));
-        assert!(!target.contains_key("top_p"));
-        assert!(!target.contains_key("logprobs"));
-        assert!(!target.contains_key("top_logprobs"));
-    }
-
-    #[test]
-    fn strip_incompatible_sampling_options_keeps_for_gpt54_none_effort() {
-        let mut target = json!({
-            "reasoning": {"effort": "none"},
-            "temperature": 0.2,
-            "top_p": 0.9
-        })
-        .as_object()
-        .cloned()
-        .expect("object");
-
-        let removed = strip_incompatible_sampling_options(&mut target, "gpt-5.4");
-        assert!(removed.is_empty());
-        assert_eq!(target.get("temperature"), Some(&json!(0.2)));
-        assert_eq!(target.get("top_p"), Some(&json!(0.9)));
     }
 }

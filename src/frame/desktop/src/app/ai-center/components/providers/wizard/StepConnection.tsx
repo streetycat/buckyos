@@ -14,6 +14,8 @@ const defaultNames: Record<string, string> = {
   anthropic: 'Anthropic',
   google: 'Google AI',
   openrouter: 'OpenRouter',
+  minimax: 'MiniMax',
+  fal: 'fal.ai',
   custom: '',
 }
 
@@ -22,6 +24,8 @@ const defaultEndpoints: Record<string, string> = {
   anthropic: 'https://api.anthropic.com/v1',
   google: 'https://generativelanguage.googleapis.com/v1beta',
   openrouter: 'https://openrouter.ai/api/v1',
+  minimax: 'https://api.minimax.io/v1',
+  fal: 'https://fal.run',
 }
 
 function InputField({
@@ -122,7 +126,7 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
       )}
 
       {/* Endpoint */}
-      {(providerType === 'openai' || providerType === 'anthropic' || providerType === 'google' || providerType === 'openrouter' || providerType === 'custom') && (
+      {providerType !== null && providerType !== 'sn_router' && (
         <InputField
           label={t('aiCenter.wizard.endpoint', 'Endpoint')}
           value={draft.endpoint}
@@ -150,10 +154,7 @@ export function StepConnection({ draft, onUpdate }: StepConnectionProps) {
               height: 44,
             }}
           >
-            <option value="">Select protocol...</option>
             <option value="openai_compatible">OpenAI Compatible</option>
-            <option value="anthropic_compatible">Anthropic Compatible</option>
-            <option value="google_compatible">Google Compatible</option>
           </select>
         </div>
       )}

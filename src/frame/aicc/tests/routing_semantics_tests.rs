@@ -2,6 +2,7 @@ mod common;
 
 use aicc::metadata_resolver::{resolve_driver_inventory, DriverModelResolveRequest};
 use aicc::model_types::{ApiType, ProviderType};
+use aicc::provider_rules::{apply_provider_inventory_overrides, load_builtin_provider_rules};
 use aicc::{CostEstimate, ModelCatalog, ProviderStartResult, Registry, Router, TenantRouteConfig};
 use buckyos_api::{
     AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiRole, AiccLogicalNodeOverlay,
@@ -11,6 +12,22 @@ use buckyos_api::{
 use common::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+fn resolve_openai_test_inventory(model: &str) -> aicc::model_types::ProviderInventory {
+    let mut inventory = resolve_driver_inventory(
+        "openai-primary",
+        ProviderType::CloudApi,
+        "openai",
+        &[DriverModelResolveRequest::new(model, vec![])],
+        Some("test".to_string()),
+    );
+    let rules = load_builtin_provider_rules("openai").expect("builtin OpenAI Provider Rules");
+    for metadata in inventory.models.iter_mut() {
+        apply_provider_inventory_overrides(metadata, &rules)
+            .expect("OpenAI Provider Rules should apply");
+    }
+    inventory
+}
 
 fn setup_route_provider(
     registry: &Registry,
@@ -812,13 +829,7 @@ async fn helper_text_to_image_expands_to_route_resolve_and_typed_inference() {
 
 #[test]
 fn openai_resolver_expands_reasoning_variants() {
-    let inventory = resolve_driver_inventory(
-        "openai-primary",
-        ProviderType::CloudApi,
-        "openai",
-        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
-        Some("test".to_string()),
-    );
+    let inventory = resolve_openai_test_inventory("gpt-5.1");
 
     let high = inventory
         .models
@@ -919,13 +930,7 @@ fn route_resolve_outputs_base_provider_model_and_variant_options() {
         vec![Capability::Llm],
         vec!["plan".to_string()],
     );
-    let inventory = resolve_driver_inventory(
-        "openai-primary",
-        ProviderType::CloudApi,
-        "openai",
-        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
-        Some("test".to_string()),
-    );
+    let inventory = resolve_openai_test_inventory("gpt-5.1");
     let provider = Arc::new(MockProvider::with_inventory(
         instance,
         inventory,
@@ -988,13 +993,7 @@ async fn typed_variant_exact_model_lowers_to_provider_base_and_options() {
         vec![Capability::Llm],
         vec!["plan".to_string()],
     );
-    let inventory = resolve_driver_inventory(
-        "openai-primary",
-        ProviderType::CloudApi,
-        "openai",
-        &[DriverModelResolveRequest::new("gpt-5.1", vec![])],
-        Some("test".to_string()),
-    );
+    let inventory = resolve_openai_test_inventory("gpt-5.1");
     let provider = Arc::new(MockProvider::with_inventory(
         instance,
         inventory,

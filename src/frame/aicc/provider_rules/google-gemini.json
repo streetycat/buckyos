@@ -1,0 +1,72 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "google-gemini",
+  "metadata_drivers": ["google-gemini"],
+  "discovery": {
+    "alias_numeric_suffix": { "min_digits": 2, "max_digits": 4 },
+    "deprecated_text_signals": [
+      "deprecat",
+      "discontinu",
+      "no longer",
+      "retired",
+      "(legacy)",
+      "sunset",
+      "end of life",
+      "end-of-life"
+    ]
+  },
+  "patterns": [
+    {
+      "pattern": "gemini-3.5-transcribe*",
+      "match_source": "origin_model_id",
+      "operations": { "audio.asr": "google.interactions.create" }
+    },
+    {
+      "pattern": "gemini-omni*",
+      "match_source": "origin_model_id",
+      "operations": {
+        "video.txt2video": "google.interactions.create",
+        "video.img2video": "google.interactions.create",
+        "video.video2video": "google.interactions.create"
+      },
+      "pricing": { "unit": "request", "amount": 0.5 },
+      "estimated_latency_ms": 120000
+    },
+    {
+      "pattern": "veo*",
+      "match_source": "origin_model_id",
+      "operations": {
+        "video.txt2video": "google.models.predictLongRunning",
+        "video.img2video": "google.models.predictLongRunning",
+        "video.extend": "google.models.predictLongRunning"
+      },
+      "pricing": { "unit": "request", "amount": 0.5 },
+      "estimated_latency_ms": 120000
+    },
+    { "pattern": "*2.5-flash-image*", "match_source": "origin_model_id", "pricing": { "unit": "image", "amount": 0.039 }, "estimated_latency_ms": 6000 },
+    { "pattern": "*2.0-flash-exp-image-generation*", "match_source": "origin_model_id", "pricing": { "unit": "image", "amount": 0.03 }, "estimated_latency_ms": 6000 },
+    { "pattern": "*2.0-flash-preview-image-generation*", "match_source": "origin_model_id", "pricing": { "unit": "image", "amount": 0.03 }, "estimated_latency_ms": 6000 },
+    { "pattern": "*2.5-pro*", "match_source": "origin_model_id", "pricing": { "input_token": 0.00000125, "output_token": 0.00001 } },
+    { "pattern": "*2.5-flash*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000003, "output_token": 0.0000025 } },
+    { "pattern": "*1.5-pro*", "match_source": "origin_model_id", "pricing": { "input_token": 0.00000125, "output_token": 0.000005 } },
+    { "pattern": "*1.5-flash*", "match_source": "origin_model_id", "pricing": { "input_token": 0.000000075, "output_token": 0.0000003 } }
+  ],
+  "defaults": {
+    "operations": {
+      "llm": "google.models.generateContent",
+      "image.txt2img": "google.models.generateContent",
+      "image.img2img": "google.models.generateContent",
+      "embedding.text": "google.models.embedContent",
+      "embedding.multimodal": "google.models.embedContent",
+      "video.txt2video": "google.models.predictLongRunning",
+      "video.img2video": "google.models.predictLongRunning",
+      "video.video2video": "google.interactions.create",
+      "video.extend": "google.models.predictLongRunning"
+    },
+    "pricing": { "input_token": 0.0000005, "output_token": 0.000002 },
+    "estimated_latency_ms": 1400
+  }
+}

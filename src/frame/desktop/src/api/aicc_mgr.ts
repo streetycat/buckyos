@@ -7,6 +7,7 @@ import type {
   ApiNamespace,
   ApiType,
   LocalModel,
+  KnownProviderProfile,
   LogicalNode,
   ModelHealthStatus,
   ModelMetadata,
@@ -35,6 +36,7 @@ export type {
   ApiType,
   AuthStatus,
   LocalModel,
+  KnownProviderProfile,
   LogicalNode,
   ModelMetadata,
   ProviderView,
@@ -98,6 +100,26 @@ const EMPTY_SNAPSHOT: StoreSnapshot = {
   },
 }
 
+const MOCK_KNOWN_PROVIDER_PROFILES: KnownProviderProfile[] = [
+  ['sn_router', 'sn-ai-provider', 'SN Router', 'sn-ai-provider', 'https://sn.buckyos.ai/api/v1/ai/', false],
+  ['openai', 'openai', 'OpenAI', 'openai-compatible', 'https://api.openai.com/v1', true],
+  ['openrouter', 'openrouter', 'OpenRouter', 'openai-compatible', 'https://openrouter.ai/api/v1', true],
+  ['anthropic', 'claude', 'Anthropic', 'anthropic-messages', 'https://api.anthropic.com/v1', true],
+  ['google', 'google-gemini', 'Google Gemini', 'google-generative-language', 'https://generativelanguage.googleapis.com/v1beta', true],
+  ['minimax', 'minimax', 'MiniMax', 'anthropic-messages', 'https://api.minimax.io/v1', true],
+  ['fal', 'fal', 'fal.ai', 'fal', 'https://fal.run', true],
+  ['custom', 'custom-openai-compatible', 'OpenAI-compatible', 'openai-compatible', '', true],
+].map(([provider_type, provider_profile_id, display_name, protocol_adapter_id, default_endpoint, credential_required]) => ({
+  provider_type: provider_type as ProviderType,
+  provider_profile_id: String(provider_profile_id),
+  display_name: String(display_name),
+  protocol_adapter_id: String(protocol_adapter_id),
+  default_endpoint: String(default_endpoint),
+  settings_section: provider_type === 'sn_router' ? 'sn-ai-provider' : String(provider_type),
+  credential_required: Boolean(credential_required),
+  metadata_drivers: [],
+}))
+
 type Listener = () => void
 
 type RawRecord = Record<string, unknown>
@@ -122,7 +144,8 @@ interface RawProviderInventory {
   provider_instance_name?: unknown
   name?: unknown
   provider_type?: unknown
-  provider_driver?: unknown
+  provider_profile_id?: unknown
+  protocol_adapter_id?: unknown
   provider_origin?: unknown
   provider_type_revision?: unknown
   version?: unknown
@@ -220,6 +243,7 @@ interface RawTraceQueryResponse {
 
 interface AiccDataProvider {
   fetchSnapshot(): Promise<StoreSnapshot>
+  getKnownProviderProfiles(): Promise<KnownProviderProfile[]>
   addProvider(draft: WizardDraft): Promise<void>
   deleteProvider(id: string): Promise<void>
   refreshProviderModels(id: string): Promise<void>
@@ -240,6 +264,7 @@ export interface AICCMgr {
   getSnapshot(): StoreSnapshot
   getSnapshotVersion(): number
   refresh(): Promise<void>
+  getKnownProviderProfiles(): Promise<KnownProviderProfile[]>
   getUsageSummary(): UsageSummary
   getUsageTrend(granularity?: string): UsageTrendPoint[]
   addProvider(draft: WizardDraft): Promise<ProviderView>
@@ -352,6 +377,10 @@ export class AICCModelStore implements AICCMgr {
     this.emit()
   }
 
+  getKnownProviderProfiles(): Promise<KnownProviderProfile[]> {
+    return this.provider.getKnownProviderProfiles()
+  }
+
   getUsageSummary(): UsageSummary {
     return this.provider.getUsageSummary()
   }
@@ -451,6 +480,10 @@ class MockAiccProvider implements AiccDataProvider {
 
   async fetchSnapshot(): Promise<StoreSnapshot> {
     return this.store.getSnapshot()
+  }
+
+  async getKnownProviderProfiles(): Promise<KnownProviderProfile[]> {
+    return MOCK_KNOWN_PROVIDER_PROFILES
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
@@ -608,6 +641,11 @@ class BuckyOSAiccProvider implements AiccDataProvider {
     this.usageTrend = toUsageTrend(usageTrend)
     const rawProviders = Array.isArray(directory.providers) ? directory.providers : []
     return toStoreSnapshot(directory, rawProviders, [], traceQuery.traces)
+  }
+
+  async getKnownProviderProfiles(): Promise<KnownProviderProfile[]> {
+    const result = await this.call<{ providers?: unknown[] }>('provider.catalog', {})
+    return (result.providers ?? []).map(toKnownProviderProfile).filter((item): item is KnownProviderProfile => item !== null)
   }
 
   async addProvider(draft: WizardDraft): Promise<void> {
@@ -898,6 +936,8 @@ function defaultProviderInstanceName(providerType: ProviderType, name: string): 
     case 'anthropic': return 'claude-main'
     case 'google': return 'google-gemini-main'
     case 'openrouter': return 'openrouter-main'
+    case 'minimax': return 'minimax-main'
+    case 'fal': return 'fal-main'
     case 'custom': return `custom-${slugify(name || 'provider')}`
     default: return `${slugify(providerType)}-main`
   }
@@ -918,6 +958,8 @@ function defaultProviderEndpoint(providerType: ProviderType | null): string {
     case 'anthropic': return 'https://api.anthropic.com/v1'
     case 'google': return 'https://generativelanguage.googleapis.com/v1beta'
     case 'openrouter': return 'https://openrouter.ai/api/v1'
+    case 'minimax': return 'https://api.minimax.io/v1'
+    case 'fal': return 'https://fal.run'
     default: return ''
   }
 }
@@ -1150,6 +1192,13 @@ function toRouteTrace(value: unknown, index: number): RouteTrace | null {
     selected_provider_instance_name: asOptionalString(trace.selected_provider_instance_name)
       ?? (selectedExactModel ? providerInstanceFromExactModel(selectedExactModel) : undefined),
     selected_provider_model_id: asOptionalString(trace.selected_provider_model_id),
+    selected_origin_model_id: asOptionalString(trace.selected_origin_model_id),
+    selected_model_driver: asOptionalString(trace.selected_model_driver),
+    selected_operation: asOptionalString(trace.selected_operation),
+    selected_provider_profile_id: asOptionalString(trace.selected_provider_profile_id),
+    selected_protocol_adapter_id: asOptionalString(trace.selected_protocol_adapter_id),
+    provider_rules_revision: asOptionalNumber(trace.provider_rules_revision),
+    pricing_source: asOptionalString(trace.pricing_source),
     provider_trace_id: asOptionalString(trace.provider_trace_id),
     pricing_snapshot: selectedPricingSnapshot,
     created_at_ms: asOptionalNumber(trace.created_at_ms),
@@ -1500,25 +1549,27 @@ function toProviderInventory(raw: RawProviderInventory): ProviderInventory {
   const instanceName = asNonEmptyString(raw.provider_instance_name, 'unknown-provider')
   const runtimeType = normalizeRuntimeType(raw.provider_type)
   const origin = normalizeProviderOrigin(raw.provider_origin)
-  const driver = asNonEmptyString(raw.provider_driver, inferDriverFromInstance(instanceName))
+  const providerProfileId = asNonEmptyString(raw.provider_profile_id, inferDriverFromInstance(instanceName))
+  const protocolAdapterId = asNonEmptyString(raw.protocol_adapter_id, 'unknown')
 
   return {
     provider_instance_name: instanceName,
     name: asOptionalString(raw.name),
     provider_type: runtimeType,
-    provider_driver: driver,
+    provider_profile_id: providerProfileId,
+    protocol_adapter_id: protocolAdapterId,
     provider_origin: origin,
     version: asOptionalString(raw.version),
     inventory_revision: asOptionalString(raw.inventory_revision),
     models: Array.isArray(raw.models)
-      ? raw.models.map((model) => toModelMetadata(model, runtimeType, driver))
+      ? raw.models.map((model) => toModelMetadata(model, runtimeType))
       : [],
   }
 }
 
 function toProviderView(inventory: ProviderInventory): ProviderView {
   const providerId = inventory.provider_instance_name
-  const providerType = inferProviderType(inventory.provider_driver, inventory.provider_instance_name)
+  const providerType = inferProviderType(inventory.provider_profile_id, inventory.provider_instance_name)
   const models = inventory.models
   const hasUnavailable = models.some((model) => model.health.status === 'unavailable')
   const costSupported = models.some((model) =>
@@ -1536,7 +1587,8 @@ function toProviderView(inventory: ProviderInventory): ProviderView {
     provider_type: providerType,
     provider_instance_name: inventory.provider_instance_name,
     provider_runtime_type: inventory.provider_type,
-    provider_driver: inventory.provider_driver,
+    provider_profile_id: inventory.provider_profile_id,
+    protocol_adapter_id: inventory.protocol_adapter_id,
     provider_origin: inventory.provider_origin,
     auto_sync_models: true,
     created_at: new Date(0).toISOString(),
@@ -1578,7 +1630,6 @@ function toLocalModels(inventory: ProviderInventory): LocalModel[] {
 function toModelMetadata(
   raw: RawModelMetadata,
   providerRuntimeType: ProviderRuntimeType,
-  providerDriver: string,
 ): ModelMetadata {
   const providerModelId = asNonEmptyString(raw.provider_model_id, 'unknown-model')
   const exactModel = asNonEmptyString(raw.exact_model, providerModelId)
@@ -1598,7 +1649,7 @@ function toModelMetadata(
     provider_actual_model_id: asOptionalString(raw.provider_actual_model_id),
     provider_options: raw.provider_options,
     exact_model: exactModel,
-    model_driver: asNonEmptyString(raw.model_driver, providerDriver),
+    model_driver: asNonEmptyString(raw.model_driver, 'unknown'),
     parameter_scale: asOptionalString(raw.parameter_scale),
     api_types: apiTypes,
     logical_mounts: toStringArray(raw.logical_mounts),
@@ -1989,6 +2040,8 @@ function inferProviderType(driver: string, instanceName: string): ProviderType {
   if (value.includes('anthropic') || value.includes('claude')) return 'anthropic'
   if (value.includes('google') || value.includes('gemini')) return 'google'
   if (value.includes('openrouter')) return 'openrouter'
+  if (value.includes('minimax')) return 'minimax'
+  if (value.includes('fal')) return 'fal'
   return 'custom'
 }
 
@@ -2002,11 +2055,31 @@ function providerDisplayName(providerType: ProviderType, instanceName: string): 
   if (providerType === 'anthropic') return 'Anthropic'
   if (providerType === 'google') return 'Google'
   if (providerType === 'openrouter') return 'OpenRouter'
+  if (providerType === 'minimax') return 'MiniMax'
+  if (providerType === 'fal') return 'fal.ai'
   return labelFromPath(instanceName)
 }
 
 export function isManagedSnProvider(provider: ProviderView): boolean {
-  return provider.config.provider_driver.trim().toLowerCase() === 'sn-ai-provider'
+  return provider.config.provider_profile_id.trim().toLowerCase() === 'sn-ai-provider'
+}
+
+export function toKnownProviderProfile(raw: unknown): KnownProviderProfile | null {
+  const value = asRecord(raw)
+  const providerType = asOptionalString(value.provider_type)
+  if (!providerType || !['sn_router', 'openai', 'anthropic', 'google', 'openrouter', 'minimax', 'fal', 'custom'].includes(providerType)) {
+    return null
+  }
+  return {
+    provider_type: providerType as ProviderType,
+    provider_profile_id: asNonEmptyString(value.provider_profile_id, providerType),
+    display_name: asNonEmptyString(value.display_name, providerType),
+    protocol_adapter_id: asNonEmptyString(value.protocol_adapter_id, 'unknown'),
+    default_endpoint: asOptionalString(value.default_endpoint) ?? '',
+    settings_section: asNonEmptyString(value.settings_section, providerType),
+    credential_required: asBoolean(value.credential_required, true),
+    metadata_drivers: toStringArray(value.metadata_drivers),
+  }
 }
 
 function inferPricingMode(models: ModelMetadata[]): PricingMode {

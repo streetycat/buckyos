@@ -1,0 +1,82 @@
+[
+  {
+    "provider_type": "sn_router",
+    "provider_profile_id": "sn-ai-provider",
+    "display_name": "SN Router",
+    "protocol_adapter_id": "sn-ai-provider",
+    "default_endpoint": "https://sn.buckyos.ai/api/v1/ai/",
+    "settings_section": "sn-ai-provider",
+    "credential_required": false,
+    "metadata_drivers": ["openai"]
+  },
+  {
+    "provider_type": "openai",
+    "provider_profile_id": "openai",
+    "display_name": "OpenAI",
+    "protocol_adapter_id": "openai-compatible",
+    "default_endpoint": "https://api.openai.com/v1",
+    "settings_section": "openai",
+    "credential_required": true,
+    "metadata_drivers": ["openai"]
+  },
+  {
+    "provider_type": "openrouter",
+    "provider_profile_id": "openrouter",
+    "display_name": "OpenRouter",
+    "protocol_adapter_id": "openai-compatible",
+    "default_endpoint": "https://openrouter.ai/api/v1",
+    "settings_section": "openai",
+    "credential_required": true,
+    "metadata_drivers": ["openai", "claude", "google-gemini"]
+  },
+  {
+    "provider_type": "anthropic",
+    "provider_profile_id": "claude",
+    "display_name": "Anthropic",
+    "protocol_adapter_id": "anthropic-messages",
+    "default_endpoint": "https://api.anthropic.com/v1",
+    "settings_section": "claude",
+    "credential_required": true,
+    "metadata_drivers": ["claude"]
+  },
+  {
+    "provider_type": "google",
+    "provider_profile_id": "google-gemini",
+    "display_name": "Google Gemini",
+    "protocol_adapter_id": "google-generative-language",
+    "default_endpoint": "https://generativelanguage.googleapis.com/v1beta",
+    "settings_section": "google",
+    "credential_required": true,
+    "metadata_drivers": ["google-gemini"]
+  },
+  {
+    "provider_type": "minimax",
+    "provider_profile_id": "minimax",
+    "display_name": "MiniMax",
+    "protocol_adapter_id": "anthropic-messages",
+    "default_endpoint": "https://api.minimax.io/v1",
+    "settings_section": "minimax",
+    "credential_required": true,
+    "metadata_drivers": ["minimax"]
+  },
+  {
+    "provider_type": "fal",
+    "provider_profile_id": "fal",
+    "display_name": "fal.ai",
+    "protocol_adapter_id": "fal",
+    "default_endpoint": "https://fal.run",
+    "settings_section": "fal",
+    "credential_required": true,
+    "metadata_drivers": ["fal"]
+  },
+  {
+    "provider_type": "custom",
+    "provider_profile_id": "custom-openai-compatible",
+    "display_name": "OpenAI-compatible",
+    "protocol_adapter_id": "openai-compatible",
+    "default_endpoint": "",
+    "settings_section": "openai",
+    "credential_required": true,
+    "metadata_drivers": []
+  }
+]

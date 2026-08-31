@@ -1,0 +1,60 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "sn-ai-provider",
+  "metadata_drivers": ["openai"],
+  "models": [
+    {
+      "id": "gpt-5",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    }
+  ],
+  "patterns": [
+    { "pattern": "*:reasoning-low", "provider_options": { "reasoning": { "effort": "low" } } },
+    { "pattern": "*:reasoning-high", "provider_options": { "reasoning": { "effort": "high" } } },
+    {
+      "pattern": "gpt-5-nano*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5-nono*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5*codex*",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-*",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        {
+          "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" },
+          "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"]
+        }
+      ]
+    },
+    { "pattern": "sora*pro*", "match_source": "origin_model_id", "pricing": { "unit": "request", "amount": 1.2 } },
+    { "pattern": "sora*", "match_source": "origin_model_id", "pricing": { "unit": "request", "amount": 0.4 } }
+  ],
+  "defaults": {
+    "pricing": { "input_token": 0.000001, "output_token": 0.000003 }
+  }
+}

@@ -6,12 +6,41 @@ use crate::model_types::{
 };
 use buckyos_kit::get_buckyos_system_etc_dir;
 use log::warn;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const DRIVER_METADATA_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelDriverMatchError {
+    ExplicitDriverUnavailable(String),
+    Ambiguous {
+        provider_model_id: String,
+        model_drivers: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ModelDriverMatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExplicitDriverUnavailable(driver) => {
+                write!(f, "explicit model driver is unavailable: {driver}")
+            }
+            Self::Ambiguous {
+                provider_model_id,
+                model_drivers,
+            } => write!(
+                f,
+                "model '{}' matches multiple model drivers: {}",
+                provider_model_id,
+                model_drivers.join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelDriverMatchError {}
 
 #[derive(Clone, Debug, Default)]
 pub struct DriverModelResolveRequest {
@@ -52,14 +81,10 @@ pub struct DriverMetadataDocument {
     pub schema_version: u32,
     #[serde(default)]
     pub schema_revision: u32,
-    pub provider_driver: String,
+    pub model_driver_id: String,
     pub revision_seq: u64,
     #[serde(default)]
     pub required_features: Vec<String>,
-    #[serde(default)]
-    pub origin_provider_aliases: HashMap<String, String>,
-    #[serde(default)]
-    pub origin_mappings: Vec<DriverOriginMapping>,
     #[serde(default)]
     pub models: Vec<DriverModelRule>,
     #[serde(default)]
@@ -135,8 +160,6 @@ pub struct DriverModelRule {
     pub exclude: bool,
     #[serde(default)]
     pub parameter_scale: Option<String>,
-    #[serde(default)]
-    pub provider_options: serde_json::Value,
     #[serde(default)]
     pub api_types: Option<Vec<ApiType>>,
     #[serde(default)]
@@ -235,8 +258,6 @@ pub struct DriverModelVariant {
     pub model_pattern: Option<String>,
     #[serde(default)]
     pub mount_suffix: Option<String>,
-    #[serde(default)]
-    pub provider_options: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -255,7 +276,6 @@ struct DriverMetadataSource {
     name: String,
     document: DriverMetadataDocument,
     exact_model_index: HashMap<String, usize>,
-    origin_mappings: Vec<(usize, Regex)>,
 }
 
 impl DriverMetadataSource {
@@ -270,22 +290,10 @@ impl DriverMetadataSource {
                     .map(|id| (id.to_ascii_lowercase(), index))
             })
             .collect();
-        let mut origin_mappings = document
-            .origin_mappings
-            .iter()
-            .enumerate()
-            .filter_map(|(index, mapping)| {
-                Regex::new(mapping.match_rule.regex.as_str())
-                    .ok()
-                    .map(|regex| (index, regex))
-            })
-            .collect::<Vec<_>>();
-        origin_mappings.sort_by_key(|(index, _)| document.origin_mappings[*index].priority);
         Self {
             name,
             document,
             exact_model_index,
-            origin_mappings,
         }
     }
 }
@@ -293,24 +301,24 @@ impl DriverMetadataSource {
 pub fn resolve_driver_inventory(
     provider_instance_name: &str,
     provider_type: ProviderType,
-    provider_driver: &str,
+    model_driver_id: &str,
     requests: &[DriverModelResolveRequest],
     inventory_revision: Option<String>,
 ) -> ProviderInventory {
-    let (sources, driver_metadata_generation) = load_driver_metadata_sources(provider_driver);
+    let (sources, driver_metadata_generation) = load_driver_metadata_sources(model_driver_id);
     let mut models = Vec::new();
     for request in requests.iter() {
         if let Some(metadata) = resolve_driver_model(
             provider_instance_name,
             provider_type.clone(),
-            provider_driver,
+            model_driver_id,
             request,
             sources.as_slice(),
         ) {
             models.push(metadata);
         }
     }
-    apply_driver_post_rules(provider_driver, &mut models, sources.as_slice());
+    apply_driver_post_rules(model_driver_id, &mut models, sources.as_slice());
     models = models
         .into_iter()
         .flat_map(|metadata| expand_model_variants(metadata, sources.as_slice()))
@@ -319,7 +327,8 @@ pub fn resolve_driver_inventory(
     ProviderInventory {
         provider_instance_name: provider_instance_name.to_string(),
         provider_type,
-        provider_driver: provider_driver.to_string(),
+        provider_profile_id: model_driver_id.to_string(),
+        protocol_adapter_id: model_driver_id.to_string(),
         provider_origin: ProviderOrigin::SystemConfig,
         provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
         provider_type_revision: None,
@@ -330,17 +339,189 @@ pub fn resolve_driver_inventory(
     }
 }
 
+pub fn match_model_driver(
+    origin_model_id: &str,
+    candidate_drivers: &[String],
+    explicit_model_driver: Option<&str>,
+) -> Result<Option<String>, ModelDriverMatchError> {
+    let origin_model_id = origin_model_id.trim();
+    if origin_model_id.is_empty() {
+        return Ok(None);
+    }
+
+    let mut normalized_candidates = Vec::<String>::new();
+    for candidate in candidate_drivers {
+        let candidate = normalize_driver(candidate);
+        if !candidate.is_empty()
+            && !normalized_candidates
+                .iter()
+                .any(|current| current.eq_ignore_ascii_case(candidate.as_str()))
+        {
+            normalized_candidates.push(candidate);
+        }
+    }
+
+    if let Some(explicit) = explicit_model_driver {
+        let explicit = normalize_driver(explicit);
+        let allowed = normalized_candidates.is_empty()
+            || normalized_candidates
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(explicit.as_str()));
+        let (sources, _) = load_driver_metadata_sources(explicit.as_str());
+        if allowed && !sources.is_empty() {
+            return Ok(sources
+                .last()
+                .map(|source| normalize_driver(source.document.model_driver_id.as_str())));
+        }
+        return Err(ModelDriverMatchError::ExplicitDriverUnavailable(explicit));
+    }
+
+    let mut matches = Vec::<String>::new();
+    for candidate in normalized_candidates {
+        let (sources, _) = load_driver_metadata_sources(candidate.as_str());
+        if sources.is_empty() {
+            continue;
+        }
+        let matched = find_exact_rule(origin_model_id, sources.as_slice())
+            .or_else(|| find_pattern_rule(origin_model_id, sources.as_slice()))
+            .is_some_and(|rule| !rule.exclude);
+        if matched {
+            let model_driver = sources
+                .last()
+                .map(|source| normalize_driver(source.document.model_driver_id.as_str()))
+                .unwrap_or(candidate);
+            if !matches
+                .iter()
+                .any(|current| current.eq_ignore_ascii_case(model_driver.as_str()))
+            {
+                matches.push(model_driver);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => Err(ModelDriverMatchError::Ambiguous {
+            provider_model_id: origin_model_id.to_string(),
+            model_drivers: matches,
+        }),
+    }
+}
+
+pub fn resolve_model_driver_metadata(
+    provider_instance_name: &str,
+    provider_type: ProviderType,
+    provider_model_id: &str,
+    origin_model_id: &str,
+    candidate_drivers: &[String],
+    explicit_model_driver: Option<&str>,
+    fallback_api_types: Vec<ApiType>,
+) -> Result<Option<ModelMetadata>, ModelDriverMatchError> {
+    Ok(resolve_model_driver_metadata_variants(
+        provider_instance_name,
+        provider_type,
+        provider_model_id,
+        origin_model_id,
+        candidate_drivers,
+        explicit_model_driver,
+        fallback_api_types,
+    )?
+    .into_iter()
+    .next())
+}
+
+pub fn resolve_model_driver_metadata_variants(
+    provider_instance_name: &str,
+    provider_type: ProviderType,
+    provider_model_id: &str,
+    origin_model_id: &str,
+    candidate_drivers: &[String],
+    explicit_model_driver: Option<&str>,
+    fallback_api_types: Vec<ApiType>,
+) -> Result<Vec<ModelMetadata>, ModelDriverMatchError> {
+    let Some(model_driver) =
+        match_model_driver(origin_model_id, candidate_drivers, explicit_model_driver)?
+    else {
+        return Ok(Vec::new());
+    };
+    let (sources, _) = load_driver_metadata_sources(model_driver.as_str());
+    let request = DriverModelResolveRequest::new(origin_model_id, fallback_api_types);
+    let Some(metadata) = resolve_driver_model(
+        provider_instance_name,
+        provider_type,
+        model_driver.as_str(),
+        &request,
+        sources.as_slice(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let variants = expand_model_variants(metadata, sources.as_slice());
+    Ok(variants
+        .into_iter()
+        .map(|mut metadata| {
+            let suffix = metadata
+                .provider_model_id
+                .strip_prefix(origin_model_id)
+                .filter(|suffix| suffix.starts_with(':'))
+                .map(str::to_string);
+            metadata.provider_model_id = suffix
+                .as_deref()
+                .map(|suffix| format!("{provider_model_id}{suffix}"))
+                .unwrap_or_else(|| provider_model_id.to_string());
+            metadata.exact_model =
+                exact_model_name(metadata.provider_model_id.as_str(), provider_instance_name);
+            metadata.model_driver = model_driver.clone();
+            metadata.origin_model_id = Some(origin_model_id.to_string());
+            metadata.provider_actual_model_id = suffix.map(|_| provider_model_id.to_string());
+            metadata
+        })
+        .collect())
+}
+
+pub fn conservative_model_metadata(
+    provider_instance_name: &str,
+    provider_type: ProviderType,
+    provider_model_id: &str,
+    origin_model_id: &str,
+    fallback_api_types: Vec<ApiType>,
+) -> ModelMetadata {
+    let request = DriverModelResolveRequest::new(origin_model_id, fallback_api_types);
+    let mut metadata = resolve_driver_model(
+        provider_instance_name,
+        provider_type,
+        "conservative",
+        &request,
+        &[],
+    )
+    .expect("non-empty provider model must produce conservative metadata");
+    metadata.provider_model_id = provider_model_id.to_string();
+    metadata.exact_model = exact_model_name(provider_model_id, provider_instance_name);
+    metadata.model_driver = "conservative".to_string();
+    metadata.origin_model_id = Some(origin_model_id.to_string());
+    metadata.provider_actual_model_id = None;
+    metadata
+}
+
+pub fn model_driver_metadata_generation(model_drivers: &[String]) -> u64 {
+    model_drivers
+        .iter()
+        .map(|model_driver| load_driver_metadata_sources(model_driver).1)
+        .max()
+        .unwrap_or(0)
+}
+
 pub(crate) fn driver_model_has_specific_metadata(
-    provider_driver: &str,
+    model_driver_id: &str,
     provider_model_id: &str,
 ) -> bool {
-    let (sources, _) = load_driver_metadata_sources(provider_driver);
+    let (sources, _) = load_driver_metadata_sources(model_driver_id);
     find_exact_rule(provider_model_id, sources.as_slice()).is_some()
         || find_pattern_rule(provider_model_id, sources.as_slice()).is_some()
 }
 
-pub(crate) fn driver_metadata_model_ids(provider_driver: &str, api_type: &ApiType) -> Vec<String> {
-    let (sources, _) = load_driver_metadata_sources(provider_driver);
+pub(crate) fn driver_metadata_model_ids(model_driver_id: &str, api_type: &ApiType) -> Vec<String> {
+    let (sources, _) = load_driver_metadata_sources(model_driver_id);
     let mut models = Vec::<String>::new();
     for source in sources {
         for rule in source.document.models {
@@ -366,12 +547,12 @@ pub(crate) fn driver_metadata_model_ids(provider_driver: &str, api_type: &ApiTyp
 }
 
 pub(crate) fn max_driver_metadata_cost(
-    provider_driver: &str,
+    model_driver_id: &str,
     api_type: &ApiType,
     input_tokens: u64,
     output_tokens: u64,
 ) -> Option<(f64, String)> {
-    let (sources, _) = load_driver_metadata_sources(provider_driver);
+    let (sources, _) = load_driver_metadata_sources(model_driver_id);
     sources
         .iter()
         .flat_map(|source| {
@@ -407,7 +588,7 @@ pub(crate) fn max_driver_metadata_cost(
 fn resolve_driver_model(
     provider_instance_name: &str,
     provider_type: ProviderType,
-    provider_driver: &str,
+    model_driver_id: &str,
     request: &DriverModelResolveRequest,
     sources: &[DriverMetadataSource],
 ) -> Option<ModelMetadata> {
@@ -415,7 +596,7 @@ fn resolve_driver_model(
     if provider_model_id.is_empty() {
         return None;
     }
-    let origin = resolve_origin_identity(provider_driver, provider_model_id, sources);
+    let origin = resolve_origin_identity(model_driver_id, provider_model_id, sources);
 
     let exact_rule = find_exact_rule(provider_model_id, sources);
     let pattern_rule = if exact_rule.is_none() {
@@ -452,7 +633,6 @@ fn resolve_driver_model(
     let mut latency_class = LatencyClass::Normal;
     let mut cost_class = CostClass::Medium;
     let mut model_driver = origin.driver.clone();
-    let mut provider_options = None;
     if let Some(rule) = rule {
         if let Some(next) = rule.model_driver.as_ref() {
             model_driver = next.clone();
@@ -464,16 +644,13 @@ fn resolve_driver_model(
             logical_mounts = next_mounts
                 .iter()
                 .map(|mount| {
-                    expand_mount_template(mount, provider_driver, provider_model_id, &origin)
+                    expand_mount_template(mount, model_driver_id, provider_model_id, &origin)
                 })
                 .collect();
         }
         apply_capabilities_patch(&mut capabilities, &rule.capabilities);
         if rule.parameter_scale.is_some() {
             parameter_scale = rule.parameter_scale.clone();
-        }
-        if !rule.provider_options.is_null() {
-            provider_options = Some(rule.provider_options.clone());
         }
         if let Some(rule_pricing) = rule.pricing.as_ref() {
             pricing.currency.clone_from(&rule_pricing.currency);
@@ -519,7 +696,7 @@ fn resolve_driver_model(
         model_driver,
         origin_model_id: Some(origin.model),
         provider_actual_model_id: None,
-        provider_options,
+        provider_options: None,
         parameter_scale,
         api_types,
         logical_mounts,
@@ -546,12 +723,12 @@ fn resolve_driver_model(
     })
 }
 
-fn load_driver_metadata_sources(provider_driver: &str) -> (Vec<DriverMetadataSource>, u64) {
+fn load_driver_metadata_sources(model_driver_id: &str) -> (Vec<DriverMetadataSource>, u64) {
     let mut sources = Vec::new();
-    if let Some(document) = load_builtin_driver_metadata(provider_driver) {
+    if let Some(document) = load_builtin_driver_metadata(model_driver_id) {
         sources.push(DriverMetadataSource::new("builtin".to_string(), document));
     }
-    let normalized = normalize_driver(provider_driver);
+    let normalized = normalize_driver(model_driver_id);
     let (remote_document, driver_metadata_generation) =
         crate::metadata_updater::load_active_remote_metadata(&normalized);
     if let Some(document) = remote_document {
@@ -560,7 +737,7 @@ fn load_driver_metadata_sources(provider_driver: &str) -> (Vec<DriverMetadataSou
             document,
         ));
     }
-    for (name, path) in driver_metadata_override_paths(provider_driver) {
+    for (name, path) in driver_metadata_override_paths(model_driver_id) {
         match std::fs::read_to_string(path.as_path()) {
             Ok(content) => match parse_and_validate_driver_metadata(
                 content.as_str(),
@@ -590,15 +767,15 @@ fn parse_driver_metadata(content: &str) -> Result<DriverMetadataDocument, serde_
 
 fn parse_and_validate_driver_metadata(
     content: &str,
-    expected_provider_driver: Option<&str>,
+    expected_model_driver_id: Option<&str>,
 ) -> Result<DriverMetadataDocument, String> {
     let document = parse_driver_metadata(content).map_err(|err| err.to_string())?;
     validate_driver_metadata_document(&document)?;
-    if let Some(expected) = expected_provider_driver {
-        if document.provider_driver != expected {
+    if let Some(expected) = expected_model_driver_id {
+        if document.model_driver_id != expected {
             return Err(format!(
-                "provider_driver '{}' does not match expected '{}'",
-                document.provider_driver, expected
+                "model_driver_id '{}' does not match expected '{}'",
+                document.model_driver_id, expected
             ));
         }
     }
@@ -617,33 +794,13 @@ pub(crate) fn validate_driver_metadata_document(
             document.schema_version
         ));
     }
-    if document.provider_driver.is_empty()
-        || document.provider_driver.trim() != document.provider_driver
+    if document.model_driver_id.is_empty()
+        || document.model_driver_id.trim() != document.model_driver_id
     {
-        return Err("provider_driver must be a non-empty trimmed string".to_string());
+        return Err("model_driver_id must be a non-empty trimmed string".to_string());
     }
     if !document.required_features.is_empty() {
         return Err("provider metadata requires unsupported features".to_string());
-    }
-
-    for (alias, driver) in document.origin_provider_aliases.iter() {
-        validate_trimmed_value(alias, "origin_provider_aliases key")?;
-        validate_trimmed_value(driver, "origin_provider_aliases value")?;
-    }
-    let mut mapping_keys = HashSet::new();
-    for (index, mapping) in document.origin_mappings.iter().enumerate() {
-        let location = format!("origin_mappings[{}]", index);
-        validate_trimmed_value(
-            mapping.mapping_key.as_str(),
-            format!("{}.mapping_key", location).as_str(),
-        )?;
-        if !mapping_keys.insert(mapping.mapping_key.to_ascii_lowercase()) {
-            return Err(format!(
-                "duplicate origin mapping key '{}'",
-                mapping.mapping_key
-            ));
-        }
-        validate_origin_mapping(mapping, location.as_str())?;
     }
 
     let mut model_ids = HashSet::new();
@@ -714,12 +871,6 @@ pub(crate) fn validate_driver_metadata_document(
                 suffix
             ));
         }
-        if !variant.provider_options.is_null() && !variant.provider_options.is_object() {
-            return Err(format!(
-                "variants[{}].provider_options must be null or an object",
-                index
-            ));
-        }
     }
 
     for (index, rule) in document.version_rules.iter().enumerate() {
@@ -767,58 +918,6 @@ pub(crate) fn validate_driver_metadata_document(
             &rule.capabilities,
             format!("version_rules[{}]", index).as_str(),
         )?;
-    }
-    Ok(())
-}
-
-fn validate_origin_mapping(mapping: &DriverOriginMapping, location: &str) -> Result<(), String> {
-    if mapping.match_rule.source != "provider_model_id" {
-        return Err(format!("{}.match.source is unsupported", location));
-    }
-    validate_trimmed_value(
-        mapping.match_rule.regex.as_str(),
-        format!("{}.match.regex", location).as_str(),
-    )?;
-    let regex = Regex::new(mapping.match_rule.regex.as_str())
-        .map_err(|err| format!("{}.match.regex is invalid: {}", location, err))?;
-    let capture_names = regex.capture_names().flatten().collect::<HashSet<_>>();
-    if !capture_names.contains("driver") || !capture_names.contains("model") {
-        return Err(format!(
-            "{}.match.regex must define driver and model captures",
-            location
-        ));
-    }
-    validate_origin_transforms(
-        mapping.transforms.driver.as_slice(),
-        format!("{}.transforms.driver", location).as_str(),
-    )?;
-    validate_origin_transforms(
-        mapping.transforms.model.as_slice(),
-        format!("{}.transforms.model", location).as_str(),
-    )
-}
-
-fn validate_origin_transforms(
-    transforms: &[DriverOriginTransform],
-    location: &str,
-) -> Result<(), String> {
-    for (index, transform) in transforms.iter().enumerate() {
-        let item = format!("{}[{}]", location, index);
-        match transform.op.as_str() {
-            "trim" | "lowercase" => {
-                if transform.table.is_some() || transform.on_missing.is_some() {
-                    return Err(format!("{} has unsupported options", item));
-                }
-            }
-            "alias" => {
-                if transform.table.as_deref() != Some("origin_provider_aliases")
-                    || transform.on_missing.as_deref().unwrap_or("keep") != "keep"
-                {
-                    return Err(format!("{} has unsupported alias options", item));
-                }
-            }
-            _ => return Err(format!("{}.op is unsupported", item)),
-        }
     }
     Ok(())
 }
@@ -956,102 +1055,21 @@ fn validate_string_list(values: &[String], location: &str) -> Result<(), String>
 }
 
 fn resolve_origin_identity(
-    provider_driver: &str,
+    model_driver_id: &str,
     provider_model_id: &str,
-    sources: &[DriverMetadataSource],
+    _sources: &[DriverMetadataSource],
 ) -> DriverOriginIdentity {
-    let fallback = DriverOriginIdentity {
-        driver: provider_driver.to_string(),
+    DriverOriginIdentity {
+        driver: model_driver_id.to_string(),
         model: provider_model_id.to_string(),
-    };
-    let Some(source) = sources.iter().rev().find(|source| {
-        source.document.schema_version == DRIVER_METADATA_SCHEMA_VERSION
-            && !source.document.origin_mappings.is_empty()
-    }) else {
-        return fallback;
-    };
-
-    for (mapping_index, regex) in source.origin_mappings.iter() {
-        let mapping = &source.document.origin_mappings[*mapping_index];
-        if mapping.match_rule.source != "provider_model_id" {
-            warn!(
-                "aicc.metadata_resolver.skip_origin_mapping source={} mapping={} unsupported_source={}",
-                source.name, mapping.mapping_key, mapping.match_rule.source
-            );
-            continue;
-        }
-        let Some(captures) = regex.captures(provider_model_id) else {
-            continue;
-        };
-        let (Some(driver), Some(model)) = (captures.name("driver"), captures.name("model")) else {
-            warn!(
-                "aicc.metadata_resolver.skip_origin_mapping source={} mapping={} missing_named_capture",
-                source.name, mapping.mapping_key
-            );
-            continue;
-        };
-        let Some(driver) = apply_origin_transforms(
-            driver.as_str(),
-            mapping.transforms.driver.as_slice(),
-            &source.document.origin_provider_aliases,
-        ) else {
-            warn!(
-                "aicc.metadata_resolver.skip_origin_mapping source={} mapping={} invalid_driver_transform",
-                source.name, mapping.mapping_key
-            );
-            continue;
-        };
-        let Some(model) = apply_origin_transforms(
-            model.as_str(),
-            mapping.transforms.model.as_slice(),
-            &source.document.origin_provider_aliases,
-        ) else {
-            warn!(
-                "aicc.metadata_resolver.skip_origin_mapping source={} mapping={} invalid_model_transform",
-                source.name, mapping.mapping_key
-            );
-            continue;
-        };
-        if driver.is_empty() || model.is_empty() {
-            continue;
-        }
-        return DriverOriginIdentity { driver, model };
     }
-    fallback
 }
 
-fn apply_origin_transforms(
-    value: &str,
-    transforms: &[DriverOriginTransform],
-    aliases: &HashMap<String, String>,
-) -> Option<String> {
-    let mut value = value.to_string();
-    for transform in transforms {
-        match transform.op.as_str() {
-            "trim" => value = value.trim().to_string(),
-            "lowercase" => value = value.to_ascii_lowercase(),
-            "alias" => {
-                if transform.table.as_deref() != Some("origin_provider_aliases") {
-                    return None;
-                }
-                if let Some(alias) = aliases.get(value.as_str()) {
-                    value = alias.clone();
-                } else if transform.on_missing.as_deref().unwrap_or("keep") != "keep" {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    Some(value)
-}
-
-fn load_builtin_driver_metadata(provider_driver: &str) -> Option<DriverMetadataDocument> {
-    let normalized = normalize_driver(provider_driver);
+fn load_builtin_driver_metadata(model_driver_id: &str) -> Option<DriverMetadataDocument> {
+    let normalized = normalize_driver(model_driver_id);
     let raw = match normalized.as_str() {
         "openai" => include_str!("../driver_metadata/openai.json"),
         "sn-ai-provider" => include_str!("../driver_metadata/openai.json"),
-        "openrouter" => include_str!("../driver_metadata/openrouter.json"),
         "claude" | "anthropic" => include_str!("../driver_metadata/claude.json"),
         "google-gemini" | "gemini" => include_str!("../driver_metadata/gemini.json"),
         "fal" => include_str!("../driver_metadata/fal.json"),
@@ -1061,19 +1079,19 @@ fn load_builtin_driver_metadata(provider_driver: &str) -> Option<DriverMetadataD
     parse_and_validate_driver_metadata(raw, None)
         .map_err(|err| {
             warn!(
-                "aicc.metadata_resolver.invalid_builtin provider_driver={} err={}",
-                provider_driver, err
+                "aicc.metadata_resolver.invalid_builtin model_driver_id={} err={}",
+                model_driver_id, err
             );
             err
         })
         .ok()
 }
 
-fn driver_metadata_override_paths(provider_driver: &str) -> Vec<(String, PathBuf)> {
+fn driver_metadata_override_paths(model_driver_id: &str) -> Vec<(String, PathBuf)> {
     let etc = get_buckyos_system_etc_dir()
         .join("aicc")
         .join("driver_metadata");
-    let driver = normalize_driver(provider_driver);
+    let driver = normalize_driver(model_driver_id);
     vec![
         (
             "local_override".to_string(),
@@ -1194,8 +1212,7 @@ fn expand_model_variants(
             exact_name.provider_instance_name.as_str(),
         );
         variant_model.provider_actual_model_id = Some(model.provider_model_id.clone());
-        variant_model.provider_options =
-            (!variant.provider_options.is_null()).then(|| variant.provider_options.clone());
+        variant_model.provider_options = None;
         variant_model.logical_mounts =
             variant_logical_mounts(model.logical_mounts.as_slice(), suffix);
         models.push(variant_model);
@@ -1232,7 +1249,7 @@ fn variant_logical_mounts(base_mounts: &[String], suffix: &str) -> Vec<String> {
     )
 }
 
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
+pub(crate) fn wildcard_matches(pattern: &str, value: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let value = value.to_ascii_lowercase();
     let pattern = pattern.as_bytes();
@@ -1468,14 +1485,14 @@ fn is_task_role_mount(mount: &str) -> bool {
 
 fn expand_mount_template(
     template: &str,
-    provider_driver: &str,
+    model_driver_id: &str,
     provider_model_id: &str,
     origin: &DriverOriginIdentity,
 ) -> String {
     template
         .replace(
-            "{provider_driver}",
-            logical_mount_segment(provider_driver).as_str(),
+            "{model_driver_id}",
+            logical_mount_segment(model_driver_id).as_str(),
         )
         .replace(
             "{provider_model_id}",
@@ -1506,8 +1523,8 @@ fn logical_mount_segment(value: &str) -> String {
         .join("-")
 }
 
-fn normalize_driver(provider_driver: &str) -> String {
-    provider_driver
+fn normalize_driver(model_driver_id: &str) -> String {
+    model_driver_id
         .trim()
         .replace('_', "-")
         .to_ascii_lowercase()
@@ -1531,12 +1548,12 @@ fn add_unique(values: &mut Vec<String>, value: String) {
 }
 
 fn apply_driver_post_rules(
-    provider_driver: &str,
+    model_driver_id: &str,
     models: &mut [ModelMetadata],
     sources: &[DriverMetadataSource],
 ) {
     for rule in driver_version_rules(sources) {
-        apply_driver_version_rule(provider_driver, models, rule, sources);
+        apply_driver_version_rule(model_driver_id, models, rule, sources);
     }
 }
 
@@ -1553,7 +1570,7 @@ fn driver_version_rules(sources: &[DriverMetadataSource]) -> &[DriverVersionRule
 }
 
 fn apply_driver_version_rule(
-    provider_driver: &str,
+    model_driver_id: &str,
     models: &mut [ModelMetadata],
     rule: &DriverVersionRule,
     sources: &[DriverMetadataSource],
@@ -1569,7 +1586,7 @@ fn apply_driver_version_rule(
             continue;
         }
         let origin =
-            resolve_origin_identity(provider_driver, model.provider_model_id.as_str(), sources);
+            resolve_origin_identity(model_driver_id, model.provider_model_id.as_str(), sources);
         let Some(rank) = rank_model_for_version_rule(model.provider_model_id.as_str(), rule) else {
             continue;
         };
@@ -1579,7 +1596,7 @@ fn apply_driver_version_rule(
                 &mut model.logical_mounts,
                 expand_mount_template(
                     version_mount,
-                    provider_driver,
+                    model_driver_id,
                     model.provider_model_id.as_str(),
                     &origin,
                 ),
@@ -1600,13 +1617,13 @@ fn apply_driver_version_rule(
     if let Some((index, _)) = latest {
         let model = &mut models[index];
         let origin =
-            resolve_origin_identity(provider_driver, model.provider_model_id.as_str(), sources);
+            resolve_origin_identity(model_driver_id, model.provider_model_id.as_str(), sources);
         if let Some(current_mount) = rule.current_mount.as_deref() {
             add_unique(
                 &mut model.logical_mounts,
                 expand_mount_template(
                     current_mount,
-                    provider_driver,
+                    model_driver_id,
                     model.provider_model_id.as_str(),
                     &origin,
                 ),
@@ -1799,7 +1816,6 @@ mod tests {
         for driver in [
             "openai",
             "sn-ai-provider",
-            "openrouter",
             "claude",
             "google-gemini",
             "fal",
@@ -1814,7 +1830,7 @@ mod tests {
     #[test]
     fn sn_metadata_reuses_openai_and_maximum_unknown_cost() {
         let document = load_builtin_driver_metadata("sn-ai-provider").expect("sn metadata");
-        assert_eq!(document.provider_driver, "openai");
+        assert_eq!(document.model_driver_id, "openai");
         assert_eq!(
             driver_metadata_model_ids("sn-ai-provider", &ApiType::Llm),
             driver_metadata_model_ids("openai", &ApiType::Llm)
@@ -1866,7 +1882,7 @@ mod tests {
             "format": "buckyos.aicc.provider-driver-metadata",
             "schema_version": DRIVER_METADATA_SCHEMA_VERSION,
             "schema_revision": 0,
-            "provider_driver": "openai",
+            "model_driver_id": "openai",
             "revision_seq": 1,
             "required_features": [],
             "models": [],
@@ -1903,229 +1919,16 @@ mod tests {
     }
 
     #[test]
-    fn origin_mapping_validation_is_fail_closed() {
-        let valid = serde_json::json!({
+    fn driver_metadata_rejects_provider_origin_mapping_fields() {
+        let document = serde_json::json!({
             "format": "buckyos.aicc.provider-driver-metadata",
             "schema_version": DRIVER_METADATA_SCHEMA_VERSION,
-            "schema_revision": 0,
-            "provider_driver": "aggregator",
+            "model_driver_id": "openai",
             "revision_seq": 1,
-            "required_features": [],
-            "origin_provider_aliases": { "vendor": "canonical-vendor" },
-            "origin_mappings": [{
-                "mapping_key": "provider-path",
-                "priority": 100,
-                "match": {
-                    "source": "provider_model_id",
-                    "regex": "^(?<driver>[^/]+)/(?<model>.+)$"
-                },
-                "transforms": {
-                    "driver": [{ "op": "lowercase" }, {
-                        "op": "alias",
-                        "table": "origin_provider_aliases",
-                        "on_missing": "keep"
-                    }],
-                    "model": [{ "op": "trim" }]
-                }
-            }]
+            "origin_provider_aliases": { "vendor": "openai" },
+            "origin_mappings": []
         });
-        assert!(parse_and_validate_driver_metadata(&valid.to_string(), Some("aggregator")).is_ok());
-
-        let mut unknown_field = valid.clone();
-        unknown_field["origin_mappings"][0]["match"]["future"] = serde_json::json!(true);
-        assert!(
-            parse_and_validate_driver_metadata(&unknown_field.to_string(), Some("aggregator"))
-                .is_err()
-        );
-
-        let mut invalid_regex = valid.clone();
-        invalid_regex["origin_mappings"][0]["match"]["regex"] = serde_json::json!("(");
-        assert!(
-            parse_and_validate_driver_metadata(&invalid_regex.to_string(), Some("aggregator"))
-                .is_err()
-        );
-
-        let mut missing_capture = valid.clone();
-        missing_capture["origin_mappings"][0]["match"]["regex"] =
-            serde_json::json!("^(?<driver>[^/]+)/.+$");
-        assert!(parse_and_validate_driver_metadata(
-            &missing_capture.to_string(),
-            Some("aggregator")
-        )
-        .is_err());
-
-        let mut unsupported_transform = valid;
-        unsupported_transform["origin_mappings"][0]["transforms"]["model"][0]["op"] =
-            serde_json::json!("future-transform");
-        assert!(parse_and_validate_driver_metadata(
-            &unsupported_transform.to_string(),
-            Some("aggregator")
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn openrouter_models_resolve_to_origin_identity() {
-        let requests = vec![
-            DriverModelResolveRequest::new("openai/gpt-5.5", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("anthropic/claude-sonnet-4", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("x-ai/grok-4.5", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-chat-latest", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/o3-mini-high", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-5.6-sol-pro", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-oss-20b:free", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-5.5:nitro", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-5.5:floor", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-5.5:exacto", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openai/gpt-9-latest", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("~x-ai/grok-latest", vec![ApiType::Llm]),
-            DriverModelResolveRequest::new("openrouter/auto", vec![ApiType::Llm]),
-        ];
-        let inventory = resolve_driver_inventory(
-            "openrouter-main",
-            ProviderType::CloudApi,
-            "openrouter",
-            requests.as_slice(),
-            None,
-        );
-
-        assert_eq!(inventory.models.len(), 3);
-        let openai = inventory
-            .models
-            .iter()
-            .find(|model| model.provider_model_id == "openai/gpt-5.5")
-            .expect("OpenAI model should resolve");
-        assert_eq!(openai.model_driver, "openai");
-        assert_eq!(openai.exact_model, "openai/gpt-5.5@openrouter-main");
-        assert_eq!(openai.provider_actual_model_id, None);
-        assert!(openai.api_types.contains(&ApiType::Rerank));
-        assert_eq!(openai.capabilities.max_context_tokens, Some(1_050_000));
-        assert_eq!(openai.capabilities.max_output_tokens, Some(128_000));
-        assert_eq!(openai.pricing.currency, "USD");
-        assert_eq!(openai.pricing.input_token, Some(0.000005));
-        assert_eq!(openai.pricing.output_token, Some(0.00003));
-        assert_eq!(openai.pricing.cache_input_token, Some(0.0000005));
-        assert!(openai
-            .logical_mounts
-            .iter()
-            .any(|mount| mount == "llm.gpt-standard"));
-        assert!(openai
-            .logical_mounts
-            .iter()
-            .any(|mount| mount == "llm.openai.gpt-5-5"));
-        let reasoning_high = inventory
-            .models
-            .iter()
-            .find(|model| model.provider_model_id == "openai/gpt-5.5:reasoning-high")
-            .expect("OpenRouter should expand OpenAI reasoning variants");
-        assert_eq!(
-            reasoning_high.provider_actual_model_id.as_deref(),
-            Some("openai/gpt-5.5")
-        );
-
-        let official = resolve_driver_inventory(
-            "openai-main",
-            ProviderType::CloudApi,
-            "openai",
-            &[DriverModelResolveRequest::new(
-                "gpt-5.5",
-                vec![ApiType::Llm],
-            )],
-            None,
-        );
-        assert!(official.models[0]
-            .logical_mounts
-            .iter()
-            .any(|mount| mount == "llm.openai.gpt-5-5"));
-    }
-
-    #[test]
-    fn openrouter_patterns_inherit_openai_rules_and_defaults() {
-        let inventory = resolve_driver_inventory(
-            "openrouter-main",
-            ProviderType::CloudApi,
-            "openrouter",
-            &[
-                DriverModelResolveRequest::new("openai/gpt-9", vec![ApiType::Llm]),
-                DriverModelResolveRequest::new("openai/future-native", vec![ApiType::Llm]),
-                DriverModelResolveRequest::new("other/gpt-10", vec![ApiType::Llm]),
-            ],
-            None,
-        );
-
-        assert_eq!(inventory.models.len(), 4);
-        let gpt = inventory
-            .models
-            .iter()
-            .find(|model| model.provider_model_id == "openai/gpt-9")
-            .expect("prefixed OpenAI pattern should match");
-        assert!(gpt.api_types.contains(&ApiType::Rerank));
-        assert!(gpt.capabilities.tool_call);
-        assert!(gpt.logical_mounts.iter().any(|mount| mount == "rerank"));
-
-        let (sources, _) = load_driver_metadata_sources("openrouter");
-        let mut other_origin = gpt.clone();
-        other_origin.provider_model_id = "anthropic/claude-future".to_string();
-        other_origin.exact_model = "anthropic/claude-future@openrouter-main".to_string();
-        assert_eq!(
-            expand_model_variants(other_origin, sources.as_slice()).len(),
-            1
-        );
-
-        let fallback = inventory
-            .models
-            .iter()
-            .find(|model| model.provider_model_id == "openai/future-native")
-            .expect("unknown native OpenAI model should use OpenAI defaults");
-        assert_eq!(fallback.api_types, vec![ApiType::Llm]);
-        assert!(!fallback.capabilities.tool_call);
-        assert!(!inventory
-            .models
-            .iter()
-            .any(|model| model.provider_model_id.starts_with("other/gpt-10")));
-    }
-
-    #[test]
-    fn openrouter_deep_research_keeps_required_web_search() {
-        let inventory = resolve_driver_inventory(
-            "openrouter-main",
-            ProviderType::CloudApi,
-            "openrouter",
-            &[DriverModelResolveRequest::new(
-                "openai/o3-deep-research",
-                vec![ApiType::Llm],
-            )],
-            None,
-        );
-        let model = inventory
-            .models
-            .iter()
-            .find(|model| model.provider_model_id == "openai/o3-deep-research")
-            .expect("deep research model should resolve");
-        assert!(model.capabilities.web_search);
-        assert!(model.logical_mounts.iter().any(|mount| mount == "llm.gpt"));
-    }
-
-    #[test]
-    fn origin_mapping_invalid_regex_is_rejected() {
-        let document = DriverMetadataDocument {
-            format: "buckyos.aicc.provider-driver-metadata".to_string(),
-            schema_version: DRIVER_METADATA_SCHEMA_VERSION,
-            provider_driver: "aggregator".to_string(),
-            revision_seq: 1,
-            origin_mappings: vec![DriverOriginMapping {
-                mapping_key: "invalid".to_string(),
-                priority: 1,
-                match_rule: DriverOriginMatch {
-                    source: "provider_model_id".to_string(),
-                    regex: "(".to_string(),
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-
-        assert!(validate_driver_metadata_document(&document).is_err());
+        assert!(parse_and_validate_driver_metadata(&document.to_string(), Some("openai")).is_err());
     }
 
     #[test]
@@ -2136,7 +1939,7 @@ mod tests {
         };
         assert_eq!(
             expand_mount_template(
-                "llm.{driver}.{model}.{provider_driver}.{provider_model_id}",
+                "llm.{driver}.{model}.{model_driver_id}.{provider_model_id}",
                 "openrouter",
                 "openai/gpt-5.5",
                 &origin,
@@ -2493,14 +2296,7 @@ mod tests {
             .logical_mounts
             .iter()
             .any(|mount| mount == "llm.opus.reasoning-medium"));
-        assert_eq!(
-            opus_reasoning
-                .provider_options
-                .as_ref()
-                .and_then(|options| options.pointer("/thinking/budget_tokens"))
-                .and_then(|value| value.as_u64()),
-            Some(4096)
-        );
+        assert!(opus_reasoning.provider_options.is_none());
 
         let sonnet = by_id("claude-sonnet-4-6");
         assert!(sonnet
@@ -2662,5 +2458,45 @@ mod tests {
             None,
         );
         assert_eq!(inventory.models.len(), 1);
+    }
+
+    #[test]
+    fn model_driver_matching_uses_exact_and_pattern_rules_not_defaults() {
+        let candidates = vec!["openai".to_string(), "claude".to_string()];
+        assert_eq!(
+            match_model_driver("gpt-5.4", candidates.as_slice(), None).unwrap(),
+            Some("openai".to_string())
+        );
+        assert_eq!(
+            match_model_driver("claude-sonnet-4-5", candidates.as_slice(), None).unwrap(),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            match_model_driver("unknown-private-model", candidates.as_slice(), None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_mapping_selects_driver_and_preserves_provider_model_id() {
+        let candidates = vec!["openai".to_string(), "claude".to_string()];
+        let metadata = resolve_model_driver_metadata(
+            "router-main",
+            ProviderType::CloudApi,
+            "anthropic/renamed-sonnet",
+            "claude-sonnet-4-5",
+            candidates.as_slice(),
+            Some("claude"),
+            vec![ApiType::Llm],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(metadata.provider_model_id, "anthropic/renamed-sonnet");
+        assert_eq!(
+            metadata.origin_model_id.as_deref(),
+            Some("claude-sonnet-4-5")
+        );
+        assert_eq!(metadata.model_driver, "claude");
+        assert_eq!(metadata.exact_model, "anthropic/renamed-sonnet@router-main");
     }
 }

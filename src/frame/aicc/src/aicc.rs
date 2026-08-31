@@ -17,6 +17,9 @@ use crate::model_types::{
     RequiredModelFeatures, RouteError, RouteErrorCode, RoutePolicy, RoutePricingSnapshot,
     RouteTrace, UserFacingProviderOrigin, UserFacingRouteSummary,
 };
+use crate::provider_rules::{
+    PricingSource, ProviderPricing, ResolvedPricing, ResolvedProviderCall,
+};
 use ::kRPC::*;
 use async_trait::async_trait;
 use base64::engine::general_purpose;
@@ -381,7 +384,8 @@ pub(crate) fn redacted_json_log(value: &Value) -> String {
 pub struct ProviderInstance {
     pub provider_instance_name: String,
     pub provider_type: ProviderType,
-    pub provider_driver: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
     pub provider_origin: ProviderOrigin,
     pub provider_type_trusted_source: ProviderTypeTrustedSource,
     pub provider_type_revision: Option<String>,
@@ -433,11 +437,11 @@ impl SnAIProviderBillingLedger {
     fn preview_billed_cost(
         &self,
         tenant_id: &str,
-        provider_driver: &str,
+        provider_profile_id: &str,
         raw_cost_usd: f64,
     ) -> Option<f64> {
         let raw_cost_usd = raw_cost_usd.max(0.0);
-        if provider_driver != "sn-ai-provider" {
+        if provider_profile_id != "sn-ai-provider" {
             return Some(raw_cost_usd);
         }
 
@@ -458,10 +462,10 @@ impl SnAIProviderBillingLedger {
     fn apply_charge(
         &self,
         tenant_id: &str,
-        provider_driver: &str,
+        provider_profile_id: &str,
         raw_cost_usd: Option<f64>,
     ) -> Option<SnAIProviderBillingAdjustment> {
-        if provider_driver != "sn-ai-provider" {
+        if provider_profile_id != "sn-ai-provider" {
             return None;
         }
 
@@ -539,19 +543,30 @@ pub enum ProviderStartResult {
 pub struct ResolvedRequest {
     pub method: String,
     pub request: AiMethodRequest,
+    pub provider_call: Option<ResolvedProviderCall>,
 }
 
 impl ResolvedRequest {
     pub fn new(request: AiMethodRequest) -> Self {
         let method = default_method_for_capability(&request.capability).to_string();
-        Self { method, request }
+        Self {
+            method,
+            request,
+            provider_call: None,
+        }
     }
 
     pub fn new_with_method(method: impl Into<String>, request: AiMethodRequest) -> Self {
         Self {
             method: method.into(),
             request,
+            provider_call: None,
         }
+    }
+
+    pub fn with_provider_call(mut self, provider_call: ResolvedProviderCall) -> Self {
+        self.provider_call = Some(provider_call);
+        self
     }
 }
 
@@ -1626,7 +1641,10 @@ fn infer_mime_from_bytes(bytes: &[u8]) -> String {
             return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
                 .to_string();
         }
-        if bytes.windows(20).any(|value| value == b"application/epub+zip") {
+        if bytes
+            .windows(20)
+            .any(|value| value == b"application/epub+zip")
+        {
             return "application/epub+zip".to_string();
         }
     }
@@ -1666,6 +1684,33 @@ pub trait Provider: Send + Sync {
     }
     fn shutdown(&self) {}
     fn estimate_cost(&self, input: &CostEstimateInput) -> CostEstimateOutput;
+    fn resolve_call(
+        &self,
+        metadata: &ModelMetadata,
+        method: &str,
+        _api_type: &ApiType,
+    ) -> std::result::Result<ResolvedProviderCall, ProviderError> {
+        Ok(ResolvedProviderCall {
+            provider_model_id: metadata
+                .provider_actual_model_id
+                .clone()
+                .unwrap_or_else(|| metadata.provider_model_id.clone()),
+            model_driver: metadata.model_driver.clone(),
+            origin_model_id: metadata.origin_model_id.clone(),
+            operation: method.to_string(),
+            options: metadata
+                .provider_options
+                .clone()
+                .unwrap_or_else(|| json!({})),
+            pricing: ResolvedPricing {
+                definition: ProviderPricing::from(&metadata.pricing),
+                source: PricingSource::ModelDriver,
+                matched_amount: metadata.pricing.estimated_cost,
+            },
+            provider_rules_revision: 0,
+            applied_request_rules: Vec::new(),
+        })
+    }
     async fn refresh_inventory(&self) -> std::result::Result<ProviderInventory, ProviderError> {
         Ok(self.inventory())
     }
@@ -2040,8 +2085,7 @@ pub struct ModelCatalogEntry {
 #[derive(Clone, Debug)]
 struct RouteAttempt {
     instance_id: String,
-    provider_model: String,
-    provider_options: Option<Value>,
+    provider_call: ResolvedProviderCall,
     exact_model: String,
     pricing_snapshot: Option<RoutePricingSnapshot>,
 }
@@ -2129,9 +2173,9 @@ impl Router {
             };
             let legacy_instance = provider.legacy_instance();
             let provider_type = legacy_instance
-                .map(|instance| instance.provider_driver.as_str())
+                .map(|instance| instance.provider_profile_id.as_str())
                 .filter(|value| !value.is_empty())
-                .unwrap_or(candidate.inventory.provider_driver.as_str());
+                .unwrap_or(candidate.inventory.provider_profile_id.as_str());
             let provider_model = model_catalog.resolve(
                 tenant_id,
                 &req.capability,
@@ -2248,8 +2292,7 @@ impl Router {
                     item.instance_id.as_str(),
                 ),
                 instance_id: item.instance_id,
-                provider_model: item.provider_model,
-                provider_options: None,
+                provider_call: legacy_resolved_call(item.provider_model),
                 pricing_snapshot: None,
             })
             .collect::<Vec<_>>();
@@ -2274,7 +2317,7 @@ impl Router {
         Ok(RouteDecision {
             primary_instance_id: primary.instance_id.clone(),
             fallback_instance_ids,
-            provider_model: primary.provider_model.clone(),
+            provider_model: primary.provider_call.provider_model_id.clone(),
             enabled_capabilities: Vec::new(),
             disabled_capabilities: Vec::new(),
             attempts: final_attempts,
@@ -2297,6 +2340,14 @@ fn legacy_route_trace(model: String, api_type: ApiType) -> RouteTrace {
         selected_exact_model: None,
         selected_provider_instance_name: None,
         selected_provider_model_id: None,
+        selected_origin_model_id: None,
+        selected_model_driver: None,
+        selected_operation: None,
+        selected_provider_profile_id: None,
+        selected_protocol_adapter_id: None,
+        provider_rules_revision: None,
+        applied_request_rules: Vec::new(),
+        pricing_source: None,
         provider_options: None,
         pricing_snapshot: None,
         candidate_count_before_filter: 0,
@@ -2380,7 +2431,7 @@ fn capability_for_method(method: &str) -> Option<Capability> {
     }
 }
 
-fn api_type_for_method(method: &str) -> Option<ApiType> {
+pub(crate) fn api_type_for_method(method: &str) -> Option<ApiType> {
     match method {
         ai_methods::LLM_CHAT => Some(ApiType::Llm),
         ai_methods::EMBEDDING_TEXT => Some(ApiType::Embedding),
@@ -2517,18 +2568,30 @@ fn route_probe_payload(estimated_input_tokens: Option<u64>) -> AiPayload {
     )
 }
 
-fn provider_call_from_metadata(metadata: &ModelMetadata) -> (String, Option<Value>) {
-    (
-        metadata
-            .provider_actual_model_id
-            .clone()
-            .unwrap_or_else(|| metadata.provider_model_id.clone()),
-        metadata.provider_options.clone(),
-    )
+fn legacy_resolved_call(provider_model_id: String) -> ResolvedProviderCall {
+    ResolvedProviderCall {
+        provider_model_id,
+        model_driver: String::new(),
+        origin_model_id: None,
+        operation: String::new(),
+        options: json!({}),
+        pricing: ResolvedPricing {
+            definition: ProviderPricing::default(),
+            source: PricingSource::Unknown,
+            matched_amount: None,
+        },
+        provider_rules_revision: 0,
+        applied_request_rules: Vec::new(),
+    }
 }
 
-fn provider_call_from_candidate(candidate: &ModelCandidate) -> (String, Option<Value>) {
-    provider_call_from_metadata(&candidate.metadata)
+fn resolved_call_options(call: &ResolvedProviderCall) -> Option<Value> {
+    (!call.options.is_null()
+        && !call
+            .options
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty))
+    .then(|| call.options.clone())
 }
 
 fn enabled_capabilities(capabilities: &ModelCapabilities, disabled: &[Feature]) -> Vec<Feature> {
@@ -2726,8 +2789,11 @@ fn append_provider_audit_to_summary(summary: &mut AiResponse, attempt: &RouteAtt
             "provider_audit".to_string(),
             json!({
                 "aicc_exact_model": attempt.exact_model,
-                "provider_actual_model": attempt.provider_model,
-                "provider_options": attempt.provider_options,
+                "provider_actual_model": attempt.provider_call.provider_model_id,
+                "provider_options": resolved_call_options(&attempt.provider_call),
+                "model_driver": attempt.provider_call.model_driver,
+                "origin_model_id": attempt.provider_call.origin_model_id,
+                "operation": attempt.provider_call.operation,
             }),
         );
     }
@@ -3203,36 +3269,6 @@ pub fn logical_mount_segment(value: &str) -> String {
 }
 
 #[allow(dead_code)]
-fn provider_driver_mount_segment(provider_driver: &str) -> String {
-    let normalized = provider_driver
-        .trim()
-        .replace('_', "-")
-        .to_ascii_lowercase();
-    let stripped = normalized
-        .strip_prefix("google-")
-        .unwrap_or(normalized.as_str());
-    logical_mount_segment(stripped)
-}
-
-#[allow(dead_code)]
-pub fn image_logical_mounts(provider_driver: &str, provider_model_id: &str) -> Vec<String> {
-    let driver_mount = format!(
-        "image.txt2img.{}",
-        provider_driver_mount_segment(provider_driver)
-    );
-    let mut mounts = vec![driver_mount];
-    let lowered = provider_model_id.to_ascii_lowercase();
-    if lowered.contains("gpt") {
-        mounts.push("image.txt2img.gpt_image".to_string());
-    } else if lowered.contains("dall-e") {
-        mounts.push("image.txt2img.dalle".to_string());
-    } else if lowered.contains("gemini") {
-        mounts.push("image.txt2img.gemini".to_string());
-    }
-    mounts
-}
-
-#[allow(dead_code)]
 pub fn provider_model_metadata(
     provider_instance_name: &str,
     provider_type: ProviderType,
@@ -3645,7 +3681,8 @@ impl AIComputeCenter {
                     .collect();
                 json!({
                     "provider_instance_name": inventory.provider_instance_name,
-                    "provider_driver": inventory.provider_driver,
+                    "provider_profile_id": inventory.provider_profile_id,
+                    "protocol_adapter_id": inventory.protocol_adapter_id,
                     "provider_type": inventory.provider_type,
                     "provider_origin": inventory.provider_origin,
                     "provider_type_revision": inventory.provider_type_revision,
@@ -3755,17 +3792,56 @@ impl AIComputeCenter {
             .registry
             .get_provider(provider_instance_name)
             .ok_or_else(|| reason_error("provider_not_found", "provider not found"))?;
-        let inventory = provider.refresh_inventory().await.map_err(|err| {
-            reason_error(
-                "provider_refresh_failed",
-                format!("refresh provider inventory failed: {}", err),
-            )
-        })?;
+        let registered_inventory = provider.inventory();
+        let (inventory, discovered) = match provider.refresh_inventory().await {
+            Ok(inventory) => (inventory, true),
+            Err(refresh_error) => {
+                let lkgs = match self.usage_log_db.as_ref() {
+                    Some(db) => db
+                        .load_provider_inventory_lkgs(
+                            provider_instance_name,
+                            registered_inventory.provider_profile_id.as_str(),
+                            registered_inventory.protocol_adapter_id.as_str(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            reason_error(
+                                "provider_refresh_failed",
+                                format!(
+                                    "refresh provider inventory failed: {refresh_error}; load LKGS failed: {error}"
+                                ),
+                            )
+                        })?,
+                    None => None,
+                };
+                let Some(lkgs) = lkgs else {
+                    return Err(reason_error(
+                        "provider_refresh_failed",
+                        format!("refresh provider inventory failed: {refresh_error}"),
+                    ));
+                };
+                warn!(
+                    "aicc.provider_inventory_refresh_lkgs provider_instance_name={} err={}",
+                    provider_instance_name, refresh_error
+                );
+                (lkgs, false)
+            }
+        };
         self.model_registry
             .write()
             .map_err(|_| reason_error("internal_error", "model registry lock poisoned"))?
             .apply_inventory(inventory.clone())
             .map_err(route_error_to_rpc)?;
+        if discovered {
+            if let Some(db) = self.usage_log_db.as_ref() {
+                if let Err(error) = db.upsert_provider_inventory_lkgs(&inventory).await {
+                    warn!(
+                        "aicc.provider_inventory_lkgs_write_failed provider_instance_name={} err={}",
+                        provider_instance_name, error
+                    );
+                }
+            }
+        }
         Ok(inventory)
     }
 
@@ -3787,11 +3863,41 @@ impl AIComputeCenter {
                     continue;
                 }
             };
-            let inventory = match inventory {
-                Ok(inventory) => inventory,
-                Err(err) => {
-                    errors.push((provider_instance_name, err.to_string()));
-                    continue;
+            let registered_inventory = provider.inventory();
+            let (inventory, discovered) = match inventory {
+                Ok(inventory) => (inventory, true),
+                Err(refresh_error) => {
+                    let lkgs = match self.usage_log_db.as_ref() {
+                        Some(db) => {
+                            db.load_provider_inventory_lkgs(
+                                provider_instance_name.as_str(),
+                                registered_inventory.provider_profile_id.as_str(),
+                                registered_inventory.protocol_adapter_id.as_str(),
+                            )
+                            .await
+                        }
+                        None => Ok(None),
+                    };
+                    match lkgs {
+                        Ok(Some(inventory)) => {
+                            warn!(
+                                "aicc.provider_inventory_refresh_lkgs provider_instance_name={} err={}",
+                                provider_instance_name, refresh_error
+                            );
+                            (inventory, false)
+                        }
+                        Ok(None) => {
+                            errors.push((provider_instance_name, refresh_error.to_string()));
+                            continue;
+                        }
+                        Err(error) => {
+                            errors.push((
+                                provider_instance_name,
+                                format!("{refresh_error}; load LKGS failed: {error}"),
+                            ));
+                            continue;
+                        }
+                    }
                 }
             };
             if !self
@@ -3810,11 +3916,24 @@ impl AIComputeCenter {
                 .map_err(|_| "model registry lock poisoned".to_string())
                 .and_then(|mut registry| {
                     registry
-                        .apply_inventory(inventory)
+                        .apply_inventory(inventory.clone())
                         .map_err(|err| err.to_string())
                 });
             match apply_result {
-                Ok(()) => refreshed = refreshed.saturating_add(1),
+                Ok(()) => {
+                    if discovered {
+                        if let Some(db) = self.usage_log_db.as_ref() {
+                            if let Err(error) = db.upsert_provider_inventory_lkgs(&inventory).await
+                            {
+                                warn!(
+                                    "aicc.provider_inventory_lkgs_write_failed provider_instance_name={} err={}",
+                                    provider_instance_name, error
+                                );
+                            }
+                        }
+                    }
+                    refreshed = refreshed.saturating_add(1)
+                }
                 Err(err) => errors.push((provider_instance_name, err)),
             }
         }
@@ -3934,13 +4053,54 @@ impl AIComputeCenter {
             .schedule(&resolution.candidates, &policy)
             .ok_or_else(|| reason_error("no_provider_available", "no route candidate generated"))?;
 
+        let resolve_call = |candidate: &ModelCandidate| {
+            let provider = self
+                .registry
+                .get_provider(candidate.provider_instance_name.as_str())
+                .ok_or_else(|| {
+                    reason_error(
+                        "no_provider_available",
+                        format!(
+                            "provider instance '{}' is not registered",
+                            candidate.provider_instance_name
+                        ),
+                    )
+                })?;
+            provider
+                .resolve_call(&candidate.metadata, method, &api_type)
+                .map_err(|error| reason_error("provider_call_resolve_failed", error.to_string()))
+        };
+        let mut selected_call = resolve_call(&scheduled.selected)?;
+        if let Some(provider_model) = self.legacy_catalog_provider_model(
+            tenant_id,
+            &request.capability,
+            request.model.alias.as_str(),
+            scheduled.selected.provider_instance_name.as_str(),
+        ) {
+            selected_call.provider_model_id = provider_model;
+            selected_call.options = json!({});
+        }
+
         resolution.trace.selected_exact_model = Some(scheduled.selected.exact_model.clone());
         resolution.trace.selected_provider_instance_name =
             Some(scheduled.selected.provider_instance_name.clone());
-        let (selected_provider_model, mut selected_provider_options) =
-            provider_call_from_candidate(&scheduled.selected);
-        resolution.trace.selected_provider_model_id = Some(selected_provider_model.clone());
-        resolution.trace.provider_options = selected_provider_options.clone();
+        resolution.trace.selected_provider_model_id = Some(selected_call.provider_model_id.clone());
+        resolution.trace.selected_origin_model_id = selected_call.origin_model_id.clone();
+        resolution.trace.selected_model_driver = Some(selected_call.model_driver.clone());
+        resolution.trace.selected_operation = Some(selected_call.operation.clone());
+        resolution.trace.provider_rules_revision = Some(selected_call.provider_rules_revision);
+        resolution.trace.applied_request_rules = selected_call.applied_request_rules.clone();
+        resolution.trace.pricing_source = serde_json::to_value(&selected_call.pricing.source)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string));
+        resolution.trace.provider_options = Some(selected_call.options.clone());
+        if let Some(inventory) = self
+            .registry
+            .inventory(scheduled.selected.provider_instance_name.as_str())
+        {
+            resolution.trace.selected_provider_profile_id = Some(inventory.provider_profile_id);
+            resolution.trace.selected_protocol_adapter_id = Some(inventory.protocol_adapter_id);
+        }
         resolution.trace.pricing_snapshot =
             RoutePricingSnapshot::from_candidate(&scheduled.selected);
         resolution.trace.ranked_candidates = scheduled.ranked_candidates;
@@ -3957,24 +4117,10 @@ impl AIComputeCenter {
                 .unwrap_or_else(|err| format!("{{\"serialize_error\":\"{}\"}}", err))
         );
 
-        let selected_provider_model = self
-            .legacy_catalog_provider_model(
-                tenant_id,
-                &request.capability,
-                request.model.alias.as_str(),
-                scheduled.selected.provider_instance_name.as_str(),
-            )
-            .map(|provider_model| {
-                selected_provider_options = None;
-                resolution.trace.provider_options = None;
-                resolution.trace.selected_provider_model_id = Some(provider_model.clone());
-                provider_model
-            })
-            .unwrap_or(selected_provider_model);
+        let selected_provider_model = selected_call.provider_model_id.clone();
         let mut attempts = vec![RouteAttempt {
             instance_id: scheduled.selected.provider_instance_name.clone(),
-            provider_model: selected_provider_model.clone(),
-            provider_options: selected_provider_options.clone(),
+            provider_call: selected_call,
             exact_model: scheduled.selected.exact_model.clone(),
             pricing_snapshot: RoutePricingSnapshot::from_candidate(&scheduled.selected),
         }];
@@ -3987,25 +4133,19 @@ impl AIComputeCenter {
                 if attempts.len() > fallback_limit {
                     break;
                 }
-                let (candidate_provider_model, candidate_provider_options) =
-                    provider_call_from_candidate(candidate);
-                let mut provider_options = candidate_provider_options;
-                let provider_model = self
-                    .legacy_catalog_provider_model(
-                        tenant_id,
-                        &request.capability,
-                        request.model.alias.as_str(),
-                        candidate.provider_instance_name.as_str(),
-                    )
-                    .map(|provider_model| {
-                        provider_options = None;
-                        provider_model
-                    })
-                    .unwrap_or(candidate_provider_model);
+                let mut provider_call = resolve_call(candidate)?;
+                if let Some(provider_model) = self.legacy_catalog_provider_model(
+                    tenant_id,
+                    &request.capability,
+                    request.model.alias.as_str(),
+                    candidate.provider_instance_name.as_str(),
+                ) {
+                    provider_call.provider_model_id = provider_model;
+                    provider_call.options = json!({});
+                }
                 attempts.push(RouteAttempt {
                     instance_id: candidate.provider_instance_name.clone(),
-                    provider_model,
-                    provider_options,
+                    provider_call,
                     exact_model: candidate.exact_model.clone(),
                     pricing_snapshot: RoutePricingSnapshot::from_candidate(&candidate),
                 });
@@ -4058,17 +4198,22 @@ impl AIComputeCenter {
             .map(|attempt| RouteFallbackAttempt {
                 exact_model: attempt.exact_model.clone(),
                 provider_instance_name: attempt.instance_id.clone(),
-                provider_model_id: attempt.provider_model.clone(),
-                provider_options: attempt.provider_options.clone(),
+                provider_model_id: attempt.provider_call.provider_model_id.clone(),
+                provider_options: resolved_call_options(&attempt.provider_call),
             })
             .collect();
 
         Ok(RouteResolveResponse {
             selected_exact_model: primary.exact_model.clone(),
             provider_instance_name: primary.instance_id.clone(),
-            provider_driver: inventory.as_ref().map(|item| item.provider_driver.clone()),
-            provider_model_id: primary.provider_model.clone(),
-            provider_options: primary.provider_options.clone(),
+            provider_profile_id: inventory
+                .as_ref()
+                .map(|item| item.provider_profile_id.clone()),
+            protocol_adapter_id: inventory
+                .as_ref()
+                .map(|item| item.protocol_adapter_id.clone()),
+            provider_model_id: primary.provider_call.provider_model_id.clone(),
+            provider_options: resolved_call_options(&primary.provider_call),
             enabled_capabilities: decision.enabled_capabilities.clone(),
             disabled_capabilities: decision.disabled_capabilities.clone(),
             fallback_attempts,
@@ -4105,14 +4250,14 @@ impl AIComputeCenter {
         provider_instance_name: &str,
     ) -> Option<String> {
         let inventory = self.registry.inventory(provider_instance_name)?;
-        if inventory.provider_driver.is_empty() {
+        if inventory.provider_profile_id.is_empty() {
             return None;
         }
         self.model_catalog.resolve(
             tenant_id,
             capability,
             alias,
-            inventory.provider_driver.as_str(),
+            inventory.provider_profile_id.as_str(),
         )
     }
 
@@ -4138,16 +4283,16 @@ impl AIComputeCenter {
                 cached_input_tokens: None,
                 request_features: request.requirements.effective_feature_names(),
             });
-            let provider_driver = self
+            let provider_profile_id = self
                 .registry
                 .inventory(candidate.provider_instance_name.as_str())
-                .map(|inventory| inventory.provider_driver)
+                .map(|inventory| inventory.provider_profile_id)
                 .unwrap_or_default();
             let effective_cost = self
                 .sn_ai_provider_billing
                 .preview_billed_cost(
                     tenant_id,
-                    provider_driver.as_str(),
+                    provider_profile_id.as_str(),
                     estimate.estimated_cost_usd,
                 )
                 .unwrap_or(estimate.estimated_cost_usd);
@@ -4211,7 +4356,7 @@ impl AIComputeCenter {
     fn apply_billing_to_summary(
         &self,
         ctx: &InvokeCtx,
-        provider_driver: &str,
+        provider_profile_id: &str,
         summary: &mut AiResponse,
     ) {
         let Some(cost) = summary.cost.clone() else {
@@ -4219,7 +4364,7 @@ impl AIComputeCenter {
         };
         let Some(adjustment) = self.sn_ai_provider_billing.apply_charge(
             ctx.tenant_id.as_str(),
-            provider_driver,
+            provider_profile_id,
             Some(cost.amount),
         ) else {
             return;
@@ -4712,7 +4857,12 @@ impl AIComputeCenter {
         let route_attempts = decision
             .attempts()
             .iter()
-            .map(|item| format!("{}:{}", item.instance_id, item.provider_model))
+            .map(|item| {
+                format!(
+                    "{}:{}",
+                    item.instance_id, item.provider_call.provider_model_id
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         info!(
@@ -5031,8 +5181,20 @@ impl AIComputeCenter {
                     trace.runtime_failover_count = trace.runtime_failover_count.saturating_add(1);
                     trace.selected_exact_model = Some(attempt.exact_model.clone());
                     trace.selected_provider_instance_name = Some(attempt.instance_id.clone());
-                    trace.selected_provider_model_id = Some(attempt.provider_model.clone());
-                    trace.provider_options = attempt.provider_options.clone();
+                    trace.selected_provider_model_id =
+                        Some(attempt.provider_call.provider_model_id.clone());
+                    trace.selected_origin_model_id = attempt.provider_call.origin_model_id.clone();
+                    trace.selected_model_driver = Some(attempt.provider_call.model_driver.clone());
+                    trace.selected_operation = Some(attempt.provider_call.operation.clone());
+                    trace.provider_rules_revision =
+                        Some(attempt.provider_call.provider_rules_revision);
+                    trace.applied_request_rules =
+                        attempt.provider_call.applied_request_rules.clone();
+                    trace.pricing_source =
+                        serde_json::to_value(&attempt.provider_call.pricing.source)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_string));
+                    trace.provider_options = Some(attempt.provider_call.options.clone());
                     trace.pricing_snapshot = attempt.pricing_snapshot.clone();
                     if let Some(summary) = trace.user_summary.as_mut() {
                         summary.display_name = attempt
@@ -5048,7 +5210,11 @@ impl AIComputeCenter {
             }
             info!(
                 "aicc.provider.start task_id={} tenant={} trace_id={:?} instance_id={} provider_model={}",
-                task_id, ctx.tenant_id, ctx.trace_id, attempt.instance_id, attempt.provider_model
+                task_id,
+                ctx.tenant_id,
+                ctx.trace_id,
+                attempt.instance_id,
+                attempt.provider_call.provider_model_id
             );
 
             if let Ok(mut selected) = selected_provider_model.write() {
@@ -5060,12 +5226,13 @@ impl AIComputeCenter {
             let mut provider_req = req.clone();
             merge_provider_options(
                 &mut provider_req.request.payload,
-                attempt.provider_options.clone(),
+                Some(attempt.provider_call.options.clone()),
             );
+            provider_req.provider_call = Some(attempt.provider_call.clone());
             let result = provider
                 .start(
                     ctx.clone(),
-                    attempt.provider_model.clone(),
+                    attempt.provider_call.provider_model_id.clone(),
                     provider_req,
                     sink.clone(),
                 )
@@ -5080,7 +5247,7 @@ impl AIComputeCenter {
                             ctx,
                             self.registry
                                 .inventory(attempt.instance_id.as_str())
-                                .map(|inventory| inventory.provider_driver)
+                                .map(|inventory| inventory.provider_profile_id)
                                 .unwrap_or_default()
                                 .as_str(),
                             summary,
@@ -5102,7 +5269,7 @@ impl AIComputeCenter {
                                 ctx.tenant_id,
                                 ctx.trace_id,
                                 attempt.instance_id,
-                                attempt.provider_model,
+                                attempt.provider_call.provider_model_id,
                                 elapsed_ms,
                                 summary_log
                             );
@@ -5114,7 +5281,7 @@ impl AIComputeCenter {
                                 ctx.tenant_id,
                                 ctx.trace_id,
                                 attempt.instance_id,
-                                attempt.provider_model,
+                                attempt.provider_call.provider_model_id,
                                 elapsed_ms
                             );
                         }
@@ -5125,7 +5292,7 @@ impl AIComputeCenter {
                                 ctx.tenant_id,
                                 ctx.trace_id,
                                 attempt.instance_id,
-                                attempt.provider_model,
+                                attempt.provider_call.provider_model_id,
                                 elapsed_ms,
                                 position
                             );
@@ -5152,7 +5319,7 @@ impl AIComputeCenter {
                         ctx.tenant_id,
                         ctx.trace_id,
                         attempt.instance_id,
-                        attempt.provider_model,
+                        attempt.provider_call.provider_model_id,
                         elapsed_ms,
                         error.is_retryable(),
                         error
@@ -5626,8 +5793,8 @@ fn merge_route_decision_into_task_data(
             "fallback_instance_ids": decision.fallback_instance_ids,
             "provider_model": decision.provider_model,
             "selected_exact_model": primary.map(|attempt| attempt.exact_model.clone()),
-            "provider_actual_model": primary.map(|attempt| attempt.provider_model.clone()),
-            "provider_options": primary.and_then(|attempt| attempt.provider_options.clone()),
+            "provider_actual_model": primary.map(|attempt| attempt.provider_call.provider_model_id.clone()),
+            "provider_options": primary.and_then(|attempt| resolved_call_options(&attempt.provider_call)),
     }));
     let progress = task_data.progress.get_or_insert_with(Default::default);
     progress.status = Some(initial_status.to_string());
@@ -7094,7 +7261,8 @@ mod tests {
         ProviderInstance {
             provider_instance_name: instance_id.to_string(),
             provider_type: ProviderType::CloudApi,
-            provider_driver: provider_type.to_string(),
+            provider_profile_id: provider_type.to_string(),
+            protocol_adapter_id: provider_type.to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -7107,7 +7275,8 @@ mod tests {
         ProviderInventory {
             provider_instance_name: instance.provider_instance_name.clone(),
             provider_type: instance.provider_type.clone(),
-            provider_driver: instance.provider_driver.clone(),
+            provider_profile_id: instance.provider_profile_id.clone(),
+            protocol_adapter_id: instance.protocol_adapter_id.clone(),
             provider_origin: instance.provider_origin.clone(),
             provider_type_trusted_source: instance.provider_type_trusted_source.clone(),
             provider_type_revision: None,
@@ -7117,7 +7286,7 @@ mod tests {
             models: vec![provider_model_metadata(
                 instance.provider_instance_name.as_str(),
                 instance.provider_type.clone(),
-                instance.provider_driver.as_str(),
+                instance.provider_profile_id.as_str(),
                 "gpt-4o-mini",
                 ApiType::Llm,
                 vec!["llm.plan.default".to_string()],

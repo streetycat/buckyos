@@ -1,0 +1,151 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "openai",
+  "metadata_drivers": ["openai"],
+  "models": [
+    {
+      "id": "gpt-5",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000125, "output_token": 0.00001 },
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "id": "gpt-5.6",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.000004, "output_token": 0.00002 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    }
+  ],
+  "patterns": [
+    { "pattern": "*:reasoning-low", "provider_options": { "reasoning": { "effort": "low" } } },
+    { "pattern": "*:reasoning-high", "provider_options": { "reasoning": { "effort": "high" } } },
+    {
+      "pattern": "gpt-5.6-terra*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.000002, "output_token": 0.000012 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.6-luna*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.0000002, "output_token": 0.0000012 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.6-sol*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.000004, "output_token": 0.00002 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.4-pro*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00003, "output_token": 0.00018 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.4-mini*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000075, "output_token": 0.0000045 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.4-nano*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.0000002, "output_token": 0.00000125 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5.4*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.0000025, "output_token": 0.000015 },
+      "request_rules": [{ "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" }, "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-pro*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.000015, "output_token": 0.00012 },
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-mini*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000025, "output_token": 0.000002 },
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-nano*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000005, "output_token": 0.0000004 },
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5-nono*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000005, "output_token": 0.0000004 },
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5*codex*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000125, "output_token": 0.00001 },
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000125, "output_token": 0.00001 },
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5*",
+      "match_source": "origin_model_id",
+      "pricing": { "input_token": 0.00000125, "output_token": 0.00001 },
+      "request_rules": [
+        {
+          "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" },
+          "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"]
+        }
+      ]
+    },
+    { "pattern": "gpt-4.1-mini*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000004, "output_token": 0.0000016 } },
+    { "pattern": "gpt-4.1*", "match_source": "origin_model_id", "pricing": { "input_token": 0.000002, "output_token": 0.000008 } },
+    { "pattern": "gpt-4o-mini*", "match_source": "origin_model_id", "pricing": { "input_token": 0.00000015, "output_token": 0.0000006 } },
+    { "pattern": "gpt-4o*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000025, "output_token": 0.00001 } },
+    { "pattern": "gpt-3.5*", "match_source": "origin_model_id", "pricing": { "input_token": 0.0000005, "output_token": 0.0000015 } },
+    { "pattern": "sora*pro*", "match_source": "origin_model_id", "pricing": { "unit": "request", "amount": 1.2 } },
+    { "pattern": "sora*", "match_source": "origin_model_id", "pricing": { "unit": "request", "amount": 0.4 } },
+    { "pattern": "gpt-image-1-mini*", "match_source": "origin_model_id", "request_rules": [{ "remove": ["/input_fidelity"] }], "pricing": { "unit": "image", "amount": 0.042 } },
+    {
+      "pattern": "gpt-image-1*",
+      "match_source": "origin_model_id",
+      "pricing": {
+        "unit": "image",
+        "amount": 0.042,
+        "rules": [
+          { "when": { "all": [{ "path": "/quality", "op": "equals", "value": "high" }, { "path": "/size", "op": "in", "value": ["1024x1536", "1536x1024"] }] }, "amount": 0.25 },
+          { "when": { "all": [{ "path": "/quality", "op": "equals", "value": "medium" }, { "path": "/size", "op": "in", "value": ["1024x1536", "1536x1024"] }] }, "amount": 0.063 },
+          { "when": { "all": [{ "path": "/quality", "op": "equals", "value": "low" }, { "path": "/size", "op": "in", "value": ["1024x1536", "1536x1024"] }] }, "amount": 0.016 },
+          { "when": { "path": "/quality", "op": "equals", "value": "high" }, "amount": 0.167 },
+          { "when": { "path": "/quality", "op": "equals", "value": "low" }, "amount": 0.011 },
+          { "when": { "path": "/size", "op": "in", "value": ["1024x1536", "1536x1024"] }, "amount": 0.063 }
+        ]
+      }
+    },
+    { "pattern": "gpt-image-2*", "match_source": "origin_model_id", "request_rules": [{ "remove": ["/input_fidelity"] }] },
+    { "pattern": "dall-e-2*", "match_source": "origin_model_id", "pricing": { "unit": "image", "amount": 0.02 } },
+    { "pattern": "dall-e-3*", "match_source": "origin_model_id", "pricing": { "unit": "image", "amount": 0.04, "rules": [{ "when": { "path": "/quality", "op": "equals", "value": "hd" }, "amount": 0.08 }] } }
+  ],
+  "defaults": {
+    "pricing": { "input_token": 0.000001, "output_token": 0.000003 }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 0,
+  "revision_seq": 1,
+  "provider_profile_id": "openrouter",
+  "metadata_drivers": ["openai", "claude", "google-gemini"],
+  "origin_provider_aliases": {
+    "openai": "openai",
+    "anthropic": "claude",
+    "google": "google-gemini"
+  },
+  "origin_mappings": [
+    {
+      "mapping_key": "vendor-model",
+      "priority": 0,
+      "match": {
+        "source": "provider_model_id",
+        "regex": "^(?<driver>[^/]+)/(?<model>.+)$"
+      },
+      "transforms": {
+        "driver": [
+          { "op": "lowercase" },
+          {
+            "op": "alias",
+            "table": "origin_provider_aliases",
+            "on_missing": "keep"
+          }
+        ],
+        "model": [{ "op": "trim" }]
+      }
+    }
+  ],
+  "models": [
+    { "id": "openrouter/auto", "exclude": true },
+    {
+      "id": "openai/gpt-5.5",
+      "remove_features": ["web_search"],
+      "pricing": {
+        "currency": "USD",
+        "estimated_cost": 0.035,
+        "input_token": 0.000005,
+        "output_token": 0.00003,
+        "cache_input_token": 0.0000005
+      }
+    }
+  ],
+  "patterns": [
+    { "pattern": "*:reasoning-low", "provider_options": { "reasoning": { "effort": "low" } } },
+    { "pattern": "*:reasoning-high", "provider_options": { "reasoning": { "effort": "high" } } },
+    { "pattern": "*:reasoning-medium", "provider_options": { "thinking": { "type": "enabled", "budget_tokens": 4096 } } },
+    { "pattern": "*:*", "exclude": true },
+    { "pattern": "*/*latest*", "exclude": true },
+    { "pattern": "openai/o*-*-high", "exclude": true },
+    { "pattern": "openai/gpt-*-sol-pro", "exclude": true },
+    {
+      "pattern": "gpt-5",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-nano*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5-nono*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        { "defaults": { "reasoning": { "effort": "minimal" }, "text": { "verbosity": "low" } } },
+        { "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }
+      ]
+    },
+    {
+      "pattern": "gpt-5*codex*",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5-*",
+      "match_source": "origin_model_id",
+      "request_rules": [{ "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"] }]
+    },
+    {
+      "pattern": "gpt-5*",
+      "match_source": "origin_model_id",
+      "request_rules": [
+        {
+          "when": { "path": "/reasoning/effort", "op": "not_equals", "value": "none" },
+          "remove": ["/temperature", "/top_p", "/logprobs", "/top_logprobs"]
+        }
+      ]
+    }
+  ]
+}

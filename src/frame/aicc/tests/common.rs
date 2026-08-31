@@ -235,7 +235,8 @@ pub fn mock_instance(
         instance: ProviderInstance {
             provider_instance_name: instance_id.to_string(),
             provider_type: ProviderType::CloudApi,
-            provider_driver: provider_type.to_string(),
+            provider_profile_id: provider_type.to_string(),
+            protocol_adapter_id: provider_type.to_string(),
             provider_origin: ProviderOrigin::SystemConfig,
             provider_type_trusted_source: ProviderTypeTrustedSource::SystemConfig,
             provider_type_revision: None,
@@ -249,11 +250,11 @@ pub fn mock_instance(
 
 pub fn mock_local_instance(
     instance_id: &str,
-    provider_driver: &str,
+    provider_profile_id: &str,
     capabilities: Vec<Capability>,
     features: Vec<String>,
 ) -> MockInstanceConfig {
-    let mut config = mock_instance(instance_id, provider_driver, capabilities, features);
+    let mut config = mock_instance(instance_id, provider_profile_id, capabilities, features);
     config.instance.provider_type = ProviderType::LocalInference;
     config
 }
@@ -437,7 +438,7 @@ fn mock_inventory(
         models.push(provider_model_metadata(
             instance.provider_instance_name.as_str(),
             instance.provider_type.clone(),
-            instance.provider_driver.as_str(),
+            instance.provider_profile_id.as_str(),
             provider_model_id,
             api_type,
             mounts.into_iter().map(str::to_string).collect(),
@@ -450,7 +451,8 @@ fn mock_inventory(
     ProviderInventory {
         provider_instance_name: instance.provider_instance_name.clone(),
         provider_type: instance.provider_type.clone(),
-        provider_driver: instance.provider_driver.clone(),
+        provider_profile_id: instance.provider_profile_id.clone(),
+        protocol_adapter_id: instance.protocol_adapter_id.clone(),
         provider_origin: instance.provider_origin.clone(),
         provider_type_trusted_source: instance.provider_type_trusted_source.clone(),
         provider_type_revision: instance.provider_type_revision.clone(),
