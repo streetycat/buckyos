@@ -34,7 +34,7 @@
 //!
 //! 1. **LlmClient 适配**：通过 `AiccLlmClient` 把 waist 侧的
 //!    `LlmInferenceRequest` 翻译成 AICC 的 `AiMethodRequest`（capability =
-//!    Llm，method = `llm.chat`），返回的 `AiResponse` 直接 forward
+//!    Llm，method = `helper.llm_chat`），返回的 `AiResponse` 直接 forward
 //!    给 waist。Running 状态本工具不做轮询（DV test 用的是同步模型），
 //!    遇到时直接报错让 caller 排查。
 //!
@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    ai_methods, get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
+    get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
     value_to_object_map, AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiResponse, AiRole,
     AiToolSpec, BuckyOSRuntimeType, Capability, ModelSpec, Requirements, RespFormat,
 };
@@ -587,21 +587,23 @@ impl LlmClient for AiccLlmClient {
             .await
             .map_err(|e| LLMComputeError::Provider(format!("get aicc client failed: {e}")))?;
         let response = client
-            .call_method(ai_methods::LLM_CHAT, request)
+            .helper_llm_chat(request)
             .await
-            .map_err(|e| LLMComputeError::Provider(format!("aicc llm.chat failed: {e}")))?;
+            .map_err(|e| LLMComputeError::Provider(format!("aicc helper.llm_chat failed: {e}")))?;
 
         match response.status {
             AiMethodStatus::Succeeded => response.result.ok_or_else(|| {
-                LLMComputeError::Provider("aicc llm.chat succeeded but result is empty".to_string())
+                LLMComputeError::Provider(
+                    "aicc helper.llm_chat succeeded but result is empty".to_string(),
+                )
             }),
             AiMethodStatus::Failed => Err(LLMComputeError::Provider(format!(
-                "aicc llm.chat failed: task_id={}, event_ref={}",
+                "aicc helper.llm_chat failed: task_id={}, event_ref={}",
                 response.task_id,
                 response.event_ref.as_deref().unwrap_or("")
             ))),
             AiMethodStatus::Running => Err(LLMComputeError::Provider(format!(
-                "aicc llm.chat returned async task `{}`; run_local_llm dev tool does \
+                "aicc helper.llm_chat returned async task `{}`; run_local_llm dev tool does \
                  not poll async tasks — use a synchronous-capable model",
                 response.task_id
             ))),
