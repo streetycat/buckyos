@@ -52,7 +52,8 @@ use async_trait::async_trait;
 use buckyos_api::{
     get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
     value_to_object_map, AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiResponse, AiRole,
-    AiToolSpec, BuckyOSRuntimeType, Capability, ModelSpec, Requirements, RespFormat,
+    AiToolSpec, BuckyOSRuntimeType, Capability, LlmChatHelperRequest, ModelSpec, Requirements,
+    RespFormat,
 };
 use llm_context::{
     LLMComputeError, LLMContextOutcome, LlmClient, LlmInferenceRequest, ToolMode, ToolPolicy,
@@ -579,6 +580,7 @@ impl LlmClient for AiccLlmClient {
             payload,
             None,
         );
+        let request = LlmChatHelperRequest::try_from(request).map_err(LLMComputeError::Provider)?;
 
         let runtime = get_buckyos_api_runtime()
             .map_err(|e| LLMComputeError::Provider(format!("get buckyos runtime failed: {e}")))?;
@@ -590,6 +592,7 @@ impl LlmClient for AiccLlmClient {
             .helper_llm_chat(request)
             .await
             .map_err(|e| LLMComputeError::Provider(format!("aicc helper.llm_chat failed: {e}")))?;
+        let response: buckyos_api::AiMethodResponse = response.into();
 
         match response.status {
             AiMethodStatus::Succeeded => response.result.ok_or_else(|| {

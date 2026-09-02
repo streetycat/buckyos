@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use buckyos_api::{
     features, get_buckyos_api_runtime, value_to_object_map, AiMethodRequest,
     AiMethodStatus, AiPayload, AiResponse, AiToolCall, AiToolSpec, AiccClient, Capability,
-    KEventClient, ModelSpec, MsgCenterClient, Requirements, RespFormat, TaskDispatcherClient,
-    TaskManagerClient, TaskOutcome, TypedTaskData,
+    KEventClient, LlmChatHelperRequest, ModelSpec, MsgCenterClient, Requirements, RespFormat,
+    TaskDispatcherClient, TaskManagerClient, TaskOutcome, TypedTaskData,
 };
 use log::warn;
 use serde_json::{json, Value};
@@ -180,6 +180,7 @@ impl LlmClient for AiccLlmClient {
         // (model_spec carries a single alias); attach them to options so the
         // aicc adapter can pick them up when it adds fallback wiring.
         let _ = fallbacks;
+        let request = LlmChatHelperRequest::try_from(request).map_err(LLMComputeError::Provider)?;
 
         let aicc = self
             .client()
@@ -189,6 +190,7 @@ impl LlmClient for AiccLlmClient {
             .helper_llm_chat(request)
             .await
             .map_err(|err| LLMComputeError::Provider(err.to_string()))?;
+        let resp: buckyos_api::AiMethodResponse = resp.into();
 
         match resp.status {
             AiMethodStatus::Succeeded => resp.result.ok_or_else(|| {
