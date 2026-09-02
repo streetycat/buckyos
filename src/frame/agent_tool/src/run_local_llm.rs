@@ -33,8 +33,8 @@
 //! ## 设计要点
 //!
 //! 1. **LlmClient 适配**：通过 `AiccLlmClient` 把 waist 侧的
-//!    `LlmInferenceRequest` 翻译成 AICC 的 `AiMethodRequest`（capability =
-//!    Llm，method = `helper.llm_chat`），返回的 `AiResponse` 直接 forward
+//!    `LlmInferenceRequest` 翻译成 AICC 的 `LlmChatHelperRequest`，返回的
+//!    `AiResponse` 直接 forward
 //!    给 waist。Running 状态本工具不做轮询（DV test 用的是同步模型），
 //!    遇到时直接报错让 caller 排查。
 //!
@@ -50,10 +50,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
-    value_to_object_map, AiMessage, AiMethodRequest, AiMethodStatus, AiPayload, AiResponse, AiRole,
-    AiToolSpec, BuckyOSRuntimeType, Capability, LlmChatHelperRequest, ModelSpec, Requirements,
-    RespFormat,
+    get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime, AiMessage,
+    AiMethodStatus, AiResponse, AiRole, AiToolSpec, BuckyOSRuntimeType, HelperModelRequirement,
+    LlmChatHelperRequest, LlmResponseFormat, ModelDisable,
 };
 use llm_context::{
     LLMComputeError, LLMContextOutcome, LlmClient, LlmInferenceRequest, ToolMode, ToolPolicy,
@@ -61,7 +60,7 @@ use llm_context::{
 
 use crate::local_llm_context::{Compressor, LocalLLMContextError};
 use crate::{LocalLLMContext, OneShotRequest};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 
@@ -448,36 +447,6 @@ impl AiccLlmClient {
     }
 }
 
-fn build_aicc_llm_options(
-    temperature: Option<f32>,
-    max_completion_tokens: Option<u32>,
-    force_json: bool,
-    json_schema: Option<Value>,
-    provider_options: Option<Value>,
-) -> Value {
-    let mut options = serde_json::Map::new();
-    if let Some(temperature) = temperature {
-        options.insert("temperature".into(), json!(temperature));
-    }
-    if let Some(max_completion_tokens) = max_completion_tokens {
-        options.insert("max_tokens".into(), json!(max_completion_tokens));
-    }
-    if force_json {
-        if let Some(schema) = json_schema {
-            options.insert("response_schema".into(), schema);
-        }
-    }
-    if let Some(extra) = provider_options {
-        match extra {
-            Value::Object(extra) => options.extend(extra),
-            extra => {
-                options.insert("provider_options".into(), extra);
-            }
-        }
-    }
-    Value::Object(options)
-}
-
 #[async_trait]
 impl LlmClient for AiccLlmClient {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
@@ -508,79 +477,50 @@ impl LlmClient for AiccLlmClient {
                 .map(|spec| AiToolSpec {
                     name: spec.name,
                     description: spec.description,
-                    args_schema: value_to_object_map(spec.args_schema),
-                    output_schema: json!({}),
+                    tool_type: "function".to_string(),
+                    args_json_schema: spec.args_schema,
+                    output_schema: None,
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        // payload.options：把 temperature / max_tokens 透传给底层 provider
-        let options_value = Some(build_aicc_llm_options(
-            temperature,
-            max_completion_tokens,
-            force_json,
-            json_schema,
-            provider_options,
-        ));
-
-        let payload = AiPayload {
-            text: None,
-            messages,
-            tool_specs: aicc_tool_specs,
-            resources: Vec::new(),
-            input_json: None,
-            options: options_value,
+        let _ = provider_options;
+        let mut disable = ModelDisable::default();
+        for feature in disable_capabilities {
+            disable.set_feature_disabled(&feature);
+        }
+        let response_format = if force_json {
+            Some(match json_schema {
+                Some(schema) => LlmResponseFormat::json_schema(None, schema, None),
+                None => LlmResponseFormat::json_object(),
+            })
+        } else {
+            None
         };
-
-        let mut must_features = Vec::new();
-        if allow_tool_calls && !payload.tool_specs.is_empty() {
-            must_features.push("tool_calling".to_string());
-        }
-        if force_json {
-            must_features.push("json_output".to_string());
-        }
-
-        let mut requirements_extra = None;
-        if !disable_capabilities.is_empty() {
-            let mut obj = match requirements_extra.take() {
-                Some(Value::Object(obj)) => obj,
-                Some(other) => {
-                    let mut obj = serde_json::Map::new();
-                    obj.insert("provider_options".to_string(), other);
-                    obj
-                }
-                None => serde_json::Map::new(),
-            };
-            obj.insert(
-                "disable_capabilities".to_string(),
-                json!(disable_capabilities),
-            );
-            requirements_extra = Some(Value::Object(obj));
-        }
-
-        let requirements = Requirements {
-            required: Default::default(),
-            must_features,
-            max_latency_ms: None,
-            max_cost_usd: None,
-            resp_format: if force_json {
-                RespFormat::Json
-            } else {
-                RespFormat::Text
+        let request = LlmChatHelperRequest {
+            logical_model: model_alias.clone(),
+            requirements: HelperModelRequirement {
+                tool_call: allow_tool_calls && !aicc_tool_specs.is_empty(),
+                json_schema: force_json,
+                ..Default::default()
             },
-            extra: requirements_extra,
+            disable,
+            policy: None,
+            messages,
+            tools: aicc_tool_specs,
+            response_format,
+            temperature: temperature.map(f64::from),
+            top_p: None,
+            max_output_tokens: max_completion_tokens.map(u64::from),
+            seed: None,
+            stop: Vec::new(),
+            output: None,
+            idempotency_key: None,
+            task_options: None,
+            session_overlay: None,
         };
-
-        let request = AiMethodRequest::new(
-            Capability::Llm,
-            ModelSpec::new(model_alias.clone(), None),
-            requirements,
-            payload,
-            None,
-        );
-        let request = LlmChatHelperRequest::try_from(request).map_err(LLMComputeError::Provider)?;
 
         let runtime = get_buckyos_api_runtime()
             .map_err(|e| LLMComputeError::Provider(format!("get buckyos runtime failed: {e}")))?;
@@ -592,14 +532,24 @@ impl LlmClient for AiccLlmClient {
             .helper_llm_chat(request)
             .await
             .map_err(|e| LLMComputeError::Provider(format!("aicc helper.llm_chat failed: {e}")))?;
-        let response: buckyos_api::AiMethodResponse = response.into();
-
         match response.status {
-            AiMethodStatus::Succeeded => response.result.ok_or_else(|| {
-                LLMComputeError::Provider(
-                    "aicc helper.llm_chat succeeded but result is empty".to_string(),
-                )
-            }),
+            AiMethodStatus::Succeeded => response
+                .message
+                .map(|message| AiResponse {
+                    message,
+                    usage: response.usage,
+                    cost: response.cost,
+                    finish_reason: response.finish_reason,
+                    provider_task_ref: response.provider_task_ref,
+                    extra: response
+                        .route_trace
+                        .map(|trace| json!({ "route_trace": trace })),
+                })
+                .ok_or_else(|| {
+                    LLMComputeError::Provider(
+                        "aicc helper.llm_chat succeeded but message is empty".to_string(),
+                    )
+                }),
             AiMethodStatus::Failed => Err(LLMComputeError::Provider(format!(
                 "aicc helper.llm_chat failed: task_id={}, event_ref={}",
                 response.task_id,
@@ -654,15 +604,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aicc_options_preserve_json_schema() {
+    fn aicc_response_format_preserves_json_schema() {
         let schema = json!({
             "type": "object",
             "required": ["answer"],
             "properties": { "answer": { "type": "string" } }
         });
-        let options =
-            build_aicc_llm_options(Some(0.0), Some(2048), true, Some(schema.clone()), None);
-        assert_eq!(options["response_schema"], schema);
-        assert_eq!(options["max_tokens"], json!(2048));
+        let format = LlmResponseFormat::json_schema(None, schema.clone(), Some(true));
+        let value = serde_json::to_value(format).unwrap();
+        assert_eq!(value["json_schema"]["schema"], schema);
+        assert_eq!(value["json_schema"]["strict"], true);
     }
 }
