@@ -13,24 +13,34 @@ fn managed_settings(enabled: bool, base_url: &str) -> Value {
         base_url.trim_end_matches("/api/v1/ai/")
     );
     json!({
-        "sn-ai-provider": {
-            "enabled": enabled,
-            "instances": [
-                {
-                    "id": "custom-provider",
-                    "provider_driver": "openai",
-                    "base_url": "https://custom.example/v1/"
+        "providers": [
+            {
+                "provider_instance_name": "custom-provider",
+                "provider_type": "cloud_api",
+                "provider_profile_id": "openai",
+                "protocol_adapter_id": "openai-responses",
+                "provider_rules_id": "openai",
+                "base_url": "https://custom.example/v1/",
+                "credentials": {"api_token": {"locked": "secret"}},
+                "enabled": true
+            },
+            {
+                "provider_instance_name": "sn-ai-provider-default",
+                "provider_type": "cloud_api",
+                "provider_profile_id": "sn",
+                "protocol_adapter_id": "sn-openai",
+                "provider_rules_id": "sn",
+                "base_url": base_url,
+                "credentials": {"device_token_ref": "runtime://device-jwt"},
+                "auth": {
+                    "mode": "dynamic_login",
+                    "login_profile": "device_jwt",
+                    "login_endpoint": login_url
                 },
-                {
-                    "id": "system-sn-provider",
-                    "provider_driver": "sn-ai-provider",
-                    "base_url": base_url,
-                    "login_url": login_url,
-                    "user_name": "alice"
-                }
-            ]
-        },
-        "unrelated": {"preserved": true}
+                "account": "alice",
+                "enabled": enabled
+            }
+        ]
     })
 }
 
@@ -74,74 +84,54 @@ fn task009_patches_only_the_managed_sn_instance() {
         .unwrap()
         .expect("managed URL should change");
 
-    let instances = next["sn-ai-provider"]["instances"].as_array().unwrap();
-    assert_eq!(instances[0]["base_url"], "https://custom.example/v1/");
-    assert_eq!(instances[1]["base_url"], "https://sn.buckyos.io/api/v1/ai/");
+    let providers = next["providers"].as_array().unwrap();
+    assert_eq!(providers[0]["base_url"], "https://custom.example/v1/");
+    assert_eq!(providers[1]["base_url"], "https://sn.buckyos.io/api/v1/ai/");
     assert_eq!(
-        instances[1]["login_url"],
+        providers[1]["auth"]["login_endpoint"],
         "https://sn.buckyos.io/api/user/login_by_device_token"
     );
-    assert_eq!(next["unrelated"], current["unrelated"]);
 }
 
 #[test]
-fn task009_invalid_zone_disables_managed_provider_without_rewriting_its_url() {
+fn task009_invalid_zone_keeps_managed_provider_unchanged() {
     let current = managed_settings(true, "https://sn.buckyos.ai/api/v1/ai/");
     let invalid = anyhow!("invalid ZoneDocument.sn");
-    let next = reconcile_managed_sn_ai_provider(&current, Err(&invalid), None)
-        .unwrap()
-        .expect("managed provider should be disabled");
+    let next = reconcile_managed_sn_ai_provider(&current, Err(&invalid), None).unwrap();
 
-    assert_eq!(next["sn-ai-provider"]["enabled"], false);
-    assert_eq!(
-        next["sn-ai-provider"]["instances"][1]["base_url"],
-        "https://sn.buckyos.ai/api/v1/ai/"
-    );
+    assert!(next.is_none());
 }
 
 #[test]
-fn task009_valid_zone_reenables_a_disabled_managed_provider() {
+fn task009_valid_zone_preserves_an_explicitly_disabled_managed_provider() {
     let current = managed_settings(false, "https://sn.buckyos.io/api/v1/ai/");
     let endpoints = derive_sn_ai_provider_endpoints(Some("sn.buckyos.io")).unwrap();
-    let next = reconcile_managed_sn_ai_provider(&current, Ok(&endpoints), Some("alice"))
-        .unwrap()
-        .expect("managed provider should be enabled");
+    let next = reconcile_managed_sn_ai_provider(&current, Ok(&endpoints), Some("alice")).unwrap();
 
-    assert_eq!(next["sn-ai-provider"]["enabled"], true);
+    assert!(next.is_none());
 }
 
 #[test]
-fn task009_reconciliation_adds_missing_managed_provider() {
+fn task009_reconciliation_does_not_recreate_a_removed_managed_provider() {
     let endpoints = derive_sn_ai_provider_endpoints(Some("sn.buckyos.io")).unwrap();
     for current in [
-        json!({}),
-        json!({"sn-ai-provider": {"enabled": false}}),
+        json!({"providers": []}),
         json!({
-            "sn-ai-provider": {
-                "enabled": true,
-                "instances": [{
-                    "provider_driver": "openai",
-                    "base_url": "https://custom.example/v1/"
-                }]
-            }
+            "providers": [{
+                "provider_instance_name": "custom-provider",
+                "provider_type": "cloud_api",
+                "provider_profile_id": "openai",
+                "protocol_adapter_id": "openai-responses",
+                "provider_rules_id": "openai",
+                "base_url": "https://custom.example/v1/",
+                "credentials": {"api_token": {"locked": "secret"}},
+                "enabled": true
+            }]
         }),
     ] {
-        let next = reconcile_managed_sn_ai_provider(&current, Ok(&endpoints), Some("alice"))
-            .unwrap()
-            .expect("managed provider should be added");
-        let instances = next["sn-ai-provider"]["instances"].as_array().unwrap();
-        let managed = instances
-            .iter()
-            .find(|instance| instance["provider_driver"] == "sn-ai-provider")
-            .expect("managed instance");
-        assert_eq!(managed["provider_instance_name"], "sn-ai-provider-default");
-        assert_eq!(managed["base_url"], "https://sn.buckyos.io/api/v1/ai/");
-        assert_eq!(
-            managed["login_url"],
-            "https://sn.buckyos.io/api/user/login_by_device_token"
-        );
-        assert_eq!(managed["user_name"], "alice");
-        assert_eq!(next["sn-ai-provider"]["enabled"], true);
+        let next =
+            reconcile_managed_sn_ai_provider(&current, Ok(&endpoints), Some("alice")).unwrap();
+        assert!(next.is_none());
     }
 }
 
@@ -150,12 +140,12 @@ fn task009_reconciliation_does_not_add_without_relay_or_user() {
     let endpoints = derive_sn_ai_provider_endpoints(Some("sn.buckyos.io")).unwrap();
     let invalid = anyhow!("ZoneDocument.sn is missing");
     assert!(
-        reconcile_managed_sn_ai_provider(&json!({}), Err(&invalid), Some("alice"))
+        reconcile_managed_sn_ai_provider(&json!({"providers": []}), Err(&invalid), Some("alice"))
             .unwrap()
             .is_none()
     );
     assert!(
-        reconcile_managed_sn_ai_provider(&json!({}), Ok(&endpoints), None)
+        reconcile_managed_sn_ai_provider(&json!({"providers": []}), Ok(&endpoints), None)
             .unwrap()
             .is_none()
     );
