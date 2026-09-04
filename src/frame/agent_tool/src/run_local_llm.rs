@@ -50,9 +50,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime, AiMessage,
-    AiMethodStatus, AiResponse, AiRole, AiToolSpec, BuckyOSRuntimeType, HelperModelRequirement,
-    LlmChatHelperRequest, LlmResponseFormat, ModelDisable,
+    get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime,
+    AiccExecutionMode, AiMessage, AiMethodStatus, AiResponse, AiRole, AiToolSpec,
+    BuckyOSRuntimeType, HelperModelRequirement, LlmChatHelperRequest, LlmResponseFormat,
+    ModelDisable,
 };
 use llm_context::{
     LLMComputeError, LLMContextOutcome, LlmClient, LlmInferenceRequest, ToolMode, ToolPolicy,
@@ -503,6 +504,7 @@ impl LlmClient for AiccLlmClient {
         let request = LlmChatHelperRequest {
             logical_model: model_alias.clone(),
             trace_id,
+            execution_mode: AiccExecutionMode::Immediate,
             requirements: HelperModelRequirement {
                 tool_call: allow_tool_calls && !aicc_tool_specs.is_empty(),
                 json_schema: force_json,
