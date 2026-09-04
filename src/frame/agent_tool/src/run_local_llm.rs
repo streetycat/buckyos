@@ -451,6 +451,7 @@ impl AiccLlmClient {
 impl LlmClient for AiccLlmClient {
     async fn infer(&self, req: LlmInferenceRequest) -> Result<AiResponse, LLMComputeError> {
         let LlmInferenceRequest {
+            trace_id,
             messages,
             model_alias,
             fallbacks: _,
@@ -501,6 +502,7 @@ impl LlmClient for AiccLlmClient {
         };
         let request = LlmChatHelperRequest {
             logical_model: model_alias.clone(),
+            trace_id,
             requirements: HelperModelRequirement {
                 tool_call: allow_tool_calls && !aicc_tool_specs.is_empty(),
                 json_schema: force_json,
