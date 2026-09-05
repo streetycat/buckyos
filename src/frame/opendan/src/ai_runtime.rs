@@ -192,7 +192,12 @@ impl LlmClient for AiccLlmClient {
                 }),
             AiMethodStatus::Running => resolve_async_aicc_result(resp.task_id.as_str()).await,
             AiMethodStatus::Failed => {
-                Err(LLMComputeError::Provider("aicc status=failed".to_string()))
+                let message = resp
+                    .error
+                    .as_ref()
+                    .map(|error| format!("aicc status=failed: {error}"))
+                    .unwrap_or_else(|| "aicc status=failed".to_string());
+                Err(LLMComputeError::Provider(message))
             }
         }
     }
