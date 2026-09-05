@@ -524,6 +524,7 @@ impl LlmClient for AiccLlmClient {
             idempotency_key: None,
             task_options: None,
             session_overlay: None,
+            session_id: None,
         };
 
         let runtime = get_buckyos_api_runtime()
