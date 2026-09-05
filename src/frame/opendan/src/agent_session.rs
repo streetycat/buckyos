@@ -2296,7 +2296,7 @@ impl AgentSession {
             let _ = self.unsubscribe_event(&pattern).await;
         }
 
-        self.handle_outcome(outcome, &behavior, final_snapshot)
+        self.handle_outcome(outcome, &behavior, final_snapshot, true)
             .await
     }
 
@@ -3171,6 +3171,8 @@ impl AgentSession {
             .as_ref()
             .map(|seed| seed.input_keys.clone())
             .unwrap_or_default();
+        let notify_user_on_error =
+            should_notify_user_on_round_error(seed.as_ref().map(|seed| &seed.trigger));
 
         // Open a round (or attach to one already open). For the PendingTool
         // resume path the worker passes `seed = None`; the caller is
@@ -3317,7 +3319,12 @@ impl AgentSession {
                             self.history.finalize_round(status).await;
                         }
                         return self
-                            .handle_outcome(synth_outcome, &behavior, final_snapshot)
+                            .handle_outcome(
+                                synth_outcome,
+                                &behavior,
+                                final_snapshot,
+                                notify_user_on_error,
+                            )
                             .await;
                     }
                     compress_rounds += 1;
@@ -3397,7 +3404,9 @@ impl AgentSession {
                     if let Some(status) = SessionHistoryRecorder::round_status_for(&other) {
                         self.history.finalize_round(status).await;
                     }
-                    return self.handle_outcome(other, &behavior, final_snapshot).await;
+                    return self
+                        .handle_outcome(other, &behavior, final_snapshot, notify_user_on_error)
+                        .await;
                 }
             }
         }
@@ -4277,6 +4286,7 @@ impl AgentSession {
         outcome: LLMContextOutcome,
         behavior: &BehaviorCfg,
         final_snapshot: LLMContextSnapshot,
+        notify_user_on_error: bool,
     ) -> Result<NextAction> {
         match outcome {
             LLMContextOutcome::Done {
@@ -4522,12 +4532,14 @@ impl AgentSession {
                             .await;
                     }
                 }
-                let _ = self
-                    .reply_tx
-                    .send(SessionReply::Error {
-                        message: format!("budget exhausted: {:?}", which),
-                    })
-                    .await;
+                if notify_user_on_error {
+                    let _ = self
+                        .reply_tx
+                        .send(SessionReply::Error {
+                            message: format!("budget exhausted: {:?}", which),
+                        })
+                        .await;
+                }
                 self.feedback_task_failed(format!("budget exhausted: {:?}", which))
                     .await;
                 self.discard_snapshot();
@@ -4560,12 +4572,14 @@ impl AgentSession {
                         Ok(NextAction::WaitForMsg)
                     }
                     Ok(ProviderFailedOutcome::Default) | Err(_) => {
-                        let _ = self
-                            .reply_tx
-                            .send(SessionReply::Error {
-                                message: error.to_string(),
-                            })
-                            .await;
+                        if notify_user_on_error {
+                            let _ = self
+                                .reply_tx
+                                .send(SessionReply::Error {
+                                    message: error.to_string(),
+                                })
+                                .await;
+                        }
                         self.feedback_task_failed(error.to_string()).await;
                         self.discard_snapshot();
                         Ok(NextAction::WaitForMsg)
@@ -4582,12 +4596,14 @@ impl AgentSession {
                     "opendan.session[{}]: ContextLimitReached reached handle_outcome (compress loop bypassed?); kind={:?}",
                     self.session_id, which
                 );
-                let _ = self
-                    .reply_tx
-                    .send(SessionReply::Error {
-                        message: format!("context limit reached: {:?}", which),
-                    })
-                    .await;
+                if notify_user_on_error {
+                    let _ = self
+                        .reply_tx
+                        .send(SessionReply::Error {
+                            message: format!("context limit reached: {:?}", which),
+                        })
+                        .await;
+                }
                 self.feedback_task_failed(format!("context limit reached: {:?}", which))
                     .await;
                 Ok(NextAction::WaitForMsg)
@@ -7865,6 +7881,13 @@ fn format_event_batch_for_turn(events: &[EventForTurn]) -> Option<String> {
         out.push_str(")\n");
     }
     Some(out.trim_end().to_string())
+}
+
+fn should_notify_user_on_round_error(trigger: Option<&RoundTrigger>) -> bool {
+    matches!(
+        trigger,
+        None | Some(RoundTrigger::UserMsg { .. } | RoundTrigger::Mixed | RoundTrigger::Resume)
+    )
 }
 
 /// First 100 chars (char-aware) of `text`, used as the `RoundTrigger::UserMsg`
