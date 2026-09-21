@@ -85,6 +85,7 @@ export function RouteTraceAuditPanel({
   const [traceNextCursor, setTraceNextCursor] = useState<string | undefined>()
   const [traceTotalCount, setTraceTotalCount] = useState(snapshotTraces.length)
   const [tracePageIndex, setTracePageIndex] = useState(0)
+  const [tracePageCursors, setTracePageCursors] = useState<Array<string | undefined>>([undefined])
   const [traceLoading, setTraceLoading] = useState(false)
   const [traceError, setTraceError] = useState<'initial' | 'more' | null>(null)
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
@@ -121,6 +122,7 @@ export function RouteTraceAuditPanel({
           setTraceNextCursor(page.nextCursor)
           setTraceTotalCount(page.totalCount ?? page.traces.length)
           setTracePageIndex(0)
+          setTracePageCursors([undefined, page.nextCursor])
           setTraceError(null)
         }
       } catch (error) {
@@ -130,6 +132,7 @@ export function RouteTraceAuditPanel({
           setTraceNextCursor(snapshotTraces.length >= ROUTE_TRACE_PAGE_SIZE ? String(ROUTE_TRACE_PAGE_SIZE) : undefined)
           setTraceTotalCount(snapshotTraces.length)
           setTracePageIndex(0)
+          setTracePageCursors([undefined])
           setTraceError('initial')
         }
       } finally {
@@ -153,18 +156,25 @@ export function RouteTraceAuditPanel({
   const loadTracePage = async (pageIndex: number) => {
     if (traceLoading) return
     const nextPageIndex = Math.max(0, pageIndex)
+    const cursor = tracePageCursors[nextPageIndex]
+    if (nextPageIndex > 0 && !cursor) return
     setTraceLoading(true)
     setTraceError(null)
     try {
       const page = await store.queryRouteTraces({
         limit: ROUTE_TRACE_PAGE_SIZE,
-        cursor: nextPageIndex > 0 ? String(nextPageIndex * ROUTE_TRACE_PAGE_SIZE) : undefined,
+        cursor,
         ...traceQueryParams,
       })
       setTraces(page.traces)
       setTraceNextCursor(page.nextCursor)
       setTraceTotalCount(page.totalCount ?? page.traces.length)
       setTracePageIndex(nextPageIndex)
+      setTracePageCursors((current) => {
+        const next = current.slice(0, nextPageIndex + 1)
+        next[nextPageIndex + 1] = page.nextCursor
+        return next
+      })
     } catch (error) {
       console.error('aicc.trace.query usage audit page failed', error)
       setTraceError('initial')
