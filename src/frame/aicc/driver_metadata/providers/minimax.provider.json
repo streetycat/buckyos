@@ -36,7 +36,8 @@
         "/voice": {
           "converter": "minimax_tts_voice_v1",
           "fallback": {
-            "action": "reject"
+            "action": "default",
+            "value": {}
           }
         }
       }
@@ -116,7 +117,8 @@
         "/voice": {
           "converter": "minimax_tts_voice_v1",
           "fallback": {
-            "action": "reject"
+            "action": "default",
+            "value": {}
           }
         }
       }
