@@ -37,7 +37,12 @@ export async function openAiccArtifact(input: {
     }),
   });
   if (!response.ok) {
-    throw new Error(`AICC artifact download failed with HTTP ${response.status}`);
+    const detail = (await response.text()).trim();
+    throw new Error(
+      `AICC artifact download failed with HTTP ${response.status}${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
   }
   return response;
 }
