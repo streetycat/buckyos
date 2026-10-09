@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "contract_revision": "2026-10-08.3",
-  "capability_baseline_revision": "2026-10-08.3",
+  "capability_baseline_revision": "2026-10-09.1",
   "capability_cells_sha256": "1bc9007779493aa9b8111d840a29da7900e7b07e3d0494005bb472f236399175",
   "logical_entrypoint_baseline_revision": "2026-10-05.1",
   "profiles": [
