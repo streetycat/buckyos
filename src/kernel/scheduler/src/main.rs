@@ -533,15 +533,11 @@ mod test {
         println!("this_snapshot: {}", this_snapshot);
 
         assert!(!schedule_plan.tx_actions.is_empty());
-        assert!(!schedule_plan
-            .tx_actions
-            .contains_key("system/content_registry"));
+        assert!(!schedule_plan.tx_actions.contains_key("system/content_registry"));
         let running_plan = build_schedule_plan(&init_map, false)
             .await
             .expect("normal schedule should succeed");
-        assert!(running_plan
-            .tx_actions
-            .contains_key("system/content_registry"));
+        assert!(running_plan.tx_actions.contains_key("system/content_registry"));
         assert_eq!(schedule_plan.schedule_snapshot.nodes.len(), 1);
         assert!(schedule_plan
             .schedule_snapshot

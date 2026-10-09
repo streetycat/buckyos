@@ -411,9 +411,7 @@ mod tests {
             Some(CLAUDE_MESSAGES_ADAPTER_ID)
         );
         assert_eq!(descriptor.operations.len(), 7);
-        assert!(contract
-            .unsupported_capabilities
-            .contains(buckyos_api::features::WEB_SEARCH));
+        assert!(contract.unsupported_capabilities.contains(buckyos_api::features::WEB_SEARCH));
         for codec in &registration.operation_codecs {
             assert!(codec.descriptor().bindings.iter().all(|binding| !binding
                 .supported_features
