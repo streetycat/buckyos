@@ -147,6 +147,28 @@ function falDiscovery(): JsonObject {
   };
 }
 
+function minimaxDiscovery(): JsonObject {
+  return {
+    revision: "t1-minimax-v1",
+    discovered_at_ms: Date.now(),
+    health: "healthy",
+    models: [
+      ["MiniMax-M3", ["llm", "vision.ocr", "vision.caption"], ["messages.create"]],
+      ["MiniMax-M2.7", ["llm"], ["messages.create"]],
+      ["MiniMax-M2.5", ["llm"], ["messages.create"]],
+      ["image-01", ["image.txt2img", "image.img2img"], ["image_generation.create"]],
+      ["MiniMax-H3", ["video.txt2video", "video.img2video"], ["video_generation.v2.create"]],
+      ["MiniMax-H3-Max", ["video.txt2video", "video.img2video"], ["video_generation.v2.create"]],
+    ].map(([provider_model_id, api_types, remote_methods]) => ({
+      provider_model_id,
+      api_types,
+      remote_methods,
+      availability: "available",
+      deprecated: false,
+    })),
+  };
+}
+
 export function buildMockSettings(
   original: unknown,
   input: {
@@ -211,6 +233,7 @@ export function buildMockSettings(
       baseUrl: `${baseUrl}/v1`,
       token: `mock-${suffix}`,
       timeoutMs,
+      discovery: minimaxDiscovery(),
     }),
     provider({
       name: `dv-openrouter-${suffix}`,

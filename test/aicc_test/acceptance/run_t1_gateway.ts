@@ -385,8 +385,18 @@ async function provisionSecondTenant(
   });
   input.otherTenantSessionToken = secondary.sessionToken;
   return async () => {
+    const cleanupSudoToken = await loginSudoToken({
+      gatewayUrl: input.gatewayUrl,
+      username: input.username,
+      password: input.password,
+      appId: input.appId,
+    });
+    const cleanupControlPanel = new buckyos.kRPCClient(
+      `${input.gatewayUrl}/kapi/control-panel`,
+      cleanupSudoToken,
+    ) as RpcClient;
     try {
-      await controlPanel.call("user.delete", { user_id: userId });
+      await cleanupControlPanel.call("user.delete", { user_id: userId });
     } catch (error) {
       if (!String(error).includes("scheduler")) throw error;
     }
@@ -535,6 +545,19 @@ async function waitForMockInventories(
       item.models.some((model) => model.api_types.includes("image.upscale")) &&
       item.models.some((model) => model.api_types.includes("video.upscale"))
     );
+    const minimaxReady = selected.some((item) =>
+      item.provider_instance_name === `dv-minimax-${suffix}` &&
+      item.models.some((model) =>
+        model.provider_model_id === "image-01" &&
+        model.api_types.includes("image.txt2img") &&
+        model.api_types.includes("image.img2img")
+      ) &&
+      item.models.some((model) =>
+        model.provider_model_id === "MiniMax-H3" &&
+        model.api_types.includes("video.txt2video") &&
+        model.api_types.includes("video.img2video")
+      )
+    );
     const typesafeReady = selected.some((item) =>
       item.provider_instance_name === `dv-typesafe-${suffix}` &&
       item.models.some((model) => model.api_types.includes("decision"))
@@ -551,7 +574,7 @@ async function waitForMockInventories(
     );
     if (
       expected.every((name) => selected.some((item) => item.provider_instance_name === name)) &&
-      openAiReady && geminiReady && falReady && typesafeReady && customReady &&
+      openAiReady && geminiReady && falReady && minimaxReady && typesafeReady && customReady &&
       doubaoSpeechReady
     ) {
       return selected;
@@ -3109,6 +3132,12 @@ async function runCases(
       cloudStage = "call_v1";
       await withMockQuotaTruth({
         systemConfig: adminSystemConfig,
+        refreshSystemConfig: () => loginSudoSystemConfig({
+          gatewayUrl: input.gatewayUrl,
+          username: input.username,
+          password: input.password,
+          appId: input.appId,
+        }),
         userId: session.userId,
         appId: "system:control-panel",
         inventories: [cloudInventoryV1],
@@ -3182,6 +3211,12 @@ async function runCases(
       cloudStage = "call_v2";
       await withMockQuotaTruth({
         systemConfig: adminSystemConfig,
+        refreshSystemConfig: () => loginSudoSystemConfig({
+          gatewayUrl: input.gatewayUrl,
+          username: input.username,
+          password: input.password,
+          appId: input.appId,
+        }),
         userId: session.userId,
         appId: "system:control-panel",
         inventories: [cloudInventoryV2],
@@ -3372,6 +3407,12 @@ async function main(): Promise<void> {
             const logicalDefinitions = logicalDefinitionsFromModelsList(modelsList);
             return await withMockQuotaTruth({
               systemConfig: sudoSystemConfig,
+              refreshSystemConfig: () => loginSudoSystemConfig({
+                gatewayUrl: input.gatewayUrl,
+                username: input.username,
+                password: input.password,
+                appId: input.appId,
+              }),
               userId: session.userId,
               appId: "system:control-panel",
               inventories: quotaInventories,
