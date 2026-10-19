@@ -1395,24 +1395,15 @@ export function createT15MockHandler(
         );
         return;
       }
+      const useInlineArtifactFixture =
+        selection.scenario === "inline_artifact_success" ||
+        (contract.inline_artifact_success_fixture !== undefined &&
+          contract.variant_api_types?.includes(selection.api_type ?? ""));
       const rawFixture = structuredClone(
-        selection.scenario === "inline_artifact_success"
+        useInlineArtifactFixture
           ? contract.inline_artifact_success_fixture ?? {}
           : contract.success_fixture ?? {},
       ) as Record<string, unknown>;
-      if (
-        selection.provider_driver === "openai" &&
-        contract.id === "openai.responses.v1" &&
-        ["image.txt2img", "image.img2img"].includes(selection.api_type ?? "")
-      ) {
-        rawFixture.output = [{
-          type: "image_generation_call",
-          id: "ig_mock_1",
-          status: "completed",
-          result: "aW1hZ2U=",
-          output_format: "png",
-        }];
-      }
       if (
         selection.provider_driver === "google-gemini" &&
         contract.id === "gemini.interactions.v1beta" &&

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "revision": "official-provider-protocols-2026-10-13.1",
-  "checked_at": "2026-10-13",
+  "revision": "official-provider-protocols-2026-10-19.3",
+  "checked_at": "2026-10-19",
   "providers": [
     {
       "provider_driver": "typesafe",
@@ -116,7 +116,7 @@
         "image.img2img": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-image-2"],
         "image.inpaint": ["gpt-image-2"],
         "audio.tts": ["gpt-4o-mini-tts"],
-        "audio.asr": ["gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"],
+        "audio.asr": ["gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gpt-4o-transcribe-diarize"],
         "video.txt2video": ["sora-2", "sora-2-pro"],
         "video.img2video": ["sora-2", "sora-2-pro"],
         "agent.computer_use": ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
@@ -1476,7 +1476,7 @@
       },
       "official_variant_sources": ["https://docs.bigmodel.cn/cn/guide/capabilities/thinking", "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3", "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2"],
       "official_variant_rules": [{
-        "model_ids": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x", "glm-4.5-air", "glm-4.5-airx", "glm-4.5v"],
+        "model_ids": ["glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.7-flash", "glm-4.7-flashx", "glm-4.6", "glm-4.6v", "glm-4.6v-flash", "glm-4.6v-flashx", "glm-4.5", "glm-4.5-x", "glm-4.5-air", "glm-4.5-airx", "glm-4.5v"],
         "variants": {
           "reasoning-thinking": { "thinking": { "type": "enabled" } }
         }
@@ -1686,7 +1686,15 @@
           }
         },
         {
-          "model_ids": ["glm-5.3", "glm-5.3-flash"],
+          "model_ids": ["glm-5.3"],
+          "variants": {
+            "reasoning-low": { "reasoning": { "effort": "low" } },
+            "reasoning-high": { "reasoning": { "effort": "high" } },
+            "reasoning-max": { "reasoning": { "effort": "max" } }
+          }
+        },
+        {
+          "model_ids": ["glm-5.3-flash"],
           "variants": {
             "reasoning-low": { "reasoning": { "effort": "low" } },
             "reasoning-medium": { "reasoning": { "effort": "high" } },
@@ -2079,6 +2087,13 @@
           "forbidden_body_paths": [
             "/audio/data"
           ],
+          "canonical_request_overrides": {
+            "audio": {
+              "kind": "url",
+              "url": "https://storage.googleapis.com/cloud-samples-data/speech/brooklyn_bridge.wav",
+              "mime_hint": "audio/wav"
+            }
+          },
           "async_protocol": "doubao_asr",
           "async_steps": [
             {
@@ -2256,26 +2271,55 @@
         "llm": [
           "qwen3.8-max",
           "qwen3.8-flash",
+          "qwen3.8-2.4t-a95b",
+          "qwen3.8-27b",
+          "qwen3.7-max",
+          "qwen3.7-max-2026-06-08",
           "qwen3.7-plus",
-          "qwen3.8-omni-flash"
+          "qwen3.7-flash",
+          "qwen3.6-plus",
+          "qwen3.6-flash",
+          "qwen3.6-35b-a3b",
+          "qwen3.5-plus",
+          "qwen3.5-flash",
+          "qwen3.5-397b-a17b",
+          "qwen3.5-122b-a10b",
+          "qwen3.5-35b-a3b",
+          "qwen3.5-27b",
+          "qwen3.8-omni-flash",
+          "qwen3.8-max-0902"
         ],
         "vision.ocr": [
-          "qwen3.8-max",
           "qwen3.8-flash",
           "qwen3.7-plus",
-          "qwen3.8-omni-flash"
+          "qwen3.5-ocr"
         ],
         "vision.caption": [
           "qwen3.8-max",
           "qwen3.8-flash",
+          "qwen3.8-27b",
+          "qwen3.7-max-2026-06-08",
           "qwen3.7-plus",
-          "qwen3.8-omni-flash"
+          "qwen3.7-flash",
+          "qwen3.6-plus",
+          "qwen3.6-flash",
+          "qwen3.6-35b-a3b",
+          "qwen3.5-plus",
+          "qwen3.5-flash",
+          "qwen3.5-397b-a17b",
+          "qwen3.5-122b-a10b",
+          "qwen3.5-35b-a3b",
+          "qwen3.5-27b",
+          "qwen3.8-omni-flash",
+          "qwen3.8-max-0902"
         ],
         "image.txt2img": [
-          "wanx2.1-t2i-turbo"
+          "wanx2.1-t2i-turbo",
+          "qwen-image-3.0-pro"
         ],
         "image.img2img": [
-          "qwen-image-edit"
+          "qwen-image-edit",
+          "qwen-image-3.0-pro"
         ],
         "video.txt2video": [
           "wan2.6-t2v"
@@ -2326,6 +2370,15 @@
           "reasoning-none": { "reasoning": { "effort": "none" } },
           "reasoning-low": { "reasoning": { "effort": "low" } },
           "reasoning-medium": { "reasoning": { "effort": "medium" } },
+          "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } }
+        }
+      }, {
+        "model_ids": ["qwen3.8-max-0902"],
+        "variants": {
+          "reasoning-minimal": { "reasoning": { "effort": "minimal" } },
+          "reasoning-low": { "reasoning": { "effort": "low" } },
+          "reasoning-medium": { "reasoning": { "effort": "medium" } },
+          "reasoning-high": { "reasoning": { "effort": "high" } },
           "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } }
         }
       }, {
@@ -2389,7 +2442,7 @@
       }],
       "test_model_ids": {
         "llm": "qwen3.8-max",
-        "vision.ocr": "qwen3.8-max",
+        "vision.ocr": "qwen3.8-flash",
         "vision.caption": "qwen3.8-max",
         "image.txt2img": "wanx2.1-t2i-turbo",
         "image.img2img": "qwen-image-edit",
@@ -2519,12 +2572,106 @@
           }
         },
         {
+          "id": "qwen.dashscope.image_generation.v1",
+          "protocol_adapter_id": "qwen-responses",
+          "api_version": "compatible-v1",
+          "api_types": [
+            "image.txt2img",
+            "image.img2img"
+          ],
+          "test_model_ids": {
+            "image.txt2img": "qwen-image-3.0-pro",
+            "image.img2img": "qwen-image-3.0-pro"
+          },
+          "operation": "dashscope.image_generation",
+          "http_method": "POST",
+          "path": "/api/v1/services/aigc/image-generation/generation",
+          "auth": {
+            "kind": "header",
+            "name": "authorization",
+            "prefix": "Bearer "
+          },
+          "content_type": "application/json",
+          "required_body_fields": [
+            "model",
+            "input"
+          ],
+          "allowed_body_fields": [
+            "model",
+            "input",
+            "parameters"
+          ],
+          "body_field_types": {
+            "model": [
+              "string"
+            ],
+            "input": [
+              "object"
+            ],
+            "parameters": [
+              "object"
+            ]
+          },
+          "official_sources": [
+            "https://help.aliyun.com/en/model-studio/qwen-image-generation-and-editing-api-reference"
+          ],
+          "evidence_summary": "Qwen Image 3.0 generation and editing use the unified message body with DashScope asynchronous submission and task polling.",
+          "required_headers": {
+            "x-dashscope-async": "enable"
+          },
+          "async_protocol": "qwen_media",
+          "async_steps": [
+            {
+              "name": "poll",
+              "http_method": "GET",
+              "path": "/api/v1/tasks/qwen_task_mock_1"
+            },
+            {
+              "name": "result",
+              "http_method": "GET",
+              "path": "/api/v1/tasks/qwen_task_mock_1"
+            }
+          ],
+          "success_fixture": {
+            "request_id": "qwen_request_mock_1",
+            "output": {
+              "task_id": "qwen_task_mock_1",
+              "task_status": "PENDING"
+            }
+          },
+          "async_result_fixture": {
+            "request_id": "qwen_request_mock_1",
+            "output": {
+              "task_id": "qwen_task_mock_1",
+              "task_status": "SUCCEEDED",
+              "choices": [
+                {
+                  "message": {
+                    "role": "assistant",
+                    "content": [
+                      {
+                        "image": "http://mock-artifact/artifacts/result.png"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "usage": {
+              "image_count": 1
+            }
+          }
+        },
+        {
           "id": "qwen.dashscope.image_edit.v1",
           "protocol_adapter_id": "qwen-responses",
           "api_version": "compatible-v1",
           "api_types": [
             "image.img2img"
           ],
+          "test_model_ids": {
+            "image.img2img": "qwen-image-edit"
+          },
           "operation": "dashscope.image_edit",
           "http_method": "POST",
           "path": "/api/v1/services/aigc/multimodal-generation/generation",
@@ -2661,34 +2808,53 @@
       "provider_driver": "sn-ai-provider",
       "provider_profile_id": "sn",
       "endpoint_path": "/api/v1/ai",
+      "operation_endpoint_paths": {
+        "embeddings.create": "/api/v1/ai/v1",
+        "images.generate": "/api/v1/ai/v1",
+        "images.edit": "/api/v1/ai/v1",
+        "audio.speech": "/api/v1/ai/v1",
+        "audio.transcriptions": "/api/v1/ai/v1"
+      },
       "credential_type": "bearer",
       "official_first_party_model_ids": {
-        "llm": ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"],
-        "vision.ocr": ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"],
-        "vision.caption": ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"]
+        "llm": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex", "glm-5", "glm-5.3", "kimi-k3", "qwen3.6-plus", "qwen3.7-plus", "qwen3.8-max-0902", "ui-tars-1.5-7b", "voxtral-small-24b-2507"],
+        "vision.ocr": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex", "kimi-k3", "qwen3.7-plus", "ui-tars-1.5-7b"],
+        "vision.caption": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex", "kimi-k3", "qwen3.6-plus", "qwen3.7-plus", "qwen3.8-max-0902", "ui-tars-1.5-7b"],
+        "embedding.text": ["text-embedding-3-large", "text-embedding-3-small", "qwen3-embedding-8b"],
+        "image.txt2img": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-image-2", "qwen-image-3-pro"],
+        "image.img2img": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-image-2", "qwen-image-3-pro"],
+        "image.inpaint": ["gpt-image-2"],
+        "audio.tts": ["gpt-4o-mini-tts"],
+        "audio.asr": ["gpt-4o-mini-transcribe", "gpt-4o-transcribe-diarize"],
+        "agent.computer_use": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
       },
       "official_variant_sources": [
-        "https://developers.openai.com/api/docs/models/gpt-5.5",
-        "https://developers.openai.com/api/docs/models/gpt-5.5-pro",
-        "https://developers.openai.com/api/docs/models/gpt-5.4",
-        "https://developers.openai.com/api/docs/models/gpt-5.4-pro",
-        "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
-        "https://developers.openai.com/api/docs/models/gpt-5.4-nano",
-        "https://developers.openai.com/api/docs/models/gpt-5.3-codex",
-        "https://github.com/buckyos/sn-business/blob/f765081d5ae038b9eeec14cb38e6af12750db31a/CD/cluster_config/release/apps.ts"
+        "https://github.com/buckyos/sn-business/blob/cebf55a/CD/cluster_config/release/apps.ts",
+        "https://openrouter.ai/z-ai/glm-5",
+        "https://openrouter.ai/z-ai/glm-5.3",
+        "https://platform.kimi.com/docs/guide/kimi-k3.html",
+        "https://openrouter.ai/qwen/qwen3.8-max-0902"
       ],
       "official_variant_rules": [
+        { "model_ids": ["gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"], "variants": { "reasoning-none": { "reasoning": { "effort": "none" } }, "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } }, "reasoning-max": { "reasoning": { "effort": "max" } } } },
+        { "model_ids": ["gpt-6-astra"], "variants": { "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } }, "reasoning-max": { "reasoning": { "effort": "max" } } } },
         { "model_ids": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"], "variants": { "reasoning-none": { "reasoning": { "effort": "none" } }, "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } } } },
         { "model_ids": ["gpt-5.5-pro", "gpt-5.4-pro"], "variants": { "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } } } },
-        { "model_ids": ["gpt-5.3-codex"], "variants": { "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } } } }
+        { "model_ids": ["gpt-5.3-codex"], "variants": { "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } } } },
+        { "model_ids": ["glm-5"], "variants": { "reasoning-none": { "reasoning": { "enabled": false } }, "reasoning-thinking": { "reasoning": { "enabled": true } } } },
+        { "model_ids": ["glm-5.3"], "variants": { "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-max": { "reasoning": { "effort": "max" } } } },
+        { "model_ids": ["kimi-k3"], "variants": { "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-max": { "reasoning": { "effort": "max" } } } },
+        { "model_ids": ["qwen3.6-plus", "qwen3.7-plus"], "variants": { "reasoning-none": { "reasoning": { "enabled": false } }, "reasoning-thinking": { "reasoning": { "enabled": true } } } },
+        { "model_ids": ["qwen3.8-max-0902"], "variants": { "reasoning-minimal": { "reasoning": { "effort": "minimal" } }, "reasoning-low": { "reasoning": { "effort": "low" } }, "reasoning-medium": { "reasoning": { "effort": "medium" } }, "reasoning-high": { "reasoning": { "effort": "high" } }, "reasoning-xhigh": { "reasoning": { "effort": "xhigh" } } } }
       ],
-      "test_model_ids": { "llm": "gpt-5.5", "vision.ocr": "gpt-5.5", "vision.caption": "gpt-5.5" },
+      "test_model_ids": { "llm": "gpt-6-sol", "vision.ocr": "gpt-6-sol", "vision.caption": "gpt-6-sol", "embedding.text": "text-embedding-3-small", "image.txt2img": "gpt-image-2", "image.img2img": "gpt-image-2", "image.inpaint": "gpt-image-2", "audio.tts": "gpt-4o-mini-tts", "audio.asr": "gpt-4o-transcribe-diarize", "agent.computer_use": "gpt-6-sol" },
       "contracts": [{
         "id": "sn.openai-responses.v1",
         "protocol_adapter_id": "sn-openai",
         "base_contract_id": "openai.responses.v1",
         "api_version": "v1",
         "api_types": ["llm", "vision.ocr", "vision.caption"],
+        "variant_api_types": ["image.txt2img", "image.img2img"],
         "operation": "responses.create",
         "http_method": "POST",
         "path": "/api/v1/ai/responses",
@@ -2699,8 +2865,113 @@
         "body_field_types": { "model": ["string"], "input": ["string", "array"] },
         "stream_protocol": "openai_responses",
         "success_fixture": { "id": "resp_mock_1", "object": "response", "status": "completed", "model": "mock-model", "output": [{ "type": "message", "id": "msg_mock_1", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
-        "official_sources": ["https://github.com/buckyos/sn-business/blob/f765081d5ae038b9eeec14cb38e6af12750db31a/src/modules/sn_aicc/src/http/public.rs", "https://github.com/buckyos/sn-business/blob/f765081d5ae038b9eeec14cb38e6af12750db31a/src/modules/sn_aicc/src/litellm/mod.rs"],
-        "evidence_summary": "SN public source at f765081 exposes POST /api/v1/ai/responses with Bearer authentication and forwards the Responses JSON/SSE wire to LiteLLM /v1/responses."
+        "inline_artifact_success_fixture": { "id": "resp_inline_artifact_mock_1", "object": "response", "status": "completed", "model": "mock-model", "output": [{ "type": "message", "id": "msg_inline_artifact_mock_1", "status": "completed", "role": "assistant", "content": [{ "type": "output_text", "text": "BUCKYOS-AICC-4827", "annotations": [] }] }, { "type": "image_generation_call", "id": "ig_inline_artifact_mock_1", "status": "completed", "result": "aW1hZ2U=", "output_format": "png" }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "inline_artifact_payload_paths": ["/output/1/result"],
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs", "https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/litellm/mod.rs"],
+        "evidence_summary": "SN public source at cebf55a exposes POST /api/v1/ai/responses with Bearer authentication and forwards the Responses JSON/SSE wire to LiteLLM /v1/responses."
+      }, {
+        "id": "sn.openai-responses.computer.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.responses.computer.v1",
+        "api_version": "v1",
+        "api_types": ["agent.computer_use"],
+        "operation": "responses.create",
+        "http_method": "POST",
+        "path": "/api/v1/ai/responses",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input", "tools"],
+        "allowed_body_fields": ["model", "input", "reasoning", "tools"],
+        "body_field_types": { "model": ["string"], "input": ["array"], "tools": ["array"] },
+        "success_fixture": { "id": "resp_computer_mock_1", "object": "response", "status": "completed", "model": "gpt-6-sol", "output": [{ "type": "computer_call", "id": "computer_mock_1", "call_id": "computer_call_mock_1", "status": "completed", "action": { "type": "click", "button": "left", "x": 640, "y": 360 }, "pending_safety_checks": [] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs"],
+        "evidence_summary": "SN forwards the Responses computer tool request and computer_call action output unchanged through its public Responses route."
+      }, {
+        "id": "sn.openai-embeddings.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.embeddings.v1",
+        "api_version": "v1",
+        "api_types": ["embedding.text"],
+        "operation": "embeddings.create",
+        "http_method": "POST",
+        "path": "/api/v1/ai/v1/embeddings",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input"],
+        "allowed_body_fields": ["model", "input", "encoding_format", "dimensions", "user"],
+        "body_field_types": { "model": ["string"], "input": ["string", "array"] },
+        "success_fixture": { "object": "list", "data": [{ "object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3] }], "model": "mock-model", "usage": { "prompt_tokens": 2, "total_tokens": 2 } },
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs", "https://openrouter.ai/docs/api-reference/embeddings"],
+        "evidence_summary": "SN proxies POST /api/v1/ai/v1/embeddings to LiteLLM's OpenAI-compatible embedding endpoint."
+      }, {
+        "id": "sn.openai-images-generations.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.images.generations.v1",
+        "api_version": "v1",
+        "api_types": ["image.txt2img"],
+        "operation": "images.generate",
+        "http_method": "POST",
+        "path": "/api/v1/ai/v1/images/generations",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "application/json",
+        "required_body_fields": ["model", "prompt"],
+        "allowed_body_fields": ["model", "prompt", "background", "moderation", "n", "output_compression", "output_format", "quality", "response_format", "size", "style", "user"],
+        "body_field_types": { "model": ["string"], "prompt": ["string"] },
+        "success_fixture": { "created": 1770000000, "data": [{ "b64_json": "aW1hZ2U=" }], "usage": { "input_tokens": 2, "output_tokens": 1, "total_tokens": 3 } },
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs", "https://openrouter.ai/qwen/qwen-image-3-pro"],
+        "evidence_summary": "SN proxies OpenAI-compatible image generation to its configured Qwen Image 3 Pro OpenRouter route."
+      }, {
+        "id": "sn.openai-images-edits.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.images.edits.v1",
+        "api_version": "v1",
+        "api_types": ["image.img2img", "image.inpaint"],
+        "operation": "images.edit",
+        "http_method": "POST",
+        "path": "/api/v1/ai/v1/images/edits",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "multipart/form-data",
+        "required_body_fields": ["model", "image", "prompt"],
+        "allowed_body_fields": ["model", "image", "mask", "prompt", "background", "input_fidelity", "n", "output_compression", "output_format", "quality", "response_format", "size", "user"],
+        "body_field_types": { "model": ["string"], "image": ["object", "array"], "prompt": ["string"] },
+        "success_fixture": { "created": 1770000000, "data": [{ "b64_json": "aW1hZ2U=" }], "usage": { "input_tokens": 2, "output_tokens": 1, "total_tokens": 3 } },
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs", "https://www.alibabacloud.com/help/en/model-studio/qwen-image-3-0-pro"],
+        "evidence_summary": "SN accepts and forwards multipart OpenAI-compatible image editing requests for Qwen Image 3 Pro and GPT Image 2."
+      }, {
+        "id": "sn.openai-audio-speech.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.audio.speech.v1",
+        "api_version": "v1",
+        "api_types": ["audio.tts"],
+        "operation": "audio.speech",
+        "http_method": "POST",
+        "path": "/api/v1/ai/v1/audio/speech",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "application/json",
+        "required_body_fields": ["model", "input", "voice"],
+        "allowed_body_fields": ["model", "input", "voice", "instructions", "response_format", "speed", "stream_format"],
+        "body_field_types": { "model": ["string"], "input": ["string"], "voice": ["string", "object"] },
+        "success_content_type": "audio/mpeg",
+        "success_fixture_base64": "SUQzAwAAAAA=",
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs"],
+        "evidence_summary": "SN proxies OpenAI-compatible speech creation and returns the generated audio bytes."
+      }, {
+        "id": "sn.openai-audio-transcriptions.v1",
+        "protocol_adapter_id": "sn-openai",
+        "base_contract_id": "openai.audio.transcriptions.v1",
+        "api_version": "v1",
+        "api_types": ["audio.asr"],
+        "operation": "audio.transcriptions",
+        "http_method": "POST",
+        "path": "/api/v1/ai/v1/audio/transcriptions",
+        "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
+        "content_type": "multipart/form-data",
+        "required_body_fields": ["file", "model"],
+        "allowed_body_fields": ["file", "model", "chunking_strategy", "include", "known_speaker_names", "known_speaker_references", "language", "prompt", "response_format", "stream", "temperature", "timestamp_granularities"],
+        "body_field_types": { "file": ["object"], "model": ["string"] },
+        "success_fixture": { "text": "BUCKYOS-AICC-4827", "usage": { "type": "tokens", "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs"],
+        "evidence_summary": "SN proxies multipart OpenAI-compatible audio transcription and returns transcript text with usage where supported."
       }]
     }
   ],
@@ -2720,7 +2991,7 @@
     "doubao": { "applicable_api_versions": ["v3"], "official_sources": ["https://www.volcengine.com/docs/82379/1330312?lang=zh"], "evidence_summary": "Standard ModelArk documents OpenAI-compatible error envelopes and HTTP-aligned request, authentication, throttling and server failure codes." },
     "doubao-tts": { "applicable_api_versions": ["v3", "plan-v3"], "official_sources": ["https://www.volcengine.com/docs/6561/2528925?lang=zh", "https://docs.volcengine.com/docs/ark/agent-plan-enterprise-voice-model?lang=zh"], "evidence_summary": "Standard and Agent Plan TTS report authentication, request, throttling and service errors through HTTP status and header.code/header.message fields." },
     "qwen": { "applicable_api_versions": ["compatible-v1"], "official_sources": ["https://www.alibabacloud.com/help/en/model-studio/error-code"], "evidence_summary": "Alibaba Model Studio documents OpenAI-compatible error codes including invalid_request_error, invalid_api_key, access_denied, Throttling and InternalError." },
-    "sn-ai-provider": { "applicable_api_versions": ["v1"], "official_sources": ["https://github.com/buckyos/sn-business/blob/f765081d5ae038b9eeec14cb38e6af12750db31a/src/modules/sn_aicc/src/http/error.rs"], "evidence_summary": "SN source at f765081 defines HTTP errors as code/message and the 429 insufficient-balance special case as an OpenAI-shaped nested error." }
+    "sn-ai-provider": { "applicable_api_versions": ["v1"], "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/error.rs"], "evidence_summary": "SN source at cebf55a defines HTTP errors as code/message and the 429 insufficient-balance special case as an OpenAI-shaped nested error." }
   },
   "error_fixtures": {
     "doubao-asr": [
