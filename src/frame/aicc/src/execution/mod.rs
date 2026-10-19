@@ -1088,12 +1088,44 @@ struct ActiveExecution {
     cancel: CancelHandle,
 }
 
+#[derive(Clone)]
 pub(crate) struct ExecutionEngine {
     store: Arc<dyn ExecutionStore>,
     tasks: Arc<dyn TaskManagerPort>,
     providers: Arc<dyn ProviderExecutionPort>,
     usage: Arc<dyn UsageCompletionPort>,
-    active: Mutex<BTreeMap<String, ActiveExecution>>,
+    active: Arc<Mutex<BTreeMap<String, ActiveExecution>>>,
+}
+
+struct ExecutionLease {
+    engine: ExecutionEngine,
+    task_id: String,
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        if self.engine.active.lock().expect("active execution lock").remove(&self.task_id).is_none() {
+            return;
+        }
+        let engine = self.engine.clone();
+        let task_id = self.task_id.clone();
+        tokio::spawn(async move {
+            let result = match engine.store.get_task(&task_id).await {
+                Ok(Some(record)) if record.state.is_terminal() => return,
+                Ok(Some(record)) if record.binding.as_ref().is_some_and(|binding| binding.remote_task_id.is_some()) => {
+                    engine.drive_native(&task_id).await.map(|_| ())
+                }
+                Ok(Some(record)) if record.output.is_some() => {
+                    engine.commit_staged_success(&task_id, record.output.unwrap()).await.map(|_| ())
+                }
+                Ok(Some(_)) => engine.finish_failure(&task_id, aicc_error(AiccErrorCode::ProviderError,
+                    "inference connection ended before Provider completion; upstream outcome is unknown", false)).await.map(|_| ()),
+                Ok(None) => return,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result { log::error!("interrupted execution recovery failed: task_id={} error={}", task_id, error); }
+        });
+    }
 }
 
 impl ExecutionEngine {
@@ -1108,7 +1140,7 @@ impl ExecutionEngine {
             tasks,
             providers,
             usage,
-            active: Mutex::new(BTreeMap::new()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -1208,6 +1240,12 @@ impl ExecutionEngine {
 
         log_llm_input(&record, &request.primary);
 
+        let (cancel, cancellation) = cancellation_pair();
+        self.active
+            .lock()
+            .expect("active execution lock")
+            .insert(record.task_id.clone(), ActiveExecution { cancel });
+        let _lease = ExecutionLease { engine:self.clone(), task_id:record.task_id.clone() };
         self.tasks
             .report_state(
                 &record.task_id,
@@ -1215,11 +1253,6 @@ impl ExecutionEngine {
                 json_state("submitted", None, record.trace_id.as_deref()),
             )
             .await?;
-        let (cancel, cancellation) = cancellation_pair();
-        self.active
-            .lock()
-            .expect("active execution lock")
-            .insert(record.task_id.clone(), ActiveExecution { cancel });
 
         let mut calls = Vec::with_capacity(1 + request.failover.len());
         calls.push(request.primary);
@@ -2338,6 +2371,7 @@ mod tests {
     }
 
     enum StartPlan {
+        Pending,
         Success(ProviderExecution),
         Failure(ProviderStartFailure),
     }
@@ -2367,7 +2401,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(runtime_generation);
-            match self.plans.lock().unwrap().pop_front().unwrap() {
+            let plan = self.plans.lock().unwrap().pop_front().unwrap();
+            match plan {
+                StartPlan::Pending => futures_util::future::pending().await,
                 StartPlan::Success(result) => Ok(result),
                 StartPlan::Failure(error) => Err(error),
             }
@@ -3079,6 +3115,30 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn dropped_provider_start_fails_locally_without_resubmitting() {
+        let providers = Arc::new(FakeProviders::default());
+        providers.plans.lock().unwrap().push_back(StartPlan::Pending);
+        let (engine, store, tasks, usage) = make_engine(providers.clone());
+        let running = engine.clone();
+        let execution = tokio::spawn(async move {running.execute(request(call("primary"))).await});
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while providers.starts.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let task_id = store.tasks.lock().unwrap().keys().next().unwrap().clone();
+        execution.abort();
+        let _ = execution.await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.failed.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let record = store.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(record.state, ExecutionState::Failed);
+        assert!(!record.error.unwrap().retriable);
+        assert!(engine.active.lock().unwrap().is_empty());
+        assert_eq!(providers.starts.lock().unwrap().len(), 1);
+        assert!(usage.writes.lock().unwrap().is_empty());
     }
 
     #[test]

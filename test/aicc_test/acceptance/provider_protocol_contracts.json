@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "official-provider-protocols-2026-10-19.3",
+  "revision": "official-provider-protocols-2026-10-19.4",
   "checked_at": "2026-10-19",
   "providers": [
     {
@@ -171,9 +171,11 @@
           "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
           "content_type": "application/json",
           "required_body_fields": ["model", "input", "tools"],
-          "allowed_body_fields": ["model", "input", "reasoning", "tools"],
+          "allowed_body_fields": ["model", "input", "reasoning", "tools", "tool_choice", "previous_response_id"],
+          "required_body_values": {"/tool_choice": "required"},
+          "computer_screenshot_handshake": true,
           "body_field_types": { "model": ["string"], "input": ["array"], "tools": ["array"] },
-          "success_fixture": { "id": "resp_computer_mock_1", "object": "response", "status": "completed", "model": "gpt-5.6", "output": [{ "type": "computer_call", "id": "computer_mock_1", "call_id": "computer_call_mock_1", "status": "completed", "action": { "type": "click", "button": "left", "x": 640, "y": 360 }, "pending_safety_checks": [] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+          "success_fixture": { "id": "resp_computer_mock_1", "object": "response", "status": "completed", "model": "gpt-5.6", "output": [{ "type": "computer_call", "id": "computer_mock_1", "call_id": "computer_call_mock_1", "status": "completed", "actions": [{ "type": "click", "button": "left", "x": 640, "y": 360 }], "pending_safety_checks": [] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
           "official_sources": ["https://developers.openai.com/api/reference/resources/responses/methods/create", "https://developers.openai.com/api/docs/models/gpt-5.6-sol"],
           "evidence_summary": "GPT-5.6 computer use is exposed through Responses with the computer tool and computer_call action output."
         },
@@ -2854,7 +2856,8 @@
         "base_contract_id": "openai.responses.v1",
         "api_version": "v1",
         "api_types": ["llm", "vision.ocr", "vision.caption"],
-        "variant_api_types": ["image.txt2img", "image.img2img"],
+        "test_model_ids": {"vision.ocr": "kimi-k3"},
+        "model_ids_by_api_type": {"vision.ocr": ["kimi-k3", "qwen3.7-plus", "ui-tars-1.5-7b"]},
         "operation": "responses.create",
         "http_method": "POST",
         "path": "/api/v1/ai/responses",
@@ -2870,6 +2873,169 @@
         "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs", "https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/litellm/mod.rs"],
         "evidence_summary": "SN public source at cebf55a exposes POST /api/v1/ai/responses with Bearer authentication and forwards the Responses JSON/SSE wire to LiteLLM /v1/responses."
       }, {
+          "id": "sn.openai-responses.background.v1",
+          "model_ids_by_api_type": {"vision.ocr": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.3-codex"], "image.txt2img": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5-pro", "gpt-5.5", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano"], "image.img2img": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]},
+          "protocol_adapter_id": "sn-openai",
+          "api_version": "v1",
+          "api_types": [
+            "vision.ocr",
+            "image.txt2img",
+            "image.img2img"
+          ],
+          "operation": "responses.background",
+          "http_method": "POST",
+          "path": "/api/v1/ai/responses",
+          "auth": {
+            "kind": "header",
+            "name": "authorization",
+            "prefix": "Bearer "
+          },
+          "content_type": "application/json",
+          "required_body_fields": [
+            "model",
+            "input",
+            "background"
+          ],
+          "allowed_body_fields": [
+            "model",
+            "input",
+            "include",
+            "instructions",
+            "max_output_tokens",
+            "metadata",
+            "parallel_tool_calls",
+            "previous_response_id",
+            "reasoning",
+            "service_tier",
+            "store",
+            "stream",
+            "temperature",
+            "text",
+            "tool_choice",
+            "tools",
+            "top_logprobs",
+            "top_p",
+            "truncation",
+            "user",
+            "background"
+          ],
+          "body_field_types": {
+            "model": [
+              "string"
+            ],
+            "input": [
+              "string",
+              "array"
+            ],
+            "background": [
+              "boolean"
+            ],
+            "stream": [
+              "boolean"
+            ]
+          },
+          "success_fixture": {
+            "id": "resp_background_mock_1",
+            "object": "response",
+            "background": true,
+            "status": "queued"
+          },
+          "inline_artifact_success_fixture": {
+            "id": "resp_inline_artifact_mock_1",
+            "object": "response",
+            "status": "completed",
+            "model": "mock-model",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_inline_artifact_mock_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "BUCKYOS-AICC-4827",
+                    "annotations": []
+                  }
+                ]
+              },
+              {
+                "type": "image_generation_call",
+                "id": "ig_inline_artifact_mock_1",
+                "status": "completed",
+                "result": "aW1hZ2U=",
+                "output_format": "png"
+              }
+            ],
+            "usage": {
+              "input_tokens": 4,
+              "output_tokens": 3,
+              "total_tokens": 7
+            }
+          },
+          "inline_artifact_payload_paths": [
+            "/output/1/result"
+          ],
+          "official_sources": [
+            "https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs",
+            "https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/litellm/mod.rs",
+            "https://developers.openai.com/api/docs/guides/background"
+          ],
+          "evidence_summary": "Responses background=true creates a response ID; GET /responses/{id} polls and retrieves output; POST /responses/{id}/cancel cancels. SN forwards these endpoints; actual upstream background support is verified separately by T2.",
+          "test_model_ids": {
+            "vision.ocr": "gpt-6-sol",
+            "image.txt2img": "gpt-6-sol",
+            "image.img2img": "gpt-6-sol"
+          },
+          "async_protocol": "openai_responses",
+          "async_steps": [
+            {
+              "name": "poll",
+              "http_method": "GET",
+              "path": "/api/v1/ai/responses/resp_background_mock_1"
+            },
+            {
+              "name": "result",
+              "http_method": "GET",
+              "path": "/api/v1/ai/responses/resp_background_mock_1"
+            },
+            {
+              "name": "cancel",
+              "http_method": "POST",
+              "path": "/api/v1/ai/responses/resp_background_mock_1/cancel"
+            }
+          ],
+          "required_body_values": {
+            "/background": true,
+            "/stream": false
+          },
+          "async_result_fixture": {
+            "id": "resp_mock_1",
+            "object": "response",
+            "status": "completed",
+            "model": "mock-model",
+            "output": [
+              {
+                "type": "message",
+                "id": "msg_mock_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                  {
+                    "type": "output_text",
+                    "text": "BUCKYOS-AICC-4827",
+                    "annotations": []
+                  }
+                ]
+              }
+            ],
+            "usage": {
+              "input_tokens": 4,
+              "output_tokens": 3,
+              "total_tokens": 7
+            }
+          }
+      }, {
         "id": "sn.openai-responses.computer.v1",
         "protocol_adapter_id": "sn-openai",
         "base_contract_id": "openai.responses.computer.v1",
@@ -2881,9 +3047,11 @@
         "auth": { "kind": "header", "name": "authorization", "prefix": "Bearer " },
         "content_type": "application/json",
         "required_body_fields": ["model", "input", "tools"],
-        "allowed_body_fields": ["model", "input", "reasoning", "tools"],
-        "body_field_types": { "model": ["string"], "input": ["array"], "tools": ["array"] },
-        "success_fixture": { "id": "resp_computer_mock_1", "object": "response", "status": "completed", "model": "gpt-6-sol", "output": [{ "type": "computer_call", "id": "computer_mock_1", "call_id": "computer_call_mock_1", "status": "completed", "action": { "type": "click", "button": "left", "x": 640, "y": 360 }, "pending_safety_checks": [] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
+        "allowed_body_fields": ["model", "input", "reasoning", "tools", "tool_choice", "previous_response_id"],
+        "required_body_values": {"/tool_choice": "required"},
+          "computer_screenshot_handshake": true,
+          "body_field_types": { "model": ["string"], "input": ["array"], "tools": ["array"] },
+        "success_fixture": { "id": "resp_computer_mock_1", "object": "response", "status": "completed", "model": "gpt-6-sol", "output": [{ "type": "computer_call", "id": "computer_mock_1", "call_id": "computer_call_mock_1", "status": "completed", "actions": [{ "type": "click", "button": "left", "x": 640, "y": 360 }], "pending_safety_checks": [] }], "usage": { "input_tokens": 4, "output_tokens": 3, "total_tokens": 7 } },
         "official_sources": ["https://github.com/buckyos/sn-business/blob/cebf55a/src/modules/sn_aicc/src/http/public.rs"],
         "evidence_summary": "SN forwards the Responses computer tool request and computer_call action output unchanged through its public Responses route."
       }, {
