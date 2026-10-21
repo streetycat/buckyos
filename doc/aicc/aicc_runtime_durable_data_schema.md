@@ -18,7 +18,7 @@ Service：`aicc`
 | `aicc_route_trace_event` | AICC 平台 RDB instance | 路由诊断与 task/request 关联 |
 | `aicc_session_route_history` | AICC 平台 RDB instance | 保留 tenant/user/app/session 隔离的上一次 exact model 软偏好 |
 | `aicc_artifact_scope` | AICC 平台 RDB instance | 记录 AICC 生成 Named Object 的租户归属，防止跨租户引用 |
-| `aicc_artifact_url_source` | AICC 平台 RDB instance | 记录 Provider 返回 URL 的来源实例、实际请求 base URL 和租户/用户归属，供直传判定与鉴权下载 |
+| `aicc_artifact_url_source` | AICC 平台 RDB instance | 记录 Provider 返回 URL 的来源实例和租户/用户归属，供直传判定与鉴权下载；配置通过来源实例读取，不另存 endpoint 快照 |
 | `aicc_provider_artifact` | AICC 平台 RDB instance | 按内容摘要**或**对象 ID、ProviderInstance、模型原厂和 tenant 保存图片、视频、音频等 artifact 的原生 ID；纯缓存 |
 | `aicc_audit_event` | AICC 平台 RDB instance | 持久安全与管理事件 |
 | Provider inventory LKGS | AICC 平台 RDB instance | 见 Provider 持久 schema |
@@ -134,7 +134,6 @@ Description：AICC 对 Provider 输出中 `ResourceRef::Url` 建立的来源和�
 | `url` | TEXT | NO | Provider 返回的精确 URL；查询命中后必须再次逐字比较以防 hash 冲突 |
 | `provider_instance_name` | TEXT | NO | 产生 URL 的 ProviderInstance |
 | `protocol_adapter_id` | TEXT | NO | 产生 URL 时使用的 Adapter；读取时必须仍与实例匹配 |
-| `provider_request_base_url` | TEXT | NO | 产生结果时该 operation 实际使用的请求 base URL；只用于比较 URL origin，不含 credential |
 | `origin_provider` | TEXT | NO | 产出内容的模型原厂 |
 | `artifact_id` | TEXT | YES | Adapter 显式绑定的 Provider artifact id；缺失时为空 |
 | `content_digest` | TEXT | YES | 完整读取 URL 内容后补全的 `sha256:<hex>`；登记时为空 |
@@ -147,7 +146,7 @@ Description：AICC 对 Provider 输出中 `ResourceRef::Url` 建立的来源和�
 
 Indexes：`idx_aicc_artifact_url_source_tenant(tenant_id, created_at_ms)`、`idx_aicc_artifact_url_source_provider(provider_instance_name, created_at_ms)`。
 
-Constraints：首次登记确定 owner、ProviderInstance、实际请求 base URL 和 `origin_provider`，冲突写入不得改变现有记录。复用输入时必须先校验 tenant/user；同 ProviderInstance 或结果 URL 与请求 base URL 不同 origin 时可直接传递，跨实例同 origin 时通过原 ProviderInstance 下载为字节。打开 reader 时必须同时满足 URL 已登记、精确 URL 相同、当前 tenant/user 相同、ProviderInstance 仍存在且 Adapter 未改变；调用方传入 `artifact_id` 时还必须与登记值一致。`expires_at_ms` 非空且小于等于当前时间时记录视为失效并删除，不再尝试下载。内容流完整读到 EOF 后以实际下载字节计算摘要并补全；失败或提前停止保持为空。URL 可能包含 Provider 签名参数，禁止写入日志、错误消息或审计 data。
+Constraints：复用输入时必须先校验 tenant/user；同 ProviderInstance 或结果 URL 与来源实例当前 base URL 不同 origin 时可直接传递，跨实例同 origin 时通过原 ProviderInstance 下载为字节。来源实例不可用时不得按公网 URL 猜测处理。需要下载已登记 URL 时，初次物化、URL fallback 和调用方下载接口均复用同一个 artifact reader，由来源 Adapter 决定鉴权及跨域下载规则，外围不再根据 origin 选择另一条下载路径。打开 reader 时必须同时满足 URL 已登记、精确 URL 相同、当前 tenant/user 相同、ProviderInstance 仍存在且 Adapter 未改变；调用方传入 `artifact_id` 时还必须与登记值一致。`expires_at_ms` 非空且小于等于当前时间时记录视为失效并删除，不再尝试下载。内容流完整读到 EOF 后以实际下载字节计算摘要并补全；失败或提前停止保持为空。URL 可能包含 Provider 签名参数，禁止写入日志、错误消息或审计 data。
 
 ### 4.6 Table: `aicc_provider_artifact`
 
@@ -202,7 +201,7 @@ Indexes：`created_at_ms`、`(tenant_id, created_at_ms)`、`(trace_id, created_a
 
 本文表集始于 beta 2.2 breaking change 后的初始契约。`aicc_schema_meta.schema_version` 当前为 `2`：`1` 为初始表集，`2` 增加 route trace 过滤列。
 
-**表集本身不参与版本化。** `SCHEMA` 完全由幂等的 `CREATE ... IF NOT EXISTS` 组成，并在每次打开时重新应用，因此新增或改名的表对全新 RDB 与既有 RDB 同时生效，不需要为此新增 migration；`MIGRATIONS` 只保留无法表达为幂等表定义的既有行改写（当前只有 `2` 的 route trace 过滤列）。表名变更不会让既有 RDB 失败：被替换掉的旧表就地废弃、不再访问，也不 `DROP`。`1` 之前的旧 AICC RDB 不提供升级路径，直接清理后由 `SCHEMA` 重建完整表结构。`finance_snapshot_json` 仍是权威数据，普通列是写入时生成且可直接信任的查询投影，读取时不反向解析 JSON，也不做双份校验。
+**表集本身不参与版本化。** `SCHEMA` 完全由幂等的 `CREATE ... IF NOT EXISTS` 组成，并在每次打开时重新应用，因此新增或改名的表对全新 RDB 与既有 RDB 同时生效，不需要为此新增 migration；`MIGRATIONS` 保留无法表达为幂等表定义的既有结构或行改写。表名变更不会让既有 RDB 失败：被替换掉的旧表就地废弃、不再访问，也不 `DROP`。`1` 之前的旧 AICC RDB 不提供升级路径，直接清理后由 `SCHEMA` 重建完整表结构。`finance_snapshot_json` 仍是权威数据，普通列是写入时生成且可直接信任的查询投影，读取时不反向解析 JSON，也不做双份校验。
 
 `usage.query` 的时间、身份、模型、Provider、method 等过滤条件、事件游标和页大小均进入 SQL；summary、group 和 time bucket 由数据库基于 typed projection 聚合，只将聚合行和请求页返回进程，不再先加载全部命中事件。
 
