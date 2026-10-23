@@ -2,7 +2,7 @@
   "format": "buckyos.aicc.provider-rules-catalog",
   "schema_version": 1,
   "schema_revision": 0,
-  "revision_seq": 5,
+  "revision_seq": 10,
   "provider_profile_id": "sn",
   "model_driver_overrides": {
     "gpt-6-astra": "openai/gpt-6-astra",
@@ -164,10 +164,21 @@
     },
     {
       "id": "voxtral-small-24b-2507",
-      "operations": {"llm": "responses.create"},
-      "remove_api_types": ["audio.asr"]
+      "operations": {"llm": "responses.create", "audio.asr": "chat.completions.create"}
     },
-    {"id": "wan-3.0", "exclude": true}
+    {
+      "id": "wan-3.0",
+      "operations": {"video.txt2video": "videos.create", "video.img2video": "videos.create", "video.video2video": "videos.create", "video.extend": "videos.create"},
+      "request_rules": [{
+        "when": {"api_type": ["video.txt2video", "video.img2video"], "operation": "videos.create"},
+        "canonical_fields": {
+          "/duration_seconds": {"converter": "passthrough", "fallback": {"action": "omit"}},
+          "/aspect_ratio": {"converter": "passthrough", "fallback": {"action": "omit"}},
+          "/resolution": {"converter": "passthrough", "fallback": {"action": "omit"}},
+          "/output/fps": {"converter": "omit", "fallback": {"action": "omit"}}
+        }
+      }]
+    }
   ],
   "patterns": [{"match": "*", "exclude": true}],
   "variants": [

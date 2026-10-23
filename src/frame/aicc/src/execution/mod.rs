@@ -1568,7 +1568,8 @@ impl ExecutionEngine {
                         self.remove_active(task_id);
                         return self.current_receipt(task_id).await;
                     }
-                    self.tasks
+                    if let Err(error) = self
+                        .tasks
                         .report_state(
                             task_id,
                             state,
@@ -1578,7 +1579,17 @@ impl ExecutionEngine {
                                 record.trace_id.as_deref(),
                             ),
                         )
-                        .await?;
+                        .await
+                    {
+                        if !error.retriable {
+                            return self.finish_failure(task_id, error).await;
+                        }
+                        log::warn!(
+                            "native task progress delivery deferred: task_id={} error={}",
+                            task_id,
+                            error
+                        );
+                    }
                     next_poll_after = Some(handle.poll_after.unwrap_or(Duration::from_secs(3)));
                 }
                 Ok(NativeTaskPoll::Pending(state, progress, retry_after)) => {
@@ -1598,13 +1609,24 @@ impl ExecutionEngine {
                         self.remove_active(task_id);
                         return self.current_receipt(task_id).await;
                     }
-                    self.tasks
+                    if let Err(error) = self
+                        .tasks
                         .report_state(
                             task_id,
                             ExecutionState::from(state),
                             json_state("provider_progress", progress, record.trace_id.as_deref()),
                         )
-                        .await?;
+                        .await
+                    {
+                        if !error.retriable {
+                            return self.finish_failure(task_id, error).await;
+                        }
+                        log::warn!(
+                            "native task progress delivery deferred: task_id={} error={}",
+                            task_id,
+                            error
+                        );
+                    }
                     next_poll_after = Some(retry_after.unwrap_or(Duration::from_secs(3)));
                 }
                 Ok(NativeTaskPoll::Complete(output)) => {
@@ -2262,6 +2284,7 @@ mod tests {
         events: Mutex<Vec<(String, ExecutionState, Value)>>,
         completed: Mutex<Vec<(String, Option<String>)>>,
         commit_error: Mutex<Option<AiccError>>,
+        report_error: Mutex<Option<AiccError>>,
         failed: Mutex<Vec<(String, Option<String>)>>,
         cancelled: Mutex<Vec<(String, Option<String>)>>,
     }
@@ -2309,6 +2332,9 @@ mod tests {
             state: ExecutionState,
             data: Value,
         ) -> Result<(), AiccError> {
+            if let Some(error) = self.report_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.events
                 .lock()
                 .unwrap()
@@ -3895,6 +3921,57 @@ mod tests {
             tasks.completed.lock().unwrap().as_slice(),
             [(started.task_id, Some("trace-1".into()))]
         );
+    }
+
+    #[tokio::test]
+    async fn native_polling_survives_transient_taskmgr_progress_failure_without_resubmitting() {
+        for retriable in [true, false] {
+            let providers = Arc::new(FakeProviders::default());
+            let mut handle = NativeTaskHandle::new("remote-progress-recovery").unwrap();
+            handle.state = NativeTaskState::Queued;
+            handle.poll_after = Some(Duration::ZERO);
+            providers
+                .plans
+                .lock()
+                .unwrap()
+                .push_back(StartPlan::Success(ProviderExecution::NativeTask {
+                    handle,
+                    resume: resume_descriptor(),
+                }));
+            providers.polls.lock().unwrap().extend([
+                NativeTaskPoll::Pending(NativeTaskState::Running, None, Some(Duration::ZERO)),
+                NativeTaskPoll::Complete(output("completed")),
+            ]);
+            let (engine, store, tasks, usage) = make_engine(providers.clone());
+            let started = engine.execute(request(call("primary"))).await.unwrap();
+            *tasks.report_error.lock().unwrap() = Some(aicc_error(
+                AiccErrorCode::InternalError,
+                "TaskMgr progress unavailable",
+                retriable,
+            ));
+            let completed = engine.drive_native(&started.task_id).await.unwrap();
+            assert_eq!(
+                completed.state,
+                if retriable {
+                    ExecutionState::Succeeded
+                } else {
+                    ExecutionState::Failed
+                }
+            );
+            assert!(engine.active.lock().unwrap().is_empty());
+            assert_eq!(providers.start_generations.lock().unwrap().len(), 1);
+            assert_eq!(usage.writes.lock().unwrap().len(), usize::from(retriable));
+            let persisted = store.get_task(&started.task_id).await.unwrap().unwrap();
+            assert_eq!(
+                persisted.binding.unwrap().remote_task_id.as_deref(),
+                Some("remote-progress-recovery")
+            );
+            assert_eq!(
+                tasks.completed.lock().unwrap().len(),
+                usize::from(retriable)
+            );
+            assert_eq!(tasks.failed.lock().unwrap().len(), usize::from(!retriable));
+        }
     }
 
     #[tokio::test]

@@ -107,6 +107,7 @@ import {
 import {
   assertT15ResponseMapping,
   buildT15TypedParams,
+  firstReusableArtifact,
   exactModel,
   variantCells,
   variantWireDiagnostics,
@@ -170,6 +171,10 @@ function t15FieldValue(
 ): unknown {
   if (field === "model") return model;
   if (field === "messages") {
+    if (apiType === "audio.asr") return [{ role: "user", content: [
+      {type: "input_audio", input_audio: {data: "UklGRm1vY2s=", format: "wav"}},
+      {type: "text", text: "Transcribe the speech verbatim."},
+    ] }];
     return [{ role: "user", content: "BUCKYOS-AICC-4827" }];
   }
   if (field === "input" && contract.operation.startsWith("dashscope.")) {
@@ -282,8 +287,7 @@ function t15ProviderRequest(
     let target = fields as Record<string, unknown>;
     for (const token of tokens.slice(0, -1)) {
       if (
-        target[token] === null || typeof target[token] !== "object" ||
-        Array.isArray(target[token])
+        target[token] === null || typeof target[token] !== "object"
       ) {
         target[token] = {};
       }
@@ -302,8 +306,7 @@ function t15ProviderRequest(
     let target = fields as Record<string, unknown>;
     for (const token of tokens.slice(0, -1)) {
       if (
-        target[token] === null || typeof target[token] !== "object" ||
-        Array.isArray(target[token])
+        target[token] === null || typeof target[token] !== "object"
       ) {
         target[token] = {};
       }
@@ -318,8 +321,7 @@ function t15ProviderRequest(
     let target = fields as Record<string, unknown>;
     for (const token of tokens.slice(0, -1)) {
       if (
-        target[token] === null || typeof target[token] !== "object" ||
-        Array.isArray(target[token])
+        target[token] === null || typeof target[token] !== "object"
       ) {
         target[token] = {};
       }
@@ -1189,7 +1191,7 @@ test("Doubao Agent Plan capability rules distinguish text-only and vision models
   }
 });
 
-test("SN official catalog requires an independent bearer session token", async () => {
+test("SN official catalog requires authenticated bearer access", async () => {
   const profile = (await baseline()).providers.find((item) =>
     item.provider_driver === "sn-ai-provider"
   )!;
@@ -3013,6 +3015,13 @@ test("generated-artifact continuation selects a complete ResourceRef, never mani
     {kind:"named_object",obj_id:"cyfile:resource",_content_type:"image"}]),{kind:"named_object",obj_id:"cyfile:resource"});
   assert.throws(()=>firstReusableResource([{obj_id:"cyfile:metadata"}]),/ResourceRef/);
   assert.throws(()=>firstReusableResource([{kind:"base64",data_base64:"aW1hZ2U="}]),/ResourceRef/);
+  const source = {kind:"named_object",obj_id:"cyfile:generated-video"};
+  assert.deepEqual(firstReusableArtifact({input:{video:{kind:"base64",mime:"video/mp4",data_base64:"aW5wdXQ="}},
+    result:{output:{video:source}}}),source);
+  for (const apiType of ["video.video2video", "video.extend", "video.upscale"]) {
+    assert.deepEqual(buildT15TypedParams(apiType, "model@provider", "run", "immediate", apiType,
+      {sourceResource:source}).video, source);
+  }
 });
 
 test("resume completion lookup is owner-scoped and rejects ambiguous task keys", async () => {
@@ -4100,7 +4109,7 @@ test("T1.5 protocol catalog is independent, traceable, and strict on Provider wi
   assert.equal(sn.path, "/api/v1/ai/responses");
   assert.ok(
     sn.official_sources.every((source) =>
-      source.includes("buckyos/sn-business/blob/cebf55a")
+      source.includes("buckyos/sn-business/blob/main")
     ),
   );
   assert.equal(
@@ -5079,11 +5088,13 @@ test("T1.5 Provider mock completes every declared async lifecycle", async (conte
       contract,
       provider.test_model_ids[contract.api_types[0]],
     );
-    assert.equal(
-      (await fetch(submit.url, submit.init)).status,
-      200,
-      `${contract.id} submit`,
-    );
+    const submitted = await fetch(submit.url, submit.init);
+    assert.equal(submitted.status, 200, `${contract.id} submit`);
+    if (contract.async_protocol === "openai_video") {
+      const job = await submitted.json() as {created_at: number};
+      assert.ok(Math.abs(job.created_at - Date.now() / 1000) < 60,
+        `${contract.id} must create a fresh video artifact with an unexpired native ID`);
+    }
     for (const step of contract.async_steps ?? []) {
       let path = step.path
         .replaceAll("{request_id}", "fal_mock_1")
@@ -5094,7 +5105,7 @@ test("T1.5 Provider mock completes every declared async lifecycle", async (conte
             : contract.async_protocol === "glm_video" ||
                 contract.async_protocol === "doubao_video"
             ? "glm_video_mock_1"
-            : "video_mock_1",
+            : encodeURIComponent(String(contract.success_fixture?.id ?? "video_mock_1")),
         );
       const url = new URL(`${baseUrl}${path}`);
       for (const field of step.required_query_fields ?? []) {
@@ -6190,4 +6201,41 @@ test("review media wire regressions reject invalid sizes, duration, missing inpu
       );
     }
   }
+});
+
+test("SN credentials create an isolated API-key instance and preserve activation providers", () => {
+  const original = { providers: [{ provider_instance_name: "sn-activation", provider_profile_id: "sn", auth: { mode: "dynamic_login", login_profile: "device_jwt" }, credentials: { device_token_ref: { runtime_ref: "runtime://device-jwt" } } }] };
+  const patched = applyProviderTokens(original, { "sn-ai-provider": "test-key" }, { "sn-ai-provider": "sn-isolated" });
+  const providers = patched.providers as Array<Record<string, unknown>>;
+  assert.deepEqual(providers[0], original.providers[0]);
+  assert.equal(providers[1].provider_profile_id, "sn");
+  assert.equal(providers[1].protocol_adapter_id, "sn-openai");
+  assert.equal(providers[1].base_url, "https://sn.buckyos.ai/api/v1/ai");
+  assert.deepEqual(providers[1].credentials, { api_token: { inline_secret: "test-key" } });
+  assert.equal(original.providers.length, 1);
+});
+
+test("SN audio chat wire rejects URL audio and uncorrelated content shapes", async () => {
+  const catalog = await loadProviderProtocolCatalog();
+  const contract = protocolContract(catalog, "sn-ai-provider", "sn.audio-chat.v1");
+  const request = t15ProviderRequest("https://mock.invalid", contract, "voxtral-small-24b-2507", {}, "audio.asr");
+  const body = JSON.parse(request.init.body as string);
+  const captured = {method: "POST", pathname: contract.path, query: new URLSearchParams(), headers: new Headers(request.init.headers), body};
+  assert.deepEqual(validateProviderRequest(contract, captured, "audio.asr"), []);
+  body.messages[0].content[0].input_audio.url = "https://example.invalid/audio.wav";
+  assert.ok(validateProviderRequest(contract, captured, "audio.asr").some((error) => error.includes("inline input_audio")));
+  delete body.messages[0].content[0].input_audio.url;
+  body.messages[0].content[0].input_audio.data = "data:audio/wav;base64,UklGRm1vY2s=";
+  assert.ok(validateProviderRequest(contract, captured, "audio.asr").some((error) => error.includes("inline input_audio")));
+});
+
+test("variant wire comparison ignores JSON object order while preserving values and array order", () => {
+  const expected = {thinking: {type: "enabled", budget_tokens: 1024}, options: {steps: ["first", "second"]}};
+  const actual = {model: "claude-haiku-4-5-20251001", options: {steps: ["first", "second"]}, thinking: {budget_tokens: 1024, type: "enabled"}};
+  assert.deepEqual(variantWireDiagnostics(actual.model, expected, [{body: actual}]), []);
+  actual.thinking.budget_tokens = 2048;
+  assert.ok(variantWireDiagnostics(actual.model, expected, [{body: actual}]).some((error) => error.includes("thinking")));
+  actual.thinking.budget_tokens = 1024;
+  actual.options.steps.reverse();
+  assert.ok(variantWireDiagnostics(actual.model, expected, [{body: actual}]).some((error) => error.includes("options")));
 });
