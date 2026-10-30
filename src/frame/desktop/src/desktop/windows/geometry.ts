@@ -1,5 +1,7 @@
+// No top margin: nothing sits above the window workspace, so a window can be
+// dragged flush against the top edge.
 export const desktopWindowViewportPadding = {
-  top: 8,
+  top: 0,
   right: 12,
   bottom: 8,
   left: 12,
@@ -11,13 +13,16 @@ export const desktopWindowMinVisibleTitleBarWidth = 120
 export function getDesktopWindowWorkspaceBounds({
   safeArea,
   topInset,
+  leftInset = 0,
   viewportSize,
 }: {
   safeArea: { top: number; bottom: number; left: number; right: number }
   topInset: number
+  /** Width of a pinned taskbar. */
+  leftInset?: number
   viewportSize: { width: number; height: number }
 }) {
-  const minX = safeArea.left + desktopWindowViewportPadding.left
+  const minX = safeArea.left + leftInset + desktopWindowViewportPadding.left
   const minY = topInset + desktopWindowViewportPadding.top
   const maxRight =
     viewportSize.width -
@@ -56,4 +61,14 @@ export function getDesktopWindowPositionBounds(
       workspaceBounds.maxBottom - desktopWindowTitleBarHeight,
     ),
   }
+}
+
+/**
+ * Windows are positioned with a compositor-only transform instead of
+ * `left`/`top`, so moving one never triggers layout. The layer writes this
+ * exact string straight to the DOM while dragging and React writes it on
+ * commit; keeping one formatter guarantees the two never disagree.
+ */
+export function desktopWindowTransform(x: number, y: number) {
+  return `translate3d(${x}px, ${y}px, 0)`
 }

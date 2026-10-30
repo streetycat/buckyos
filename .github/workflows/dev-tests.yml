@@ -19,6 +19,8 @@ on:
       - "make_local_pkg.py"
       - "notepads/GitActionv2.md"
       - "src/**"
+      - "test/aicc_test/**"
+      - "doc/aicc/**"
 
 permissions:
   contents: read
@@ -42,6 +44,11 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install cargo test dependencies
         run: |
           sudo apt-get update
@@ -57,11 +64,46 @@ jobs:
         with:
           limit-access-to-actor: true
 
+  aicc-acceptance-static:
+    name: AICC Acceptance Static Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.13.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install AICC acceptance dependencies
+        working-directory: ./test/aicc_test
+        run: pnpm install && pnpm update buckyos
+
+      - name: Validate AICC acceptance contracts
+        working-directory: ./test/aicc_test
+        run: |
+          deno check acceptance/*.ts
+          pnpm run acceptance:preflight
+          pnpm run acceptance:self-test
+
   dev-tests:
     name: ${{ matrix.name }}
     needs:
       - quick-unit-tests
-    if: ${{ always() && (needs.quick-unit-tests.result == 'success' || needs.quick-unit-tests.result == 'skipped') }}
+      - aicc-acceptance-static
+    if: ${{ always() && (needs.quick-unit-tests.result == 'success' || needs.quick-unit-tests.result == 'skipped') && needs.aicc-acceptance-static.result == 'success' }}
     runs-on: ${{ fromJSON((matrix.platform_key == 'macos' && matrix.arch == 'aarch64' && vars.DEVTESTS_MACOS_ARM64_RUNNER_JSON) || (matrix.platform_key == 'macos' && matrix.arch == 'x86_64' && vars.DEVTESTS_MACOS_X64_RUNNER_JSON) || matrix.runner_json) }}
     timeout-minutes: 180
     strategy:
@@ -203,7 +245,7 @@ jobs:
         run: choco install nsis -y --no-progress
 
       - name: Install buckyos devkit
-        run: python -m pip install -U "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
+        run: python -m pip install -U "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
 
       - name: Set runtime paths (Unix)
         if: ${{ runner.os != 'Windows' }}
@@ -218,9 +260,9 @@ jobs:
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          "BUCKYOS_ROOT=$($env:APPDATA)\BuckyOS" >> $env:GITHUB_ENV
+          "BUCKYOS_ROOT=C:\buckyos" >> $env:GITHUB_ENV
           "BUCKYOS_BUILD_ROOT=C:\opt\buckyosci" >> $env:GITHUB_ENV
-          "BUCKYOS_LOGS_PATH=$($env:APPDATA)\BuckyOS\logs" >> $env:GITHUB_ENV
+          "BUCKYOS_LOGS_PATH=C:\buckyos\logs" >> $env:GITHUB_ENV
           "LOCAL_PKG_DIR=$env:GITHUB_WORKSPACE\publish" >> $env:GITHUB_ENV
           "PYTHONIOENCODING=utf-8" >> $env:GITHUB_ENV
           "PYTHONLEGACYWINDOWSSTDIO=utf-8" >> $env:GITHUB_ENV
@@ -240,11 +282,11 @@ jobs:
           New-Item -ItemType Directory -Path $env:BUCKYOS_ROOT -Force | Out-Null
 
       - name: Clone cyfs-gateway
-        run: git clone --depth 1 --branch beta2.2 https://github.com/buckyos/cyfs-gateway.git ../cyfs-gateway
+        run: git clone --depth 1 --branch main https://github.com/buckyos/cyfs-gateway.git ../cyfs-gateway
 
       - name: Clone BuckyOSApp
         if: ${{ matrix.needs_tauri }}
-        run: git clone --depth 1 --branch beta2.2 https://github.com/buckyos/BuckyOSApp.git ../BuckyOSApp
+        run: git clone --depth 1 --branch main https://github.com/buckyos/BuckyOSApp.git ../BuckyOSApp
 
       - name: Install BuckyOSApp dependencies (Unix)
         if: ${{ matrix.needs_tauri && runner.os != 'Windows' }}
@@ -295,7 +337,7 @@ jobs:
           popd
 
           pushd src
-          buckyos-build ${{ matrix.build_target_arg }}
+          "$PYTHON_BIN" buckyos-build.py ${{ matrix.build_target_arg }}
           buckyos-install --all
           sudo HOME="$HOME" PATH="$PATH" BUCKYOS_ROOT="$BUCKYOS_ROOT" "$PYTHON_BIN" start.py --all
           wait_for_port "node gateway" 127.0.0.1 3180
@@ -402,7 +444,10 @@ jobs:
           Pop-Location
 
           Push-Location .\src
-          buckyos-build ${{ matrix.build_target_arg }}
+          python .\buckyos-build.py ${{ matrix.build_target_arg }}
+          if ($LASTEXITCODE -ne 0) {
+            throw "BuckyOS build failed with exit code $LASTEXITCODE"
+          }
           buckyos-install --all
           python .\start.py --all
           Wait-ForPort -Name "node gateway" -TargetHost "127.0.0.1" -Port 3180

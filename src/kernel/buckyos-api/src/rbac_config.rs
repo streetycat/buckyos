@@ -16,7 +16,7 @@ g = _, _
 e = priority(p.eft) || deny
 
 [matchers]
-m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.sub) || keyGet3(r.obj, p.obj, p.sub) =="") && keyMatch3(r.obj,p.obj)) && (p.act == "all" || regexMatch(r.act, p.act))
+m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.sub) || r.sub == "app:" + keyGet3(r.obj, p.obj, p.sub) || r.sub == "system:" + keyGet3(r.obj, p.obj, p.sub) || keyGet3(r.obj, p.obj, p.sub) =="") && keyMatch3(r.obj,p.obj)) && (p.act == "all" || regexMatch(r.act, p.act))
 "#;
 
 /*
@@ -34,8 +34,8 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 - su_admin 系统所有权限
 - admin 除别的用户的数据之外的读权限，
 - users 自己的数据的读权限，不包含敏感数据的写权限
-- su_users 自己敏感数据的写权限
-- limit_users 暂不实现
+- su_users 不带策略：本人 settings / doc 不可写，改密与类型、组、状态变更经 Control Panel 业务方法以服务身份写入
+- limited 零权限底座：只读自己的 settings、读写自己的 profile；系统用户组 group:<id> 不带策略
 - author 逻辑权限，资源的创建者
 
 
@@ -68,9 +68,9 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 所有可上链的资源修改都要su权限，在未上链时可本地修改，否则统一走先更新链再同步的逻辑
 
 ### user 相关
-- obj://config/users/{user}/settings 用户设置(含密码)，需要su_users修改
-- obj://config/users/{user}/doc 用户身份资料，需要su_users修改修改
-- obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链），注意保存的是private profile
+- obj://config/users/{user}/settings 用户设置(含密码)，只经 Control Panel 业务方法修改
+- obj://config/users/{user}/doc 用户身份资料（账号→DID 的唯一真相源），只经 Control Panel 修改
+- obj://config/users/{user}/profile 用户资料，可以随时修改 （可上链），注意保存的是private profile；非管理者写入时 did 必须等于 doc 的 id（system-config 校验）
 - obj://config/security/{user}/key 用户密钥，local账户才有，需要su_admin修改
 
 ### app 相关
@@ -78,14 +78,29 @@ m = (g(r.sub, p.sub) || r.sub == p.sub) && ((r.sub == keyGet3(r.obj, p.obj, p.su
 ### agent 相关
 
 ### task 相关
-- obj://task/{user} 该用户名下 Task 的集合视图。TaskMgr 用它回答“当前 principal 能否越过
+- obj://taskmgr/users/{user} 该用户名下 Task 的集合视图。TaskMgr 用它回答“当前 principal 能否越过
   Creator 的 app_id 看该用户的 Task”，从而让 control-panel 这类系统控制面成为用户的 Task
-  总览入口，而普通 app/agent（app/agent/frame 组没有 obj://task 规则）仍然只能看自己创建的
+  总览入口，而普通 app/agent（app/agent/frame 组没有 obj://taskmgr 规则）仍然只能看自己创建的
   Task。注意 enforce 是 app 侧和 user 侧的合取：app 侧决定“哪个 App 可以充当控制面”，
   user 侧的 {user} 占位符把可见范围绑定到请求者本人（root/su_admin 的全局通配规则除外）。
 
  */
 pub const DEFAULT_RBAC_POLICY: &str = r#"
+p, agent_read_only, obj://config/users/{user}/settings,all,deny
+p, agent_read_only, obj://config/users/{user}/agents/{agent}/key,all,deny
+p, agent_read_only, obj://config/security/*,all,deny
+p, agent_read_write, obj://*, all,allow
+p, agent_read_only, obj://*, ^(read|list|query|subscribe)$,allow
+p, system:scheduler, obj://config/system/content_registry,all,allow
+p, kernel, obj://config/system/content_registry,write|create|delete,deny
+p, system, obj://config/system/content_registry,write|create|delete,deny
+p, frame, obj://config/system/content_registry,write|create|delete,deny
+p, app, obj://config/system/content_registry,write|create|delete,deny
+p, system:control-panel, obj://config/users/{user}/content_defaults,read|write,allow
+p, kernel, obj://config/users/{user}/content_defaults,write,deny
+p, system, obj://config/users/{user}/content_defaults,write,deny
+p, frame, obj://config/users/{user}/content_defaults,write,deny
+p, app, obj://config/users/{user}/content_defaults,write,deny
 p, kernel, obj://*, all,allow
 p, ood, obj://*, all,allow
 p, root, obj://*, all,allow
@@ -97,67 +112,179 @@ p, system, obj://*, all,allow
 
 p, frame, obj://config/boot/*, read,allow
 p, frame, obj://config/system/*,read,allow
-p, frame, obj://config/agents/{agent}/{key},read,allow
 p, frame, obj://config/services/{frame}/*,all,allow
 p, frame, obj://config/services/{service}/info,read,allow
 p, frame, obj://config/users*,read,allow
 
+p, app, obj://config/system/content_registry,read,allow
+p, app, obj://config/users/{user}/content_defaults,read,allow
+p, users, obj://config/system/content_registry,read,allow
+p, users, obj://config/users/{users}/content_defaults,read|write,allow
+p, admin, obj://config/users/{admin}/content_defaults,read|write,allow
+p, app, obj://config/users/{user}/content_defaults,write,deny
 p, app, obj://config/boot/*, read,allow
 p, app, obj://config/users/{user}/apps/{app}/settings,read|write,allow
 p, app, obj://config/users/{user}/apps/{app}/spec,read,allow
 p, app, obj://config/users/{user}/apps/{app}/info,read|write,allow
 p, app, obj://config/services/{service}/info,read,allow
+p, app, obj://config/services/{app}@[^/@]+/instances/{node},write,allow
+
+# An App runtime is promoted to this role only when an AgentSpec binds to it.
+# AgentSpec is public runtime identity/configuration; the sibling private key
+# deliberately remains inaccessible to the runtime App principal.
+p, agent_runtime, obj://config/users/{user}/agents,read|list|query,allow
+p, agent_runtime, obj://config/users/{user}/agents/{agent}/spec,read,allow
 
 p, agent, obj://config/boot/*, read,allow
-p, agent, obj://config/agents/{agent}/*,read,allow
 p, agent, obj://config/users/{user}/agents/{agent}/settings,read|write,allow
 p, agent, obj://config/users/{user}/agents/{agent}/spec,read,allow
 p, agent, obj://config/users/{user}/agents/{agent}/info,read|write,allow
+p, agent, obj://config/users/{user}/agents/{agent}/profile,read|write,allow
 p, agent, obj://config/services/{service}/info,read,allow
 p, agent, obj://config/services/{agent}/instances/{node},write,allow
 
 p, admin,obj://config/boot/*, read,allow
 p, admin,obj://config/system/*,read,allow
-p, admin,obj://config/agents/{agent}/doc,read,allow
-p, admin,obj://config/agents/{agent}/settings,read|write,allow
 p, admin,obj://config/users/{admin}/*,read,allow
 p, admin,obj://config/users/{admin}/profile,read|write,allow
 p, admin,obj://config/users/{admin}/apps/{app}/{key},read|write,allow
+p, admin,obj://config/users/{admin}/agents,list|query,allow
 p, admin,obj://config/users/{admin}/agents/{agent}/{key},read|write,allow
 p, admin,obj://config/services/aicc/settings,read|write,allow
+p, admin,obj://config/services/aicc/driver_metadata_update,read|write,allow
 p, admin,obj://config/services/msg-center/settings,read|write,allow
 p, admin,obj://config/services/{service}/instances/{node},write,allow
 p, admin,obj://config/services/*,read,allow
-p, admin,obj://task/{admin},read,allow
+p, admin,obj://taskmgr/users/{admin},read,allow
 
 p, users,obj://config/boot/*, read,allow
-p, users,obj://config/agents/{agent}/doc,read,allow
 # p, su_user,obj://config/users/{user}/*,all,allow
 p, users,obj://config/users/{users}/*,read,allow
 p, users,obj://config/users/{users}/profile,read|write,allow
 p, users,obj://config/users/{users}/apps/{app}/{key},read|write,allow
+p, users,obj://config/users/{users}/agents,list|query,allow
 p, users,obj://config/users/{users}/agents/{agent}/{key},read|write,allow
 p, users,obj://config/services/{service}/info,read,allow
 p, users,obj://config/services/{service}/instances/{node},write,allow
-p, users,obj://task/{users},read,allow
+p, users,obj://taskmgr/users/{users},read,allow
 
-g, node-daemon, kernel
-g, scheduler, kernel
-g, system-config, kernel
-g, verify-hub, kernel
-g, cyfs-gateway, kernel
-g, buckycli, kernel
+# Limited accounts carry no business or resource permission; they only read
+# their own settings and read/write their own profile. System user groups
+# (`group:<id>`) add no policy.
+p, limited,obj://config/users/{limited}/settings,read,allow
+p, limited,obj://config/users/{limited}/profile,read|write,allow
+# Its own address book only (msg-center binds the owner to the caller and
+# checks the account may edit it); no sessions, mailboxes or other owner data.
+p, limited,obj://msg-center/owners/*/contacts,read|write,allow
+# AICC calls (restricted sessions open the `aicc` scope); the Provider /
+# Model allow lists of the account's groups decide what it may use.
+p, limited,obj://config/services/aicc/info,read,allow
 
-g, task-manager, system
-g, kmsg, system
-g, control-panel, system
+p, users,obj://msg-center/objects,read,allow
+p, admin,obj://msg-center/objects,read,allow
+p, users,obj://msg-center/inbox/*,read|write,allow
+p, users,obj://msg-center/sent/*,read|write,allow
+p, users,obj://msg-center/group_inbox/*,read,allow
+p, users,obj://msg-center/request_box/*,read|write,allow
+p, users,obj://msg-center/owners/*,read|write,allow
+p, users,obj://msg-center/group,create,allow
+p, admin,obj://msg-center/inbox/*,read|write,allow
+p, admin,obj://msg-center/sent/*,read|write,allow
+p, admin,obj://msg-center/group_inbox/*,read,allow
+p, admin,obj://msg-center/request_box/*,read|write,allow
+p, admin,obj://msg-center/owners/*,read|write,allow
+p, admin,obj://msg-center/group,create,allow
+p, users,obj://msg-center/notify,read|write,allow
+p, admin,obj://msg-center/notify,read|write,allow
+# A user signed in on an App origin (`appid = app:<id>`) creates groups with the user's own
+# rights; enforce is the conjunction of both sides, so the app side must allow it too
+# (self-host-group-extension TODO §11, EXT-10). Membership and Session checks stay with msg-center.
+p, app,obj://msg-center/group,create,allow
+p, app,obj://msg-center/group_inbox/*,read,allow
+p, app,obj://msg-center/notify,read|write,allow
+p, frame,obj://msg-center/notify,read|write,allow
+# Resource services ask whether a DID is in an owner's contact group
+# (contact.check_membership, projection included).
+p, system:aiworkspace,obj://msg-center/contact_membership,read,allow
+# Wish runs call AICC on behalf of the workspace owner or the triggering user.
+p, system:aiworkspace,obj://aicc/on_behalf_of,write,allow
+p, system:homestation,obj://msg-center/contact_membership,read,allow
+p, system:opendan,obj://msg-center/*,all,allow
+p, system:msg-center,obj://msg-center/*,all,allow
+# Agents: their own mailbox rules are exact lines from the scheduler; observing
+# the owner's sessions and contacts is read-only and msg-center binds the owner.
+p, agent,obj://msg-center/owners/*,read|list|query|subscribe,allow
+p, agent,obj://msg-center/objects,read,allow
+p, agent,obj://msg-center/group_inbox/*,read,allow
+p, agent,obj://msg-center/notify,read|write,allow
 
-g, repo-service, frame
-g, aicc, frame
-g, msg-center, frame
-g, opendan, frame
-g, slog_server, frame
-g, smb_service, frame
+# Service object roots (doc/key url.md §4.1). Per-object owner, share and public
+# rules stay with each service after this coarse layer.
+p, users, obj://aiworkspace/*, read|list|query|subscribe|write|create, allow
+p, admin, obj://aiworkspace/*, read|list|query|subscribe|write|create, allow
+p, agent, obj://aiworkspace/*, read|list|query|subscribe, allow
+p, users, obj://homestation/home/{users}, read|list|query|subscribe|write|create|delete, allow
+p, users, obj://homestation/home/{users}/*, read|list|query|subscribe|write|create|delete, allow
+p, admin, obj://homestation/home/{admin}, read|list|query|subscribe|write|create|delete, allow
+p, admin, obj://homestation/home/{admin}/*, read|list|query|subscribe|write|create|delete, allow
+p, users, obj://homestation/home/*, read|list|query, allow
+p, admin, obj://homestation/home/*, read|list|query, allow
+p, agent, obj://homestation/home/*, read|list|query, allow
+p, users, obj://opendan, read|list|query, allow
+p, admin, obj://opendan, read|list|query, allow
+p, agent, obj://opendan, read|list|query, allow
+
+# Zone default device (doc/key url.md §3).
+p, users, obj://config/system/default_device, read, allow
+p, app, obj://config/system/default_device, read, allow
+p, agent, obj://config/system/default_device, read, allow
+p, admin, obj://config/system/default_device, read|write, allow
+
+# Application object buckets: obj://bucket/<scope>/<appid>/<owner>/<name>/<key>.
+# A user's own buckets, the app's own buckets, a service's own buckets; admin may
+# list/read/manage every bucket but not write or delete (D16). Agents and grants,
+# tokens and data-policy rules are decided by nfs-server after this layer.
+p, users, obj://bucket/user/{appid}/{users}/*, list|read|create|write|delete|manage, allow
+p, admin, obj://bucket/user/{appid}/{admin}/*, list|read|create|write|delete|manage, allow
+p, admin, obj://bucket/*, list|read|manage, allow
+p, app, obj://bucket/user/{app}/*, list|read|create|write|delete|manage, allow
+p, agent_read_only, obj://bucket/user/{agent_read_only}/*, list|read|create|write, allow
+p, frame, obj://bucket/user/{frame}/*, all, allow
+p, frame, obj://bucket/zone/{frame}/*, all, allow
+
+p, frame, obj://ndm/uploads, write, allow
+p, frame, obj://ndm/objects, read, allow
+p, frame, obj://ndm/retain, write, allow
+p, admin, obj://ndm/uploads, write, allow
+p, admin, obj://ndm/objects, read, allow
+p, admin, obj://ndm/retain, write, allow
+p, admin, obj://ndm/manage, write, allow
+p, users, obj://ndm/uploads, write, allow
+p, app, obj://ndm/uploads, write, allow
+p, agent, obj://ndm/objects, read, allow
+
+g, system:node-daemon, kernel
+g, system:scheduler, kernel
+g, system:system-config, kernel
+g, system:verify-hub, kernel
+g, system:cyfs-gateway, kernel
+g, system:buckycli, kernel
+
+g, system:task-manager, system
+g, system:kmsg, system
+g, system:control-panel, system
+
+g, system:repo-service, frame
+g, system:aicc, frame
+g, system:msg-center, frame
+g, system:opendan, frame
+g, system:slog-server, frame
+g, system:smb-service, frame
+g, system:nfs-server, frame
+g, system:aiworkspace, frame
+g, system:homestation, frame
+p, system:homestation, obj://msg-center/owners/*,read,allow
+p, system:homestation, obj://msg-center/contact_tags/homestation,write,allow
 
 "#;
 
@@ -168,6 +295,19 @@ pub struct RbacConfig {
     pub policy_tail: String,
     pub policy_version: u64,
     pub is_changed: bool,
+}
+
+/// Escapes a literal resource (DID, app id, mailbox key) for use inside a policy
+/// pattern: keyMatch3 treats the pattern as a regex.
+pub fn rbac_literal(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        if "\\.^$|?*+()[]{}".contains(ch) {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 pub fn overlap_rbac_policy(default_policy: &str, policy_tail: &str) -> String {
@@ -194,10 +334,12 @@ pub fn build_current_rbac_config(policy_tail: Option<&str>) -> RbacConfig {
     }
 }
 
+pub const RBAC_POLICY_KEY: &str = "system/rbac/policy";
+
 pub async fn load_current_rbac_config(
     system_config_client: &SystemConfigClient,
 ) -> Result<RbacConfig> {
-    let policy_result = match system_config_client.get("system/rbac/policy").await {
+    let policy_result = match system_config_client.get(RBAC_POLICY_KEY).await {
         Ok(value) => Some(value),
         Err(SystemConfigError::KeyNotFound(_)) => None,
         Err(error) => {
@@ -217,6 +359,53 @@ pub async fn load_current_rbac_config(
     Ok(config)
 }
 
+struct RbacSyncState {
+    rounds: u64,
+    last_error: Option<String>,
+}
+
+static RBAC_SYNC: tokio::sync::Mutex<RbacSyncState> =
+    tokio::sync::Mutex::const_new(RbacSyncState {
+        rounds: 0,
+        last_error: None,
+    });
+static RBAC_SYNC_ROUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Rounds run one at a time; with `join_finished_round` a caller that waited
+/// takes the finished round's outcome.
+pub(crate) async fn sync_rbac_enforcer<F, Fut>(load: F, join_finished_round: bool) -> Result<bool>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<RbacConfig>>,
+{
+    use std::sync::atomic::Ordering;
+
+    let seen_rounds = RBAC_SYNC_ROUNDS.load(Ordering::Acquire);
+    let mut state = RBAC_SYNC.lock().await;
+    if join_finished_round && state.rounds != seen_rounds {
+        return match &state.last_error {
+            None => Ok(false),
+            Some(error) => Err(RPCErrors::ReasonError(error.clone())),
+        };
+    }
+
+    let outcome = match load().await {
+        Ok(config) => rbac::apply_enforcer_policy(&config.model, &config.policy)
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("update rbac enforcer failed: {}", error))
+            }),
+        Err(error) => Err(error),
+    };
+    state.rounds += 1;
+    state.last_error = outcome.as_ref().err().map(|error| match error {
+        RPCErrors::ReasonError(reason) => reason.clone(),
+        other => other.to_string(),
+    });
+    RBAC_SYNC_ROUNDS.store(state.rounds, Ordering::Release);
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +421,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agents_write_their_own_buckets_whatever_their_permission_mode() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some(
+            "g, alice, users\ng, app:writer.example.com, agent_read_write\ng, app:writer.example.com, app\ng, app:reader.example.com, agent_read_only",
+        ));
+        rbac::create_enforcer(&config.model, &config.policy).await.unwrap();
+        let own = "obj://bucket/user/reader.example.com/alice/artifacts/r/report.md";
+        for action in ["list", "read", "create", "write"] {
+            assert!(rbac::enforce("alice", "app:reader.example.com", own, action, None).await, "{action}");
+        }
+        assert!(!rbac::enforce("alice", "app:reader.example.com", own, "delete", None).await);
+        let other = "obj://bucket/user/photos/alice/library/a.jpg";
+        assert!(rbac::enforce("alice", "app:reader.example.com", other, "read", None).await);
+        assert!(!rbac::enforce("alice", "app:reader.example.com", other, "write", None).await);
+        assert!(rbac::enforce("alice", "app:writer.example.com", "obj://bucket/user/writer.example.com/alice/artifacts/x", "write", None).await);
+    }
+
+    #[tokio::test]
+    async fn an_app_may_notify_its_user_but_not_read_the_mailbox() {
+        let _guard = TEST_LOCK.lock().await;
+        let config =
+            build_current_rbac_config(Some("g, alice, users\ng, ood1, ood\ng, app:notes, app"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let notify = "obj://msg-center/notify";
+        assert!(rbac::enforce("alice", "app:notes", notify, "write", None).await);
+        assert!(rbac::enforce("alice", "app:notes", notify, "read", None).await);
+        assert!(rbac::enforce("alice", "system:control-panel", notify, "read", None).await);
+        assert!(rbac::enforce("ood1", "system:aiworkspace", notify, "write", None).await);
+        assert!(
+            !rbac::enforce(
+                "alice",
+                "app:notes",
+                "obj://msg-center/inbox/did:bns:alice",
+                "read",
+                None
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_grant_is_exact_and_does_not_authorize_owner_collections() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some(
+            r#"
+g, alice, users
+g, app:session-ui, app
+p, app:session-ui,obj://msg-center/inbox/did:bns:alice/session-a,read|write,allow
+"#,
+        ));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let resource = "obj://msg-center/inbox/did:bns:alice/session-a";
+        assert!(rbac::enforce("alice", "app:session-ui", resource, "read", None).await);
+        assert!(rbac::enforce("alice", "app:session-ui", resource, "write", None).await);
+        assert!(!rbac::enforce("alice", "app:session-ui", resource, "delegate", None).await);
+        for resource in [
+            "obj://msg-center/inbox/did:bns:alice/session-b",
+            "obj://msg-center/inbox/did:bns:alice/session-a-child",
+            "obj://msg-center/inbox/did:bns:alice",
+            "obj://msg-center/owners/did:bns:alice",
+            "obj://msg-center/sent/did:bns:alice/session-a",
+            "obj://msg-center/objects",
+            "obj://msg-center/delivery",
+        ] {
+            assert!(
+                !rbac::enforce("alice", "app:session-ui", resource, "read", None).await,
+                "{resource}"
+            );
+        }
+        assert!(rbac::enforce("alice", "system:control-panel", resource, "read", None).await);
+    }
+
+    #[tokio::test]
+    async fn mailbox_grants_escape_pattern_metacharacters_without_aliases() {
+        use crate::{MailboxAddress, MailboxKind};
+        use name_lib::DID;
+        let _guard = TEST_LOCK.lock().await;
+        let address =
+            MailboxAddress::new(DID::new("web", "agent.zone"), Some("approval.1".into())).unwrap();
+        let resource = address.resource(MailboxKind::Inbox);
+        assert_eq!(
+            resource,
+            "obj://msg-center/inbox/did:web:agent.zone/approval.1"
+        );
+        let policy = format!(
+            "g, alice, users\ng, app:session-ui, app\np, app:session-ui,{},read,allow\np, app:session-ui,{},read,allow",
+            rbac_literal(&resource),
+            rbac_literal(&address.owner_resource())
+        );
+        let config = build_current_rbac_config(Some(&policy));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        assert!(rbac::enforce("alice", "app:session-ui", &resource, "read", None).await);
+        for (owner, session) in [
+            ("agentXzone", "approval.1"),
+            ("agent.zone", "approvalX1"),
+            ("agent%2Ezone", "approval.1"),
+            ("agent.zone", "approval%2E1"),
+        ] {
+            let other = MailboxAddress::new(DID::new("web", owner), Some(session.into())).unwrap();
+            assert!(
+                !rbac::enforce(
+                    "alice",
+                    "app:session-ui",
+                    &other.resource(MailboxKind::Inbox),
+                    "read",
+                    None
+                )
+                .await
+            );
+            if owner != "agent.zone" {
+                assert!(
+                    !rbac::enforce(
+                        "alice",
+                        "app:session-ui",
+                        &other.owner_resource(),
+                        "read",
+                        None
+                    )
+                    .await
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_users_and_admins_may_create_groups_but_not_write_group_inboxes() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, users\ng, bob, admin"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let group = "obj://msg-center/group";
+        let inbox = "obj://msg-center/group_inbox/did:web:g.example";
+        for user in ["alice", "bob"] {
+            assert!(rbac::enforce(user, "system:control-panel", group, "create", None).await);
+            assert!(rbac::enforce(user, "system:control-panel", inbox, "read", None).await);
+            assert!(!rbac::enforce(user, "system:control-panel", inbox, "write", None).await);
+        }
+        // The same users from an App origin (EXT-10): create and read, never write the inbox.
+        let config = build_current_rbac_config(Some("g, alice, users\ng, app:crm, app"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        assert!(rbac::enforce("alice", "app:crm", group, "create", None).await);
+        assert!(rbac::enforce("alice", "app:crm", inbox, "read", None).await);
+        assert!(!rbac::enforce("alice", "app:crm", inbox, "write", None).await);
+        assert!(!rbac::enforce("mallory", "app:crm", group, "create", None).await);
+    }
+
+    #[tokio::test]
     async fn device_principal_and_kernel_service_can_access_zone_state() {
         let _guard = TEST_LOCK.lock().await;
         let config = build_current_rbac_config(Some("g, ood1, ood"));
@@ -242,7 +587,7 @@ mod tests {
         assert!(
             rbac::enforce(
                 "ood1",
-                "node-daemon",
+                "system:node-daemon",
                 "obj://config/nodes/ood1/config",
                 "read",
                 None,
@@ -252,10 +597,123 @@ mod tests {
         assert!(
             rbac::enforce(
                 "ood1",
-                "node-daemon",
+                "system:node-daemon",
                 "obj://config/devices/ood1/info",
                 "write",
                 None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn homestation_reads_owner_contacts_only() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, ood1, ood"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let owner =
+            crate::MailboxAddress::new(name_lib::DID::from_str("did:bns:alice").unwrap(), None)
+                .unwrap()
+                .owner_resource();
+        assert!(rbac::enforce("ood1", "system:homestation", &owner, "read", None).await);
+        assert!(!rbac::enforce("ood1", "system:homestation", &owner, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:aiworkspace", &owner, "read", None).await);
+        let own_tags = format!("{}homestation", crate::CONTACT_TAGS_RBAC_RESOURCE_PREFIX);
+        let other_tags = format!("{}aiworkspace", crate::CONTACT_TAGS_RBAC_RESOURCE_PREFIX);
+        assert!(rbac::enforce("ood1", "system:homestation", &own_tags, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:homestation", &other_tags, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:aiworkspace", &own_tags, "write", None).await);
+    }
+
+    #[tokio::test]
+    async fn buckyos_info_is_read_only_for_admin_and_writable_by_scheduler() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, admin\ng, ood1, ood"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let resource = "obj://config/system/buckyos_info";
+        assert!(rbac::enforce("alice", "system:control-panel", resource, "read", None).await);
+        assert!(!rbac::enforce("alice", "system:control-panel", resource, "write", None).await);
+        assert!(rbac::enforce("ood1", "system:scheduler", resource, "write", None).await);
+    }
+
+    #[tokio::test]
+    async fn buckyos_dev_config_write_requires_admin_sudo() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, admin\ng, su_alice, su_admin"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let resource = "obj://config/system/buckyos_dev_config";
+        assert!(rbac::enforce("alice", "system:control-panel", resource, "read", None).await);
+        assert!(!rbac::enforce("alice", "system:control-panel", resource, "write", None).await);
+        assert!(
+            rbac::enforce(
+                "alice",
+                "system:control-panel",
+                resource,
+                "write",
+                Some(rbac::SudoMode::Sudo("su_alice".to_string())),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn limited_accounts_only_reach_their_own_settings_and_profile() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some(
+            "g, carol, limited\ng, carol, group:customer\ng, bob, users\ng, ood1, ood",
+        ));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let app = "system:control-panel";
+        let own_settings = "obj://config/users/carol/settings";
+        let own_profile = "obj://config/users/carol/profile";
+        assert!(rbac::enforce("carol", app, own_settings, "read", None).await);
+        assert!(!rbac::enforce("carol", app, own_settings, "write", None).await);
+        assert!(rbac::enforce("carol", app, own_profile, "read", None).await);
+        assert!(rbac::enforce("carol", app, own_profile, "write", None).await);
+        for (resource, action) in [
+            ("obj://config/users/bob/settings", "read"),
+            ("obj://config/users/bob/profile", "read"),
+            ("obj://config/users/carol/doc", "read"),
+            ("obj://config/users/carol/apps/notes/settings", "read"),
+            ("obj://config/system/user_groups/customer", "read"),
+            ("obj://config/boot/config", "read"),
+            ("obj://msg-center/inbox/did:bns:carol", "read"),
+            ("obj://taskmgr/users/carol", "read"),
+            ("obj://ndm/uploads", "write"),
+        ] {
+            assert!(
+                !rbac::enforce("carol", app, resource, action, None).await,
+                "{resource} {action}"
+            );
+        }
+        assert!(rbac::enforce("bob", app, "obj://config/users/bob/settings", "read", None).await);
+
+        let owner = crate::MailboxAddress::new(
+            name_lib::DID::from_str("did:web:carol.example.com").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(rbac::enforce("carol", app, &owner.contacts_resource(), "read", None).await);
+        assert!(rbac::enforce("carol", app, &owner.contacts_resource(), "write", None).await);
+        assert!(!rbac::enforce("carol", app, &owner.owner_resource(), "read", None).await);
+        assert!(rbac::enforce("bob", app, &owner.contacts_resource(), "write", None).await);
+        assert!(
+            rbac::enforce(
+                "ood1",
+                "system:homestation",
+                &owner.contacts_resource(),
+                "read",
+                None
             )
             .await
         );
@@ -322,9 +780,7 @@ p, root, obj://config/*, read|write,allow
     //   的子路径, 超出了原本"单段 agent_id / app_id"的意图.
     //
     // 单段通配应该改用 `{xxx}` 占位符 (会被替换成 `[^/]+`), 例如:
-    //   obj://config/agents/{agent_id}/doc
-    //   obj://config/agents/{agent_id}/settings
-    //   obj://config/agents/{agent_id}/{key}
+    //   obj://config/users/{user}/apps/{app}/{key}
     //
     // 下面 `assert!(!...)` 断言的都是"修复后的正确语义", 因此 BUG 还在
     // 的时候每条断言都会 FAIL, 并把对应的 BUG 信息打印出来; 等 BUG
@@ -344,41 +800,11 @@ g, su_alice, su_admin
             .await
             .unwrap();
 
-        // ---- sanity: 单段 agent_id 下的访问应当通过 ----
-        assert!(
-            rbac::enforce(
-                "alice",
-                "buckycli",
-                "obj://config/agents/jarvis/doc",
-                "read",
-                None,
-            )
-            .await
-        );
-        assert!(
-            rbac::enforce(
-                "bob",
-                "buckycli",
-                "obj://config/agents/jarvis/doc",
-                "read",
-                None,
-            )
-            .await
-        );
-        assert!(
-            rbac::enforce(
-                "alice",
-                "buckycli",
-                "obj://config/agents/jarvis/settings",
-                "write",
-                None,
-            )
-            .await
-        );
+        // ---- sanity ----
         assert!(
             rbac::enforce(
                 "su_alice",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/dvtest1782201008431/doc",
                 "write",
                 None,
@@ -393,42 +819,11 @@ g, su_alice, su_admin
         // 每条 case: (userid, appid, res_path, action, bug 描述).
         // 期望: enforce 返回 false; 若返回 true 就说明该规则过度匹配.
         let over_match_cases: &[(&str, &str, &str, &str, &str)] = &[
-            (
-                "alice",
-                "buckycli",
-                "obj://config/agents/foo/bar/doc",
-                "read",
-                "BUG: admin 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
-            ),
-            (
-                "bob",
-                "buckycli",
-                "obj://config/agents/foo/bar/doc",
-                "read",
-                "BUG: users 的 agents/*/doc 不应匹配多层路径 (foo/bar/doc)",
-            ),
-            (
-                "alice",
-                "buckycli",
-                "obj://config/agents/foo/bar/settings",
-                "write",
-                "BUG: admin 的 agents/*/settings 不应匹配多层路径 (foo/bar/settings)",
-            ),
-            // frame 的 `obj://config/agents/*/*` 等效于 agents/.*/.*.
-            // user side 用 root (有全权), app side 用 repo-service
-            // (g, repo-service, frame), 把 BUG 隔离到 frame 这条规则.
-            (
-                "root",
-                "repo-service",
-                "obj://config/agents/a/b/c/d",
-                "read",
-                "BUG: frame 的 agents/*/* 不应匹配 4 层路径 (a/b/c/d)",
-            ),
             // admin 的 `obj://config/users/{admin}/apps/*/*` 同样会跨段:
             // 期望 apps 下面正好是 "{app_id}/{key}" 两段.
             (
                 "alice",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/alice/apps/some_app/extra/key",
                 "write",
                 "BUG: admin 的 users/{admin}/apps/*/* 不应匹配 apps 下 3 层以上路径",
@@ -462,7 +857,7 @@ g, su_alice, su_admin
         assert!(
             rbac::enforce(
                 "bob",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/bob/settings",
                 "read",
                 None,
@@ -472,7 +867,7 @@ g, su_alice, su_admin
         assert!(
             rbac::enforce(
                 "bob",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/bob/profile",
                 "write",
                 None,
@@ -482,7 +877,7 @@ g, su_alice, su_admin
         assert!(
             !rbac::enforce(
                 "bob",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/bob/settings",
                 "write",
                 None,
@@ -492,7 +887,7 @@ g, su_alice, su_admin
         assert!(
             !rbac::enforce(
                 "bob",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/alice/settings",
                 "read",
                 None,
@@ -502,7 +897,7 @@ g, su_alice, su_admin
         assert!(
             !rbac::enforce(
                 "bob",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/alice/profile",
                 "write",
                 None,
@@ -512,12 +907,79 @@ g, su_alice, su_admin
     }
 
     #[tokio::test]
-    async fn admin_can_write_aicc_settings() {
+    async fn limited_accounts_reach_aicc_and_only_aiworkspace_delegates() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let policy_tail = r#"
+g, lin, limited
+g, bob, users
+g, ood1, ood
+"#;
+        let config = build_current_rbac_config(Some(policy_tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        assert!(
+            rbac::enforce(
+                "lin",
+                "system:control-panel",
+                "obj://config/services/aicc/info",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "lin",
+                "system:control-panel",
+                "obj://config/services/aicc/settings",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "ood1",
+                "system:aiworkspace",
+                "obj://aicc/on_behalf_of",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "ood1",
+                "system:homestation",
+                "obj://aicc/on_behalf_of",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "system:control-panel",
+                "obj://aicc/on_behalf_of",
+                "write",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn aicc_rbac_allows_calls_but_restricts_settings_to_admin() {
         let _guard = TEST_LOCK.lock().await;
 
         let policy_tail = r#"
 g, alice, admin
 g, bob, users
+g, app:ai-client, app
+g, did:bns:jarvis, agent
 "#;
         let config = build_current_rbac_config(Some(policy_tail));
         rbac::create_enforcer(&config.model, &config.policy)
@@ -527,17 +989,7 @@ g, bob, users
         assert!(
             rbac::enforce(
                 "alice",
-                "control-panel",
-                "obj://config/services/aicc/settings",
-                "write",
-                None,
-            )
-            .await
-        );
-        assert!(
-            !rbac::enforce(
-                "bob",
-                "control-panel",
+                "system:control-panel",
                 "obj://config/services/aicc/settings",
                 "write",
                 None,
@@ -547,7 +999,57 @@ g, bob, users
         assert!(
             rbac::enforce(
                 "alice",
-                "control-panel",
+                "system:control-panel",
+                "obj://config/services/aicc/driver_metadata_update",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "system:control-panel",
+                "obj://config/services/aicc/settings",
+                "write",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "bob",
+                "app:ai-client",
+                "obj://config/services/aicc/info",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "bob",
+                "did:bns:jarvis",
+                "obj://config/services/aicc/info",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "app:ai-client",
+                "obj://config/services/aicc/settings",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "alice",
+                "system:control-panel",
                 "obj://config/services/msg-center/settings",
                 "write",
                 None,
@@ -557,11 +1059,11 @@ g, bob, users
     }
 
     #[tokio::test]
-    async fn agent_can_report_own_service_instance() {
+    async fn app_can_report_own_service_instance() {
         let _guard = TEST_LOCK.lock().await;
 
         let config = build_current_rbac_config(Some(
-            "g, alice, admin\ng, bob, users\ng, buckyos_jarvis, agent",
+            "g, alice, admin\ng, bob, users\ng, app:jarvis.buckyos.bns.did, app",
         ));
         rbac::create_enforcer(&config.model, &config.policy)
             .await
@@ -570,8 +1072,8 @@ g, bob, users
         assert!(
             rbac::enforce(
                 "alice",
-                "buckyos_jarvis",
-                "obj://config/services/buckyos_jarvis/instances/ood1",
+                "app:jarvis.buckyos.bns.did",
+                "obj://config/services/jarvis.buckyos.bns.did@alice/instances/ood1",
                 "write",
                 None,
             )
@@ -580,8 +1082,8 @@ g, bob, users
         assert!(
             rbac::enforce(
                 "bob",
-                "buckyos_jarvis",
-                "obj://config/services/buckyos_jarvis/instances/ood1",
+                "app:jarvis.buckyos.bns.did",
+                "obj://config/services/jarvis.buckyos.bns.did@bob/instances/ood1",
                 "write",
                 None,
             )
@@ -590,18 +1092,35 @@ g, bob, users
         assert!(
             !rbac::enforce(
                 "alice",
-                "buckyos_jarvis",
-                "obj://config/services/other-agent/instances/ood1",
+                "app:jarvis.buckyos.bns.did",
+                "obj://config/services/other-agent.example@alice/instances/ood1",
                 "write",
                 None,
             )
             .await
         );
+        for service_id in [
+            "jarvis.buckyos.bns.did",
+            "jarvis.buckyos.bns.did@",
+            "jarvis.buckyos.bns.did@alice@bob",
+        ] {
+            assert!(
+                !rbac::enforce(
+                    "alice",
+                    "app:jarvis.buckyos.bns.did",
+                    &format!("obj://config/services/{service_id}/instances/ood1"),
+                    "write",
+                    None,
+                )
+                .await,
+                "unexpected write permission for {service_id}"
+            );
+        }
         assert!(
             !rbac::enforce(
                 "alice",
-                "buckyos_jarvis",
-                "obj://config/services/buckyos_jarvis/settings",
+                "app:jarvis.buckyos.bns.did",
+                "obj://config/services/jarvis.buckyos.bns.did/settings",
                 "write",
                 None,
             )
@@ -609,7 +1128,167 @@ g, bob, users
         );
     }
 
-    /// `obj://task/{user}` is the collection view TaskMgr consults to decide
+    #[tokio::test]
+    async fn bound_agent_runtime_can_discover_specs_but_not_private_keys() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let config = build_current_rbac_config(Some(
+            "g, alice, admin\ng, app:jarvis.buckyos.bns.did, app\ng, app:jarvis.buckyos.bns.did, agent_runtime\ng, app:gallery.buckyos.bns.did, app",
+        ));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let runtime = "app:jarvis.buckyos.bns.did";
+        assert!(
+            rbac::enforce(
+                "alice",
+                runtime,
+                "obj://config/users/alice/agents",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            rbac::enforce(
+                "alice",
+                runtime,
+                "obj://config/users/alice/agents/jarvis.example.com/spec",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "alice",
+                runtime,
+                "obj://config/users/alice/agents/jarvis.example.com/key",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "alice",
+                "app:gallery.buckyos.bns.did",
+                "obj://config/users/alice/agents/jarvis.example.com/spec",
+                "read",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn constructed_agent_app_only_reaches_its_own_agent_records() {
+        let _guard = TEST_LOCK.lock().await;
+
+        let config = build_current_rbac_config(Some(
+            "g, bob, users\ng, app:xiaobai.example.com, app\ng, app:xiaobai.example.com, agent_runtime\ng, app:xiaobai.example.com, agent\ng, app:xiaohei.example.com, app\ng, app:xiaohei.example.com, agent_runtime\ng, app:xiaohei.example.com, agent",
+        ));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let runtime = "app:xiaobai.example.com";
+        for (key, act) in [
+            ("settings", "read"),
+            ("settings", "write"),
+            ("profile", "read"),
+            ("profile", "write"),
+            ("info", "read"),
+            ("info", "write"),
+            ("spec", "read"),
+        ] {
+            assert!(
+                rbac::enforce(
+                    "bob",
+                    runtime,
+                    &format!("obj://config/users/bob/agents/xiaobai.example.com/{key}"),
+                    act,
+                    None,
+                )
+                .await,
+                "{key} {act}"
+            );
+        }
+        for (key, act) in [
+            ("settings", "read"),
+            ("settings", "write"),
+            ("profile", "read"),
+            ("profile", "write"),
+            ("info", "write"),
+        ] {
+            assert!(
+                !rbac::enforce(
+                    "bob",
+                    runtime,
+                    &format!("obj://config/users/bob/agents/xiaohei.example.com/{key}"),
+                    act,
+                    None,
+                )
+                .await,
+                "other agent {key} {act}"
+            );
+        }
+        assert!(
+            !rbac::enforce(
+                "bob",
+                runtime,
+                "obj://config/users/bob/agents/xiaobai.example.com/key",
+                "read",
+                None,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn agents_observe_owner_sessions_read_only_and_own_their_objects() {
+        use crate::{MailboxAddress, MailboxKind};
+        use name_lib::DID;
+        let _guard = TEST_LOCK.lock().await;
+        let agent = DID::new("web", "xiaobai.test.buckyos.io");
+        let mailbox = MailboxAddress::new(agent.clone(), None).unwrap();
+        let agent_sub = agent.to_string();
+        let mut tail = format!("g, bob, users\ng, {agent_sub}, agent\ng, app:xiaobai.test.buckyos.io, agent");
+        for resource in [
+            rbac_literal(&mailbox.owner_resource()),
+            format!("{}/*", rbac_literal(&mailbox.owner_resource())),
+            format!("{}/*", rbac_literal(&mailbox.resource(MailboxKind::Inbox))),
+            "obj://xiaobai\\.test\\.buckyos\\.io".to_string(),
+            "obj://xiaobai\\.test\\.buckyos\\.io/*".to_string(),
+        ] {
+            for subject in [agent_sub.as_str(), "app:xiaobai.test.buckyos.io"] {
+                tail.push_str(&format!("\np, {subject}, {resource},all,allow"));
+            }
+        }
+        tail.push_str("\np, bob, obj://xiaobai\\.test\\.buckyos\\.io/*,read|list|query|subscribe,allow");
+        let config = build_current_rbac_config(Some(&tail));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let app = "app:xiaobai.test.buckyos.io";
+        let owner_sessions = "obj://msg-center/owners/did:bns:bob/sessions/chat-1";
+        assert!(rbac::enforce(&agent_sub, app, owner_sessions, "read", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, owner_sessions, "write", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, "obj://msg-center/inbox/did:bns:bob/chat-1", "read", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, "obj://msg-center/sent/did:bns:bob/chat-1", "write", None).await);
+        assert!(rbac::enforce(&agent_sub, app, &format!("{}/s-1", mailbox.resource(MailboxKind::Inbox)), "write", None).await);
+        assert!(rbac::enforce(&agent_sub, app, "obj://xiaobai.test.buckyos.io/sessions/s-1", "write", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, "obj://xiaohei.test.buckyos.io/sessions/s-1", "read", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, "obj://xiaobaiXtestXbuckyosXio/sessions/s-1", "read", None).await);
+        assert!(rbac::enforce("bob", "system:control-panel", "obj://xiaobai.test.buckyos.io/sessions/s-1", "read", None).await);
+        assert!(!rbac::enforce("bob", "system:control-panel", "obj://xiaobai.test.buckyos.io/sessions/s-1", "write", None).await);
+        assert!(rbac::enforce(&agent_sub, app, "obj://opendan", "list", None).await);
+        assert!(rbac::enforce(&agent_sub, app, "obj://aiworkspace/ws_1/entities/e1", "read", None).await);
+        assert!(!rbac::enforce(&agent_sub, app, "obj://aiworkspace/ws_1/entities/e1", "write", None).await);
+    }
+
+    /// `obj://taskmgr/users/{user}` is the collection view TaskMgr consults to decide
     /// whether a principal may look past the creator's `app_id`. The bindings
     /// here mirror a real zone's policy tail (control-panel promoted to
     /// `kernel`, the owner bound to `admin`, agents left in `agent`).
@@ -621,10 +1300,10 @@ g, bob, users
 g, devtest, admin
 g, su_devtest, su_admin
 g, bob, users
-g, control-panel, kernel
-g, task-manager, kernel
-g, buckyos_jarvis, agent
-g, buckyos_filebrowser, app
+g, system:control-panel, kernel
+g, system:task-manager, kernel
+g, app:buckyos_jarvis, agent
+g, app:buckyos_filebrowser, app
 "#;
         let config = build_current_rbac_config(Some(policy_tail));
         rbac::create_enforcer(&config.model, &config.policy)
@@ -636,26 +1315,53 @@ g, buckyos_filebrowser, app
         assert!(
             rbac::enforce(
                 "devtest",
-                "control-panel",
-                "obj://task/devtest",
+                "system:control-panel",
+                "obj://taskmgr/users/devtest",
                 "read",
                 None
             )
             .await
         );
-        assert!(rbac::enforce("bob", "control-panel", "obj://task/bob", "read", None).await);
+        assert!(
+            rbac::enforce(
+                "bob",
+                "system:control-panel",
+                "obj://taskmgr/users/bob",
+                "read",
+                None
+            )
+            .await
+        );
 
         // ...but not another user's, even from the control surface.
-        assert!(!rbac::enforce("devtest", "control-panel", "obj://task/bob", "read", None).await);
-        assert!(!rbac::enforce("bob", "control-panel", "obj://task/devtest", "read", None).await);
+        assert!(
+            !rbac::enforce(
+                "devtest",
+                "system:control-panel",
+                "obj://taskmgr/users/bob",
+                "read",
+                None
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "bob",
+                "system:control-panel",
+                "obj://taskmgr/users/devtest",
+                "read",
+                None
+            )
+            .await
+        );
 
         // Ordinary apps and agents keep the doc §8.5 isolation: no cross-app
         // view even of their own user's tasks.
         assert!(
             !rbac::enforce(
                 "devtest",
-                "buckyos_jarvis",
-                "obj://task/devtest",
+                "app:buckyos_jarvis",
+                "obj://taskmgr/users/devtest",
                 "read",
                 None
             )
@@ -664,8 +1370,8 @@ g, buckyos_filebrowser, app
         assert!(
             !rbac::enforce(
                 "devtest",
-                "buckyos_filebrowser",
-                "obj://task/devtest",
+                "app:buckyos_filebrowser",
+                "obj://taskmgr/users/devtest",
                 "read",
                 None
             )
@@ -676,8 +1382,8 @@ g, buckyos_filebrowser, app
         assert!(
             rbac::enforce(
                 "devtest",
-                "control-panel",
-                "obj://task/bob",
+                "system:control-panel",
+                "obj://taskmgr/users/bob",
                 "read",
                 Some(rbac::SudoMode::Sudo("su_devtest".to_string())),
             )
@@ -688,8 +1394,8 @@ g, buckyos_filebrowser, app
         assert!(
             !rbac::enforce(
                 "devtest",
-                "control-panel",
-                "obj://task/devtest",
+                "system:control-panel",
+                "obj://taskmgr/users/devtest",
                 "write",
                 None
             )
@@ -698,45 +1404,43 @@ g, buckyos_filebrowser, app
     }
 
     #[tokio::test]
-    async fn sudo_users_role_can_write_own_sensitive_user_data() {
+    async fn sudo_users_role_cannot_write_own_identity_records() {
         let _guard = TEST_LOCK.lock().await;
 
+        // What scheduler generates for a User: the sudo role carries no rule on
+        // its own settings or doc; password and identity changes go through
+        // Control Panel, which writes with its service identity.
         let policy_tail = r#"
 g, bob, users
 g, su_bob, su_users
-p, su_bob, obj://config/users/bob/settings, read|write, allow
-p, su_bob, obj://config/users/bob/doc, read|write, allow
 "#;
         let config = build_current_rbac_config(Some(policy_tail));
         rbac::create_enforcer(&config.model, &config.policy)
             .await
             .unwrap();
 
+        for key in [
+            "obj://config/users/bob/settings",
+            "obj://config/users/bob/doc",
+            "obj://config/users/alice/settings",
+        ] {
+            assert!(
+                !rbac::enforce(
+                    "bob",
+                    "system:buckycli",
+                    key,
+                    "write",
+                    Some(rbac::SudoMode::Sudo("su_bob".to_string())),
+                )
+                .await,
+                "{key}"
+            );
+        }
         assert!(
             rbac::enforce(
                 "bob",
-                "buckycli",
-                "obj://config/users/bob/settings",
-                "write",
-                Some(rbac::SudoMode::Sudo("su_bob".to_string())),
-            )
-            .await
-        );
-        assert!(
-            rbac::enforce(
-                "bob",
-                "buckycli",
-                "obj://config/users/bob/doc",
-                "write",
-                Some(rbac::SudoMode::Sudo("su_bob".to_string())),
-            )
-            .await
-        );
-        assert!(
-            !rbac::enforce(
-                "bob",
-                "buckycli",
-                "obj://config/users/alice/settings",
+                "system:buckycli",
+                "obj://config/users/bob/profile",
                 "write",
                 Some(rbac::SudoMode::Sudo("su_bob".to_string())),
             )
@@ -760,7 +1464,7 @@ g, su_alice, su_admin
         assert!(
             rbac::enforce(
                 "alice",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/alice/settings",
                 "read",
                 Some(rbac::SudoMode::Sudo("su_alice".to_string())),
@@ -770,7 +1474,7 @@ g, su_alice, su_admin
         assert!(
             rbac::enforce(
                 "alice",
-                "buckycli",
+                "system:buckycli",
                 "obj://config/users/bob/settings",
                 "read",
                 Some(rbac::SudoMode::Sudo("su_alice".to_string())),
@@ -787,7 +1491,7 @@ g, su_alice, su_admin
 g, alice, admin
 g, bob, users
 g, su_alice, su_admin
-g, gallery, app
+g, app:gallery, app
 "#;
         let config = build_current_rbac_config(Some(policy_tail));
         rbac::create_enforcer(&config.model, &config.policy)
@@ -796,17 +1500,17 @@ g, gallery, app
         let resource = "obj://config/security/dvlocal/key";
 
         for action in ["read", "write"] {
-            assert!(!rbac::enforce("bob", "buckycli", resource, action, None).await);
-            assert!(!rbac::enforce("alice", "buckycli", resource, action, None).await);
-            assert!(!rbac::enforce("root", "repo-service", resource, action, None).await);
-            assert!(!rbac::enforce("root", "gallery", resource, action, None).await);
-            assert!(!rbac::enforce("root", "control-panel", resource, action, None).await);
+            assert!(!rbac::enforce("bob", "system:buckycli", resource, action, None).await);
+            assert!(!rbac::enforce("alice", "system:buckycli", resource, action, None).await);
+            assert!(!rbac::enforce("root", "system:repo-service", resource, action, None).await);
+            assert!(!rbac::enforce("root", "app:gallery", resource, action, None).await);
+            assert!(!rbac::enforce("root", "system:control-panel", resource, action, None).await);
 
-            assert!(rbac::enforce("root", "scheduler", resource, action, None).await);
+            assert!(rbac::enforce("root", "system:scheduler", resource, action, None).await);
             assert!(
                 rbac::enforce(
                     "alice",
-                    "buckycli",
+                    "system:buckycli",
                     resource,
                     action,
                     Some(rbac::SudoMode::Sudo("su_alice".to_string())),
@@ -814,5 +1518,191 @@ g, gallery, app
                 .await
             );
         }
+    }
+
+    #[tokio::test]
+    async fn app_and_system_authorization_names_cannot_collide() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, app:control-panel, app"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        assert!(
+            rbac::enforce(
+                "root",
+                "system:control-panel",
+                "obj://config/system/rbac",
+                "read",
+                None,
+            )
+            .await
+        );
+        assert!(
+            !rbac::enforce(
+                "root",
+                "app:control-panel",
+                "obj://config/system/rbac",
+                "read",
+                None,
+            )
+            .await
+        );
+    }
+    #[tokio::test]
+    async fn content_preferences_are_shell_only_and_registry_scheduler_only() {
+        let _guard = TEST_LOCK.lock().await;
+        let config =
+            build_current_rbac_config(Some("g, alice, users\ng, app:editor, app\ng, ood1, ood"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+        let registry = "obj://config/system/content_registry";
+        let defaults = "obj://config/users/alice/content_defaults";
+        assert!(rbac::enforce("alice", "app:editor", registry, "read", None).await);
+        assert!(rbac::enforce("alice", "system:control-panel", defaults, "write", None).await);
+        assert!(!rbac::enforce("alice", "app:editor", defaults, "write", None).await);
+        assert!(
+            !rbac::enforce(
+                "alice",
+                "system:control-panel",
+                "obj://config/users/bob/content_defaults",
+                "write",
+                None
+            )
+            .await
+        );
+        assert!(rbac::enforce("ood1", "system:scheduler", registry, "write", None).await);
+        assert!(!rbac::enforce("kernel", "system:node-daemon", registry, "write", None).await);
+        assert!(!rbac::enforce("ood1", "system:control-panel", registry, "write", None).await);
+    }
+
+    #[tokio::test]
+    async fn rbac_sync_rebuilds_only_for_changed_policy() {
+        let _guard = TEST_LOCK.lock().await;
+        let base = build_current_rbac_config(Some("g, alice, users\ng, bob, users"));
+        rbac::create_enforcer(&base.model, &base.policy)
+            .await
+            .unwrap();
+        let builds = rbac::enforcer_build_count();
+        let bob_profile = "obj://config/users/bob/profile";
+
+        for _ in 0..20 {
+            let mut reread = base.clone();
+            reread.is_changed = true;
+            assert!(!sync_rbac_enforcer(|| async { Ok(reread) }, true)
+                .await
+                .unwrap());
+        }
+        assert_eq!(rbac::enforcer_build_count(), builds);
+        assert!(!rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        let granted = build_current_rbac_config(Some(&format!(
+            "{}\np, alice, {bob_profile}, read, allow",
+            base.policy_tail
+        )));
+        assert!(sync_rbac_enforcer(|| async { Ok(granted.clone()) }, true)
+            .await
+            .unwrap());
+        assert!(rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        assert!(sync_rbac_enforcer(|| async { Ok(base.clone()) }, true)
+            .await
+            .unwrap());
+        assert!(!rbac::enforce("alice", "system:control-panel", bob_profile, "read", None).await);
+
+        let deleted = build_current_rbac_config(None);
+        let alice_profile = "obj://config/users/alice/profile";
+        assert!(rbac::enforce("alice", "system:control-panel", alice_profile, "read", None).await);
+        assert!(sync_rbac_enforcer(|| async { Ok(deleted) }, true)
+            .await
+            .unwrap());
+        assert!(!rbac::enforce("alice", "system:control-panel", alice_profile, "read", None).await);
+        assert_eq!(rbac::enforcer_build_count(), builds + 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rbac_sync_never_installs_an_older_read_last() {
+        let _guard = TEST_LOCK.lock().await;
+        let old = build_current_rbac_config(Some("g, alice, users"));
+        let new = build_current_rbac_config(Some("g, alice, admin"));
+        rbac::create_enforcer(&old.model, &old.policy)
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let slow_policy = old.clone();
+        let slow = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(slow_policy)
+            },
+            false,
+        ));
+        started_rx.await.unwrap();
+
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let forced_reads = reads.clone();
+        let forced = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                forced_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(new)
+            },
+            false,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_tx.send(()).unwrap();
+        assert!(!slow.await.unwrap().unwrap());
+        assert!(forced.await.unwrap().unwrap());
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            rbac::enforce(
+                "alice",
+                "system:control-panel",
+                "obj://config/system/x",
+                "read",
+                None
+            )
+            .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rbac_sync_callers_that_waited_share_the_finished_round() {
+        let _guard = TEST_LOCK.lock().await;
+        let config = build_current_rbac_config(Some("g, alice, users"));
+        rbac::create_enforcer(&config.model, &config.policy)
+            .await
+            .unwrap();
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let failing = tokio::spawn(sync_rbac_enforcer(
+            move || async move {
+                started_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Err::<RbacConfig, _>(RPCErrors::ReasonError("system-config timeout".into()))
+            },
+            true,
+        ));
+        started_rx.await.unwrap();
+        let waiter = tokio::spawn(sync_rbac_enforcer(
+            || async { panic!("a waiting caller reuses the finished round") },
+            true,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+
+        let failed = failing.await.unwrap().unwrap_err().to_string();
+        assert!(failed.contains("system-config timeout"));
+        assert_eq!(waiter.await.unwrap().unwrap_err().to_string(), failed);
+
+        assert!(!sync_rbac_enforcer(|| async { Ok(config) }, true)
+            .await
+            .unwrap());
     }
 }

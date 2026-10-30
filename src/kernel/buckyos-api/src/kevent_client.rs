@@ -208,13 +208,6 @@ pub enum KEventDaemonRequest {
     UnregisterReader {
         reader_id: String,
     },
-    UpdateReader {
-        reader_id: String,
-        #[serde(default)]
-        add: Vec<String>,
-        #[serde(default)]
-        remove: Vec<String>,
-    },
     PublishGlobal {
         event: Event,
     },
@@ -755,14 +748,16 @@ impl KEventClient {
                 }
                 Err(err) => Err(err),
             },
-            KEventTransport::PublishOnlyBridge(bridge) => match bridge.publish_global(event).await {
-                Ok(_) => Ok(()),
-                Err(err) if is_transport_error(&err) => {
-                    self.inner.note_shm_publish_dropped(&event.eventid, &err);
-                    Ok(())
+            KEventTransport::PublishOnlyBridge(bridge) => {
+                match bridge.publish_global(event).await {
+                    Ok(_) => Ok(()),
+                    Err(err) if is_transport_error(&err) => {
+                        self.inner.note_shm_publish_dropped(&event.eventid, &err);
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
-            },
+            }
             KEventTransport::None => Err(KEventError::NotSupported(
                 "client has no global event transport".to_string(),
             )),

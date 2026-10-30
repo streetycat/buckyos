@@ -1,0 +1,623 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 1,
+  "revision_seq": 7,
+  "provider_profile_id": "minimax",
+  "static_inventory_models": [
+    "asr-1.0",
+    "speech-2.8-hd",
+    "speech-2.8-turbo",
+    "image-01",
+    "MiniMax-H3",
+    "MiniMax-H3-Max"
+  ],
+  "supplemental_inventory_api_types": [
+    "audio.asr",
+    "audio.tts",
+    "image.txt2img",
+    "image.img2img",
+    "video.generate"
+  ],
+  "models": [
+    {
+      "id": "asr-1.0",
+      "operations": {
+        "audio.asr": "speech_to_text.create"
+      }
+    },
+    {
+      "id": "speech-2.8-hd",
+      "operations": {
+        "audio.tts": "t2a.create"
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "minimax_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "image-01",
+      "operations": {
+        "image.txt2img": "image_generation.create",
+        "image.img2img": "image_generation.create"
+      }
+    },
+    {
+      "id": "MiniMax-H3",
+      "operations": {
+        "video.generate": "video_generation.v2.create"
+      }
+    },
+    {
+      "id": "MiniMax-H3-Max",
+      "operations": {
+        "video.generate": "video_generation.v2.create"
+      }
+    },
+    {
+      "id": "MiniMax-Hailuo-02",
+      "operations": {
+        "video.generate": "video_generation.create"
+      }
+    },
+    {
+      "id": "music-3.0",
+      "operations": {
+        "audio.music": "music_generation.create"
+      }
+    }
+  ],
+  "patterns": [
+    {
+      "match": {
+        "provider_model_id": [
+          "MiniMax-M3*",
+          "minimax-m3*"
+        ]
+      },
+      "operations": {
+        "llm": "messages.create",
+        "vision.ocr": "messages.create",
+        "vision.caption": "messages.create"
+      },
+      "request_rules": [
+        {
+          "defaults": {
+            "temperature": 1.0,
+            "top_p": 0.95
+          },
+          "remove": [
+            "/stop"
+          ]
+        }
+      ]
+    },
+    {
+      "match": "MiniMax-M2*",
+      "operations": {
+        "llm": "messages.create"
+      },
+      "request_rules": [
+        {
+          "defaults": {
+            "temperature": 1.0,
+            "top_p": 0.9
+          },
+          "remove": [
+            "/stop"
+          ]
+        }
+      ]
+    },
+    {
+      "match": "speech-*",
+      "operations": {
+        "audio.tts": "t2a.create"
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "minimax_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "match": "image-*",
+      "operations": {
+        "image.txt2img": "image_generation.create",
+        "image.img2img": "image_generation.create"
+      }
+    },
+    {
+      "match": "MiniMax-Hailuo-*",
+      "operations": {
+        "video.generate": "video_generation.create"
+      }
+    },
+    {
+      "match": "music-*",
+      "operations": {
+        "audio.music": "music_generation.create"
+      }
+    },
+    {
+      "match": "*",
+      "operations": {
+        "llm": "messages.create"
+      },
+      "request_rules": [
+        {
+          "remove": [
+            "/stop"
+          ]
+        }
+      ]
+    }
+  ],
+  "variants": [
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-none",
+      "match": {
+        "origin_model_id": "MiniMax-M3",
+        "variant": "reasoning-none"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "disabled"
+        }
+      }
+    },
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-low",
+      "match": {
+        "origin_model_id": "MiniMax-M3.1-Flash-Preview",
+        "variant": "reasoning-low"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "low"
+        }
+      }
+    },
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-medium",
+      "match": {
+        "origin_model_id": "MiniMax-M3.1-Flash-Preview",
+        "variant": "reasoning-medium"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "medium"
+        }
+      }
+    },
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-high",
+      "match": {
+        "origin_model_id": "MiniMax-M3.1-Flash-Preview",
+        "variant": "reasoning-high"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "high"
+        }
+      }
+    },
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-xhigh",
+      "match": {
+        "origin_model_id": "MiniMax-M3.1-Flash-Preview",
+        "variant": "reasoning-xhigh"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "xhigh"
+        }
+      }
+    },
+    {
+      "model_driver": "minimax",
+      "variant": "reasoning-max",
+      "match": {
+        "origin_model_id": "MiniMax-M3.1-Flash-Preview",
+        "variant": "reasoning-max"
+      },
+      "provider_options": {
+        "thinking": {
+          "type": "adaptive"
+        },
+        "output_config": {
+          "effort": "max"
+        }
+      }
+    }
+  ],
+  "model_pricing": [
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 3e-07,
+        "output_token": 1.2e-06,
+        "cache_input_token": 6e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.7",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 6e-07,
+        "output_token": 2.4e-06,
+        "cache_input_token": 6e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.7-highspeed",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 3e-07,
+        "output_token": 1.2e-06,
+        "cache_input_token": 3e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.5",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 6e-07,
+        "output_token": 2.4e-06,
+        "cache_input_token": 3e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.5-highspeed",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 3e-07,
+        "output_token": 1.2e-06,
+        "cache_input_token": 3e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.1",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 6e-07,
+        "output_token": 2.4e-06,
+        "cache_input_token": 3e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2.1-highspeed",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "input_token": 3e-07,
+        "output_token": 1.2e-06,
+        "cache_input_token": 3e-08,
+        "cache_write_input_token": 3.75e-07,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "MiniMax-M2",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "unit": "character",
+        "amount": 0.0001,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "speech-2.8-hd",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "unit": "character",
+        "amount": 6e-05,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "speech-2.8-turbo",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "unit": "character",
+        "amount": 0.0001,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "speech-2.6-hd",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "unit": "character",
+        "amount": 6e-05,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "speech-2.6-turbo",
+        "region": "global"
+      }
+    },
+    {
+      "pricing": {
+        "currency": "USD",
+        "unit": "image",
+        "amount": 0.0035,
+        "source_url": "https://platform.minimax.io/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-25"
+      },
+      "match": {
+        "provider_model_id": "image-01",
+        "region": "global"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "MiniMax-M3",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "tiers": {
+          "dimension": "input_tokens",
+          "mode": "volume",
+          "steps": [
+            {
+              "up_to": 524288,
+              "input_token": 0.0000021,
+              "output_token": 0.0000084,
+              "cache_input_token": 4.2e-7
+            },
+            {
+              "up_to": null,
+              "input_token": 0.0000042,
+              "output_token": 0.0000168,
+              "cache_input_token": 8.4e-7
+            }
+          ]
+        }
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "MiniMax-M2.7",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 0.0000021,
+        "cache_input_token": 4.2e-7,
+        "output_token": 0.0000084
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "MiniMax-M2.7-highspeed",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 0.0000042,
+        "cache_input_token": 4.2e-7,
+        "output_token": 0.0000168
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "speech-2.8-hd",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.00035,
+        "unit": "character"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "speech-2.8-turbo",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.0002,
+        "unit": "character"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "asr-1.0",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.0006944444444444445,
+        "unit": "audio_second"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "image-01",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.025,
+        "unit": "image"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "image-01-live",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.025,
+        "unit": "image"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "MiniMax-H3",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.5,
+        "unit": "video_second",
+        "rules": [
+          {
+            "when": { "/video/resolution": "2K" },
+            "amount": 0.8,
+            "unit": "video_second"
+          }
+        ]
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "MiniMax-H3-Max",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "amount": 0.5,
+        "unit": "video_second",
+        "rules": [
+          {
+            "when": { "/video/resolution": "480P" },
+            "amount": 0.33,
+            "unit": "video_second"
+          }
+        ]
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "minimax-m3",
+        "region": "china"
+      },
+      "pricing": {
+        "source_url": "https://platform.minimaxi.com/docs/guides/pricing-paygo",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "tiers": {
+          "dimension": "input_tokens",
+          "mode": "volume",
+          "steps": [
+            {
+              "up_to": 524288,
+              "input_token": 0.0000021,
+              "output_token": 0.0000084,
+              "cache_input_token": 4.2e-7
+            },
+            {
+              "input_token": 0.0000042,
+              "output_token": 0.0000168,
+              "cache_input_token": 8.4e-7
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,116 @@
+{
+  "format": "buckyos.aicc.model-driver-catalog",
+  "schema_version": 2,
+  "schema_revision": 0,
+  "model_driver_id": "deepseek",
+  "revision_seq": 5,
+  "required_features": [],
+  "models": [
+    {
+      "id": "deepseek-v4-flash",
+      "parameter_scale": "flash",
+      "api_types": ["llm"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 393216
+      },
+      "llm": {
+        "spec": "deepseek-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["none", "low", "high", "max"],
+        "stability": "stable",
+        "weight": 40
+      }
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "parameter_scale": "pro",
+      "api_types": ["llm"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 393216
+      },
+      "llm": {
+        "spec": "deepseek-pro",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["none", "low", "high", "max"],
+        "stability": "stable",
+        "weight": 40
+      }
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "parameter_scale": "flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 393216
+      },
+      "llm": {
+        "spec": "deepseek-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["none", "low", "high", "max"],
+        "stability": "stable",
+        "weight": 41
+      }
+    },
+    {
+      "id": "deepseek-v4-flash-vision-exp",
+      "parameter_scale": "flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "reasoning": true,
+        "vision": true,
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 393216
+      },
+      "llm": {
+        "spec": "deepseek-vision",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["none", "high", "max"],
+        "stability": "experimental",
+        "weight": 40
+      }
+    }
+  ],
+  "patterns": [],
+  "defaults": {
+    "api_types": [],
+    "capabilities": {}
+  },
+  "specs": [
+    {
+      "id": "deepseek-flash"
+    },
+    {
+      "id": "deepseek-pro"
+    },
+    {
+      "id": "deepseek-vision"
+    }
+  ]
+}

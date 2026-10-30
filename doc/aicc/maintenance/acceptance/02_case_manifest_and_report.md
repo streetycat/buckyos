@@ -35,7 +35,7 @@
       "case_id": "routing_exact_model_no_fallback",
       "layer": "L1",
       "priority": "P0",
-      "method": "llm.chat",
+      "method": "chat.completions.create",
       "model": "gpt-5.2@openai-mock-1",
       "provider": "openai-mock-1",
       "status": "passed",
@@ -141,10 +141,10 @@ Manifest 样例：
 
 ```toml
 [[cases]]
-case_id = "l3_krpc_llm_chat_json_schema_success"
+case_id = "l3_krpc_chat_completions_create_json_schema_success"
 layer = "L3"
 priority = "P0"
-method = "llm.chat"
+method = "chat.completions.create"
 model_alias = "llm.plan"
 provider = "openai-mock-1"
 scenario = "success"
@@ -188,9 +188,9 @@ method = "maintenance.update"
 provider = "openai-mock-1"
 model = "gpt-5-mini@openai-mock-1"
 update_type = "metadata"
-api_types = ["llm.chat"]
+api_types = ["llm"]
 logical_catalogs = ["llm.chat"]
-tags = ["update:metadata", "provider:openai", "model:gpt-5-mini", "api_type:llm.chat", "logical:llm.chat"]
+tags = ["update:metadata", "provider:openai", "model:gpt-5-mini", "api_type:llm", "logical:llm.chat"]
 requires = ["mock_provider", "aicc_service", "settings_reload"]
 expect_status = "succeeded"
 expect_usage = false
@@ -207,9 +207,9 @@ expect_trace = true
 | `api_type` | canonical `ApiType` 序列化值，例如 `llm`、`vision.ocr`、`image.txt2img` |
 | `method` | AICC method 或 `workflow` |
 | `logical_path` | 标准逻辑目录路径，例如 `llm.plan`、`image.ocr`；不得用 `vision.ocr` 代替 `image.ocr` |
-| `model_alias` | 请求模型名，可为逻辑模型或精确模型 |
+| `logical_model` / `exact_model` | 路由段的逻辑模型与 typed inference 段的精确模型 |
 | `provider` | 期望命中的 Provider；路由类用例可为空 |
-| `provider_driver` | Provider driver 名，例如 `openai`、`google-gemini`、`claude` |
+| `provider_profile_id` / `protocol_adapter_id` / `model_driver_id` | 渠道、协议与模型语义的独立身份 |
 | `scenario` | Mock 行为场景 |
 | `update_type` | 维护更新类型，例如 `metadata`、`policy`、`routing`、`provider_settings`、`adapter_release`、`rollback` |
 | `api_types` | 本用例覆盖的 AICC method / API type 列表；L4 矩阵用例必须同时填写单值 `api_type` |
@@ -235,7 +235,7 @@ Runner 要求：
 - 报告中的 case 顺序应与 manifest 顺序一致，便于人工阅读。
 - L4 动态矩阵用例可以由模板 case 展开；展开后的 `case_id` 必须唯一，并保留 `api_type`、`method`、`logical_path`、`provider`、`model`、`matrix_source`。
 - L4 attempt 明细必须挂在同一个 case 下，不能展开成多个独立 case 影响通过率统计。
-- 维护更新类用例必须支持按 `update_type`、`provider_driver`、`provider`、`model`、`api_types`、`logical_catalogs` 和 `tags` 筛选；报告中应能单独汇总本次更新相关用例与全量回归用例。
+- 维护更新类用例必须支持按 `update_type`、`provider_profile_id`、`protocol_adapter_id`、`model_driver_id`、`provider`、`model`、`api_types`、`logical_catalogs` 和 `tags` 筛选；报告中应能单独汇总本次更新相关用例与全量回归用例。
 
 ## 4. 失败分类与诊断信息
 
@@ -311,7 +311,7 @@ Total: 103 passed, 2 failed, 31 skipped, 184 not_applicable, 1 partial.
 
 | Case | Api Type | Method | Logical Path | Provider | Exact Model | Logical Result | Exact Result | Attempts |
 |---|---|---|---|---|---|---|---|---:|
-| l4_gateway_llm_llm_chat_llm_plan_openai_gpt_5_5_pro | llm | llm.chat | llm.plan | openai | gpt-5.5-pro@openai | passed | passed | 1 |
+| l4_gateway_llm_chat_completions_create_llm_plan_openai_gpt_5_5_pro | llm | chat.completions.create | llm.plan | openai | gpt-5.5-pro@openai | passed | passed | 1 |
 | l4_gateway_vision_ocr_vision_ocr_image_ocr_google_florence_2 | vision.ocr | vision.ocr | image.ocr | google-gemini | florence-2@google | failed | not_run | 3 |
 | l4_gateway_image_upscale_image_upscale_image_upscale_fal_esrgan | image.upscale | image.upscale | image.upscale | fal | esrgan@fal | passed | passed | 1 |
 
@@ -320,7 +320,7 @@ Total: 103 passed, 2 failed, 31 skipped, 184 not_applicable, 1 partial.
 ### l3_krpc_provider_5xx_failover
 
 - Failure class: routing_failed
-- Method: llm.chat
+- Method: chat.completions.create
 - Model: llm.plan
 - Provider: openai-mock-1
 - Error code: AICC_ROUTE_NO_CANDIDATE
@@ -377,4 +377,3 @@ Total: 103 passed, 2 failed, 31 skipped, 184 not_applicable, 1 partial.
 - skipped 不能只显示数量，必须显示原因。
 - L4 报告必须显示真实模型调用次数、attempt 次数、`api_type × method × logical_path × Provider × model` 覆盖矩阵、not_applicable/skipped 原因和估算成本。
 - L4 报告必须显示临时 group 是否已清理；如未清理，必须显示保留原因和手工清理命令。
-

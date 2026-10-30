@@ -1,0 +1,460 @@
+export const RESULT_STATUSES = [
+  "passed",
+  "failed",
+  "provider_restricted",
+  "skipped",
+  "not_applicable",
+  "review",
+] as const;
+
+export type ResultStatus = (typeof RESULT_STATUSES)[number];
+
+export const FAILURE_CLASSES = [
+  "preflight_failed",
+  "baseline_mismatch",
+  "routing_failed",
+  "provider_protocol_failed",
+  "provider_runtime_failed",
+  "task_lifecycle_failed",
+  "resource_failed",
+  "message_transport_failed",
+  "attachment_failed",
+  "usage_failed",
+  "security_failed",
+  "judge_failed",
+  "assertion_failed",
+  "cleanup_failed",
+  "platform_limitation",
+] as const;
+
+export type FailureClass = (typeof FAILURE_CLASSES)[number];
+
+export type TestLayer = "T1" | "T1.5" | "T2" | "T3";
+export type Priority = "P0" | "P1" | "P2";
+export type ExecutionMode = "immediate" | "stream";
+
+export type ExpectedOutput = {
+  kinds: string[];
+  attachment_count: { min: number; max: number };
+  mime_types: string[];
+};
+
+export type AcceptanceCase = {
+  case_id: string;
+  layer: TestLayer;
+  priority: Priority;
+  tags: string[];
+  input_entry: string;
+  user: string;
+  session: string;
+  provider_driver: string | null;
+  provider_instance: string | null;
+  model_selector: { kind: "exact" | "logical"; value: string } | null;
+  api_type: string | null;
+  method: string;
+  execution_mode: ExecutionMode;
+  required_capabilities: string[];
+  disabled_capabilities: string[];
+  fixtures: string[];
+  mock_scenario: string | null;
+  expected_exact_model: string | null;
+  expected_provider_instance: string | null;
+  expected_task_status: string | null;
+  expected_error_class: string | null;
+  expected_output: ExpectedOutput;
+  semantic_rubric: string[];
+  timeout_ms: number;
+  max_attempts: number;
+  estimated_cost_usd: number;
+  cleanup: string[];
+  protocol_contract_id?: string;
+  protocol_evidence_revision?: string;
+  protocol_adapter_id?: string;
+  provider_api_version?: string;
+  expected_wire_fixture?: string;
+  response_fixture?: string;
+  expected_aicc_error_code?: string;
+  expected_provider_error_code?: string;
+  expected_retriable?: boolean;
+  expected_provider_options?: Record<string, unknown>;
+  switch_source_provider_driver?: string;
+  switch_source_contract_id?: string;
+  switch_source_model_id?: string;
+  switch_target_provider_driver?: string;
+  switch_target_contract_id?: string;
+  artifact_source_provider_driver?: string;
+  artifact_source_contract_id?: string;
+  artifact_source_api_type?: string;
+  artifact_source_model_id?: string;
+  artifact_target_expect_provider_id?: boolean;
+};
+
+export type ProviderModel = {
+  exact_model: string;
+  provider_model_id: string;
+  provider_actual_model_id?: string;
+  provider_options?: Record<string, unknown>;
+  api_types: string[];
+  logical_mounts: string[];
+  health?: string;
+  quota?: string;
+  official_lifecycle_status?: string;
+  official_task_types?: string[];
+  pricing?: {
+    currency?: string;
+    input_token?: number;
+    output_token?: number;
+    cache_input_token?: number;
+    estimated_cost?: number;
+  };
+};
+
+export type ProviderInventory = {
+  provider_instance_name: string;
+  provider_driver: string;
+  provider_profile_id?: string;
+  provider_type?: string;
+  inventory_revision?: string | null;
+  models: ProviderModel[];
+};
+
+export type RouteExposureMode =
+  | "logical_routable"
+  | "exact_only"
+  | "excluded"
+  | "not_applicable";
+
+export type RouteExposureDeclaration = {
+  mode: RouteExposureMode;
+  logical_entrypoint?: string;
+  logical_entrypoint_ref?: "api_type_default";
+  reason?: string;
+};
+
+export type RouteExposureContract = {
+  schema_version: number;
+  contract_revision: string;
+  capability_baseline_revision: string;
+  capability_cells_sha256: string;
+  logical_entrypoint_baseline_revision: string;
+  profiles: Array<{
+    provider_driver: string;
+    provider_profile_id: string;
+    covered_model_patterns: string[];
+    default_exposure: RouteExposureDeclaration;
+    overrides: Array<RouteExposureDeclaration & {
+      model_pattern: string;
+      api_type: string;
+    }>;
+  }>;
+};
+
+export type CapabilityRule = {
+  disabled_api_types?: string[];
+  model_pattern: string;
+  status: "active" | "preview" | "deprecated" | "removed";
+  source_status?: string;
+  api_types: string[];
+  methods: string[];
+  input_kinds: string[];
+  output_kinds: string[];
+  resource_representation?: "url" | "base64" | "named_object";
+  document_formats?: string[];
+  api_io?: Record<string, {
+    input_combinations: string[][];
+    output_combinations: string[][];
+  }>;
+  request_defaults?: Record<string, Record<string, unknown>>;
+  source_urls: string[];
+  evidence_summary: string;
+};
+
+export type ModelCoverageRule = {
+  model_pattern: string;
+  action: "exclude" | "alias";
+  physical_model_id?: string;
+  reason:
+    | "deprecated_or_retiring"
+    | "logical_alias"
+    | "not_physical_model"
+    | "unsupported_canonical_protocol";
+  source_urls: string[];
+  evidence_summary: string;
+};
+
+export type ModelCoverageRecord = {
+  source?: "official_catalog" | "aicc_inventory";
+  provider_driver: string;
+  provider_instance: string;
+  exact_model: string;
+  provider_model_id: string;
+  provider_actual_model_id?: string;
+  physical_model_id: string;
+  status: "included" | "filtered";
+  reason?:
+    | "deprecated_or_retiring"
+    | "logical_alias"
+    | "not_physical_model"
+    | "unsupported_canonical_protocol"
+    | "duplicate_physical_model";
+  retained_exact_model?: string;
+  source_urls: string[];
+  evidence_summary: string;
+};
+
+export type OfficialCatalogConfig = {
+  endpoint: string;
+  format: "openai" | "anthropic" | "gemini" | "fal" | "sn" | "typesafe" | "frozen";
+  authentication: "bearer" | "x-api-key" | "query-key" | "fal-key" | "none";
+  page_size?: number;
+  anthropic_version_header?: boolean;
+  endpoint_ids?: string[];
+  include_model_ids?: string[];
+  model_ids?: string[];
+  supplemental_model_ids?: string[];
+  task_type_api_types?: Record<string, string[]>;
+  checked_at?: string;
+  risk?: string;
+};
+
+export type ProviderBaseline = {
+  schema_version: number;
+  baseline_revision: string;
+  checked_at: string;
+  canonical_api_types: string[];
+  providers: Array<{
+    provider_driver: string;
+    provider_profile_id: string;
+    protocol_adapter_ids: string[];
+    model_driver_ids: string[];
+    discovery: "official_catalog" | "runtime_catalog" | "internal_inventory";
+    official_catalog: OfficialCatalogConfig;
+    capability_source_provider?: string;
+    source_urls: string[];
+    protocol_evidence: {
+      documentation_version: string;
+      streaming_semantics: string;
+      async_operation_semantics: string;
+      usage_semantics: string;
+      input_output_formats: string;
+      item_request_batch_limits: string;
+      image_audio_video_limits: string;
+      context_output_limits: string;
+      region_restrictions: string;
+      account_tier_restrictions: string;
+      preview_allowlist: string;
+    };
+    coverage_rules?: ModelCoverageRule[];
+    rules: CapabilityRule[];
+  }>;
+};
+
+export type MatrixCell = {
+  case_id: string;
+  provider_driver: string;
+  provider_instance: string;
+  exact_model: string;
+  provider_model_id: string;
+  api_type: string;
+  method: string;
+  variant?: "embedding_large_artifact";
+  generated_artifact_source_api_type?: string;
+  baseline_status: CapabilityRule["status"];
+  input_kinds: string[];
+  output_kinds: string[];
+  resource_representation?: "url" | "base64" | "named_object";
+  document_format?: string;
+  request_defaults?: Record<string, unknown>;
+  source_urls: string[];
+  estimated_cost_usd?: number;
+};
+
+export type DocumentFormatCoverageRecord = {
+  provider_driver: string;
+  provider_instance: string;
+  exact_model: string;
+  provider_model_id: string;
+  format: string;
+  status: "supported" | "not_applicable";
+  source_urls: string[];
+};
+
+export type AttemptReport = {
+  attempt: number;
+  started_at: string;
+  elapsed_ms: number;
+  status: ResultStatus;
+  error_code?: string;
+  failure_class?: FailureClass;
+  diagnostic?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    request_units?: number;
+  };
+  estimated_cost_usd?: number;
+  actual_cost_usd?: number;
+  raw_cost_usd?: number;
+  credit_applied_usd?: number;
+  cost_status?: "actual" | "estimated" | "unknown" | "not_called";
+};
+
+export type JudgeReport = {
+  rubric_version: string;
+  configured_model: string;
+  task_id: string;
+  exact_model?: string;
+  provider_driver?: string;
+  provider_instance?: string;
+  input_summary: string;
+  score: number;
+  passed: boolean;
+  reason: string;
+  distinct_provider_or_family?: boolean;
+};
+
+export type CaseReport = {
+  run_id: string;
+  case_id: string;
+  layer: TestLayer;
+  status: ResultStatus;
+  provider_driver?: string;
+  provider_profile_id?: string;
+  provider_instance?: string;
+  model_rule?: string;
+  exposure_mode?: RouteExposureMode;
+  exact_model?: string;
+  api_type?: string;
+  method: string;
+  trace_id?: string;
+  task_id?: string;
+  provider_operation_id?: string;
+  inbound_message_id?: string;
+  session_id?: string;
+  outbound_message_ids: string[];
+  artifact_ids: string[];
+  artifact_audits?: import("./artifact_validation.ts").ArtifactAudit[];
+  judge?: JudgeReport;
+  usage?: Record<string, unknown>;
+  cost_usd?: number;
+  attempts: AttemptReport[];
+};
+
+export type ProductDefect = {
+  defect_id: string;
+  component: "AICC" | "Jarvis" | "msg-center" | "message-tunnel";
+  case_id: string;
+  expected: string;
+  observed: string;
+  evidence_paths: string[];
+  failure_class: FailureClass;
+};
+
+export type AcceptanceReport = {
+  schema_version: 1;
+  run_id: string;
+  started_at: string;
+  finished_at: string;
+  commit: string;
+  baseline_revision: string;
+  allow_real_model_calls: boolean;
+  planned_real_calls: number;
+  actual_real_calls: number;
+  estimated_cost_usd: number;
+  actual_cost_usd: number;
+  raw_cost_usd: number;
+  credit_applied_usd: number;
+  finance: FinancialReport;
+  cases: CaseReport[];
+  product_defects: ProductDefect[];
+  model_coverage?: ModelCoverageRecord[];
+  document_format_coverage?: DocumentFormatCoverageRecord[];
+  targeted_retest_command?: string;
+  protocol_evidence_revision?: string;
+  official_evidence_checked_at?: string;
+  providers?: string[];
+  limits?: {
+    global_concurrency: number;
+    provider_concurrency: number;
+    provider_min_interval_ms: number;
+  };
+  manifest_coverage?: {
+    total: number;
+    executed: number;
+    passed: number;
+    failed: number;
+    coverage_rate: number;
+    unexecuted_case_ids: string[];
+  };
+  t1_requirement_coverage?: import("./coverage.ts").T1Coverage;
+  route_exposure_coverage?: {
+    planned: number;
+    passed: number;
+    failed: number;
+    skipped: number;
+    cells: Array<{
+      case_id: string;
+      provider_profile_id: string;
+      model_rule: string;
+      api_type: string;
+      exposure_mode: RouteExposureMode;
+      status: ResultStatus;
+    }>;
+  };
+  cleanup: { status: "passed" | "failed"; details: string[] };
+};
+
+export type FinancialEntry = {
+  case_id: string;
+  attempt: number;
+  provider_driver: string;
+  provider_instance: string;
+  exact_model: string;
+  api_type: string;
+  method: string;
+  started_at: string;
+  status: ResultStatus;
+  usage?: AttemptReport["usage"];
+  estimated_cost_usd: number;
+  actual_cost_usd?: number;
+  raw_cost_usd?: number;
+  credit_applied_usd?: number;
+  cost_status: "actual" | "estimated" | "unknown";
+};
+
+export type FinancialAggregate = {
+  key: string;
+  calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  request_units: number;
+  actual_cost_usd: number;
+  raw_cost_usd: number;
+  credit_applied_usd: number;
+  estimated_exposure_usd: number;
+  unknown_cost_calls: number;
+};
+
+export type FinancialReport = {
+  currency: "USD";
+  budget_usd: number;
+  planned_max_calls: number;
+  planned_max_cost_usd: number;
+  actual_calls: number;
+  actual_cost_usd: number;
+  raw_cost_usd: number;
+  credit_applied_usd: number;
+  estimated_exposure_usd: number;
+  total_exposure_usd: number;
+  remaining_budget_usd: number;
+  unknown_cost_calls: number;
+  budget_exceeded: boolean;
+  entries: FinancialEntry[];
+  by_provider: FinancialAggregate[];
+  by_instance: FinancialAggregate[];
+  by_model: FinancialAggregate[];
+  by_api_type: FinancialAggregate[];
+  by_case: FinancialAggregate[];
+};

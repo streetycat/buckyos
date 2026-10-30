@@ -1,0 +1,168 @@
+# xllm Rust SDK 参考
+
+- 日期：2026-09-18；2026-10-02 同步 AgentRuntime 与快照 v4（`PendingToolCall {task_id, until_ms}`）；2026-10-03 同步 `RunRecord.version = 5`（`handover`，宿主 Run 的 behavior 交接点）；2026-10-10 同步 H4 报告协议，当前 RunRecord v6、快照 v5、`xllm/2`
+- 实现：`src/frame/agent_tool/src/xllm.rs`（SDK）、`src/frame/agent_tool/src/run_local_llm.rs`（CLI，`agent_tool xllm ...`）
+- 依据：[xllm PRD](../../product/xllm/PRD.md)。本文只记录 Rust 实现落实 PRD 时固定下来的协议决定，供 websdk 的 TS 版本对照；产品行为以 PRD 为准。
+
+## 1. 分层与入口
+
+| 层 | 类型 / 函数 | 职责 |
+| --- | --- | --- |
+| 配置 | `discover_config_files` / `load_config_layers` / `merge_config_layers` → `MergedConfig` | 从工作目录向上查找 `.llm_context`，按“祖先 → 子目录”合并；每个字段记录来源文件 |
+| 准备 | `XllmTask::prepare(workdir, TaskInput, TaskOverrides, &XllmDeps) → PreparedTask` | 选组、展开工具（含 MCP 发现）、读取附件、渲染模板、组装提示词、能力校验；**不建立 Run** |
+| 执行 | `XllmRun::start(prepared, deps)` → `execute()` → `RunOutcome` | 分配 runid、加锁、首次模型请求前写记录、驱动 waist `LLMContext` 到本次停止点 |
+| 恢复 | `XllmRun::resume(store, run_id?, workdir?, ResumeLimits, deps) → ResumeStart::{Terminal, Run}` | 终态只返回记录；非终态重建工具与 Provider，装回最新快照 |
+| 查询 | `list_runs` / `latest_run` / `load_run` / `export_result` / `build_result_view` | 只读记录，不触发执行 |
+
+`XllmDeps` 注入：`LlmClientFactory`（默认 buckyos→AICC、openai→Chat Completions）、具名工具（`tools: - name: x`）、`RunObserver`（进度事件）、锁目录。
+
+## 2. `.llm_context` 解析要点
+
+- YAML 手工转换，未知字段、类型错误、别名/行号冲突都报 `XllmError::Config { file, field, reason }`。
+- `runs_dir: none`（或 null）表示不落盘（内存 `RunStore`）。相对路径相对声明它的文件；`~` 展开为主目录。
+- `prompt.groups.<name>` 为字符串时是外部组文件（根节点即组对象），加载时展开并记录来源。
+- section 键：数字行号或固定别名（role=10、contexts/env=20、rules=30、cmd_manual=40、output_format=100）；`text: ""` 显式清空；`name` 与固定别名冲突报错。
+- 合并规则：标量覆盖；`tools` 对象按字段合并，`tools`/`actions`/`bash_tools` 列表整体替换；组按名合并、section 按行号合并；`mode: custom` 与同层 `select`/`sections` 冲突报错。
+- 凭据只保存引用（`SecretRef::ConfigFile{path, field}` / `Env{name}`），resume 时重新解析。
+
+## 3. 有效配置优先级
+
+`默认值 → 合并后的文件配置 → 选中组 → prompt.tools → CLI（TaskOverrides）`。工具开关：`tools.enabled` 默认 false；`--tools/--no-tools` 最高。仅启用未配置列表时使用 `bash` 组（`read_file`、`write_file`、`edit_file`、`shell`；`shell` 处于 auto 模式时另有 `wait_task`、`get_task_state`、`cancel_task`）。`shell` 在 Windows native runtime 中使用 PowerShell 语法，其它已支持的 runtime 使用 Bash，说明按 runtime 与执行模式生成（长命令 TODO §3.3）。执行模式由配置 `tools.shell.mode` 决定：`auto`（默认）先在工具内等 `wait_ms`（默认 30s，上限 30 分钟），到期仍未结束的命令转为进程内 task 并立即返回“仍在运行”（含 task_id、已有输出、已运行时长与 `wait_task` / `get_task_state` 提示）；`wait` 硬等到结束或 `timeout_ms`（默认 1800s，上限 `tools.shell.max_timeout_ms`，默认 3600s，0 = 不限），到期结束命令并返回 Error 结果（`timed_out`、已有输出与重试提示）。输出按头 1/4 + 尾 3/4 保留 64KB，写入 run 目录下的执行目录 `runs/<run_id>/exec/<call_id>/{command,stdout,stderr,exit}`；非 0 退出的 Error 观察同时带 summary 与输出。子进程遵循标准父子进程语义（§3.2）：native 命令使用 Unix 进程组或 Windows Job Object，被打断、到达 `--timeout`（默认 3600s）或 wait 模式超时时整组终止；命令正常返回后留下的后台进程不被跟踪也不被杀。Ctrl-C 经 `ToolCallCtx` 作用于正在执行的工具，结果记为 `Cancelled`，而不是业务 Error。function_call 下配置 `actions` 或 `tools2actions` 报能力错误；behavior + `tools2actions` 把 tools 转为 actions，原生列表置空。
+
+`tools.filesystem_policy` 可在顶层、选中组或 `prompt.tools` 中配置，按同样的字段覆盖顺序生效。`workspace`（省略时的默认值）将内置文件工具路径和 `shell.cwd` 限制在工作目录内；`unrestricted` 清空读写路径白名单并允许 `shell.cwd` 指向其它目录，实际文件访问由运行用户的操作系统权限决定，相对路径仍以工作目录为基准。[通用模板](../../product/xllm/PRD.md#49-通用配置模板参考-pi-mono) 显式选择 `unrestricted`。该策略对 function_call 和 behavior 中的内置 `bash` 组均生效，不改变 MCP 或宿主工具的策略；`workspace` 也不隔离 shell 命令自身的文件访问。实际策略保存在 `RunRecord.config.tools.filesystem_policy` 中，resume 使用保存值，不重新读取目录配置。
+
+## 4. 提示词组装
+
+system = 按行号升序的非空 section（`## <name>` 标题 + 用户文本 + 系统说明）+ `## runtime_protocol`。系统说明：20 补齐未被模板引用的 RuntimeInfo 核心字段；30 列出实际可用 tools/actions（或声明没有工具）；40 只在 shell 启用时输出命令手册（含 `bash_tools`），shell 未启用时整段省略。custom 模式 = 用户整段 + `## capabilities` + `## runtime_protocol`。
+
+模板：`{{runtime.id|kind|os|arch|hostname|shell|cwd|tools|current_time|timezone}}`、`{{env.NAME}}`；`\{{` 转义；缺失变量在模型请求前报 `XllmError::Template`。渲染结果与变量随 Run 保存。
+
+user = 任务要求（显式 > 组默认 > stdin）→ 附件（命令顺序；文本用 `<material name="...">`，图片用 `[image N: label]` + 图片块）→ `<stdin>` 材料。配置 `file_model` 且有图片时先由文件模型分析，主模型收到 `<image_analysis model="...">` 而不再收到图片。
+
+behavior 协议（`XllmActionParser`）：`<response><thinking/><actions>…</actions><report/></response>`；动作标签集由本次生效 actions 决定，属性→参数，正文→`command`/`content` 等正文参数或 JSON；**没有动作且带 `<report>` 的回复即为最终答案**。
+
+正文/CDATA 直接承载参数值，不加字段名或 `字段名:` 前缀。例如读取文件使用 `<read_file><![CDATA[fixture.txt]]></read_file>`，也可使用 `<read_file path="fixture.txt"/>`。同一个正文参数已通过属性给出时保留属性值，空 CDATA 不会覆盖它；未通过属性给出的正文参数仍支持空字符串（例如写入空文件）和原始空白。
+
+`context_window`（顶层，token，可选）是模型上下文窗口，记入 `RunLimits.context_window_tokens`。设置后，待发送请求的估算达到窗口的 75% 时 waist 让出上下文压缩，估算加 `max_tokens` 超过窗口的请求从不发送；未设置时只在 Provider 以结构化错误码拒绝（OpenAI 兼容接口的 `context_length_exceeded`）时压缩。压缩用本次模型（`LlmSummarizeCompressor`），function_call 以 `RewrittenHistory`、behavior 以 `RewrittenSteps`（物化历史折叠进 input，编号继续）续跑，压缩后的上下文先保存快照再继续，每个 run 最多 3 次。
+
+`max_tool_iterations`（默认 8；CLI `--max-tool-iterations`，`TaskOverrides` / `RunLimits` / `ResumeLimits` 同名字段）是原生 tools 与 behavior actions 共用的工具预算，映射到 waist `ToolPolicy.max_tool_iterations`。一次工具迭代 = 一批实际派发的原生工具调用（一次 response 的全部调用），或一个派发 action 的 behavior Step（同一 Step 多个 action 只计一次）；工具业务失败也计入，behavior Step 内层的原生工具批次与外层 action 共用剩余额度。额度耗尽后仍允许模型返回无工具的最终答案，再请求工具或 action 则进入 `limit_reached`（`tool iteration limit (N) reached`），不会执行超额调用。`max_calls_per_round = 16` 另限一次 response（一个 Round）的原生调用数，不限制 Step 的 action 数。
+
+工具预算不计推理次数：无工具的最终回答、解析纠错后的重试都是 Round，但不消耗工具迭代。推理尝试数记在 `RunRecord.usage.llm_requests`（§5），xllm 不设推理次数上限。
+
+## 5. Run 记录
+
+```
+<runs_dir>/<run_id>/run.json        RunRecord
+<runs_dir>/<run_id>/snapshots/NNNN.json   waist LLMContextSnapshot（每次推理前 + outcome 边界；快照 v5）
+<runs_dir>/<run_id>/.lock           该 Run 的执行互斥
+<lock_dir>/<hash(workdir)>.lock     启用工具的任务按工作目录互斥（默认 ~/.xllm/locks）
+```
+
+`run_id` = `YYYYMMDD-HHMMSS-<6hex>`。`RunRecord` 关键字段：`version`（当前 5，`RUN_RECORD_VERSION`）、`status`、`workdir`、`input`（请求、来源、附件摘要与 sha256、stdin 角色）、`config`（有效 runtime 配置与 runtime_descriptor/Provider/模型/loop/限制 `limits: RunLimits {max_tokens, max_tool_iterations, timeout_secs, llm_timeout_secs, context_window_tokens}`/result_format/工具展开结果/配置文件与字段来源）、`prompt`（section 渲染结果、runtime_protocol 与版本、最终 system、模板变量）、`file_model_stage`、`pending_input`（首次快照前保留的输入，之后清空）、`latest_snapshot_idx`、`last_error`（phase/kind/message/recoverable/condition）、`result`（raw 原文、按 result_format 的提取值、`--json` 校验结果）、`artifacts`、`usage`（主模型/文件模型分别记录；`llm_requests` = 本 Run 经宿主 `LlmClient::infer` 发起的推理尝试数，含失败尝试、文件模型阶段以及 xllm 自己执行时的上下文压缩摘要请求，每个执行段只累加、不重置）、`limit_reason`、`interrupt_reason`、`handover`（`Option<RunHandover { next_behavior, at_ms }>`，只出现在宿主装配的 Run 上，见 §10）。
+
+## 6. 状态机与错误分类
+
+| 状态 | 终态 | 触发 |
+| --- | --- | --- |
+| running | 否 | 执行中；记录为 running 但无进程持锁时，查询显示为“已中断（进程退出）” |
+| interrupted | 否 | `XllmInterrupter::interrupt`（Ctrl-C）或进程退出 |
+| paused | 否 | Provider 超时 / Transient / 疑似凭据问题（Permanent 且信息含 token、401、expired 等）/ 存储 checkpoint 失败 / 工具基础设施失败；宿主装配的 Run 以 `Done` 交接到另一个 behavior（记录 `handover`，xllm 不可 resume，见 §10） |
+| completed | 是 | waist `Done`（宿主装配的 Run 交接到另一个 behavior 时除外，见 paused） |
+| failed | 是 | Provider Permanent（非凭据）/ Unknown、输出解析或工具错误连续超限、上下文压缩 3 次仍超限、deferred tool |
+| limit_reached | 是 | 工具迭代（`max_tool_iterations`）/ 总时长（`timeout`，映射为 waist wallclock 预算）/ token 预算 |
+
+resume：终态只返回记录（附带限制参数则报 `RunTerminal`）；非终态重置 wallclock 起点，工具迭代沿用已消耗值（`ResumeLimits.max_tool_iterations` 显式调高时剩余 = 新总额 − 已消耗，只增加差额），`usage.llm_requests` 继续累加。`RunRecord.version` 不是 5 或快照版本不是 4（`SNAPSHOT_FORMAT_VERSION`）的 Run 不能恢复（不迁移旧格式）。记录了 `handover` 的宿主 Run 报 `NotResumable`（转移由宿主 Session 提交）。保存于上下文上限挂起态的快照先压缩再续跑；等待 deferred 工具结果的快照报 `NotResumable`（xllm 不提供 deferred 结果）。
+
+## 7. CLI（`agent_tool xllm`）
+
+CLI 自身的帮助、状态标签（含结构化结果中的 `status_label`）、阶段、进度日志和诊断信息统一使用英文。用户输入、模型结果和外部工具返回内容按原文保留。
+
+参数面与 PRD §6 一致。stdin 只在是管道（FIFO）或文件重定向时自动读到 EOF；终端、socket、`/dev/null` 视为无管道输入；管道为空报错且不建立 Run。
+
+退出码：0 完成/查询成功；1 终态失败或查询目标不存在；2 参数/配置/输入预检错误（无 Run）；3 可恢复暂停；4 用户中断；5 `--output` 写入失败；6 结果提取或 `--json` 校验失败（原文已保存）。
+
+`--format json` 输出 `XllmResult`（runid、状态、是否终态/可恢复、answer、artifacts、usage、error、Provider/模型/实际返回模型、resume 命令）。
+
+`run_logs: info/debug` 启动时在 stderr 显示实际合并的 `.llm_context` 数量及路径，按祖先到工作目录的覆盖顺序排列；未找到配置时显示 0。resume 显示沿用的原 Run 配置来源，不重新合并。`shell` 的开始、完成和失败日志在括号中显示实际 command，多行和控制字符转义为单行；call_id 保留在内部事件与运行记录中。日志级别取生效配置，显式 `--run-logs` 可覆盖；warn/result 隐藏这些常规进度。
+
+## 8. buckyos Provider 的登录方式
+
+`model` / `file_model`（包括 `--model` / `--file-model` 覆盖）支持两种选择器：`llm.chat`、`llm.vision` 等逻辑名走 AICC `helper.llm_chat`；`model@provider` 或 `model:variant@provider` 精确选择器走 `chat.completions.create`，原样保留模型、variant 和 provider，不进行逻辑路由或 fallback。例如：`agent_tool xllm --model 'gpt-5.6-sol@openai-main' '你好'`。精确选择器中的模型和 provider 必须存在于当前 AICC 环境；格式错误由 AICC SDK 拒绝。
+
+`ensure_buckyos_runtime` 按顺序选择身份（`BUCKYOS_APP_ID` 可覆盖默认的 `buckycli`）：
+
+1. 设置了 `BUCKYOS_APPCLIENT_SESSION_TOKEN`：AppClient，直接使用 verify-hub 签发的 session token（OpenDAN 给工具注入的方式）。`BUCKYOS_APP_ID` 应与 token 的 appid 一致；应用 owner 从 token 的应用实例 claims 补齐，无需额外设置 `BUCKYOS_OWNER_USER_ID`。`control-panel` 等 system 会话使用自己的 system target。
+2. 在 OOD 本机且能读到设备密钥（`/opt/buckyos/security/<device>/authentication.private.pem`）：以 KernelService 语义初始化（服务地址走 127.0.0.1），用设备密钥签 `sub = iss = 设备名` 的登录断言，经 node gateway（默认 3180 端口）上的 verify-hub 换取正式会话后登录。`buckycli` 在 RBAC 中属于 kernel 角色，system-config 与 AICC 均接受。DV Test 环境下 root 直接运行即可，不需要 dev 目录或额外环境变量。
+3. 否则：AppClient，用 `$BUCKYOS_DEV_HOME` / `~/.buckycli` 下的用户私钥签断言，经 verify-hub 换会话；该路径要求所选 app 已安装在 zone 中（否则 verify-hub 返回 `AppAccessDenied`）。
+
+## 9. 验证
+
+- `cargo test -p agent_tool --lib xllm --locked -- --test-threads=1`（SDK，ScriptedLlm 驱动，覆盖配置合并、section 组装、工具优先级、behavior/function_call 循环、暂停与恢复、锁、文件模型阶段等）。
+- `cargo test -p agent_tool --lib run_local_llm --locked -- --test-threads=1`（CLI 参数与 stdin 规则）。
+- Windows native runtime 使用 PowerShell：优先从 PATH 发现 `pwsh.exe`，否则使用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`。命令通过 UTF-8 BOM 的 `script.ps1` 执行，探测和包装脚本使用 UTF-16LE `EncodedCommand`，禁用 profile 并使用 UTF-8 输出；不依赖 Git Bash 或 WSL。PATH 使用 Windows 原生路径和分号，工具手册说明 `$env:NAME`、`Get-Content`、`Start-Sleep` 和 `Start-Process -WindowStyle Hidden` 等 PowerShell 用法，外部程序的退出码沿用 `$LASTEXITCODE`。
+- Windows stdin 按句柄类型区分管道、磁盘文件与 `NUL`；空管道报错，`NUL` 和空文件不提供输入。`run_local_llm::tests::stdin_distinguishes_pipe_file_and_null` 用真实子进程重定向验证这些场景。Windows Shell 使用 Job Object 管理当前命令及其子进程，超时、取消或执行句柄被丢弃时终止；正常返回或交给 task 时解除执行器的终止责任，保留命令留下的后台进程，task 主动取消仍终止整组。`llm_bash::tests::timeout_kills_child_processes` 和 `background_job_does_not_block_and_survives_the_call` 同时覆盖 Windows 与 Unix，`tasks::tests::detached_shell_task_cancel_stops_the_running_script` 验证 Windows task 接管后的取消。
+- 2026-10-03 Windows 11 原生验证：PowerShell 7 与系统 Windows PowerShell 5.1 下，`agent_tool` 各通过 212 项测试（含 xllm 44 项、CLI 5 项、Shell 19 项、task 取消回归）；5 项原有测试忽略，扩展工作区符号链接测试因当前用户缺少权限（1314）失败后单独跳过。完整命令为 `cargo test -p agent_tool --lib --locked -- --test-threads=1 --skip workspace::tests::external_workspace_tools_bind_and_list_from_agent_tool_backend`。PowerShell 5.1 验证时从子进程 PATH 移除 `pwsh` 和 Git；两种 Shell 各通过本地 mock HTTP 的 7 组 CLI 场景，覆盖中文/空格/引号路径、管道、NUL、文件工具、Shell 执行记录、查询/导出和暂停/恢复。`llm_context` 199 项、`cargo build -p agent_tool --locked` 通过。CLI 验证使用调用 `run_subcommand` 的临时薄入口：正式 `agent_tool_cli_dev` 构建被 OpenDAN 的 `MsgObject.to_session` 字段编译错误阻断；真实 AICC、SSH 传输未验证。
+- 真实环境：在 DV Test 的 OOD 上以 root 运行 `agent_tool xllm "问题"`，即走上面第 2 种登录方式。
+- 端到端（无 BuckyOS）：用一个 OpenAI 兼容的 mock HTTP 服务（返回 `choices[0].message` 与可选 `tool_calls`），在 `.llm_context` 里配置 `provider.type: openai`、`base_url`、`api_key_env`，即可跑通新任务、管道串联、工具循环、`--json`、暂停/resume、`--output`、list/status/result。
+
+## 10. 宿主装配的 Run 与恢复检查（2026-09-29，Agent Session SDK §8.7）
+
+libOpenDAN 把 session 的 `runs/` 直接作为 xllm 的 run 目录。为此增加以下可选能力，xllm 自己的 Run 行为不变：
+
+- **宿主装配（X2）**：`XllmTask::prepare_hosted(workdir, llm_context_json, origin, host_system, deps) -> HostedTask`。宿主给出 `.llm_context` 的 JSON 形式（同 schema、严格键）和自己的 system 文本；xllm 计算有效配置、展开工具，并在宿主文本后追加 `capabilities` / `cmd_manual` / `runtime_protocol` 段（`protocol_version = xllm/2`）。宿主 system 支持稳定 runtime.* 与具名 env.* 模板，current_time/timezone 在输入批次提供，system 引用新鲜量会报 Template；`HostedTask::new_record` / `build_request`、`hosted_request`、`hosted_waist_deps`（behavior 用 `XllmActionParser` + `XmlStepRenderer`）让宿主驱动 waist，而 run 目录保持 xllm 可接手。`rebuild_toolset` / `create_run_llm` 按保存的记录重建工具与 Provider。`XllmDeps.host_prompt_sections: HostPromptSections { capabilities, cmd_manual, runtime_protocol }`（缺省全开）决定追加哪几段：自己陈述约束、命令与回复契约的宿主（Agent Session 的 UI 会话）可关掉，`prompt.runtime_protocol` 仍计算并记入 run.json 便于排查；`runtime_protocol = false` 只允许 function call 循环（behavior 循环的回复形状由它定义），否则报 `Capability`。`.llm_context` 的 `json: true` / `json_schema: {…}` 让最终回复成为一个 JSON 值：宿主装配的 run 由 `hosted_request` 生成回复契约 `OutputSpec::Json { schema, strict: true, max_repairs: Some(1) }`（provider 原生结构化输出为主路径，waist 校验 + 一次纠正兜底，仍不满足时以 `ContextOutput::Invalid` 交还宿主；只允许 function call 循环），xllm 自己的 run 与 `--json` 同义。`XllmDeps.shell_note` 追加在 `shell` 说明末尾（宿主事实，如 PATH 上的命令）；`XllmDeps.task_cli`（如 `agent-session task`）配合内置组 `bash_core`（`read` / `write_file` / `edit_file` / `shell`，`read` 是 `read_file` 的超集：同一实现读文件，另可读 `cyfile:` 对象、接受 `offset/limit`）：auto 模式下长命令不再由 task 工具跟进，而由 run 的 task CLI 桥（`agent_tool::task_bridge`：在 Unix socket 上服务本 run 的 `CompositeTaskResolver`，端点经环境变量 `XLLM_TASK_ENDPOINT` 传给每条命令；`state` / `wait` / `cancel` 的结果文本与 task 工具逐字一致）；没有 task 命令或桥起不来时 `bash_core` 仍带三个 task 工具。`XllmDeps.host_protocol: HostProtocolFlavor`（缺省 `OneShot`）决定宿主装配 run 的 `runtime_protocol` 开场白：`Session { intro }` 由宿主给出（Agent Session 不是一次性任务，是否等用户由宿主规则决定），其余协议正文不变。宿主装配的 run（`record.host` 非空）无论由谁执行都用不带时间戳的 `XmlStepRenderer`，xllm 接手后渲染出的历史与宿主逐字节一致。`shell` 工具把本次调用的 id 以环境变量 `XLLM_CALL_ID` 传给命令（命令可用它作为自己创建对象的幂等键）。`CompositeTaskResolver::can_resolve` 对非本地 task id 委托给注入的 `buckyos_tasks`。
+- **RunStore（X1）**：`create_run`、`lock_run`、`remove_run`、`prune_snapshots` 公开；`run.json` 与快照写入先 fsync 再原子发布（目录也 fsync）。
+- **RunRecord 新字段**（均可缺省）：`host`（`assembled_by`、`session_id`、`runtime_kind`、`runtime_id`、`env_check`）、`host_commit_pending`、`inflight[]`、`handover`。
+- **behavior 交接点（`handover`，run 版本 6）**：宿主装配的 Run（`record.host` 非空）以 `Done` 返回且 `next_behavior` 指向另一个 behavior（`is_handover_target`：非空且不是 `WAIT_USER_MSG`；END / done 在 parser 阶段即拒绝）时，这个 Run 没有完成：xllm 把状态记为 `paused` 并写入 `handover = RunHandover { next_behavior, at_ms }`，不写 `result`。xllm 只记录事实，目标 behavior 的进入模式（`switch_context` / `create_sub_context` / `fork`）由宿主读自己的配置决定，转移也只由宿主 Session 提交（libOpenDAN 的 reconcile 按 `at_ms` 恰好提交一次）；宿主重新打开该 Run 执行时清除该字段。没有宿主的 xllm Run 不受影响：`next_behavior` 指向其它 behavior 的 `Done` 仍按 `completed` 结束。
+- **resume 检查（X3 / X6）**：`version` 不等于当前版本（`RUN_RECORD_VERSION = 5`）→ 拒绝；`host_commit_pending` 非空 → 拒绝（须由宿主补交输入）；`handover` 非空 → 拒绝（`NotResumable`：“handed over to behavior … its host session commits the transfer”，须用宿主 Runner 推进 Session）；按保存的 runtime 构造执行体并核对完整 descriptor（kind、id、实际 target、cwd）；Session 接管校验保存的环境、PATH、bin manifest 与 helper 内容，凭据重新读取环境引用；取得 run 锁后把没有持久结果的 `inflight[]` 物化为“被打断、结果未知”（`materialize_unresolved`，文本由 `AgentRuntime::describe_interrupted` 按 runtime 生成：native 给命令与开始时间并说明命令可能部分执行、通常随执行器结束但不保证、后台进程不受影响；remote_ssh 读执行目录，已有 `exit` 时给退出码与输出尾部，没有时说明“可能仍在运行”与查看位置）并落盘，**不核验、不停止任何进程，不重放工具**。挂起在 task 上（`PendingTool`）的 run 被接手时不等待：用 resolver 查 task 当时的状态立即回填后续跑；task 属于接手方访问不了的 task-mgr（非 `local:` 前缀且未注入 `XllmDeps.buckyos_tasks`）时拒绝接手；libOpenDAN 中装配了 `call_behavior` 的 Run（包括挂起在子 context 上、task id 为 `subctx:<call_id>` 的 Run）xllm 不能接手：重建工具集时该宿主工具未注册即报错，且 `subctx:` task 也不属于 xllm 可达的 task-mgr，须由 Session 自己的 Runner 推进。
+- **执行目录与 task（长命令 TODO §3.2 / §4 / §5）**：`agent_tool::exec_tracking` 只保留 `InflightAction` / `HostRunInfo` / `materialize_unresolved`；进程跟踪（`ExecutionRecord`、`OPENDAN_EXECUTION_ID`、启动握手、`probe_execution` / `stop_execution`、`reconcile_execution`、`run.executions[]`）已删除。`shell` 命令统一写执行目录 `(run, call_id)`（native：`runs/<run_id>/exec/<call_id>`；remote_ssh：`/tmp/llm-runtime-<uid>/<run_id>/<call_id>`）。auto 模式到期的命令交给进程内 task-mgr（`agent_tool::tasks::InProcessTaskManager`，id 为 `local:shell:<call_id>`），`CompositeTaskResolver` 作为 waist 的 `RunningTaskResolver`（进程内 task + 执行目录回读 + 可选 buckyos task-mgr）。xllm 没有 Session，`allow_deferred` 关闭，任何工具内等待最长 30 分钟后带 task 状态返回 LLM（libOpenDAN 只为 `call_behavior` 打开 deferred，其它工具同样在调用内等待）。`XllmDeps.runtime` 注入共享 `AgentRuntime`，`buckyos_tasks`、`runtime_env` 与 `runtime_path_prefix` 由宿主装配；`XllmDeps.skip_workdir_lock` 让宿主自行协调共享 workspace。
+- **用量累加**：宿主驱动时由宿主在每个 outcome 后把本段推理尝试数加到 `usage.llm_requests`（libOpenDAN 如此），xllm 接手后在其上继续累加；任何执行段都不覆盖已有值。
+- 快照版本与宿主元数据见《LLM Context 设计》§9.4；session 协议见 `doc/opendan/protocol/`。
+
+## 10. 共享 AgentRuntime
+
+完整架构、执行与恢复边界见 [AgentRuntime 设计](<AgentRuntime 设计.md>)。
+
+`agent_tool::runtime` 提供 `RuntimeConfig`、`RuntimeRegistry`、`AgentRuntime` 与 `Sandbox: ToolManager`。`prepare` / `prepare_hosted` 经 `open_runtime` 调用 `runtime.open(ctx, tools_cfg, deps)`，返回 `(EffectiveTools, XllmToolManager)`；后者实现 Sandbox，接受未展开工具配置并复用既有工具解析。`RuntimeOpenCtx` 包含控制侧 workdir、run_id、LoopModel、工具来源、宿主 env/PATH 前缀和 Run 绑定槽，不依赖 Session 类型。`from_config` 构造 native/SSH；`from_config_with` 还支持 remote_node，需要 `XllmDeps.node_executor`，xllm CLI 已注入按需连接 BuckyOS 的 connector。Runtime 的 `descriptor()` 在打开后才表示实际目标；native/SSH 的 `info()` 刷新执行处时间与时区，Node 当前使用控制侧 UTC 时间。
+
+`.llm_context` 顶层 runtime 默认 native：
+
+```yaml
+runtime:
+  kind: native
+  workdir: ./workspace
+  env: { LANG: en_US.UTF-8 }
+```
+
+```yaml
+runtime:
+  kind: remote_ssh
+  workdir: /srv/review
+  remote_ssh:
+    host: review-host
+    user: alice
+    port: 22
+    identity_file: ~/.ssh/review_key
+```
+
+```yaml
+runtime:
+  kind: remote_node
+  workdir: /srv/agent-work
+  remote_node:
+    node_did: did:dev:example-node
+    profile_id: dev
+```
+
+同 kind 逐字段覆盖，env 按键覆盖；切换 kind 重置整段。native 的 workdir 与 SSH 的 identity_file 按声明配置文件目录解析；SSH/Node workdir 必须显式为目标绝对路径。id 是身份，不是 profile 查找键。未知字段和无关连接块报 Config；规划中的 container、container_host、http_proxy_runtime 报 Capability。runtime 不接受 fs_view、path_layers、limits 或 policy。可选 `baseline: standard | extended` 是登记者对环境基线的声明，只进入 `{{runtime.baseline}}` 与运行环境段，不被探测；`{{runtime.platform}}`（`linux / macos / windows`）与 `{{runtime.shell_kind}}`（shell 程序名）由探测结果归一得到。文件工具的 workspace 策略在目标侧解析真实路径，防止符号链接逃逸；shell 的文件访问仍由系统权限控制。
+
+shell、read/write/edit 共用执行体；模板执行需宿主显式注入 `SandboxPromptExec`，当前生产模板默认未启用，Node 尚不支持模板 EXEC。MCP 仍在所配置服务执行，进程内宿主工具仍在 Runner 执行；都由 Sandbox 派发，具名宿主工具缺失时拒绝接管。SSH 使用系统 ssh/sftp、非交互认证和 known_hosts，要求远端 Linux/bash/SFTP；探测与身份核验在首次模型请求前完成。SSH 命令由包装脚本在后台启动，输出与退出码写入远端执行目录；Node 则在控制侧持久保存操作 locator，结果由目标 Executor 查询返回。恢复均不核验或停止旧进程，不重放副作用。
+
+run.json 的 workdir、配置文件、日志和快照属于控制侧；config.runtime.workdir 是执行侧路径。恢复沿用保存配置，不重读 .llm_context；实际 descriptor 变化会拒绝接管。native 保留实际 cwd 的 flock；SSH/Node 不取远端路径的本地锁，跨 Runner 并发由宿主协调。完整 Session 目前支持 native 与创建时冻结到节点 runtime 的 remote_node；SSH 的远端 Session helper 尚未部署，SSH 可独立用于 xllm。
+
+新任务可用 `--runtime <kind>` 覆盖 kind；连接字段仍需来自配置。resume 与查询不接受该参数；status 显示实际 runtime、target、cwd 和 env_check。核心测试：`cargo test -p agent_tool --lib`、`cargo test -p llm_context`；真实传输测试：仓库根目录 `bash test/runtime_ssh/run.sh`（需 ssh、sftp、sshd），覆盖文件、取消、认证失败、断线、强杀与目标变更。
+
+### 显式报告与恢复（H4）
+
+Behavior 的阶段 `<report>` 不结束 run；最终结果必须使用 `<report end="true">`。两套 parser 共享 `LLMBehaviorResult::validate`，在同次原生工具派发前检查结束冲突。`StepRecord` 保存 `report_end`、`report_artifacts`、`report_result`，快照 v5 保存 `state.report_end`；独立 run 落盘的最终 Step 在恢复时直接返回同一份 Done，不增加推理。宿主 run 由 xllm 执行到 XML 最终 Step 时保存快照后保持 paused，以 snapshot.state.report_end 交回 Session 验证，不提前标 Completed；xllm 再次 resume 会拒绝该交接点。宿主恢复通过校验时直接提交，产物 / 活动任务校验失败时回到可修正 Step，不永久卡在终态。run v6 与 runtime protocol `xllm/2` 只接受当前版本。
+
+宿主 `report` 工具按冻结工具表重建，独立 xllm 不默认安装它。接手已冻结 report 的 libopendan run 时，缺少宿主实现会装回原 schema 的占位工具，其调用返回 requires Session host executor 的可修正错误，不接受报告；其它工具仍可继续。`host.extra.reports` 中已有 `is_end=true` 的提交时，xllm 拒绝接手并要求宿主完成结果配对和 Session 提交。普通阶段报告不触发此门槛。

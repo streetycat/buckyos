@@ -224,7 +224,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
             ▼
 [Worker Image]（默认运行镜像）
     └─ 预置 CLI 工具集（ffmpeg、imagemagick、poppler、
-       libreoffice、pandoc、tesseract 等）
+       libreoffice、tesseract 等）
     └─ 受限 Python 运行时（仅用于胶水、不可装包）
             │（仅当用户显式启用工匠能力时继续向上）
             ▼
@@ -237,6 +237,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
             ▼
 [External Tool Volume]（独立交付物，非镜像）
     └─ 由 Crafter 生产，挂载到应用容器中
+    └─ 随版本预置的工具包（pandoc 静态发行版，见 publish/exttool/）
 ```
 
 要点：
@@ -245,6 +246,7 @@ OpenDAN Agent 一开始就存在自改提示词、角色描述、流程规则与
 2. 工匠镜像是工作镜像的文件系统超集，但**不作为默认运行环境**；它只在用户显式开启“打造新兵器”能力时，为工匠 Agent 启动。
 3. 工匠镜像的产物是独立的工具包，不是“工匠镜像本身替代工作镜像”。工具包加载回工作镜像后，工作层 Agent 才能使用新能力。
 4. 工匠镜像必须具备“模拟工作镜像环境”的能力，以便在交付前验证产物能在干净的工作镜像里运行，避免构建环境与运行环境之间的隐式依赖泄漏。
+5. 体积大、但只有部分任务用到的 CLI（目前是 pandoc）以自包含工具包的形式随 External Tool Volume 发布（`/opt/buckyos/tools/bin/` 在 PATH 上），不进工作镜像。External Tool Volume 不可用时 Worker 照常启动，只是缺这些工具（node_daemon 记 error 日志）。
 
 ## 7. 核心需求
 
@@ -370,6 +372,7 @@ OpenDAN 必须被纳入统一 App 模型，而不是继续维持独立特例：
 2. 本地演化副本必须落在实例卷。
 3. 升级逻辑应采用文件级同步/合并，不再依赖文件系统级 COW。
 4. Agent 默认仍运行在受限容器边界内，其可见目录与宿主机能力继续由挂载策略/桥接工具决定。
+   例外：zone owner 的 Agent 把默认 runtime 设为某节点的 `host` 时，Agent Service 作为 node_daemon 管理的原生进程跑在该节点上，不使用工作镜像；这种 Agent 没有 `container` runtime，命令只经 Node Executor 以节点 `owner_agents` 的 profile 执行（`doc/app_service/rust_app_loader.md` §9.3.1）。
 5. 删除实例卷后，Agent 应回退到更接近原始发行状态，这应被视为诊断与恢复能力的一部分。
 
 ### 8.3 传统二进制 App

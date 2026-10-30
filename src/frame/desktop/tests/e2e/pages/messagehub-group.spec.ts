@@ -1,0 +1,422 @@
+import { expect, test, type Page } from '@playwright/test'
+
+declare global {
+  interface Window { __messageHubMock: import('../../../src/app/messagehub/mock/store').MessageHubMockStore }
+}
+
+const SELF = 'did:buckyos:user:self'
+const OWN = { viewerDid: SELF, ownerDid: SELF, mode: 'self' as const }
+const BOB = 'did:buckyos:person:bob'
+const HIKING = 'did:buckyos:group:weekend-hiking'
+const TEAM = 'did:buckyos:group:product-team'
+
+async function openHub(page: Page, entityId?: string) {
+  await page.route('https://upload.wikimedia.org/**', route => route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"/>' }))
+  await page.goto(entityId ? `/messagehub?entityId=${encodeURIComponent(entityId)}` : '/messagehub')
+  await expect(page.getByTestId('hub-create-menu')).toBeVisible()
+}
+
+test('a group is created from picked contacts and opens on its own conversation', async ({ page }) => {
+  await openHub(page)
+  await page.getByTestId('hub-create-menu').click()
+  await page.getByTestId('new-group').click()
+  const dialog = page.getByRole('dialog', { name: 'New group' })
+  const picker = dialog.getByTestId('people-picker')
+  await expect(picker.getByRole('button', { name: 'Alice Chen', exact: true })).toBeVisible()
+  await expect(picker.getByTestId('people-picker-row').filter({ hasText: 'Carol Wang' })).toHaveCount(0)
+  await picker.getByRole('searchbox', { name: 'Search people' }).fill('ali')
+  await picker.getByRole('button', { name: 'Alice Chen', exact: true }).click()
+  await picker.getByRole('searchbox', { name: 'Search people' }).fill('')
+  await picker.getByRole('button', { name: 'Bob Zhang', exact: true }).click()
+  await expect(dialog.getByTestId('people-picker-selected').getByRole('button')).toHaveCount(2)
+  await expect(dialog.getByRole('textbox', { name: 'Group name' })).toHaveAttribute('placeholder', 'Alice Chen, Bob Zhang')
+  await page.screenshot({ path: 'test-results/messagehub-group-create.png' })
+  await dialog.getByRole('textbox', { name: 'Group name' }).fill('Launch crew')
+  await dialog.getByRole('button', { name: 'Create group', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+
+  const groupDid = await page.evaluate(context => window.__messageHubMock.entities(context).find(entity => entity.name === 'Launch crew')?.id, OWN)
+  expect(groupDid).toMatch(/^did:buckyos:group:/)
+  await expect(page.getByRole('button', { name: 'Entity details: Launch crew' }).last()).toBeVisible()
+  await expect(page.getByTestId('action-message')).toHaveText(['You created the group', 'You invited Alice Chen', 'You invited Bob Zhang'])
+
+  await page.locator('textarea').fill('Hello crew')
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('conversation-history').getByText('Hello crew')).toBeVisible()
+  const sent = await page.evaluate(({ context, id }) => window.__messageHubMock.reader(context, id).readRange(0, 10), { context: OWN, id: groupDid! })
+  expect(sent.at(-1)).toMatchObject({ kind: 'group_msg', to: [groupDid], content: { content: 'Hello crew' } })
+
+  await page.getByRole('button', { name: 'Entity details: Launch crew' }).last().click()
+  const panel = page.getByTestId('group-panel')
+  await expect(panel.getByTestId('group-members').locator('li')).toHaveCount(3)
+  await expect(panel.locator('li', { hasText: 'You' })).toContainText('Owner')
+  await expect(panel.locator('li', { hasText: 'Alice Chen' })).toContainText('Invited')
+  await page.screenshot({ path: 'test-results/messagehub-group-panel.png' })
+
+  await page.evaluate(({ group, alice }) => window.__messageHubMock.simulateJoin(group, alice), { group: groupDid!, alice: 'did:buckyos:person:alice' })
+  await expect(panel.locator('li', { hasText: 'Alice Chen' })).not.toContainText('Invited')
+  await expect(page.getByTestId('action-message').last()).toHaveText('Alice Chen joined')
+
+  await panel.getByRole('button', { name: 'Invite', exact: true }).click()
+  const invite = page.getByRole('dialog', { name: 'Invite to Launch crew' })
+  const aliceRow = invite.getByTestId('people-picker-row').filter({ hasText: 'Alice Chen' })
+  await expect(aliceRow).toContainText('Member')
+  await expect(aliceRow.getByRole('button', { name: 'Alice Chen', exact: true })).toHaveCount(0)
+  await invite.getByRole('button', { name: 'Dave Li', exact: true }).click()
+  await invite.getByRole('button', { name: 'Invite', exact: true }).click()
+  await expect(invite).toHaveCount(0)
+  await expect(panel.locator('li', { hasText: 'Dave Li' })).toContainText('Invited')
+
+  await panel.getByRole('button', { name: 'Cancel invitation: Dave Li' }).click()
+  await page.getByRole('dialog', { name: 'Cancel invitation' }).getByRole('button', { name: 'Cancel invitation' }).click()
+  await expect(panel.locator('li', { hasText: 'Dave Li' })).toHaveCount(0)
+
+  await panel.getByRole('button', { name: 'Delete group' }).click()
+  await page.getByRole('dialog', { name: 'Delete group' }).getByRole('button', { name: 'Delete group' }).click()
+  await expect(panel).toContainText('This group has been deleted.')
+  await expect(page.getByTestId('composer-readonly')).toContainText('You are not a member of this group.')
+})
+
+test('quick entry points: groups filter row, empty-state button and contact details preselect', async ({ page }) => {
+  await openHub(page)
+  await page.getByTestId('entity-filters').getByRole('button', { name: 'Groups' }).click()
+  await page.getByTestId('entity-list-create-group').click()
+  await expect(page.getByRole('dialog', { name: 'New group' })).toBeVisible()
+  await page.getByRole('dialog', { name: 'New group' }).getByRole('button', { name: 'Cancel' }).click()
+
+  await page.getByTestId('entity-filters').getByRole('button', { name: 'All' }).click()
+  await page.getByRole('button', { name: /^Bob Zhang/ }).click()
+  await page.getByRole('button', { name: 'Entity details: Bob Zhang' }).last().click()
+  await page.getByTestId('entity-create-group').click()
+  const dialog = page.getByRole('dialog', { name: 'New group' })
+  await expect(dialog.getByTestId('people-picker-selected')).toHaveText('Bob Zhang')
+  await expect(dialog.getByRole('button', { name: 'Create group', exact: true })).toBeEnabled()
+  await dialog.getByRole('button', { name: 'Cancel' }).click()
+  await expect(dialog).toHaveCount(0)
+})
+
+test('an invitation card joins the group and opens it; an admin manages the seeded group', async ({ page }) => {
+  await openHub(page, BOB)
+  const card = page.getByTestId('group-notice')
+  await expect(card).toHaveAttribute('data-state', 'pending')
+  await expect(card).toContainText('Bob Zhang invited you to join')
+  await expect(card).toContainText('Weekend Hiking')
+  expect(await page.evaluate(context => window.__messageHubMock.entities(context).some(entity => entity.id === 'did:buckyos:group:weekend-hiking'), OWN)).toBe(false)
+  await page.screenshot({ path: 'test-results/messagehub-group-invitation.png' })
+  await card.getByRole('button', { name: 'Join group' }).click()
+  await expect(card).toHaveAttribute('data-state', 'joined')
+  await card.getByRole('button', { name: 'Open' }).click()
+  await expect(page.getByRole('button', { name: 'Entity details: Weekend Hiking' }).last()).toBeVisible()
+  await expect(page.getByTestId('action-message').last()).toHaveText('You joined')
+  await page.getByRole('button', { name: 'Entity details: Weekend Hiking' }).last().click()
+  const panel = page.getByTestId('group-panel')
+  await expect(panel.locator('li', { hasText: 'Bob Zhang' })).toContainText('Owner')
+  await expect(panel.getByRole('button', { name: 'Invite' })).toHaveCount(0)
+  await panel.getByRole('button', { name: 'Leave group' }).click()
+  await page.getByRole('dialog', { name: 'Leave group' }).getByRole('button', { name: 'Leave group' }).click()
+  await expect(page.getByTestId('composer-readonly')).toContainText('You are not a member of this group.')
+  expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.myRole, { context: OWN, group: HIKING })).toBeUndefined()
+
+  await page.getByRole('button', { name: /^Product Team/ }).click()
+  await page.getByRole('button', { name: 'Entity details: Product Team' }).last().click()
+  await expect(panel.locator('li', { hasText: 'Alice Chen' })).toContainText('Owner')
+  await expect(panel.locator('li', { hasText: 'You' })).toContainText('Admin')
+  await expect(panel.getByRole('button', { name: 'Remove from group: Alice Chen' })).toHaveCount(0)
+  await panel.getByRole('button', { name: 'Remove from group: Dave Li' }).click()
+  await page.getByRole('dialog', { name: 'Remove from group' }).getByRole('button', { name: 'Remove from group' }).click()
+  await expect(panel.locator('li', { hasText: 'Dave Li' })).toHaveCount(0)
+  expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.members?.find(member => member.did === 'did:buckyos:entity:person-dave')?.state, { context: OWN, group: TEAM })).toBe('removed')
+})
+
+test('group creation is a full-height sheet-friendly dialog on a phone', async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 })
+  await page.goto('/messagehub')
+  await page.getByRole('button', { name: 'Back to conversation list', exact: true }).click()
+  await page.getByTestId('hub-create-menu').click()
+  await page.getByTestId('new-group').click()
+  const dialog = page.getByRole('dialog', { name: 'New group' })
+  await expect(dialog.getByTestId('people-picker')).toBeVisible()
+  const box = await dialog.boundingBox()
+  expect(box!.x).toBeGreaterThanOrEqual(0)
+  expect(box!.x + box!.width).toBeLessThanOrEqual(375)
+  await page.screenshot({ path: 'test-results/messagehub-group-create-375.png' })
+})
+
+const ALICE = 'did:buckyos:person:alice'
+const CAROL = 'did:buckyos:entity:person-carol'
+const DAVE = 'did:buckyos:entity:person-dave'
+const BOOK = 'did:buckyos:group:book-club'
+const ERIN = 'did:buckyos:person:erin'
+
+test('notification cards: an auto-accepted invite shows joined, a join request is approved, an owner transfer is accepted', async ({ page }) => {
+  await openHub(page, ALICE)
+  const invite = page.locator('[data-testid="group-notice"][data-action="invite"]')
+  await expect(invite).toHaveAttribute('data-state', 'joined')
+  await expect(invite).toContainText('Joined')
+  await expect(invite.getByRole('button', { name: 'Join group' })).toHaveCount(0)
+  await expect(invite).toContainText('Role: Admin')
+
+  const approval = page.locator('[data-testid="group-notice"][data-action="pending_approval"]')
+  await expect(approval).toContainText('asked to join')
+  await approval.getByRole('button', { name: 'Approve' }).click()
+  await expect(approval).toContainText('Approved')
+  expect(await page.evaluate(({ context, group, member }) => window.__messageHubMock.group(context, group)?.members?.find(item => item.did === member)?.state, { context: OWN, group: TEAM, member: ERIN })).toBe('active')
+
+  const transfer = page.locator('[data-testid="group-notice"][data-action="owner_transfer"]')
+  await expect(transfer).toContainText('offers you ownership of')
+  await page.screenshot({ path: 'test-results/messagehub-group-notices.png' })
+  await transfer.getByRole('button', { name: 'Accept ownership' }).click()
+  await expect(transfer).toContainText('You are now the group owner')
+  expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.myRole, { context: OWN, group: TEAM })).toBe('owner')
+  await expect(page.getByTestId('action-message').last()).toHaveCount(0)
+})
+
+test('the owner changes roles, mutes a member, edits the profile and issues an invite link', async ({ page }) => {
+  await openHub(page, TEAM)
+  await page.evaluate(({ context, group }) => window.__messageHubMock.acceptGroupOwnerTransfer(context, group, 'transfer-team'), { context: OWN, group: TEAM })
+  await page.getByRole('button', { name: 'Entity details: Product Team' }).last().click()
+  const panel = page.getByTestId('group-panel')
+  await expect(panel.locator('li', { hasText: 'You' })).toContainText('Owner')
+
+  await panel.getByRole('button', { name: 'Member actions: Bob Zhang' }).click()
+  await page.getByRole('menuitem', { name: 'Make admin' }).click()
+  await expect(panel.locator('li', { hasText: 'Bob Zhang' })).toContainText('Admin')
+  await panel.getByRole('button', { name: 'Member actions: Bob Zhang' }).click()
+  await expect(page.getByRole('menuitem', { name: 'Remove admin' })).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  await panel.getByRole('button', { name: 'Member actions: Dave Li' }).click()
+  await page.getByRole('menuitem', { name: 'Mute for 1 hour' }).click()
+  await expect.poll(() => page.evaluate(({ group, member }) => (window.__messageHubMock.getSnapshot().groups[group].members[member].mutedUntil ?? 0) > Date.now(), { group: TEAM, member: DAVE })).toBe(true)
+
+  await panel.getByRole('button', { name: 'Edit group info' }).click()
+  const form = panel.getByTestId('group-profile-form')
+  await form.getByLabel('Group name').fill('Product Team v2')
+  await form.getByLabel('Description').fill('Now with a description')
+  await form.getByRole('button', { name: 'Save' }).click()
+  await expect(panel.getByTestId('group-profile')).toContainText('Product Team v2')
+  await expect(panel.getByTestId('group-profile')).toContainText('Now with a description')
+  await expect(page.getByRole('button', { name: 'Entity details: Product Team v2' }).last()).toBeVisible()
+
+  await panel.getByRole('button', { name: 'Create invite link' }).click()
+  const link = panel.getByTestId('group-invite-link-text')
+  await expect(link).toHaveText(new RegExp(`^${TEAM}\\?invite=[0-9a-f]+$`))
+  await page.screenshot({ path: 'test-results/messagehub-group-manage.png' })
+  await panel.getByRole('button', { name: 'Revoke link' }).click()
+  await expect(panel.getByTestId('group-invite-link')).toHaveCount(0)
+})
+
+test('Join group in the + menu previews the group; an unknown token is rejected, a valid one joins', async ({ page }) => {
+  await openHub(page)
+  await page.getByTestId('hub-create-menu').click()
+  await page.getByTestId('join-group').click()
+  const dialog = page.getByRole('dialog', { name: 'Join Group' })
+  const input = dialog.getByLabel('Group DID or invite link')
+  await input.fill(`${BOOK}?invite=nope`)
+  await dialog.getByRole('button', { name: 'Find', exact: true }).click()
+  await expect(dialog.getByTestId('join-group-preview')).toContainText('Book Club')
+  await dialog.getByTestId('join-group-submit').click()
+  await expect(dialog.getByTestId('join-group-error')).toContainText('invite link is not valid')
+  await input.fill(`${BOOK}?invite=book-club-token`)
+  await dialog.getByRole('button', { name: 'Find', exact: true }).click()
+  await dialog.getByTestId('join-group-submit').click()
+  await expect(dialog.getByTestId('join-group-outcome')).toHaveAttribute('data-outcome', 'active')
+  await dialog.getByRole('button', { name: 'Done', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Entity details: Book Club' }).last()).toBeVisible()
+  await expect(page.getByTestId('action-message').last()).toHaveText('You joined')
+  expect(await page.evaluate(({ context, group }) => window.__messageHubMock.group(context, group)?.myRole, { context: OWN, group: BOOK })).toBe('member')
+})
+
+test('an accepted invitation awaiting sync offers retry without claiming the group is ready', async ({ page }) => {
+  await openHub(page, BOB)
+  await page.evaluate(() => {
+    const store = window.__messageHubMock
+    const originalView = store.groupInvitation.bind(store)
+    const originalAccept = store.acceptGroupInvitation.bind(store)
+    let syncing = false
+    let firstAttempt = true
+    Object.assign(store, {
+      groupInvitation: (...args: Parameters<typeof originalView>) => {
+        const view = originalView(...args)
+        return syncing ? { ...view, state: 'syncing' } : view
+      },
+      acceptGroupInvitation: async (...args: Parameters<typeof originalAccept>) => {
+        if (firstAttempt) {
+          firstAttempt = false
+          syncing = true
+          throw Error('group-sync-pending')
+        }
+        await originalAccept(...args)
+        syncing = false
+      },
+    })
+  })
+  const card = page.getByTestId('group-notice')
+  await card.getByRole('button', { name: 'Join group' }).click()
+  await expect(card).toHaveAttribute('data-state', 'syncing')
+  await expect(card).toContainText('Accepted, waiting for group sync')
+  await expect(card.getByRole('alert')).toContainText('you can safely retry')
+  await expect(card.getByRole('button', { name: 'Open', exact: true })).toHaveCount(0)
+  await card.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(card).toHaveAttribute('data-state', 'joined')
+  await expect(card.getByRole('button', { name: 'Open', exact: true })).toBeVisible()
+  await expect(card.getByRole('alert')).toHaveCount(0)
+})
+
+test('session guests: the invite card is accepted, the owner accepts for an agent, and guest sessions are badged', async ({ page }) => {
+  await openHub(page, CAROL)
+  const agentInvite = page.locator('[data-testid="group-notice"][data-action="invite"]')
+  await expect(agentInvite).toContainText('Carol Wang invited your agent CodeAssistant to join')
+  await agentInvite.getByRole('button', { name: 'Accept for the agent' }).click()
+  await expect(agentInvite).toContainText('Agent joined')
+  expect(await page.evaluate(({ group, member }) => window.__messageHubMock.getSnapshot().groups[group].members[member].state, { group: BOOK, member: 'did:buckyos:agent:codeassistant' })).toBe('active')
+
+  const sessionInvite = page.locator('[data-testid="group-notice"][data-action="session_invite"]')
+  await expect(sessionInvite).toContainText('invited you to the session "Reading list"')
+  await sessionInvite.getByRole('button', { name: 'Accept' }).click()
+  await expect(sessionInvite).toContainText('Joined')
+  await sessionInvite.getByRole('button', { name: 'Open' }).click()
+  await expect(page.getByRole('button', { name: 'Entity details: Book Club' }).last()).toBeVisible()
+  await expect(page.getByTestId('action-message').last()).toHaveText('You joined this session')
+  await expect(page.locator('textarea')).toBeVisible()
+
+  await page.getByRole('button', { name: /^Product Team/ }).click()
+  await page.getByRole('button', { name: 'Sessions', exact: true }).click()
+  const row = page.locator('[data-testid="session-row"]', { hasText: 'Design review' })
+  await expect(row.getByTestId('session-badge')).toHaveText('Has guests')
+  await row.getByRole('button', { name: /Design review/ }).first().click()
+  await page.getByRole('button', { name: 'Session details' }).last().click()
+  const details = page.getByTestId('session-details')
+  await expect(details.getByTestId('guest-badge')).toHaveText('Has guests')
+  await expect(details.getByTestId('session-announcement')).toContainText('Review every Thursday.')
+  await expect(details.getByTestId('group-session-actions').getByRole('button', { name: 'Archive session' })).toBeVisible()
+  await details.getByTestId('shared-state-form').getByLabel('Announcement').fill('Moved to Friday.')
+  await details.getByTestId('shared-state-form').getByRole('button', { name: 'Save' }).click()
+  await expect(details.getByTestId('session-announcement')).toContainText('Moved to Friday.')
+  await page.screenshot({ path: 'test-results/messagehub-group-session-details.png' })
+})
+
+test('message relations: edit, reaction, reply, recall, admin delete, mentions and read receipts', async ({ page }) => {
+  await openHub(page, TEAM)
+  const SESSION = 'session-team-1'
+  const history = page.getByTestId('conversation-history')
+  // A reply bubble quotes its target, so plain bubbles are the ones without a quote.
+  const bubble = (text: string) => history.locator('[data-testid="message-bubble"]', { hasText: text }).filter({ hasNot: page.getByTestId('reply-quote') })
+  const replyBubble = (text: string) => history.locator('[data-testid="message-bubble"]', { hasText: text }).filter({ has: page.getByTestId('reply-quote') })
+  await page.locator('textarea').fill('Draft one')
+  await page.keyboard.press('Enter')
+  await expect(bubble('Draft one')).toBeVisible()
+  await expect(bubble('Draft one').getByTestId('read-receipt')).toContainText('Read by 2')
+
+  await bubble('Draft one').getByTestId('message-actions').click()
+  await page.getByRole('menuitem', { name: 'Edit' }).click()
+  await expect(page.getByTestId('composer-relation')).toHaveAttribute('data-kind', 'edit')
+  await expect(page.locator('textarea')).toHaveValue('Draft one')
+  await page.locator('textarea').fill('Draft two')
+  await page.keyboard.press('Enter')
+  await expect(bubble('Draft two')).toBeVisible()
+  await expect(bubble('Draft two').getByTestId('edited-marker')).toHaveText('edited')
+  await expect(history.getByText('Draft one', { exact: true })).toHaveCount(0)
+
+  await bubble('Draft two').getByRole('button', { name: 'React with 👍' }).click()
+  await expect(bubble('Draft two').getByTestId('reactions')).toContainText('👍 1')
+  await expect(bubble('Draft two').getByTestId('reactions').getByRole('button', { pressed: true })).toHaveCount(1)
+  const targetId = await page.evaluate(async ({ context, id }) => (await window.__messageHubMock.reader(context, id).readRange(0, 500)).find(message => message.content.content === 'Draft one')?.ui_message_id, { context: OWN, id: SESSION })
+  expect(targetId).toBeTruthy()
+  await page.evaluate(({ owner, id, target }) => window.__messageHubMock.injectRelation(owner, id, 'did:buckyos:person:bob', target!, { rel: 'reaction', key: '👍' }, '👍'), { owner: SELF, id: SESSION, target: targetId as string })
+  await expect(bubble('Draft two').getByTestId('reactions')).toContainText('👍 2')
+  await page.evaluate(({ owner, id, target }) => window.__messageHubMock.injectRelation(owner, id, 'did:buckyos:person:bob', target!, { rel: 'thread' }, 'Looks good'), { owner: SELF, id: SESSION, target: targetId as string })
+  await expect(replyBubble('Looks good').getByTestId('reply-quote')).toContainText('Draft two')
+
+  await bubble('Draft two').getByTestId('message-reply').click()
+  await expect(page.getByTestId('composer-relation')).toContainText('Replying to You')
+  await page.getByTestId('mention-button').click()
+  await page.getByTestId('mention-picker').getByRole('option', { name: 'Bob Zhang' }).click()
+  await expect(page.locator('textarea')).toHaveValue('@Bob Zhang ')
+  await page.locator('textarea').press('End')
+  await page.keyboard.type('ping')
+  await page.keyboard.press('Enter')
+  await expect(replyBubble('@Bob Zhang ping').getByTestId('reply-quote')).toContainText('Draft two')
+  const sent = await page.evaluate(async ({ context, id }) => (await window.__messageHubMock.reader(context, id).readRange(0, 500)).find(message => message.content.content === '@Bob Zhang ping'), { context: OWN, id: SESSION })
+  expect(sent).toMatchObject({ mentions: { dids: ['did:buckyos:person:bob'] }, relates_to: { rel: 'thread', target: targetId } })
+  await page.getByTestId('mention-button').click()
+  await expect(page.getByTestId('mention-picker').getByRole('option', { name: /@all/ })).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  await page.evaluate(({ owner, id, self }) => window.__messageHubMock.injectMessage(owner, id, { from: 'did:buckyos:person:bob', to: [owner], kind: 'group_msg', created_at_ms: Date.now(), ui_message_id: 'msg-bob-mention', ui_sender_name: 'Bob Zhang', mentions: { dids: [self] }, content: { format: 'text/plain', content: 'Hey you' } }), { owner: SELF, id: SESSION, self: SELF })
+  await expect(bubble('Hey you').getByTestId('mention-badge')).toBeVisible()
+  await page.screenshot({ path: 'test-results/messagehub-group-relations.png' })
+
+  await bubble('Hey you').getByTestId('message-delete').click()
+  await page.getByRole('menuitem', { name: 'Delete for everyone' }).click()
+  await expect(history.getByTestId('message-redacted').filter({ hasText: 'deleted by You' })).toBeVisible()
+  await bubble('Draft two').getByTestId('message-delete').click()
+  await page.getByRole('menuitem', { name: 'Recall' }).click()
+  await expect(history.getByTestId('message-redacted').filter({ hasText: 'Message recalled' })).toBeVisible()
+  await expect(history.getByText('Draft two', { exact: true })).toHaveCount(0)
+})
+
+test('typing @ suggests the session members and picks one with the keyboard', async ({ page }) => {
+  await openHub(page, TEAM)
+  const input = page.locator('textarea')
+  const picker = page.getByTestId('mention-picker')
+  await input.click()
+  await input.pressSequentially('mail@example.com and ')
+  await expect(picker).toHaveCount(0)
+  await input.pressSequentially('@bo')
+  await expect(picker.getByRole('option')).toHaveText(['Bob Zhang'])
+  await expect(input).toHaveAttribute('aria-activedescendant', /option-0$/)
+  await page.keyboard.press('Enter')
+  await expect(input).toHaveValue('mail@example.com and @Bob Zhang ')
+  await expect(picker).toHaveCount(0)
+
+  await input.pressSequentially('and @')
+  await expect(picker.getByRole('option')).toHaveText([/@all/, 'Alice Chen', 'Bob Zhang', 'Dave Li', 'CodeAssistant'])
+  await page.keyboard.press('ArrowDown')
+  await expect(picker.getByRole('option', { name: 'Alice Chen' })).toHaveAttribute('aria-selected', 'true')
+  await page.screenshot({ path: 'test-results/messagehub-mention-autocomplete.png' })
+  await page.keyboard.press('Tab')
+  await expect(input).toHaveValue('mail@example.com and @Bob Zhang and @Alice Chen ')
+
+  // Escape closes the suggestions without leaving the draft; Enter then sends.
+  await input.pressSequentially('@da')
+  await expect(picker.getByRole('option')).toHaveText(['Dave Li'])
+  await page.keyboard.press('Escape')
+  await expect(picker).toHaveCount(0)
+  await page.keyboard.press('Enter')
+  const content = 'mail@example.com and @Bob Zhang and @Alice Chen @da'
+  await expect(page.getByTestId('conversation-history').getByText(content)).toBeVisible()
+  const sent = await page.evaluate(async ({ context, id, content }) => (await window.__messageHubMock.reader(context, id).readRange(0, 500)).find(message => message.content.content === content), { context: OWN, id: 'session-team-1', content })
+  expect(sent?.mentions).toEqual({ dids: [BOB, 'did:buckyos:person:alice'] })
+})
+
+test('the participants of a named group session are listed and can be removed', async ({ page }) => {
+  await openHub(page, TEAM)
+  await page.getByRole('button', { name: 'Sessions', exact: true }).click()
+  await page.locator('[data-testid="session-row"]', { hasText: 'Design review' }).getByRole('button', { name: /Design review/ }).first().click()
+  await page.getByRole('button', { name: 'Session details' }).last().click()
+  const participants = page.getByTestId('session-details').getByTestId('session-participants')
+  await expect(participants.locator('li')).toHaveCount(6)
+  await expect(participants.locator('li').first()).toHaveAttribute('data-member-did', 'did:buckyos:person:alice')
+  await expect(participants.locator('li').first()).toContainText('Owner')
+  await expect(participants.locator('li[data-kind="guest"]')).toContainText('Guest')
+  // Neither the owner nor the viewer is offered for removal.
+  await expect(participants.locator('li[data-member-did="did:buckyos:person:alice"]').getByRole('button')).toHaveCount(0)
+  await expect(participants.locator(`li[data-member-did="${SELF}"]`).getByRole('button')).toHaveCount(0)
+  await page.screenshot({ path: 'test-results/messagehub-session-participants.png' })
+
+  await participants.getByRole('button', { name: 'Remove from session: Bob Zhang' }).click()
+  await page.getByRole('dialog').getByRole('button', { name: 'Remove from session' }).click()
+  await expect(participants.locator(`li[data-member-did="${BOB}"]`)).toHaveCount(0)
+  await expect(page.getByTestId('action-message').last()).toHaveText('You removed Bob Zhang from this session')
+  expect(await page.evaluate(group => window.__messageHubMock.getSnapshot().groups[group].sessions['design-review'].participants['did:buckyos:person:bob'], TEAM)).toBe('removed')
+
+  // Mentions follow the session's participants.
+  await page.getByTestId('session-details').getByRole('button', { name: 'Close' }).click()
+  const input = page.getByTestId('message-composer').locator('textarea')
+  await input.click()
+  await input.pressSequentially('@')
+  await expect(page.getByTestId('mention-picker').getByRole('option', { name: 'Bob Zhang' })).toHaveCount(0)
+  await expect(page.getByTestId('mention-picker').getByRole('option', { name: 'Dave Li' })).toBeVisible()
+})

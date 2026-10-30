@@ -8,7 +8,7 @@
  * backend data, the UI does not self-persist. Refresh = back to seeds.
  */
 
-import type { FileEntry, SortDir, SortKey } from '../types'
+import type { CollectionSummary, FileEntry, SortDir, SortKey } from '../types'
 import type { CollectionNode, CollectionReader } from '../data/CollectionModel'
 import type {
   FileItem,
@@ -16,18 +16,14 @@ import type {
   ListQuery,
   LocationCapabilities,
 } from '../data/FolderReader'
+import { registerCollectionDirectory } from '../data/collectionDirectory'
 import { registerReaderProvider } from '../data/readerRegistry'
 import { resolveTarget } from '../data/targetResolver'
 import { compareEntries } from '../data/sortEntries'
 import { collectionUrl, dfsPathOf, parseCollectionUrl } from '../data/urls'
 import { mockDelay } from '../data/mockReader'
 
-export interface CollectionSummary {
-  id: string
-  title: string
-  /** Reference count across all nested groups. */
-  refCount: number
-}
+export type { CollectionSummary }
 
 interface CollectionDef {
   id: string
@@ -424,5 +420,15 @@ export function registerCollectionReader() {
   registerReaderProvider({
     scheme: 'collection',
     create: (url) => new MockCollectionReader(url),
+  })
+  registerCollectionDirectory({
+    subscribe: (listener) => collectionStore.subscribeList(listener),
+    snapshot: () => collectionStore.listSnapshot(),
+    list: () => collectionStore.list(),
+    get: (id) => collectionStore.get(id),
+    create: async (title) => {
+      await mockDelay(20, 60)
+      return collectionStore.create(title)
+    },
   })
 }

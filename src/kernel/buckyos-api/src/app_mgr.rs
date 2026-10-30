@@ -1,12 +1,19 @@
 //system control panel client
 
 use crate::{
-    AppClass, AppDoc, InstanceVolumeConfig, PermissionItem, RdbInstanceConfig, ServiceProtocol,
+    AppDoc, AppId, AppInstanceId, DeploymentPackage, InstanceVolumeConfig, NodeExecutionSpec,
+    PermissionItem, RdbInstanceConfig, ServiceProtocol, SubPkgDesc, TaskId,
+    NODE_EXECUTION_SPEC_SCHEMA_VERSION,
 };
 use ::kRPC::*;
 use name_lib::DID;
+use ndn_lib::ObjId;
+use package_lib::PackageId;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
 pub const SERVICE_INSTANCE_INFO_UPDATE_INTERVAL: u64 = 30;
 
@@ -15,21 +22,73 @@ pub const KNOWN_SERVICE_HTTP: (&str, u16) = ("http", 80);
 pub const KNOWN_SERVICE_HTTPS: (&str, u16) = ("https", 443);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentIdentity {
+    pub app_instance_id: AppInstanceId,
+    pub task_id: TaskId,
+    pub app_doc_object_id: ObjId,
+    pub spec_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pikg_digest: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentHealth {
+    Unknown,
+    Healthy,
+    Unhealthy,
+    Materialized,
+    GatewayReady,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeploymentError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Why the scheduler places no instance of an App spec: the product does not
+/// run it, or no node can (`services/<spec_id>/schedule_status`). Absent
+/// once the spec is placed.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecScheduleStatus {
+    pub code: String,
+    pub message: String,
+}
+
+pub fn spec_schedule_status_key(spec_id: &str) -> String {
+    format!("services/{spec_id}/schedule_status")
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StaticWebDeploymentEvidence {
+    pub deployment: DeploymentIdentity,
+    pub node_id: String,
+    pub content_id: String,
+    pub gateway_config_generation: String,
+    pub materialized_at: u64,
+    pub gateway_ready_at: u64,
+    pub observed_at: u64,
+    pub expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_error: Option<DeploymentError>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ServiceState {
-    #[serde(alias = "New")]
     New,
-    #[serde(alias = "Running", alias = "Deployed", alias = "deployed")]
     Running,
-    #[serde(alias = "Stopped", alias = "Disable")]
     Stopped,
-    #[serde(alias = "Stopping")]
     Stopping,
-    #[serde(alias = "Restarting")]
     Restarting,
-    #[serde(alias = "Updating")]
     Updating,
-    #[serde(alias = "Deleted")]
     Deleted,
 }
 
@@ -51,9 +110,8 @@ pub enum ServiceInstanceState {
 }
 
 //用于上报给调度器的实例信息
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ServiceInstanceReportInfo {
-    pub instance_id: String,
     pub node_id: String,
     pub node_did: DID,
     pub state: ServiceInstanceState,
@@ -61,6 +119,15 @@ pub struct ServiceInstanceReportInfo {
     pub last_update_time: u64,
     pub start_time: u64,
     pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentIdentity>,
+    pub instance_epoch: String,
+    pub node_session_id: String,
+    pub observed_at: u64,
+    pub expires_at: u64,
+    pub health: DeploymentHealth,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_error: Option<DeploymentError>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -232,6 +299,12 @@ pub struct ServiceSpecConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub rdb_instances: HashMap<String, RdbInstanceConfig>,
+    /// Declared object buckets; nfs-server creates them lazily from this spec.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub buckets: HashMap<String, bucket_store::BucketDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_quota_mib: Option<u64>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub bash_envs: HashMap<String, String>,
@@ -264,6 +337,8 @@ impl Default for ServiceSpecConfig {
             start_param: None,
             res_pool_id: default_res_pool_id(),
             rdb_instances: HashMap::new(),
+            buckets: HashMap::new(),
+            storage_quota_mib: None,
             instance_volume: InstanceVolumeConfig::default(),
             bash_envs: HashMap::new(),
             runtime_caps: HashMap::new(),
@@ -282,12 +357,24 @@ impl ServiceSpecConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AppServiceSpec {
+    pub app_instance_id: AppInstanceId,
+    pub app_did: DID,
+    pub deployment: DeploymentIdentity,
     pub app_doc: AppDoc,
-    pub app_index: u16,  //app index in user's app list
-    pub user_id: String, //app's owner userid,注意不应该假设所有的请求都来自该用户
-    pub app_class: AppClass,
+    /// scheduler-only projection from `system/app_registry`.
+    pub app_name: String,
+    /// scheduler-only projection from `system/app_registry`.
+    pub app_host_name: String,
+    /// scheduler-only projection from `system/app_registry`.
+    pub app_index: u16,
+    pub owner_user_id: String,
     pub permission: Vec<PermissionItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_components: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<DeploymentPackage>,
 
     //与调度器相关的关键参数
     pub enable: bool,
@@ -301,33 +388,122 @@ pub struct AppServiceSpec {
 }
 
 impl AppServiceSpec {
-    pub fn app_id(&self) -> &str {
-        self.app_doc.name.as_str()
+    pub fn is_installed(&self) -> bool {
+        self.state != ServiceState::Deleted
     }
 
-    pub fn app_instance_id(&self) -> String {
-        format!("{}@{}", self.app_id(), self.user_id)
+    pub fn app_id(&self) -> &AppId {
+        self.app_instance_id.app_id()
+    }
+
+    pub fn app_instance_id(&self) -> &AppInstanceId {
+        &self.app_instance_id
+    }
+
+    pub fn to_node_execution_spec(&self) -> Result<NodeExecutionSpec> {
+        if self.app_instance_id != self.deployment.app_instance_id
+            || self.owner_user_id != self.app_instance_id.owner_user_id()
+            || AppId::from_app_did(&self.app_did).as_ref() != Ok(self.app_id())
+        {
+            return Err(RPCErrors::ReasonError(
+                "AppServiceSpec contains inconsistent identity fields".to_string(),
+            ));
+        }
+        let mut packages = BTreeMap::new();
+        for package in &self.packages {
+            let parsed = PackageId::parse(&package.pkg_id).map_err(|error| {
+                RPCErrors::ReasonError(format!(
+                    "deployment package `{}` has invalid PackageId: {error}",
+                    package.sub_pkg_name
+                ))
+            })?;
+            if parsed.objid.as_deref() != Some(package.package_meta_object_id.to_string().as_str())
+            {
+                return Err(RPCErrors::ReasonError(format!(
+                    "deployment package `{}` does not pin its Package Meta ObjectId",
+                    package.sub_pkg_name
+                )));
+            }
+            let previous = packages.insert(
+                package.sub_pkg_name.clone(),
+                SubPkgDesc {
+                    pkg_id: package.pkg_id.clone(),
+                    pkg_objid: Some(package.package_meta_object_id.clone()),
+                    docker_image_name: package.docker_image_name.clone(),
+                    docker_image_digest: package.docker_image_digest.clone(),
+                    source_url: None,
+                    selector: None,
+                    required: Some(true),
+                },
+            );
+            if previous.is_some() {
+                return Err(RPCErrors::ReasonError(format!(
+                    "duplicate deployment package `{}`",
+                    package.sub_pkg_name
+                )));
+            }
+        }
+        Ok(NodeExecutionSpec {
+            schema_version: NODE_EXECUTION_SPEC_SCHEMA_VERSION,
+            app_instance_id: self.app_instance_id.clone(),
+            app_did: self.app_did.clone(),
+            app_doc_object_id: self.deployment.app_doc_object_id.clone(),
+            spec_generation: self.deployment.spec_generation,
+            app_type: self.app_doc.get_app_type(),
+            packages,
+            permission: self.permission.clone(),
+            service_spec_config: self.spec_config.clone(),
+            app_name: self.app_name.clone(),
+            app_host_name: self.app_host_name.clone(),
+            app_index: self.app_index,
+        })
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+/// How a node runs an app instance. An Agent's Agent Service runs natively
+/// when its owner (the zone owner) chose the node's host-native runtime as
+/// its default ([`crate::native_agent_node`]); everything else runs as the
+/// scheduler and the node's container support decide.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRunMode {
+    #[default]
+    Container,
+    Native,
+}
+
+impl AppRunMode {
+    pub fn is_container(&self) -> bool {
+        *self == AppRunMode::Container
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AppServiceInstanceConfig {
     pub target_state: ServiceInstanceState,
     pub node_id: String,
-    pub app_spec: AppServiceSpec,
+    pub node_execution_spec: NodeExecutionSpec,
     //service_name -> service instance port ,use instance port can access the service
     pub service_ports_config: HashMap<String, u16>,
-    //#[serde(skip_serializing_if = "Option::is_none")]
-    //pub node_install_config: Option<ServiceSpecConfig>,//当存在的时候，覆盖app_spec.spec_config,目前只是占位，并未使用
+    pub deployment: DeploymentIdentity,
+    #[serde(default, skip_serializing_if = "AppRunMode::is_container")]
+    pub run_mode: AppRunMode,
 }
 impl AppServiceInstanceConfig {
-    pub fn new(node_id: &str, app_config: &AppServiceSpec) -> AppServiceInstanceConfig {
-        AppServiceInstanceConfig {
+    pub fn new(node_id: &str, app_config: &AppServiceSpec) -> Result<AppServiceInstanceConfig> {
+        let node_execution_spec = app_config.to_node_execution_spec()?;
+        node_execution_spec
+            .validate_against(&app_config.deployment)
+            .map_err(RPCErrors::ReasonError)?;
+        Ok(AppServiceInstanceConfig {
             target_state: ServiceInstanceState::Started,
             node_id: node_id.to_string(),
-            app_spec: app_config.clone(),
+            node_execution_spec,
             service_ports_config: HashMap::new(),
-        }
+            deployment: app_config.deployment.clone(),
+            run_mode: AppRunMode::Container,
+        })
     }
 
     pub fn to_string(&self) -> String {
@@ -445,6 +621,7 @@ mod tests {
                 "create table demo(id int)".to_string(),
             )]),
             connection: "postgres://scheduler-assigned".to_string(),
+            partitions: vec![crate::RdbPartition::UserData],
         };
         let mut spec = ServiceSpecConfig::default();
         spec.rdb_instances.insert("main".to_string(), rdb.clone());

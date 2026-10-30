@@ -1,0 +1,82 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 1,
+  "revision_seq": 7,
+  "provider_profile_id": "kimi",
+  "models": [],
+  "patterns": [
+    {
+      "match": "*",
+      "operations": { "llm": "chat.completions.create", "vision.ocr": "chat.completions.create", "vision.caption": "chat.completions.create" }
+    }
+  ],
+  "variants": [
+    {"model_driver": "kimi", "variant": "reasoning-low", "match": {"origin_model_id": "kimi-k3", "variant": "reasoning-low"}, "provider_options": {"reasoning_effort": "low"}},
+    {"model_driver": "kimi", "variant": "reasoning-high", "match": {"origin_model_id": "kimi-k3", "variant": "reasoning-high"}, "provider_options": {"reasoning_effort": "high"}},
+    {"model_driver": "kimi", "variant": "reasoning-max", "match": {"origin_model_id": "kimi-k3", "variant": "reasoning-max"}, "provider_options": {"reasoning_effort": "max"}},
+    {"model_driver": "kimi", "variant": "reasoning-medium", "match": {"origin_model_id": ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"], "variant": "reasoning-medium"}, "provider_options": {"thinking": {"type": "enabled", "keep": "all"}}},
+    {"model_driver": "kimi", "variant": "reasoning-medium", "match": {"origin_model_id": "kimi-k2.6", "variant": "reasoning-medium"}, "provider_options": {"thinking": {"type": "enabled"}}},
+    {"model_driver": "kimi", "variant": "reasoning-none", "match": {"origin_model_id": "kimi-k2.6", "variant": "reasoning-none"}, "provider_options": {"thinking": {"type": "disabled"}}}
+  ],
+  "model_pricing": [
+    {
+      "pricing": {
+        "source_url": "https://platform.kimi.com/docs/pricing/chat",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 2e-05,
+        "output_token": 0.0001,
+        "cache_input_token": 2e-06,
+        "cache_write_input_token": 2e-05,
+        "cache_write_1h_input_token": 4e-05
+      },
+      "match": {
+        "provider_model_id": "kimi-k3",
+        "region": "china"
+      }
+    },
+    {
+      "pricing": {
+        "source_url": "https://platform.kimi.com/docs/pricing/chat",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 6.5e-06,
+        "output_token": 2.7e-05,
+        "cache_input_token": 1.3e-06
+      },
+      "match": {
+        "provider_model_id": "kimi-k2.7-code",
+        "region": "china"
+      }
+    },
+    {
+      "pricing": {
+        "source_url": "https://platform.kimi.com/docs/pricing/chat",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 1.3e-05,
+        "output_token": 5.4e-05,
+        "cache_input_token": 2.6e-06
+      },
+      "match": {
+        "provider_model_id": "kimi-k2.7-code-highspeed",
+        "region": "china"
+      }
+    },
+    {
+      "pricing": {
+        "source_url": "https://platform.kimi.com/docs/pricing/chat",
+        "verified_at": "2026-09-26",
+        "currency": "CNY",
+        "input_token": 6.5e-06,
+        "output_token": 2.7e-05,
+        "cache_input_token": 1.1e-06
+      },
+      "match": {
+        "provider_model_id": "kimi-k2.6",
+        "region": "china"
+      }
+    }
+  ]
+}

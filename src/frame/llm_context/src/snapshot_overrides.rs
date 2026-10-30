@@ -1,23 +1,15 @@
-//! Snapshot overrides — the data shape and helpers that schedulers use to
-//! rebuild the next [`LLMContext`] from a previous run's snapshot while
-//! changing only the inputs they care about (system prompt, tool policy,
-//! ...). Inherited state (`accumulated` history, step records, usage,
-//! pending tool calls — though see the pre-condition below) carries over
-//! unchanged.
+//! Snapshot overrides — rebuilding the next [`LLMContext`] of the *same*
+//! run from its own snapshot while changing request-side inputs (tool
+//! policy, budget, …). Inherited state (`accumulated` history, step records,
+//! usage) carries over unchanged.
 //!
-//! Three scheduler modes are expressed via the same two functions:
-//!
-//! - **switch** — same session, swap system messages + tool policy, persist
-//!   the rebuilt snapshot back to the session's state file.
-//! - **fork** — sub-context inherits parent snapshot, runs to completion,
-//!   parent resumes from its own on-disk snapshot. The sub-context's
-//!   rebuilt snapshot is intentionally never persisted.
-//! - **independent** — each named behavior has its own snapshot file; the
-//!   active one is loaded, optionally rebuilt with new policies, and run.
-//!
-//! Originally lived in `opendan::llm_context_helper`. Moved here so the
-//! waist owns its own data-rebuilding surface; opendan now imports these
-//! types directly rather than re-defining them.
+//! This is not how one context hands over to another. A hand-over never
+//! replaces the system prompt over an existing history: the target either
+//! resumes its own snapshot (SWITCH_CONTEXT), or is derived as a child with
+//! [`crate::context_derive::derive_child`] (create-sub-context, own system)
+//! or [`crate::context_derive::fork_snapshot`] (fork, same system and
+//! complete history). `RequestOverrides.system_messages` /
+//! `user_messages` remain for the legacy opendan runtime only.
 
 use buckyos_api::{AiMessage, AiRole};
 
@@ -29,6 +21,7 @@ use crate::request::{
     BudgetSpec, ErrorPolicy, HumanPolicy, LLMContextRequest, ModelPolicy, OutputSpec, ToolPolicy,
 };
 use crate::state::LLMContextSnapshot;
+use crate::suspension::strip_snapshot_thinking;
 
 /// Overlay applied to a base [`LLMContextSnapshot`] before rebuilding the next
 /// [`LLMContext`]. Every field is `Option`/`bool` so callers only specify what
@@ -52,10 +45,11 @@ pub struct RequestOverrides {
     pub error_policy: Option<ErrorPolicy>,
     pub output: Option<OutputSpec>,
 
-    /// Reset `state.rounds_left` to the new `tool_policy.max_rounds`. Caller
-    /// sets `true` for fork / independent, leaves `false` for switch (which
-    /// continues the parent budget).
-    pub reset_rounds: bool,
+    /// Reset `state.tool_iterations_left` to the new
+    /// `tool_policy.max_tool_iterations`. Caller sets `true` for fork /
+    /// independent, leaves `false` for switch (which continues the parent
+    /// budget).
+    pub reset_tool_iterations: bool,
     /// Reset `state.consecutive_errors` to 0. Caller sets `true` for fork /
     /// independent — switch keeps the counter so a behavior swap cannot
     /// silently bypass the error cap.
@@ -75,18 +69,30 @@ pub struct RequestOverrides {
 ///
 /// Maintains the invariant that `request.input` and `state.accumulated` share
 /// the same leading System segment.
+///
+/// Thinking is only valid for the model and the exact prefix (system, tools,
+/// earlier messages) it was produced with. When an override really changes
+/// that prefix — system messages, history, the offered tool set, the model
+/// or the behavior the steps are rendered for — every thinking block of the
+/// snapshot is dropped. Overrides that leave the prefix alone keep it.
 pub fn apply_overrides_to_snapshot(
     mut snap: LLMContextSnapshot,
     ov: RequestOverrides,
 ) -> LLMContextSnapshot {
+    let mut prefix_changed = false;
     if let Some(new_system) = ov.system_messages {
+        prefix_changed |= split_leading_system(&snap.request.input).0 != new_system.as_slice()
+            || split_leading_system(&snap.state.accumulated).0 != new_system.as_slice();
         replace_leading_system(&mut snap.request.input, &new_system);
         replace_leading_system(&mut snap.state.accumulated, &new_system);
     }
     if let Some(new_user) = ov.user_messages {
+        prefix_changed = true;
         replace_after_leading_system(&mut snap.request.input, &new_user);
         replace_after_leading_system(&mut snap.state.accumulated, &new_user);
-        snap.state.pending_tool_calls.clear();
+        snap.state.suspended = None;
+        snap.state.tool_batch = None;
+        snap.state.action_step = None;
         snap.state.steps.clear();
         snap.state.history_summaries.clear();
         snap.state.history_inputs.clear();
@@ -95,14 +101,15 @@ pub fn apply_overrides_to_snapshot(
     }
 
     if let Some(tp) = ov.tool_policy {
-        if ov.reset_rounds {
-            snap.state.rounds_left = tp.max_rounds;
+        prefix_changed |= offered_tools_differ(&snap.request.tool_policy, &tp);
+        if ov.reset_tool_iterations {
+            snap.state.tool_iterations_left = tp.max_tool_iterations;
         }
         snap.request.tool_policy = tp;
-    } else if ov.reset_rounds {
+    } else if ov.reset_tool_iterations {
         // No new policy supplied but caller asked for reset — reset to the
-        // existing policy's max_rounds.
-        snap.state.rounds_left = snap.request.tool_policy.max_rounds;
+        // existing policy's max_tool_iterations.
+        snap.state.tool_iterations_left = snap.request.tool_policy.max_tool_iterations;
     }
 
     if ov.reset_errors {
@@ -113,12 +120,15 @@ pub fn apply_overrides_to_snapshot(
         snap.request.objective = obj;
     }
     if let Some(behavior_name) = ov.behavior_name {
+        prefix_changed |= snap.request.behavior_name != behavior_name;
         snap.request.behavior_name = behavior_name;
     }
     if let Some(trace) = ov.trace {
         snap.request.trace = trace;
     }
     if let Some(mp) = ov.model_policy {
+        prefix_changed |= snap.request.model_policy.preferred != mp.preferred
+            || snap.request.model_policy.fallbacks != mp.fallbacks;
         snap.request.model_policy = mp;
     }
     if let Some(b) = ov.budget {
@@ -149,7 +159,29 @@ pub fn apply_overrides_to_snapshot(
         }
     }
 
+    if prefix_changed {
+        strip_snapshot_thinking(&mut snap);
+    }
+
     snap
+}
+
+/// Whether two policies offer the model a different tool / action set.
+/// Budgets and dispatch options are not part of the request prefix.
+fn offered_tools_differ(old: &ToolPolicy, new: &ToolPolicy) -> bool {
+    old.mode != new.mode
+        || old.whitelist != new.whitelist
+        || old.action_mode != new.action_mode
+        || old.action_whitelist != new.action_whitelist
+        || old.disable_capabilities != new.disable_capabilities
+}
+
+fn split_leading_system(msgs: &[AiMessage]) -> (&[AiMessage], &[AiMessage]) {
+    let leading = msgs
+        .iter()
+        .position(|m| m.role != AiRole::System)
+        .unwrap_or(msgs.len());
+    msgs.split_at(leading)
 }
 
 /// Replace the leading run of `System`-role messages in `msgs` with `new_system`.
@@ -179,18 +211,19 @@ fn replace_after_leading_system(msgs: &mut Vec<AiMessage>, new_tail: &[AiMessage
 /// the request side. Used by **switch** (caller writes snapshot back to the
 /// session) and **fork** (caller throws sub snapshot away after sub run ends).
 ///
-/// Returns `Err(SnapshotCorrupted)` if the base snapshot is in a suspended
-/// state (has `pending_tool_calls`) — caller must resume that one first via
-/// the normal [`LLMContext::resume`] flow before inheriting from it.
+/// Returns `Err(SnapshotCorrupted)` if the base snapshot is suspended or a
+/// tool batch / behavior step is only partly dispatched — caller must resume
+/// that one first via the normal [`LLMContext::resume`] flow before
+/// inheriting from it.
 pub fn rebuild_with_inherit(
     base_snap: LLMContextSnapshot,
     overrides: RequestOverrides,
     deps: LLMContextDeps,
 ) -> Result<LLMContext, LLMComputeError> {
-    if !base_snap.state.pending_tool_calls.is_empty() {
+    if base_snap.state.suspended.is_some() || base_snap.state.has_continuation() {
         return Err(LLMComputeError::SnapshotCorrupted(
-            "rebuild_with_inherit: base snapshot has pending tool calls — \
-             resume the pending tools before forking/switching"
+            "rebuild_with_inherit: base snapshot is suspended or mid-batch — \
+             resume it before forking/switching"
                 .to_string(),
         ));
     }
@@ -240,7 +273,7 @@ mod tests {
         };
         let mut state = LLMContextState::from_request(&request, 0);
         state.accumulated = accumulated;
-        state.rounds_left = request.tool_policy.max_rounds;
+        state.tool_iterations_left = request.tool_policy.max_tool_iterations;
         LLMContextSnapshot { request, state }
     }
 
@@ -314,7 +347,7 @@ mod tests {
         assert_eq!(out.request.input[1].text_content(), "u");
         assert_eq!(out.state.accumulated[0].text_content(), "sys-new");
         assert_eq!(out.state.accumulated[1].text_content(), "u");
-        // Accumulated tail (assistant from earlier rounds) survives.
+        // Accumulated tail (assistant messages of earlier inferences) survives.
         assert_eq!(out.state.accumulated[2].text_content(), "a-runtime");
     }
 
@@ -342,35 +375,35 @@ mod tests {
     }
 
     #[test]
-    fn apply_overrides_reset_rounds_uses_new_policy() {
+    fn apply_overrides_reset_tool_iterations_uses_new_policy() {
         let snap = snap_with(vec![msg(AiRole::User, "u")], vec![msg(AiRole::User, "u")]);
         let mut tp = ToolPolicy::default();
         tp.mode = ToolMode::Whitelist;
-        tp.max_rounds = 99;
+        tp.max_tool_iterations = 99;
         let ov = RequestOverrides {
             tool_policy: Some(tp),
-            reset_rounds: true,
+            reset_tool_iterations: true,
             ..Default::default()
         };
         let out = apply_overrides_to_snapshot(snap, ov);
-        assert_eq!(out.state.rounds_left, 99);
-        assert_eq!(out.request.tool_policy.max_rounds, 99);
+        assert_eq!(out.state.tool_iterations_left, 99);
+        assert_eq!(out.request.tool_policy.max_tool_iterations, 99);
     }
 
     #[test]
-    fn apply_overrides_no_reset_keeps_rounds_left() {
+    fn apply_overrides_no_reset_keeps_tool_iterations_left() {
         let mut snap = snap_with(vec![msg(AiRole::User, "u")], vec![msg(AiRole::User, "u")]);
-        snap.state.rounds_left = 3; // mid-run state
+        snap.state.tool_iterations_left = 3; // mid-run state
         let mut tp = ToolPolicy::default();
-        tp.max_rounds = 99;
+        tp.max_tool_iterations = 99;
         let ov = RequestOverrides {
             tool_policy: Some(tp),
-            reset_rounds: false,
+            reset_tool_iterations: false,
             ..Default::default()
         };
         let out = apply_overrides_to_snapshot(snap, ov);
-        assert_eq!(out.state.rounds_left, 3, "switch must not reset budget");
-        assert_eq!(out.request.tool_policy.max_rounds, 99);
+        assert_eq!(out.state.tool_iterations_left, 3, "switch must not reset budget");
+        assert_eq!(out.request.tool_policy.max_tool_iterations, 99);
     }
 
     #[test]

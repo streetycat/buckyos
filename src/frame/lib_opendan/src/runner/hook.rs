@@ -1,0 +1,255 @@
+//! The checkpoint hook (§8.3 / §8.5).
+//!
+//! The hook runs before every inference with the outer snapshot: it
+//! publishes the snapshot with the tool results it now contains (clears the
+//! in-flight markers it covers), routes what the bus delivered meanwhile
+//! (controls are applied, Observe events are merged into `pending_events`
+//! and saved) and refreshes the activity heartbeat.
+//!
+//! Inputs are never injected here: reaching a checkpoint, finishing a tool
+//! call or receiving an Observe event never puts a message or an event into
+//! the context. Saved semi-subscription state waits for the next controlled
+//! input (`on_init / on_input / on_context_switch`), which renders it as the
+//! snapshot message in front of its own. The one host observation placed
+//! here is the background after tool results of a run that asks for it
+//! (`[input] background = "after_tools"`, see `observe.rs`).
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use llm_context::deps::{CheckpointHook, Injection};
+use llm_context::state::LLMContextSnapshot;
+use serde_json::{json, Value};
+
+use crate::error::Result;
+use crate::protocol::*;
+use crate::session::runs::RunHandle;
+use crate::state::declared_refs;
+
+use super::inputs::route_inputs;
+use super::shared::{report, Shared};
+
+pub(super) fn watched_view(status: &SessionStatus, watch: &[String]) -> Value {
+    let full = json!({
+        "run_state": status.run_state,
+        "outcome": status.outcome,
+        "acceptance": status.acceptance,
+        "one_line_status": status.one_line_status,
+    });
+    let mut out = serde_json::Map::new();
+    let fields: Vec<String> = if watch.is_empty() {
+        vec![
+            "run_state".into(),
+            "outcome".into(),
+            "acceptance".into(),
+            "one_line_status".into(),
+        ]
+    } else {
+        watch.to_vec()
+    };
+    for f in fields {
+        out.insert(f.clone(), full.get(&f).cloned().unwrap_or(Value::Null));
+    }
+    Value::Object(out)
+}
+
+/// The per-run checkpoint hook.
+pub struct SessionCheckpointHook {
+    shared: Arc<Shared>,
+    run: RunHandle,
+    rounds: Arc<super::rounds::RoundCounter>,
+    /// The run is shown background after its tool results.
+    background: bool,
+    behavior: bool,
+}
+
+impl SessionCheckpointHook {
+    pub fn new(
+        shared: Arc<Shared>,
+        run: RunHandle,
+        rounds: Arc<super::rounds::RoundCounter>,
+    ) -> Self {
+        let background = super::observe::enabled(&run);
+        let behavior = run.record().config.loop_model == agent_tool::xllm::LoopModel::Behavior;
+        Self {
+            shared,
+            run,
+            rounds,
+            background,
+            behavior,
+        }
+    }
+
+    async fn boundary(&self, snapshot: &LLMContextSnapshot) -> Result<()> {
+        let sh = &self.shared;
+        sh.lease.check()?;
+        super::drive::verify_workspace_admission(sh).await?;
+        // Tool results first: publish and clear covered in-flight actions.
+        self.run.checkpoint_with_results(snapshot, None)?;
+        super::rounds::flush_counts(sh, &self.run, &self.rounds).await?;
+        super::reports::sync_xml(sh, &self.run, snapshot).await?;
+        // Controls, rejected records, Observe events. msg / Input events
+        // stay queued for the next controlled input.
+        route_inputs(sh, true, &[]).await?;
+        let (stop, turn_stop) = {
+            let s = sh.session.lock().await;
+            (s.state.stop_requested, s.state.turn_stop_requested)
+        };
+        if stop || turn_stop {
+            if let Some(h) = sh.interrupt.lock().expect("interrupt lock").as_ref() {
+                h.interrupt(if stop {
+                    "session stop requested"
+                } else {
+                    "turn stop requested"
+                });
+            }
+            return Ok(());
+        }
+        // A Turn that reached a tool call tells the other side it is being
+        // worked on; its task follows what the session does.
+        let tool_called = sh.current_tool.lock().expect("current tool").is_some();
+        super::outbound::maybe_placeholder(sh, tool_called).await;
+        super::turn_task::sync_turn_task(sh).await;
+        self.heartbeat().await
+    }
+
+    /// Merge inferred touching, refresh the heartbeat (throttled commit).
+    async fn heartbeat(&self) -> Result<()> {
+        let sh = &self.shared;
+        let touched: Vec<Touching> = std::mem::take(&mut *sh.touched.lock().expect("touched"));
+        let now = crate::now_ms();
+        let mut s = sh.session.lock().await;
+        let before = s.state.activity.touching.clone();
+        for t in touched {
+            s.state.activity.touch(t);
+        }
+        let changed = s.state.activity.touching != before;
+        let due = now.saturating_sub(s.state.activity.heartbeat_ms)
+            >= sh.deps.options.heartbeat_interval.as_millis() as u64;
+        if changed || due {
+            s.state.activity.heartbeat_ms = now;
+            s.commit_state(&sh.lease)?;
+            let status = s.status(sh.lease.epoch());
+            drop(s);
+            report(sh, status).await;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl CheckpointHook for SessionCheckpointHook {
+    async fn before_tool_call(
+        &self,
+        snapshot: &LLMContextSnapshot,
+    ) -> std::result::Result<(), String> {
+        self.shared.lease.check().map_err(|e| e.to_string())?;
+        super::drive::verify_workspace_admission(&self.shared)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.run
+            .checkpoint_with_results(snapshot, None)
+            .map_err(|e| e.to_string())?;
+        super::rounds::flush_counts(&self.shared, &self.run, &self.rounds)
+            .await
+            .map_err(|e| e.to_string())?;
+        super::reports::sync_xml(&self.shared, &self.run, snapshot)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn validate_report(
+        &self,
+        _snapshot: &LLMContextSnapshot,
+        result: &llm_context::behavior_loop::LLMBehaviorResult,
+        step_index: u32,
+    ) -> std::result::Result<(), String> {
+        let args = super::reports::ReportArgs {
+            report: result.self_report.clone().unwrap_or_default(),
+            artifacts: result.report_artifacts.clone(),
+            result: result.report_result.clone(),
+            is_end: result.report_end,
+        };
+        if self
+            .run
+            .reports()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|r| r.source == ReportSource::Behavior { step_index })
+        {
+            return Ok(());
+        }
+        super::reports::validate(&self.shared, &self.run, &args)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn before_inference(
+        &self,
+        snapshot: &LLMContextSnapshot,
+    ) -> std::result::Result<Option<Injection>, String> {
+        self.boundary(snapshot).await.map_err(|e| e.to_string())?;
+        if !self.background {
+            return Ok(None);
+        }
+        super::observe::at_boundary(&self.shared, snapshot, self.behavior)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Hand-overs to a Todo executor and yields are the session's to judge
+    /// (TodoList §2.2): refused, they are corrected in the same run.
+    async fn review_decision(
+        &self,
+        snapshot: &LLMContextSnapshot,
+        result: &llm_context::LLMBehaviorResult,
+        _step_index: u32,
+        decision: llm_context::StepDecision,
+    ) -> Option<llm_context::DecisionVerdict> {
+        let run_id = self.run.run_id();
+        match decision {
+            llm_context::StepDecision::Handover => {
+                let target = result.next_behavior.as_deref()?.trim();
+                if !agent_tool::xllm::is_handover_target(target) {
+                    return None;
+                }
+                super::todos::review_handover(&self.shared, run_id, target).await
+            }
+            llm_context::StepDecision::Yield => {
+                super::todos::review_yield(&self.shared, run_id, snapshot).await
+            }
+        }
+    }
+}
+
+/// Refs a session declared at creation (for activity initialization).
+pub fn scope_touching(cfg: &SessionConfig, entry: Option<&RegistryEntry>) -> Vec<Touching> {
+    let mut out = Vec::new();
+    if let Some(e) = entry {
+        for r in declared_refs(e) {
+            let kind = if r.starts_with("artifact:") {
+                "artifact"
+            } else if r.starts_with("ws:") || r.starts_with('/') {
+                "path"
+            } else {
+                "object"
+            };
+            out.push(Touching {
+                kind: kind.into(),
+                target: r,
+                mode: "write".into(),
+                since_ms: crate::now_ms(),
+            });
+        }
+    } else if let Some(scope) = &cfg.session.scope {
+        for p in &scope.paths {
+            out.push(Touching {
+                kind: "path".into(),
+                target: p.clone(),
+                mode: "write".into(),
+                since_ms: crate::now_ms(),
+            });
+        }
+    }
+    out
+}

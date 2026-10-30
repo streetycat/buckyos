@@ -1,26 +1,54 @@
+mod buckets;
 mod contact_mgr;
-mod group_mgr;
+mod contact_lookup;
+mod contact_rpc;
+mod cyfs_dispatch;
+mod friend_service;
+mod group_auth;
+mod group_http;
+mod group_publication;
+mod group_remote;
+mod group_service;
+mod group_store;
+mod group_sync;
+mod group_types;
 mod message_hub;
 mod msg_box_db;
 mod msg_center;
 mod msg_tunnel;
+mod notify;
+mod network_directory;
+mod obj_provider;
+mod object_access;
+mod owner_session;
+mod owner_session_db;
+#[cfg(test)]
+mod test_contact_network;
+#[cfg(test)]
+mod test_group_service;
+#[cfg(test)]
+mod test_group_remote;
+#[cfg(test)]
+mod test_hybrid_sso;
 #[cfg(test)]
 mod test_msg_center;
+#[cfg(test)]
+mod test_notify;
 mod tg_tunnel;
+mod zone_agent;
 
 use ::kRPC::*;
 use anyhow::{Context, Result};
 use buckyos_api::{
     get_buckyos_api_runtime, init_buckyos_api_runtime, set_buckyos_api_runtime, AccountBinding,
     BuckyOSRuntimeType, DeliveryRecordWithObject, DeliveryReportResult, DeliveryState,
-    MsgCenterClient, MsgCenterServerHandler,
-    SystemConfigClient, UserContactSettings, UserPrivateProfile, UserSettings, UserState,
-    MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
+    project_contacts, MsgCenterClient, MsgCenterServerHandler, SystemConfigClient,
+    UserContactSettings, UserGroupDirectory, UserPrivateProfile, UserSettings,
+    contact_tag_kind, ContactTagKind, MSG_CENTER_SERVICE_NAME, MSG_CENTER_SERVICE_PORT,
 };
 use buckyos_http_server::Runner;
 use buckyos_http_server::{
-    serve_http_by_rpc_handler, server_err, HttpServer, ServerError, ServerErrorCode, ServerResult,
-    StreamInfo,
+    serve_http_by_rpc_handler, HttpServer, ServerError, ServerResult, StreamInfo,
 };
 use buckyos_kit::{get_buckyos_service_data_dir, init_logging};
 use bytes::Bytes;
@@ -31,16 +59,20 @@ use name_lib::DID;
 use ndn_lib::{MsgContent, MsgContentFormat, MsgObject};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::contact_mgr::ZoneUserContactSeed;
+use crate::contact_mgr::{ContactProjection, ProjectedContact, ZoneUserContactSeed};
+use crate::msg_center::ZoneAccounts;
 use crate::message_hub::MessageHubExecutor;
 use crate::msg_center::MessageCenter;
 use crate::msg_tunnel::{DeliveryExecutor, DeliveryExecutorMgr, ExecutorInstanceState};
+use crate::owner_session::serve_with_request_identity;
 use crate::tg_tunnel::{GrammersTgGatewayConfig, TgBotBinding, TgTunnel, TgTunnelConfig};
+use crate::zone_agent::{load_zone_agents, ZoneAgent, TELEGRAM_PLATFORM};
 
 const MSG_CENTER_HTTP_PATH: &str = "/kapi/msg-center";
 const MSG_CENTER_DEFAULT_TG_TUNNEL_DID: &str = "did:bns:msg-center-default-tunnel";
@@ -51,6 +83,7 @@ const METHOD_SERVICE_RELOAD_SETTINGS: &str = "service.reload_settings";
 const METHOD_REALOAD_SETTINGS: &str = "reaload_settings";
 const METHOD_SERVICE_REALOAD_SETTINGS: &str = "service.reaload_settings";
 const DELIVERY_PUMP_IDLE_SLEEP_MS: u64 = 300;
+const ZONE_USER_SYNC_INTERVAL_SECS: u64 = 30;
 const DELIVERY_PUMP_ERROR_SLEEP_MS: u64 = 1_000;
 const DELIVERY_PUMP_RETRY_AFTER_MS: u64 = 2_000;
 
@@ -65,7 +98,7 @@ struct RawMsgCenterSettings {
     telegram_tunnel: Option<TelegramTunnelSettings>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TelegramGatewayMode {
     DryRun,
@@ -79,7 +112,7 @@ impl Default for TelegramGatewayMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 struct TelegramGatewaySettings {
     #[serde(default)]
     mode: TelegramGatewayMode,
@@ -91,7 +124,7 @@ struct TelegramGatewaySettings {
     session_dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct TelegramBindingSettings {
     owner_did: String,
     bot_token: String,
@@ -101,7 +134,7 @@ struct TelegramBindingSettings {
     extra: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 struct TelegramTunnelSettings {
     #[serde(default = "default_tg_tunnel_enabled")]
     enabled: bool,
@@ -138,43 +171,34 @@ impl Default for TelegramTunnelSettings {
 
 struct MsgCenterHttpServer {
     rpc_handler: MsgCenterServerHandler<MessageCenter>,
-    executor_mgr: Arc<DeliveryExecutorMgr>,
+    zone_sync: Arc<ZoneSync>,
+    objects: std::sync::OnceLock<buckyos_http_server::DIDObjectHttpServer<buckyos_api::KrpcObjectProvider>>,
 }
 
 impl MsgCenterHttpServer {
-    fn new(center: MessageCenter, executor_mgr: Arc<DeliveryExecutorMgr>) -> Self {
+    fn new(center: MessageCenter, zone_sync: Arc<ZoneSync>) -> Self {
         Self {
             rpc_handler: MsgCenterServerHandler::new(center),
-            executor_mgr,
+            zone_sync,
+            objects: std::sync::OnceLock::new(),
         }
     }
 
+    fn enable_objects(self: &Arc<Self>, zone_did: name_lib::DID) {
+        let provider = obj_provider::provider(Arc::downgrade(self), zone_did);
+        let _ = self.objects.set(provider.into_http_server());
+    }
+
     async fn handle_reload_settings(&self) -> std::result::Result<serde_json::Value, RPCErrors> {
-        let runtime = get_buckyos_api_runtime()
-            .map_err(|err| RPCErrors::ReasonError(format!("get runtime failed: {}", err)))?;
-        let settings = match runtime.get_my_settings().await {
-            Ok(settings) => settings,
-            Err(err) => {
-                warn!(
-                    "load msg-center settings failed during reload, use empty settings: {}",
-                    err
-                );
-                serde_json::json!({})
-            }
-        };
-
-        let tunnel_result =
-            apply_tg_tunnel_settings(&self.rpc_handler.0, self.executor_mgr.as_ref(), &settings)
-                .await
-                .map_err(|err| {
-                    RPCErrors::ReasonError(format!("reload msg-center settings failed: {}", err))
-                })?;
-
-        if let Err(error) = sync_zone_user_contacts_once(&self.rpc_handler.0, &settings).await {
-            warn!("reload settings zone-user sync failed: {}", error);
-        }
-
-        Ok(tunnel_result)
+        let settings = load_msg_center_settings().await.map_err(|err| {
+            RPCErrors::ReasonError(format!("load msg-center settings failed: {}", err))
+        })?;
+        let dispatch_settings = cyfs_dispatch::CyfsDispatchSettings::parse(&settings)
+            .map_err(|e| RPCErrors::ParseRequestError(e.to_string()))?;
+        *self.rpc_handler.0.cyfs_dispatch.write().unwrap() = dispatch_settings;
+        self.zone_sync.sync(&settings, true).await.map_err(|err| {
+            RPCErrors::ReasonError(format!("reload msg-center settings failed: {}", err))
+        })
     }
 }
 
@@ -185,19 +209,58 @@ impl RPCHandler for MsgCenterHttpServer {
         req: RPCRequest,
         ip_from: IpAddr,
     ) -> std::result::Result<RPCResponse, RPCErrors> {
-        if req.method == METHOD_RELOAD_SETTINGS
-            || req.method == METHOD_SERVICE_RELOAD_SETTINGS
-            || req.method == METHOD_REALOAD_SETTINGS
-            || req.method == METHOD_SERVICE_REALOAD_SETTINGS
-        {
-            let result = self.handle_reload_settings().await?;
+        let center = &self.rpc_handler.0;
+        if req.method == group_service::METHOD_GROUP_DESCRIBE_ENTRY {
+            let value = center.describe_group_entry(&req.params).await?;
             return Ok(RPCResponse {
-                result: RPCResult::Success(result),
+                result: RPCResult::Success(value),
                 seq: req.seq,
                 trace_id: req.trace_id,
             });
         }
-        self.rpc_handler.handle_rpc_call(req, ip_from).await
+        if req.token.is_none() {
+            return Err(RPCErrors::NoPermission("authentication-required".into()));
+        }
+        let method = req.method.clone();
+        let request = Box::pin(async move {
+            let ctx = RPCContext::from_request(&req, ip_from);
+            // Every method checks the session first: restricted sessions only
+            // reach the methods that open their scope (D-4).
+            center.caller_identity(&ctx).await?;
+            if req.method == METHOD_RELOAD_SETTINGS
+                || req.method == METHOD_SERVICE_RELOAD_SETTINGS
+                || req.method == METHOD_REALOAD_SETTINGS
+                || req.method == METHOD_SERVICE_REALOAD_SETTINGS
+            {
+                center.require_service_caller(&ctx).await?;
+                let result = self.handle_reload_settings().await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(result),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            if req.method == buckyos_api::METHOD_MSG_COLLECT_ATTACHMENT {
+                let value = center.collect_attachment(req.params.clone(), &ctx).await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(value),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            if req.method.starts_with("group.") {
+                let value = center
+                    .group_rpc(&req.method, req.params.clone(), ctx)
+                    .await?;
+                return Ok(RPCResponse {
+                    result: RPCResult::Success(value),
+                    seq: req.seq,
+                    trace_id: req.trace_id,
+                });
+            }
+            self.rpc_handler.handle_rpc_call(req, ip_from).await
+        });
+        owner_session::serve_method(&method, request).await
     }
 }
 
@@ -205,16 +268,33 @@ impl RPCHandler for MsgCenterHttpServer {
 impl HttpServer for MsgCenterHttpServer {
     async fn serve_request(
         &self,
-        req: http::Request<BoxBody<Bytes, ServerError>>,
+        mut req: http::Request<BoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
-        if *req.method() == Method::POST {
-            return serve_http_by_rpc_handler(req, info, self).await;
-        }
-        Err(server_err!(
-            ServerErrorCode::BadRequest,
-            "Method not allowed"
-        ))
+        serve_with_request_identity(async move {
+            if let Some(response) = group_http::serve(&self.rpc_handler.0, &mut req).await {
+                return Ok(response);
+            }
+            if let Some(response) = object_access::serve(&self.rpc_handler.0, &req).await {
+                return Ok(response);
+            }
+            if let Some(objects) = self.objects.get() {
+                if req.uri().path().starts_with(&format!("{MSG_CENTER_HTTP_PATH}/obj")) {
+                    return objects.serve_request(req, info).await;
+                }
+            }
+            if *req.method() == Method::POST
+                && (req.uri().path() == MSG_CENTER_HTTP_PATH
+                    || req
+                        .uri()
+                        .path()
+                        .starts_with(&format!("{MSG_CENTER_HTTP_PATH}/")))
+            {
+                return serve_http_by_rpc_handler(req, info, self).await;
+            }
+            Ok(cyfs_dispatch::serve(&self.rpc_handler.0, req).await)
+        })
+        .await
     }
 
     fn id(&self) -> String {
@@ -259,43 +339,6 @@ fn parse_msg_center_settings(settings: &Value) -> Result<MsgCenterSettings> {
 
     let telegram_tunnel = raw.telegram_tunnel.unwrap_or_default();
     Ok(MsgCenterSettings { telegram_tunnel })
-}
-
-fn collect_sync_owner_dids(raw_settings: &Value) -> Vec<DID> {
-    let mut owners = Vec::new();
-    let settings = match parse_msg_center_settings(raw_settings) {
-        Ok(settings) => settings,
-        Err(error) => {
-            warn!(
-                "parse msg-center settings failed while collecting sync owners: {}",
-                error
-            );
-            return owners;
-        }
-    };
-
-    for binding in settings.telegram_tunnel.bindings {
-        let owner_raw = binding.owner_did.trim();
-        if owner_raw.is_empty() {
-            continue;
-        }
-        match DID::from_str(owner_raw) {
-            Ok(owner) => {
-                if !owners.iter().any(|existing| existing == &owner) {
-                    owners.push(owner);
-                }
-            }
-            Err(error) => {
-                warn!(
-                    "skip invalid telegram binding owner_did while collecting sync owners: owner_did={}, error={}",
-                    owner_raw,
-                    error
-                );
-            }
-        }
-    }
-
-    owners
 }
 
 fn now_ms() -> u64 {
@@ -441,10 +484,8 @@ fn build_delivery_failure_notice(record: &DeliveryRecordWithObject) -> Option<Ms
         content: text,
         ..Default::default()
     };
-    msg.meta.insert(
-        "delivery_failure_fallback".to_string(),
-        Value::Bool(true),
-    );
+    msg.meta
+        .insert("delivery_failure_fallback".to_string(), Value::Bool(true));
     Some(msg)
 }
 
@@ -481,46 +522,44 @@ fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSet
         .and_then(|value| serde_json::from_value::<UserContactSettings>(value.clone()).ok())
 }
 
+/// The contact of an account. Its DID is the account's (`users/<id>/doc`);
+/// the user-writable profile only adds display data, a note, user tags and
+/// platform bindings, never another DID or a system tag.
 fn build_zone_user_seed(
     username: &str,
-    settings: UserSettings,
+    settings: &UserSettings,
+    did: DID,
     profile: Option<UserPrivateProfile>,
 ) -> Option<ZoneUserContactSeed> {
-    if !matches!(settings.state, UserState::Active) {
+    if !settings.is_active() {
         return None;
     }
 
-    let mut contact_did = DID::new("bns", username);
     let mut note = None;
-    let mut groups = vec!["zone_user".to_string()];
     let mut tags = vec!["zone_user".to_string()];
     let mut bindings = Vec::new();
 
     if let Some(contact_cfg) = profile.as_ref().and_then(profile_system_contact) {
-        if let Some(raw_did) = contact_cfg.did.as_ref() {
-            let did = raw_did.trim();
-            if !did.is_empty() {
-                match DID::from_str(did) {
-                    Ok(parsed) => {
-                        contact_did = parsed;
-                    }
-                    Err(error) => {
-                        warn!(
-                            "invalid user contact.did, fallback to did:bns:{}: did={}, error={}",
-                            username, did, error
-                        );
-                    }
-                }
-            }
-        }
-
         note = contact_cfg.note;
-        groups.extend(contact_cfg.groups);
-        tags.extend(contact_cfg.tags);
+        tags.extend(
+            contact_cfg
+                .tags
+                .into_iter()
+                .filter(|tag| contact_tag_kind(tag) == ContactTagKind::User),
+        );
 
         for binding in contact_cfg.bindings {
             let platform = binding.platform.trim().to_string();
-            let account_id = binding.account_id.trim().to_string();
+            let account_id = binding.account_id.trim();
+            let account_id = if platform.eq_ignore_ascii_case(TELEGRAM_PLATFORM) {
+                account_id
+                    .strip_prefix("user:")
+                    .unwrap_or(account_id)
+                    .trim()
+            } else {
+                account_id
+            }
+            .to_string();
             if platform.is_empty() || account_id.is_empty() {
                 warn!(
                     "skip invalid user tunnel binding for {}: platform='{}', account_id='{}'",
@@ -555,13 +594,15 @@ fn build_zone_user_seed(
         }
     }
 
-    let name = profile
+    let public_profile = profile.as_ref().map(UserPrivateProfile::to_public_profile);
+    let name = public_profile
         .as_ref()
         .and_then(|profile| profile.display_name.as_ref().or(profile.name.as_ref()))
         .map(|value| value.trim().to_string())
         .unwrap_or_default();
     Some(ZoneUserContactSeed {
-        did: contact_did,
+        avatar: public_profile.and_then(|profile| profile.avatar),
+        did,
         name: if name.is_empty() {
             username.to_string()
         } else {
@@ -569,7 +610,6 @@ fn build_zone_user_seed(
         },
         note,
         bindings,
-        groups,
         tags,
     })
 }
@@ -600,21 +640,154 @@ async fn load_zone_user_profile(
     }
 }
 
-async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
+/// One account record of the Zone as the zone sync reads it.
+#[derive(Debug, Clone)]
+struct ZoneAccount {
+    username: String,
+    settings: UserSettings,
+    did: DID,
+    /// Present for active accounts.
+    seed: Option<ZoneUserContactSeed>,
+}
+
+/// The Zone's account records and user groups (product/users_and_agents/UserType.md).
+#[derive(Debug, Clone, Default)]
+struct ZoneDirectory {
+    accounts: Vec<ZoneAccount>,
+    /// Every account name, including records that cannot be read.
+    names: Vec<String>,
+    groups: UserGroupDirectory,
+}
+
+impl ZoneDirectory {
+    fn seeds(&self) -> Vec<ZoneUserContactSeed> {
+        self.accounts
+            .iter()
+            .filter_map(|account| account.seed.clone())
+            .collect()
+    }
+
+    /// Who is a local recipient: active Admin and User accounts.
+    fn zone_accounts(&self) -> ZoneAccounts {
+        ZoneAccounts {
+            recipients: self
+                .accounts
+                .iter()
+                .filter(|account| {
+                    account.seed.is_some() && account.settings.user_type.can_receive_direct_messages()
+                })
+                .filter_map(|account| account.seed.as_ref().map(|seed| seed.did.to_string()))
+                .collect(),
+            dids: self
+                .accounts
+                .iter()
+                .map(|account| account.did.to_string())
+                .collect(),
+            names: self.names.iter().cloned().collect(),
+            user_ids: self
+                .accounts
+                .iter()
+                .map(|account| (account.did.to_string(), account.username.clone()))
+                .collect(),
+        }
+    }
+
+    /// Every active account's view of the others through the projection rules.
+    fn contact_projection(&self, built_at_ms: u64) -> ContactProjection {
+        let rules = self.groups.projection_rules();
+        let defined = self.groups.defined_group_ids();
+        let active: Vec<(&ZoneAccount, &ZoneUserContactSeed, UserSettings)> = self
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let seed = account.seed.as_ref()?;
+                let mut settings = account.settings.clone();
+                settings.user_id = account.username.clone();
+                Some((account, seed, settings))
+            })
+            .collect();
+        let mut projection = ContactProjection {
+            built_at_ms,
+            ..Default::default()
+        };
+        for (_, viewer_seed, viewer) in &active {
+            let viewer_did = viewer_seed.did.to_string();
+            if !viewer.can_edit_contacts() {
+                projection.read_only_owners.insert(viewer_did.clone());
+            }
+            let visible = project_contacts(
+                &rules,
+                &defined,
+                viewer,
+                active.iter().map(|(_, _, settings)| settings),
+            );
+            let entries: HashMap<DID, ProjectedContact> = active
+                .iter()
+                .filter_map(|(account, seed, _)| {
+                    let sources = visible.get(&account.username)?;
+                    Some((
+                        seed.did.clone(),
+                        ProjectedContact {
+                            seed: (*seed).clone(),
+                            sources: sources.iter().map(ToString::to_string).collect(),
+                        },
+                    ))
+                })
+                .filter(|(did, _)| did.to_string() != viewer_did)
+                .collect();
+            if !entries.is_empty() {
+                projection.by_owner.insert(viewer_did, entries);
+            }
+        }
+        projection
+    }
+
+    /// What a sync would change besides the contact seeds.
+    fn signature(&self) -> String {
+        let mut parts: Vec<String> = self
+            .accounts
+            .iter()
+            .map(|account| {
+                format!(
+                    "{}|{}|{}|{}|{:?}|{:?}",
+                    account.username,
+                    account.did.to_string(),
+                    account.settings.user_type,
+                    String::from(account.settings.state.clone()),
+                    account.settings.groups,
+                    account.settings.allow_contact_edit
+                )
+            })
+            .collect();
+        parts.extend(self.names.iter().map(|name| format!("name|{name}")));
+        parts.sort();
+        parts.push(serde_json::to_string(&self.groups.projection_rules()).unwrap_or_default());
+        let mut groups: Vec<&String> = self.groups.groups.iter().map(|g| &g.group_id).collect();
+        groups.sort();
+        parts.push(format!("{groups:?}"));
+        parts.join("\n")
+    }
+}
+
+async fn load_zone_directory() -> Result<ZoneDirectory> {
     let runtime = get_buckyos_api_runtime()?;
     let control_panel_client = runtime
         .get_control_panel_client()
         .await
         .map_err(|error| anyhow::anyhow!("get control panel client failed: {}", error))?;
 
-    let users = control_panel_client
+    let names = control_panel_client
         .get_user_list()
         .await
         .map_err(|error| anyhow::anyhow!("list users failed: {}", error))?;
-    let mut contacts = Vec::new();
+    let groups = control_panel_client
+        .load_user_groups()
+        .await
+        .map_err(|error| anyhow::anyhow!("load user groups failed: {}", error))?;
     let system_config_client = runtime.get_system_config_client().await?;
+    let mut accounts = Vec::new();
 
-    for username in users {
+    for username in names.iter() {
         let settings = match control_panel_client
             .get_user_settings_by_username(username.as_str())
             .await
@@ -628,48 +801,297 @@ async fn load_zone_user_contact_seeds() -> Result<Vec<ZoneUserContactSeed>> {
                 continue;
             }
         };
+        let did = match control_panel_client.get_user_did(username.as_str()).await {
+            Ok(did) => did,
+            Err(error) => {
+                warn!("account {} has no readable DID document; skipped: {}", username, error);
+                continue;
+            }
+        };
         let profile = load_zone_user_profile(&system_config_client, username.as_str()).await;
+        let seed = build_zone_user_seed(username.as_str(), &settings, did.clone(), profile);
+        accounts.push(ZoneAccount {
+            username: username.clone(),
+            settings,
+            did,
+            seed,
+        });
+    }
 
-        if let Some(seed) = build_zone_user_seed(username.as_str(), settings, profile) {
-            contacts.push(seed);
+    Ok(ZoneDirectory {
+        accounts,
+        names,
+        groups,
+    })
+}
+
+async fn load_msg_center_settings() -> Result<Value> {
+    Ok(get_buckyos_api_runtime()?.get_my_settings().await?)
+}
+
+async fn load_system_zone_agents() -> Result<Vec<ZoneAgent>> {
+    let client = get_buckyos_api_runtime()?
+        .get_system_config_client()
+        .await?;
+    load_zone_agents(client.as_ref()).await
+}
+
+/// The Telegram bindings to run: msg-center settings plus each Agent's own
+/// bot from `settings.msg_tunnels` (`owner_did` = Agent DID). An Agent's own
+/// bot replaces a settings binding of the same Agent.
+fn with_agent_telegram_bindings(
+    mut tunnel: TelegramTunnelSettings,
+    agents: &[ZoneAgent],
+) -> TelegramTunnelSettings {
+    let agent_bindings: Vec<TelegramBindingSettings> = agents
+        .iter()
+        .filter_map(|agent| {
+            let (bot_token, bot_account_id) = agent.telegram_tunnel()?;
+            Some(TelegramBindingSettings {
+                owner_did: agent.did().to_string(),
+                bot_token: bot_token.to_string(),
+                bot_account_id: bot_account_id.map(str::to_string),
+                extra: HashMap::new(),
+            })
+        })
+        .collect();
+    tunnel.bindings.retain(|binding| {
+        !agent_bindings
+            .iter()
+            .any(|agent| agent.owner_did == binding.owner_did.trim())
+    });
+    tunnel.bindings.extend(agent_bindings);
+    tunnel
+        .bindings
+        .sort_by(|left, right| left.owner_did.cmp(&right.owner_did));
+    tunnel
+}
+
+/// What msg-center follows from system-config: the Telegram bot bindings and
+/// the zone user / Agent contacts. Users, Agents and their settings change
+/// without notifying msg-center, so they are re-read every
+/// `ZONE_USER_SYNC_INTERVAL_SECS`; `reload_settings` runs a round at once.
+/// Rounds run one at a time and only rebuild what changed.
+struct ZoneSync {
+    center: MessageCenter,
+    executor_mgr: Arc<DeliveryExecutorMgr>,
+    applied: tokio::sync::Mutex<AppliedZoneSync>,
+}
+
+#[derive(Default)]
+struct AppliedZoneSync {
+    tunnel: Option<(TelegramTunnelSettings, Value)>,
+    contacts: Option<String>,
+}
+
+impl ZoneSync {
+    fn new(center: MessageCenter, executor_mgr: Arc<DeliveryExecutorMgr>) -> Self {
+        Self {
+            center,
+            executor_mgr,
+            applied: tokio::sync::Mutex::new(AppliedZoneSync::default()),
         }
     }
 
-    Ok(contacts)
+    async fn sync(&self, raw_settings: &Value, force: bool) -> Result<Value> {
+        let agents = load_system_zone_agents().await?;
+        self.apply(raw_settings, &agents, force).await
+    }
+
+    /// `force` rebuilds the tunnel executors and rewrites contacts even when
+    /// nothing changed. Tunnel configuration errors are returned; contact
+    /// sync failures are retried by the next round.
+    async fn apply(
+        &self,
+        raw_settings: &Value,
+        agents: &[ZoneAgent],
+        force: bool,
+    ) -> Result<Value> {
+        let settings = parse_msg_center_settings(raw_settings)?;
+        let tunnel = with_agent_telegram_bindings(settings.telegram_tunnel, agents);
+        let mut applied = self.applied.lock().await;
+        let unchanged = applied
+            .tunnel
+            .as_ref()
+            .is_some_and(|(current, _)| *current == tunnel);
+        if force || !unchanged {
+            match apply_tg_tunnel_settings(&self.center, self.executor_mgr.as_ref(), &tunnel).await
+            {
+                Ok(result) => applied.tunnel = Some((tunnel, result)),
+                Err(error) => {
+                    applied.tunnel = Some((
+                        tunnel,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    ));
+                    return Err(error);
+                }
+            }
+        }
+        let result = applied
+            .tunnel
+            .as_ref()
+            .map(|(_, result)| result.clone())
+            .unwrap_or_default();
+        if let Err(error) = self.sync_contacts(&mut applied, agents, force).await {
+            if force {
+                return Err(error);
+            }
+            warn!("zone contact sync failed: {}", error);
+        }
+        Ok(result)
+    }
+
+    async fn sync_contacts(
+        &self,
+        applied: &mut AppliedZoneSync,
+        agents: &[ZoneAgent],
+        force: bool,
+    ) -> Result<()> {
+        let directory = load_zone_directory().await?;
+        let signature = format!(
+            "{}\n{}",
+            zone_contact_seed_signature(&directory.seeds(), agents),
+            directory.signature()
+        );
+        if !force && applied.contacts.as_deref() == Some(signature.as_str()) {
+            return Ok(());
+        }
+        apply_zone_directory(&self.center, &directory).await?;
+        sync_zone_agent_contacts(&self.center, &directory.seeds(), agents).await?;
+        applied.contacts = Some(signature);
+        Ok(())
+    }
 }
 
-async fn sync_zone_user_contacts_once(center: &MessageCenter, raw_settings: &Value) -> Result<()> {
-    let contacts = load_zone_user_contact_seeds().await?;
-    let mut owner_scopes: Vec<Option<DID>> = vec![None];
-    for owner in collect_sync_owner_dids(raw_settings) {
-        owner_scopes.push(Some(owner));
+fn avatar_fingerprint(avatar: Option<&str>) -> String {
+    avatar
+        .map(|avatar| hex::encode(Sha256::digest(avatar.as_bytes())))
+        .unwrap_or_default()
+}
+
+/// What a contact sync would write, without the per-load binding timestamps.
+fn zone_contact_seed_signature(seeds: &[ZoneUserContactSeed], agents: &[ZoneAgent]) -> String {
+    let mut parts: Vec<String> = seeds
+        .iter()
+        .map(|seed| {
+            let mut bindings: Vec<String> = seed
+                .bindings
+                .iter()
+                .map(|binding| {
+                    let mut meta: Vec<_> = binding.meta.iter().collect();
+                    meta.sort();
+                    format!(
+                        "{}|{}|{}|{}|{:?}",
+                        binding.platform,
+                        binding.account_id,
+                        binding.display_id,
+                        binding.tunnel_instance_id,
+                        meta
+                    )
+                })
+                .collect();
+            bindings.sort();
+            format!(
+                "{}|{}|{}|{:?}|{:?}|{:?}",
+                seed.did.to_string(),
+                seed.name,
+                avatar_fingerprint(seed.avatar.as_deref()),
+                seed.note,
+                seed.tags,
+                bindings
+            )
+        })
+        .collect();
+    parts.extend(agents.iter().map(|agent| {
+        format!(
+            "agent|{}|{}|{}|{}",
+            agent.did().to_string(),
+            agent.owner().to_string(),
+            agent.display_name(),
+            avatar_fingerprint(agent.profile.avatar.as_deref())
+        )
+    }));
+    parts.sort();
+    parts.join("\n")
+}
+
+fn start_zone_sync(sync: Arc<ZoneSync>) {
+    tokio::spawn(async move {
+        let period = std::time::Duration::from_secs(ZONE_USER_SYNC_INTERVAL_SECS);
+        loop {
+            tokio::time::sleep(period).await;
+            let settings = match load_msg_center_settings().await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    warn!("load msg-center settings for zone sync failed: {}", error);
+                    continue;
+                }
+            };
+            if let Err(error) = sync.sync(&settings, false).await {
+                warn!("periodic zone sync failed: {}", error);
+            }
+        }
+    });
+}
+
+async fn sync_zone_agent_contacts(
+    center: &MessageCenter,
+    users: &[ZoneUserContactSeed],
+    agents: &[ZoneAgent],
+) -> Result<()> {
+    for agent in agents {
+        let owner_contact = users
+            .iter()
+            .find(|user| &user.did == agent.owner())
+            .cloned()
+            .unwrap_or_else(|| ZoneUserContactSeed {
+                avatar: None,
+                did: agent.owner().clone(),
+                name: agent.owner().id.clone(),
+                note: None,
+                bindings: vec![],
+                tags: vec![],
+            });
+        center.register_local_recipients([agent.did().clone()]);
+        center
+            .upsert_zone_user_contacts(vec![owner_contact], Some(agent.did().clone()))
+            .await?;
+        center
+            .contact_mgr
+            .upsert_zone_agent_contacts(
+                vec![ZoneUserContactSeed {
+                    avatar: agent.profile.avatar.clone(),
+                    did: agent.did().clone(),
+                    name: agent.display_name(),
+                    note: None,
+                    bindings: vec![],
+                    tags: vec![],
+                }],
+                agent.owner().clone(),
+            )
+            .await?;
     }
+    Ok(())
+}
 
-    for owner in owner_scopes {
-        let updated = center
-            .upsert_zone_user_contacts(contacts.clone(), owner.clone())
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "zone user sync failed for owner_scope={}: {}",
-                    owner
-                        .as_ref()
-                        .map(|did| did.to_string())
-                        .unwrap_or_else(|| "__system__".to_string()),
-                    error
-                )
-            })?;
-
-        info!(
-            "zone user sync applied on settings reload/startup: owner_scope={}, contacts={}",
-            owner
-                .as_ref()
-                .map(|did| did.to_string())
-                .unwrap_or_else(|| "__system__".to_string()),
-            updated
-        );
-    }
-
+/// Apply the Zone's accounts: local recipients, the system scope contacts
+/// (tunnel routing), and every user's projected address book. Users' own
+/// stores do not receive Zone users.
+async fn apply_zone_directory(center: &MessageCenter, directory: &ZoneDirectory) -> Result<()> {
+    center.set_zone_accounts(directory.zone_accounts());
+    let seeds = directory.seeds();
+    let updated = center
+        .upsert_zone_user_contacts(seeds, None)
+        .await
+        .map_err(|error| anyhow::anyhow!("zone user sync failed for owner_scope=__system__: {}", error))?;
+    center
+        .contact_mgr
+        .set_projection(directory.contact_projection(now_ms()));
+    info!(
+        "zone directory applied: accounts={}, system contacts updated={}",
+        directory.accounts.len(),
+        updated
+    );
     Ok(())
 }
 
@@ -845,10 +1267,9 @@ async fn clear_tunnel_instances(
 async fn apply_tg_tunnel_settings(
     center: &MessageCenter,
     executor_mgr: &DeliveryExecutorMgr,
-    raw_settings: &Value,
+    tunnel: &TelegramTunnelSettings,
 ) -> Result<serde_json::Value> {
-    let settings = parse_msg_center_settings(raw_settings)?;
-    if !settings.telegram_tunnel.enabled {
+    if !tunnel.enabled {
         info!("telegram tunnel is disabled by settings");
         clear_tunnel_instances(center, executor_mgr).await?;
         return Ok(serde_json::json!({
@@ -859,12 +1280,8 @@ async fn apply_tg_tunnel_settings(
         }));
     }
 
-    let transport_did = resolve_tg_transport_did(&settings.telegram_tunnel)?;
-    let tunnel_instance_id = settings
-        .telegram_tunnel
-        .tunnel_instance_id
-        .trim()
-        .to_string();
+    let transport_did = resolve_tg_transport_did(tunnel)?;
+    let tunnel_instance_id = tunnel.tunnel_instance_id.trim().to_string();
     let tunnel_instance_id = if tunnel_instance_id.is_empty() {
         default_tg_tunnel_instance_id()
     } else {
@@ -872,20 +1289,19 @@ async fn apply_tg_tunnel_settings(
     };
     let mut cfg = TgTunnelConfig::new(transport_did.clone());
     cfg.tunnel_instance_id = tunnel_instance_id.clone();
-    cfg.supports_ingress = settings.telegram_tunnel.supports_ingress;
-    cfg.supports_egress = settings.telegram_tunnel.supports_egress;
+    cfg.supports_ingress = tunnel.supports_ingress;
+    cfg.supports_egress = tunnel.supports_egress;
 
     // Rebuild the executor set + tunnel route registry from settings.
     clear_tunnel_instances(center, executor_mgr).await?;
-    let tg_tunnel = Arc::new(build_tg_tunnel(cfg, &settings.telegram_tunnel)?);
+    let tg_tunnel = Arc::new(build_tg_tunnel(cfg, tunnel)?);
 
     tg_tunnel
         .bind_msg_center_handler(Arc::new(center.clone()))
         .context("bind msg_center handler to telegram tunnel failed")?;
-    bind_tg_tunnel_bots(tg_tunnel.as_ref(), &settings.telegram_tunnel)?;
+    bind_tg_tunnel_bots(tg_tunnel.as_ref(), tunnel)?;
     // Bot owners (agents) receive replies natively via the message hub.
-    let binding_owner_dids = settings
-        .telegram_tunnel
+    let binding_owner_dids = tunnel
         .bindings
         .iter()
         .filter_map(|binding| DID::from_str(binding.owner_did.trim()).ok());
@@ -894,7 +1310,7 @@ async fn apply_tg_tunnel_settings(
         "telegram tunnel {} (instance '{}') loaded {} binding(s)",
         transport_did.to_string(),
         tunnel_instance_id,
-        settings.telegram_tunnel.bindings.len()
+        tunnel.bindings.len()
     );
 
     executor_mgr
@@ -908,6 +1324,7 @@ async fn apply_tg_tunnel_settings(
         transport_did.clone(),
         "telegram".to_string(),
     )?;
+    center.declare_edit_capability(&transport_did, tg_tunnel.edit_capability());
 
     let mut started = false;
     let mut start_error: Option<String> = None;
@@ -937,7 +1354,7 @@ async fn apply_tg_tunnel_settings(
         "transport_did": transport_did.to_string(),
         "tunnel_instance_id": tunnel_instance_id,
         "tunnel_started": started,
-        "bindings": settings.telegram_tunnel.bindings.len(),
+        "bindings": tunnel.bindings.len(),
         "start_error": start_error
     }))
 }
@@ -964,6 +1381,7 @@ async fn register_message_hub(
     let hub_did = resolve_message_hub_did();
     center.set_message_hub_did(hub_did.clone());
     let hub = Arc::new(MessageHubExecutor::new(hub_did.clone(), center.clone()));
+    center.declare_edit_capability(&hub_did, hub.edit_capability());
     executor_mgr
         .register(hub)
         .map_err(|err| anyhow::anyhow!("register message hub executor failed: {}", err))?;
@@ -1006,37 +1424,73 @@ pub async fn start_msg_center_service() -> Result<()> {
         }
     };
 
+    // Native messages of this Zone's users leave signed by the OOD device
+    // (Zone custody); without the key they can only use configured routes.
+    let zone_signer = match runtime.load_device_private_key() {
+        Ok(()) => runtime
+            .device_private_key
+            .clone()
+            .zip(runtime.device_config.as_ref().map(|d| d.id.to_string()))
+            .map(|(key, device)| network_directory::ZoneSigner {
+                key,
+                kid: format!("{device}#main_key"),
+            }),
+        Err(err) => {
+            warn!("device key unavailable, native messages stay unsigned: {}", err);
+            None
+        }
+    };
+
     set_buckyos_api_runtime(runtime)
         .map_err(|err| anyhow::anyhow!("register msg-center runtime failed: {}", err))?;
 
     let center = MessageCenter::open_from_service_spec()
         .await
         .map_err(|err| anyhow::anyhow!("create message center failed: {:?}", err))?;
+    *center.cyfs_dispatch.write().unwrap() = cyfs_dispatch::CyfsDispatchSettings::parse(&settings)?;
+    if let Some(signer) = zone_signer {
+        center.zone_signer.set(signer);
+    }
+    center.set_bucket_host(buckets::BucketHost::Runtime);
     center.start_idempotency_sweep();
+    center.start_friend_request_sweep();
+    center.start_notify_sweep();
+    center.start_group_sync();
 
     let executor_mgr = Arc::new(DeliveryExecutorMgr::new());
     register_message_hub(&center, executor_mgr.as_ref()).await?;
     // Tunnel assembly must fail startup on configuration errors — most
     // importantly a duplicate tunnel_instance_id must never be silently
     // overwritten (shadow endpoint DID stability depends on it).
-    let tunnel_result = apply_tg_tunnel_settings(&center, executor_mgr.as_ref(), &settings)
+    // Agent bots that cannot be scanned yet join on the next sync round.
+    let agents = load_system_zone_agents().await.unwrap_or_else(|error| {
+        warn!("zone agent scan failed during startup: {}", error);
+        vec![]
+    });
+    let zone_sync = Arc::new(ZoneSync::new(center.clone(), executor_mgr.clone()));
+    let tunnel_result = zone_sync
+        .apply(&settings, &agents, true)
         .await
         .map_err(|err| anyhow::anyhow!("assemble tunnel registry failed: {}", err))?;
     info!("msg-center settings initialized: {}", tunnel_result);
-    if let Err(error) = sync_zone_user_contacts_once(&center, &settings).await {
-        warn!("zone-user sync failed during startup: {}", error);
+    start_zone_sync(zone_sync.clone());
+    start_delivery_pump(center.clone(), executor_mgr);
+    let server = Arc::new(MsgCenterHttpServer::new(center, zone_sync));
+    if let Ok(runtime) = get_buckyos_api_runtime() {
+        server.enable_objects(runtime.zone_id.clone());
     }
-    start_delivery_pump(center.clone(), executor_mgr.clone());
-    let server = MsgCenterHttpServer::new(center, executor_mgr);
 
     let runner = Runner::new(MSG_CENTER_SERVICE_PORT);
-    if let Err(err) = runner.add_http_server(MSG_CENTER_HTTP_PATH.to_string(), Arc::new(server)) {
+    if let Err(err) = runner.add_http_server(MSG_CENTER_HTTP_PATH.to_string(), server.clone()) {
         error!("failed to add msg-center http server: {:?}", err);
         return Err(anyhow::anyhow!(
             "failed to add msg-center http server: {:?}",
             err
         ));
     }
+    runner
+        .add_http_server("/".into(), server)
+        .map_err(|e| anyhow::anyhow!("register CYFS adapter: {e}"))?;
     if let Err(err) = runner.run().await {
         error!("msg-center runner exited with error: {:?}", err);
         return Err(anyhow::anyhow!(
@@ -1060,6 +1514,356 @@ async fn main() {
     }
 }
 
+/// A Zone directory of active accounts named by DID host label.
+#[cfg(test)]
+pub(crate) fn test_zone_directory(
+    accounts: &[(&DID, buckyos_api::UserType, &[&str])],
+    groups: UserGroupDirectory,
+) -> ZoneDirectory {
+    let accounts: Vec<ZoneAccount> = accounts
+        .iter()
+        .map(|(did, user_type, user_groups)| {
+            let username = did.id.split('.').next().unwrap().to_string();
+            let settings: UserSettings = serde_json::from_value(serde_json::json!({
+                "user_id": username, "type": user_type.as_str(), "password": "", "state": "active",
+                "res_pool_id": "default", "groups": user_groups,
+            }))
+            .unwrap();
+            let seed = build_zone_user_seed(&username, &settings, (*did).clone(), None);
+            ZoneAccount {
+                username,
+                settings,
+                did: (*did).clone(),
+                seed,
+            }
+        })
+        .collect();
+    ZoneDirectory {
+        names: accounts.iter().map(|a| a.username.clone()).collect(),
+        accounts,
+        groups,
+    }
+}
+
+#[cfg(test)]
+mod zone_contact_tests {
+    use super::*;
+    use crate::msg_box_db::MsgBoxDbMgr;
+    use crate::msg_tunnel::ExecutorInstanceState;
+    use crate::zone_agent::test_support::{agent_document, put_agent};
+    use buckyos_api::{AgentId, AgentProfile, RdbBackend};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn zone_agent(did: &str, owner: &DID, settings: Value, profile: Value) -> ZoneAgent {
+        let did = DID::new("web", did);
+        ZoneAgent {
+            agent_id: AgentId::from_agent_did(&did).unwrap(),
+            doc: agent_document(&did, owner),
+            settings: serde_json::from_value(settings).unwrap(),
+            profile: serde_json::from_value(profile).unwrap(),
+        }
+    }
+
+    fn active_user() -> UserSettings {
+        serde_json::from_value(json!({
+            "user_id": "alice", "type": "user", "password": "", "state": "active",
+            "res_pool_id": "default"
+        }))
+        .unwrap()
+    }
+
+    async fn new_center() -> (MessageCenter, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("msg-center.db");
+        let conn = format!(
+            "sqlite:///{}?mode=rwc",
+            db_path.to_string_lossy().replace('\\', "/")
+        );
+        let cfg = buckyos_api::msg_center_default_rdb_instance_config();
+        let schema = cfg.schema.get(&RdbBackend::Sqlite).cloned();
+        let db = MsgBoxDbMgr::open(&conn, RdbBackend::Sqlite, schema.as_deref())
+            .await
+            .unwrap();
+        (MessageCenter::open_with_db(db).await.unwrap(), tmp)
+    }
+
+    #[test]
+    fn zone_user_contact_is_the_account_did_whatever_the_profile_says() {
+        // The user-writable profile names another account's DID twice and
+        // claims a system group; only display data and user tags count.
+        let doc_did = DID::new("web", "alice.test.buckyos.io");
+        let victim = DID::new("web", "bob.test.buckyos.io");
+        let profile: UserPrivateProfile = serde_json::from_value(json!({
+            "did": victim.to_string(),
+            "display_name": "Alice",
+            "private_extra": {"system_contact": {
+                "did": victim.to_string(),
+                "note": "night shift",
+                "tags": ["vip", "group:service", "type:admin", "zone_agent", "homestation.following"]
+            }}
+        }))
+        .unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), doc_did.clone(), Some(profile.clone())).unwrap();
+        assert_eq!(seed.did, doc_did);
+        assert_eq!(seed.name, "Alice");
+        assert_eq!(seed.note.as_deref(), Some("night shift"));
+        assert_eq!(seed.tags, vec!["zone_user".to_string(), "vip".to_string()]);
+
+        let directory = ZoneDirectory {
+            accounts: vec![ZoneAccount {
+                username: "alice".into(),
+                settings: active_user(),
+                did: doc_did.clone(),
+                seed: Some(seed),
+            }],
+            names: vec!["alice".into()],
+            groups: Default::default(),
+        };
+        let accounts = directory.zone_accounts();
+        assert!(accounts.recipients.contains(&doc_did.to_string()));
+        assert!(!accounts.recipients.contains(&victim.to_string()));
+        assert!(!accounts.dids.contains(&victim.to_string()));
+        assert_eq!(accounts.user_ids.get(&doc_did.to_string()).map(String::as_str), Some("alice"));
+        assert!(!accounts.user_ids.contains_key(&victim.to_string()));
+    }
+
+    #[test]
+    fn zone_user_contact_publishes_only_the_public_avatar() {
+        let mut profile: UserPrivateProfile = serde_json::from_value(json!({
+            "did": "did:web:alice.test.buckyos.io",
+            "display_name": "Alice",
+            "avatar": "data:image/png;base64,AAAA"
+        }))
+        .unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile.clone())).unwrap();
+        assert_eq!(seed.avatar.as_deref(), Some("data:image/png;base64,AAAA"));
+
+        profile.privacy = serde_json::from_value(json!({
+            "fields": {"avatar": {"visibility": "private"}}
+        }))
+        .unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
+        assert_eq!(seed.avatar, None);
+        assert_eq!(seed.name, "Alice");
+    }
+
+    #[test]
+    fn avatar_only_changes_trigger_contact_sync() {
+        let profile: UserPrivateProfile = serde_json::from_value(json!({
+            "did": "did:web:alice.test.buckyos.io",
+            "display_name": "Alice"
+        }))
+        .unwrap();
+        let mut seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
+        let original = zone_contact_seed_signature(&[seed.clone()], &[]);
+        seed.avatar = Some("data:image/png;base64,AAAA".to_string());
+        let with_avatar = zone_contact_seed_signature(&[seed.clone()], &[]);
+        assert_ne!(original, with_avatar);
+        assert!(!with_avatar.contains("AAAA"));
+        seed.avatar = Some("data:image/png;base64,BBBB".to_string());
+        assert_ne!(with_avatar, zone_contact_seed_signature(&[seed], &[]));
+
+        let alice = DID::new("bns", "alice");
+        let agent = zone_agent("xiaobai.test.buckyos.io", &alice, json!({}), json!({}));
+        let mut with_agent_avatar = agent.clone();
+        with_agent_avatar.profile.avatar = Some("data:image/png;base64,CCCC".to_string());
+        assert_ne!(
+            zone_contact_seed_signature(&[], &[agent]),
+            zone_contact_seed_signature(&[], &[with_agent_avatar])
+        );
+    }
+
+    #[test]
+    fn zone_user_telegram_accounts_are_bare_ids() {
+        let profile: UserPrivateProfile = serde_json::from_value(json!({
+            "did": "did:web:alice.test.buckyos.io",
+            "private_extra": {"system_contact": {"bindings": [
+                {"platform": "telegram", "account_id": "user:10001"},
+                {"platform": "telegram", "account_id": "20002"},
+                {"platform": "email", "account_id": "user:alice@example.com"}
+            ]}}
+        }))
+        .unwrap();
+        let seed = build_zone_user_seed("alice", &active_user(), profile.did.clone(), Some(profile)).unwrap();
+        let accounts: Vec<_> = seed
+            .bindings
+            .iter()
+            .map(|binding| (binding.platform.as_str(), binding.account_id.as_str()))
+            .collect();
+        assert_eq!(
+            accounts,
+            vec![
+                ("telegram", "10001"),
+                ("telegram", "20002"),
+                ("email", "user:alice@example.com")
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_changes_trigger_contact_sync() {
+        let alice = DID::new("bns", "alice");
+        let agent = zone_agent("xiaobai.test.buckyos.io", &alice, json!({}), json!({}));
+        let original = zone_contact_seed_signature(&[], &[agent.clone()]);
+        assert_ne!(original, zone_contact_seed_signature(&[], &[]));
+        let mut renamed_agent = agent.clone();
+        renamed_agent.profile.display_name = Some("My assistant".into());
+        let renamed = zone_contact_seed_signature(&[], &[renamed_agent.clone()]);
+        assert_ne!(original, renamed);
+        renamed_agent.doc.owner = DID::new("bns", "bob");
+        assert_ne!(renamed, zone_contact_seed_signature(&[], &[renamed_agent]));
+    }
+
+    #[tokio::test]
+    async fn agent_contact_is_named_by_profile_or_agent_name() {
+        let (center, _tmp) = new_center().await;
+        let alice = DID::new("web", "alice.test.buckyos.io");
+        let named = zone_agent(
+            "xiaobai.test.buckyos.io",
+            &alice,
+            json!({}),
+            json!({"display_name": " 小白 "}),
+        );
+        let unnamed = zone_agent(
+            "xiaohei.test.buckyos.io",
+            &alice,
+            json!({}),
+            json!({"display_name": "  "}),
+        );
+        sync_zone_agent_contacts(&center, &[], &[named.clone(), unnamed.clone()])
+            .await
+            .unwrap();
+        for (agent, name) in [(&named, "小白"), (&unnamed, "xiaohei")] {
+            let contact = center
+                .contact_mgr
+                .get_contact(agent.did().clone(), Some(alice.clone()))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(contact.name, name);
+        }
+        assert_eq!(
+            AgentProfile::default().resolved_display_name(&unnamed.agent_id),
+            "xiaohei"
+        );
+    }
+
+    #[tokio::test]
+    async fn telegram_bindings_merge_settings_with_agents_that_have_a_spec() {
+        let alice = DID::new("web", "alice.test.buckyos.io");
+        let ready = agent_document(&DID::new("web", "xiaobai.test.buckyos.io"), &alice);
+        let creating = agent_document(&DID::new("web", "xiaohei.test.buckyos.io"), &alice);
+        let tunnel = |token: &str| json!({"msg_tunnels": [{"platform": "telegram", "bot_token": token, "bot_account_id": "@bot"}]});
+        let mut config = BTreeMap::new();
+        put_agent(
+            &mut config,
+            "alice",
+            &ready,
+            true,
+            tunnel("1:ready"),
+            json!({}),
+        );
+        put_agent(
+            &mut config,
+            "alice",
+            &creating,
+            false,
+            tunnel("2:creating"),
+            json!({}),
+        );
+        let agents = crate::zone_agent::load_zone_agents(&config).await.unwrap();
+
+        let settings = parse_msg_center_settings(&json!({"telegram_tunnel": {
+            "gateway": {"mode": "bot_api"},
+            "bindings": [
+                {"owner_did": ready.id.to_string(), "bot_token": "9:replaced"},
+                {"owner_did": "did:web:ops.test.buckyos.io", "bot_token": "3:ops"}
+            ]
+        }}))
+        .unwrap();
+        let merged = with_agent_telegram_bindings(settings.telegram_tunnel, &agents);
+        let bindings: Vec<_> = merged
+            .bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.owner_did.as_str(),
+                    binding.bot_token.as_str(),
+                    binding.bot_account_id.as_deref(),
+                )
+            })
+            .collect();
+        let ready_did = ready.id.to_string();
+        assert_eq!(
+            bindings,
+            vec![
+                ("did:web:ops.test.buckyos.io", "3:ops", None),
+                (ready_did.as_str(), "1:ready", Some("@bot")),
+            ]
+        );
+        assert_eq!(merged.gateway.mode, TelegramGatewayMode::BotApi);
+    }
+
+    #[tokio::test]
+    async fn forced_zone_sync_requires_contact_directory() {
+        let (center, _tmp) = new_center().await;
+        let sync = ZoneSync::new(center, Arc::new(DeliveryExecutorMgr::new()));
+        let settings = json!({"telegram_tunnel": {"enabled": false}});
+        let expected = load_zone_directory().await.unwrap_err().to_string();
+
+        assert_eq!(
+            sync.apply(&settings, &[], true).await.unwrap_err().to_string(),
+            expected
+        );
+        assert!(sync.applied.lock().await.contacts.is_none());
+        assert!(sync.apply(&settings, &[], false).await.is_ok());
+        assert!(sync.applied.lock().await.contacts.is_none());
+    }
+
+    #[tokio::test]
+    async fn bot_api_without_bindings_runs_and_rebuilds_only_on_change() {
+        let (center, _tmp) = new_center().await;
+        let executor_mgr = Arc::new(DeliveryExecutorMgr::new());
+        let sync = ZoneSync::new(center, executor_mgr.clone());
+        let activated = json!({"telegram_tunnel": {
+            "enabled": true,
+            "gateway": {"mode": "bot_api"},
+            "bindings": []
+        }});
+        let result = sync.apply(&activated, &[], false).await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["tunnel_started"], true);
+        assert_eq!(result["bindings"], 0);
+        let transport = DID::from_str(MSG_CENTER_DEFAULT_TG_TUNNEL_DID).unwrap();
+        let state = || {
+            executor_mgr
+                .list_instances()
+                .unwrap()
+                .into_iter()
+                .find(|instance| instance.transport_did == transport)
+                .map(|instance| instance.state)
+        };
+        assert_eq!(state(), Some(ExecutorInstanceState::Running));
+
+        let dry_run = json!({"telegram_tunnel": {"gateway": {"mode": "dry_run"}}});
+        sync.apply(&dry_run, &[], false).await.unwrap();
+        executor_mgr.stop_instance(&transport).await.unwrap();
+        sync.apply(&dry_run, &[], false).await.unwrap();
+        assert_eq!(state(), Some(ExecutorInstanceState::Stopped));
+
+        let agent = zone_agent(
+            "xiaobai.test.buckyos.io",
+            &DID::new("web", "alice.test.buckyos.io"),
+            json!({"msg_tunnels": [{"platform": "telegram", "bot_token": "1:a"}]}),
+            json!({}),
+        );
+        let result = sync.apply(&dry_run, &[agent], false).await.unwrap();
+        assert_eq!(result["bindings"], 1);
+        assert_eq!(state(), Some(ExecutorInstanceState::Running));
+    }
+}
+
 #[cfg(test)]
 mod delivery_failure_tests {
     use super::*;
@@ -1070,7 +1874,7 @@ mod delivery_failure_tests {
         let transport_did = DID::new("bns", "telegram");
         let target_did = DID::new("msgtunnel", "42.user.telegram");
         let mut msg = MsgObject {
-            from: DID::new("bns", "jarvis"),
+            from: DID::new("web", "xiaobai.test.buckyos.io"),
             to: vec![target_did.clone()],
             kind: MsgObjKind::Chat,
             content: MsgContent {
@@ -1129,10 +1933,12 @@ mod delivery_failure_tests {
     #[test]
     fn does_not_recurse_for_failure_notice() {
         let mut record = record_with_notice();
-        record.msg.as_mut().unwrap().meta.insert(
-            "delivery_failure_fallback".to_string(),
-            Value::Bool(true),
-        );
+        record
+            .msg
+            .as_mut()
+            .unwrap()
+            .meta
+            .insert("delivery_failure_fallback".to_string(), Value::Bool(true));
         assert!(build_delivery_failure_notice(&record).is_none());
     }
 }

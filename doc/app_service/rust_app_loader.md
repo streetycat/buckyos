@@ -295,6 +295,23 @@ Rust App Loader 需要支持：
 6. 容器命名必须可稳定映射到实例。
 7. 需要显式支持 Windows/macOS/Linux 下 Docker 的差异化路径处理。
 
+Docker App 和 Agent/Script Worker 默认将宿主 `$BUCKYOS_ROOT/etc/` 只读映射到容器 `/opt/buckyos/etc/`，
+AppService runtime 读取 `machine.json` 中的 bridge 与 HTTPS 策略，缺文件使用默认机器策略。
+`start_config.json`、开发 CA 私钥和私有 boot 模板存放于不挂载的 `security/`。
+宿主 `etc/` 中仍有 `start_config.json`、`ca_key.pem` 或基础模板含 PEM 私钥时拒绝挂载，须先迁走这些文件并恢复公开基础模板。
+已有容器需通过 recreate 流程重建以获得新挂载，单纯 `docker restart` 不更新挂载；路径说明见 `doc/path_usage.md`。
+
+## 9.1.1 Worker 镜像（paios/aios、paios/exttool）
+
+Agent 和 Host Script 共用 Worker 镜像 `paios/aios`，ExtTool 内容由 `paios/exttool` 播种到命名卷。规则与第三方 Docker App 不同（实现在 `node_daemon/src/paios_images.rs`）：
+
+1. `$BUCKYOS_ROOT/bin/paios-images/paios_images.json` 存在时是锁定模式：使用清单里当前架构的不可变 tag，按镜像 id / registry digest / 层列表加 revision 校验身份，缺失或不符时校验同目录 tar 的 sha256 后 `docker load`。
+2. 清单不存在时是本机模式：使用 `<repo>:latest-<arch>`，repo 取 `etc/devenv.json` 的 `aios` / `exttool` 覆盖或默认值；`devenv.json` 的覆盖在锁定模式下同样优先。
+3. 两种模式都不 `docker pull`；本机模式缺镜像直接报错并提示 `docker pull` / `uv run build.py` / `./build_aios --local-test`。
+4. ExtTool 卷名是 `buckyos-exttool-<镜像 id 前 12 位>`，播种时写入 `.buckyos-seeded-<id12>` 标记；卷存在但没有标记时重建。锁定模式播种后删除 exttool 镜像（可从 tar 重建）。拿不到 ExtTool 时记 error，Worker 不挂载它照样启动。
+5. Worker 容器带 `buckyos.image_digest`（实际 Worker 镜像 id）和 `buckyos.exttool_volume` 标签；状态检查发现与当前镜像或卷不一致时判定为 `Stopped`，reconcile 会删掉旧容器按新镜像重建。
+6. 锁定模式下 node_daemon 启动时在后台预加载两个镜像并播种卷，与 deploy 共用锁。
+
 ## 9.2 Host Script App
 
 Rust App Loader 需要支持：
@@ -320,6 +337,19 @@ Rust App Loader 需要支持：
    - service ports
    - data/cache/local 路径
 6. 将“开发者必须自行构建完整镜像”的要求，降级为可选高级用法。
+
+### 9.3.1 原生 Agent Service（`RuntimeType::NativeAgent`）
+
+zone owner 的 Agent 把默认 runtime 设为某个节点的 `host`（`AgentRuntimeTarget::Node`），且该节点的执行器开启并对 owner Agent 开放（`owner_agents`）时，这个 Agent 的 Agent Service 不在 `paios/aios` 容器里，而是 node_daemon 管理的原生进程。判断只有一处：`buckyos_api::native_agent_node`；调度器据此把实例放到那个节点（`node_affinity = node:<id>`，`need_container = false`），并在节点配置里写 `apps/<instance>/run_mode = "native"`（缺省 `container`，不写出）。默认 runtime 在 host 与 container 之间切换，`run_mode` 随之改写，AppLoader 以另一种方式重启 Agent Service。
+
+AppLoader 只看 `run_mode`，与节点是否支持容器无关：
+
+1. deploy：与容器 Agent 相同，安装 agent 包与 agent_skills 包。
+2. start：节点支持容器时先删掉该实例遗留的容器，再以 `build_runtime_env` 的同一套 env 起 `$BUCKYOS_ROOT/bin/opendan/opendan[.exe] --appid <id> --agent-bin <agent 包> --service-port <port>`（独立进程组）。路径类 env 换成宿主路径（数据 / 日志 / storage / pkg、`BUCKYOS_AGENT_SKILLS_PKG_DIR`），网关与 kevent 指向 `127.0.0.1`，`BUCKYOS_TOOL_ENDPOINT = http://127.0.0.1:3180`，另设 `OPENDAN_SERVICE_MODE = native`。
+3. pid 与进程启动时间记在 `$BUCKYOS_ROOT/local/app_native/<runtime_key>.json`；status 只在记录的进程仍是原来那个（pid 与启动时间都对得上）时算 `Started`，agent 包不在时是 `NotExist`；stop 结束进程树并删记录，容器 Agent 的 stop 也先做这一步（原生 → 容器切换）。
+4. 进程身份是 node_daemon 的身份：Desktop 上是登录用户，Linux OOD 上是 root（已知风险，所以 Linux 上新建 Agent 默认用容器）。opendan 的日志在 `$BUCKYOS_ROOT/logs/opendan/`。
+
+这种模式下 Loader 把内建的 `container` runtime 投影为不可用：Agent Service 所在的宿主环境不当作 `exec: native` 的 runtime，模型命令只经 Node Executor 以 `owner_agents` 派生的 profile 执行。
 
 ## 9.4 VM Runtime App
 

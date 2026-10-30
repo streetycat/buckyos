@@ -20,15 +20,16 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
   const { t } = useI18n()
   const store = useAICCStore()
   const [checks, setChecks] = useState<CheckItem[]>([
-    { key: 'endpoint', label: t('aiCenter.wizard.checkEndpoint', 'Checking endpoint connectivity...'), status: 'pending' },
+    { key: 'base_url', label: t('aiCenter.wizard.checkBaseUrl', 'Checking base URL connectivity...'), status: 'checking' },
     { key: 'auth', label: t('aiCenter.wizard.checkAuth', 'Verifying authentication...'), status: 'pending' },
     { key: 'models', label: t('aiCenter.wizard.checkModels', 'Discovering available models...'), status: 'pending' },
     { key: 'balance', label: t('aiCenter.wizard.checkBalance', 'Checking balance capability...'), status: 'pending' },
   ])
   const [models, setModels] = useState<string[]>([])
+  const [readiness, setReadiness] = useState<ValidationResult | null>(null)
 
-  const detailFor = (result: ValidationResult, kind: 'endpoint' | 'auth' | 'models') =>
-    result.error_details?.find((item) => item.kind === kind)?.message
+  const detailFor = (result: ValidationResult, ...kinds: NonNullable<ValidationResult['error_details']>[number]['kind'][]) =>
+    result.error_details?.find((item) => kinds.includes(item.kind))?.message
 
   useEffect(() => {
     let cancelled = false
@@ -36,17 +37,18 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
 
     void store.validateConnection(draft).then((result) => {
       if (cancelled) return
+      setReadiness(result)
       const steps = [
         {
-          key: 'endpoint',
+          key: 'base_url',
           delay: 400,
           update: (): CheckItem => ({
-            key: 'endpoint',
-            label: result.endpoint_reachable
-              ? t('aiCenter.wizard.endpointOk', 'Endpoint reachable')
-              : t('aiCenter.wizard.endpointFail', 'Endpoint not reachable'),
-            status: result.endpoint_reachable ? 'ok' as const : 'error' as const,
-            detail: detailFor(result, 'endpoint'),
+            key: 'base_url',
+            label: result.base_url_reachable
+              ? t('aiCenter.wizard.baseUrlOk', 'Base URL reachable')
+              : t('aiCenter.wizard.baseUrlFail', 'Base URL not reachable'),
+            status: result.base_url_reachable ? 'ok' as const : 'error' as const,
+            detail: detailFor(result, 'base_url'),
           }),
         },
         {
@@ -58,7 +60,7 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
               ? t('aiCenter.wizard.authOk', 'Authentication valid')
               : t('aiCenter.wizard.authFail', 'Authentication failed'),
             status: result.auth_valid ? 'ok' as const : 'error' as const,
-            detail: detailFor(result, 'auth'),
+            detail: detailFor(result, 'authentication'),
           }),
         },
         {
@@ -67,8 +69,8 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
           update: (): CheckItem => ({
             key: 'models',
             label: t('aiCenter.wizard.modelsFound', '{{count}} models discovered', { count: result.models_discovered.length }),
-            status: detailFor(result, 'models') ? 'error' as const : result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
-            detail: detailFor(result, 'models'),
+            status: detailFor(result, 'configuration', 'protocol', 'models') ? 'error' as const : result.models_discovered.length > 0 ? 'ok' as const : 'warning' as const,
+            detail: detailFor(result, 'configuration', 'protocol', 'models'),
           }),
         },
         {
@@ -107,25 +109,18 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
     }).catch((error) => {
       if (cancelled) return
       const result: ValidationResult = {
-        endpoint_reachable: false,
+        base_url_reachable: false,
         auth_valid: false,
         models_discovered: [],
         balance_available: false,
-        errors: [error instanceof Error ? error.message : 'Validation failed'],
+        errors: [error instanceof Error ? error.message : t('aiCenter.wizard.validationFailed', 'Validation failed')],
         error_details: [{
-          kind: 'endpoint',
-          message: error instanceof Error ? error.message : 'Validation failed',
+          kind: 'base_url',
+          message: error instanceof Error ? error.message : t('aiCenter.wizard.validationFailed', 'Validation failed'),
         }],
       }
       setChecks((prev) => prev.map((item) => ({ ...item, status: 'error' as const })))
       onResult(result)
-    })
-
-    // Start first item as checking
-    setChecks((prev) => {
-      const next = [...prev]
-      next[0] = { ...next[0], status: 'checking' }
-      return next
     })
 
     return () => {
@@ -147,6 +142,36 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
 
   return (
     <div className="flex flex-col gap-4 max-w-lg">
+      {readiness && (
+        <div className="rounded-lg border p-3 text-xs" style={{ borderColor: 'var(--cp-border)' }}>
+          <p>{t('aiCenter.wizard.recognizedModels', 'Recognized models')}: {readiness.models_recognized?.length ?? 0}</p>
+          <p>{t('aiCenter.wizard.chatCandidates', 'Configured chat candidates')}: {readiness.routing_candidates?.['llm.chat']?.length ?? 0}</p>
+          <p>{t('aiCenter.wizard.unmappedPresets', 'Presets without channel mapping')}: {readiness.unavailable_presets?.length ?? 0}</p>
+          <p>{t('aiCenter.wizard.unknownModels', 'Models needing an identity mapping')}: {readiness.unmatched_models?.length ?? 0}</p>
+          {(readiness.filtered_capabilities?.length ?? 0) > 0 && (
+            <details className="rounded-lg border p-3 text-xs" style={{ borderColor: 'var(--cp-border)' }}>
+              <summary className="cursor-pointer" style={{ color: 'var(--cp-warning)' }}>
+                {t('aiCenter.providers.filteredCapabilities', 'Unsupported capabilities filtered out')}: {readiness.filtered_capabilities?.length}
+              </summary>
+              <div className="mt-2 max-h-64 overflow-auto">
+                {readiness.filtered_capabilities?.map((item, index) => (
+                  <div key={index} className="border-t py-2 break-words" style={{ borderColor: 'var(--cp-border)' }}>
+                    <p className="font-mono">{item.provider_model_id} · {item.api_type}</p>
+                    <p className="font-mono">{item.protocol_adapter_id}{item.operation_id ? ` · ${item.operation_id}` : ''}</p>
+                    <p>{item.reason === 'unregistered_binding'
+                      ? t('aiCenter.providers.unregisteredBinding', 'No protocol binding for this capability and operation')
+                      : item.reason === 'unsupported_api_type'
+                        ? t('aiCenter.providers.unsupportedApiType', 'The selected protocol or discovery does not support this capability')
+                        : item.reason}</p>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+          {(readiness.warnings ?? []).map((warning) => <p key={warning} style={{ color: 'var(--cp-warning)' }}>{warning}</p>)}
+          <p>{t('aiCenter.wizard.readinessScope', 'These checks validate configuration only. Access policies and a real model call are required to confirm conversation readiness.')}</p>
+        </div>
+      )}
       {checks.map((check) => (
         <div key={check.key} className="flex items-start gap-3">
           <div className="pt-0.5">{statusIcon(check.status)}</div>
@@ -181,7 +206,7 @@ export function StepValidation({ draft, onResult }: StepValidationProps) {
           ))}
           {models.length > 10 && (
             <div className="text-xs pt-1" style={{ color: 'var(--cp-muted)' }}>
-              +{models.length - 10} more
+              {t('aiCenter.wizard.moreModels', '+{{count}} more', { count: models.length - 10 })}
             </div>
           )}
         </div>

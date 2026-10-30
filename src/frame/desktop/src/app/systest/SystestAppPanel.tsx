@@ -1,8 +1,11 @@
 import { buckyos } from 'buckyos'
 import { useI18n } from '../../i18n/provider'
+import { useAppText } from '../../presentation/appText'
 import { isMockRuntime } from '../../runtime'
 import type { AppContentLoaderProps } from '../types'
 import { desktopCatalogIdForLogicalApp } from '../backend-apps'
+import { useAppLaunch } from '../web-frame/launch'
+import { AppLaunchStatus } from '../web-frame/AppLaunchStatus'
 
 function resolveZoneHost() {
   let sdkZoneHost: string | null = null
@@ -48,7 +51,9 @@ function buildAppWebUrl(app: AppContentLoaderProps['app']) {
 
 export function SystestAppPanel({ app }: AppContentLoaderProps) {
   const { t } = useI18n()
+  const appText = useAppText()
   const src = buildAppWebUrl(app)
+  const launch = useAppLaunch(app.appInstanceId ?? app.id, src ?? undefined)
 
   if (!src) {
     return (
@@ -59,13 +64,16 @@ export function SystestAppPanel({ app }: AppContentLoaderProps) {
   }
 
   const isSystest = desktopCatalogIdForLogicalApp(app.logicalAppId ?? app.id) === 'systest'
+  if (launch.outcome?.kind !== 'ready') {
+    return <AppLaunchStatus outcome={launch.outcome} title={appText(app).title} onRetry={launch.retry} />
+  }
 
   return (
     <iframe
       className="block h-full w-full border-0 bg-white"
       data-testid={isSystest ? 'systest-frame' : 'web-app-frame'}
-      src={src}
-      title={t(app.labelKey)}
+      src={launch.outcome.url}
+      title={appText(app).title}
     />
   )
 }

@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "Capabilities": {
+      "properties": {
+        "network": {
+          "type": "boolean"
+        },
+        "os": {
+          "type": "string"
+        },
+        "tools": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "network",
+        "os",
+        "tools"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "capabilities": {
+      "$ref": "#/definitions/Capabilities"
+    },
+    "host": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "target": true,
+    "workdir": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "capabilities",
+    "kind",
+    "runtime_id",
+    "target",
+    "workdir"
+  ],
+  "title": "RuntimeDescriptor",
+  "type": "object"
+}

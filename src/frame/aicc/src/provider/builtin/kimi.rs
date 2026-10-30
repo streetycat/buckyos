@@ -1,0 +1,286 @@
+use super::super::{
+    validate_discovery, DiscoveryContext, ProviderDiscovery, ProviderDiscoverySnapshot,
+    ProviderError, ProviderHealthState, ProviderResult,
+};
+#[cfg(test)]
+use super::super::{DiscoveryMode, ProviderProfile};
+#[cfg(test)]
+use crate::catalog::{CurrentCatalogFile, ModelDriverCatalog, ProviderRulesCatalog};
+use crate::protocol::{CredentialKind, HttpRequest, HttpTransport, KIMI_CHAT_ADAPTER_ID};
+use async_trait::async_trait;
+#[cfg(test)]
+use buckyos_api::features;
+#[cfg(test)]
+use reqwest::header::ETAG;
+use reqwest::{Method, Url};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub(crate) const KIMI_PROVIDER_PROFILE_ID: &str = "kimi";
+
+const MODELS_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) fn kimi_profile() -> ProviderProfile {
+    super::builtin_profile(KIMI_PROVIDER_PROFILE_ID, DiscoveryMode::MachineApi)
+}
+
+#[cfg(test)]
+pub(crate) fn kimi_known_provider() -> crate::catalog::KnownProvider {
+    super::builtin_known_provider(KIMI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn kimi_provider_rules(_revision_seq: u64) -> ProviderRulesCatalog {
+    super::builtin_provider_rules(KIMI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn kimi_model_driver() -> ModelDriverCatalog {
+    super::builtin_model_driver(KIMI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn kimi_catalog_files() -> Vec<CurrentCatalogFile> {
+    super::builtin_catalog_files(&[KIMI_PROVIDER_PROFILE_ID])
+}
+
+use super::openai_responses_compatible::OpenAiCompatibleModelsTransport as KimiModelsTransport;
+
+#[derive(Clone)]
+pub(crate) struct KimiDiscovery {
+    transport: Arc<dyn KimiModelsTransport>,
+}
+
+impl KimiDiscovery {
+    pub(crate) fn new(transport: HttpTransport) -> Self {
+        Self {
+            transport: Arc::new(transport),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: Arc<dyn KimiModelsTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait]
+impl ProviderDiscovery for KimiDiscovery {
+    async fn discover(
+        &self,
+        context: &DiscoveryContext<'_>,
+    ) -> ProviderResult<ProviderDiscoverySnapshot> {
+        validate_context(context)?;
+        let mut request =
+            HttpRequest::new(Method::GET, models_endpoint(&context.instance.base_url)?);
+        context
+            .credential
+            .apply(&mut request.headers)
+            .map_err(|error| ProviderError::Credential(error.to_string()))?;
+        request.timeout = Some(Duration::from_secs(30));
+        request.max_response_bytes = Some(MODELS_RESPONSE_LIMIT);
+        let (models, revision) = super::openai_responses_compatible::discover_model_ids(
+            self.transport.as_ref(),
+            request,
+            KIMI_PROVIDER_PROFILE_ID,
+            true,
+        )
+        .await?;
+        let snapshot = ProviderDiscoverySnapshot {
+            revision,
+            discovered_at_ms: super::super::now_ms()?,
+            health: ProviderHealthState::Healthy,
+            models,
+        };
+        validate_discovery(&snapshot)?;
+        Ok(snapshot)
+    }
+}
+
+fn validate_context(context: &DiscoveryContext<'_>) -> ProviderResult<()> {
+    if context.profile.provider_profile_id != KIMI_PROVIDER_PROFILE_ID
+        || context.profile.default_protocol_adapter_id != KIMI_CHAT_ADAPTER_ID
+        || context.instance.provider_profile_id != KIMI_PROVIDER_PROFILE_ID
+        || context.instance.protocol_adapter_id != KIMI_CHAT_ADAPTER_ID
+    {
+        return Err(ProviderError::InvalidConfiguration(
+            "Kimi discovery requires its builtin profile and adapter".to_owned(),
+        ));
+    }
+    if context.credential.audit().kind != CredentialKind::Bearer {
+        return Err(ProviderError::Credential(
+            "Kimi discovery requires a Bearer credential".to_owned(),
+        ));
+    }
+    if context.instance.account.is_some() {
+        return Err(ProviderError::InvalidConfiguration(
+            "Kimi profile does not accept account".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn models_endpoint(base_url: &str) -> ProviderResult<String> {
+    let mut url = Url::parse(base_url)
+        .map_err(|_| ProviderError::InvalidConfiguration("Kimi base_url is invalid".to_owned()))?;
+    if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+        return Err(ProviderError::InvalidConfiguration(
+            "Kimi base_url must be an absolute HTTP URL".to_owned(),
+        ));
+    }
+    let path = url.path().trim_end_matches('/');
+    let prefix = if path.ends_with("/v1") {
+        path.to_owned()
+    } else if path.is_empty() {
+        "/v1".to_owned()
+    } else {
+        format!("{path}/v1")
+    };
+    url.set_path(&format!("{prefix}/models"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{ProtocolError, ResolvedCredential};
+    use crate::provider::{CredentialReference, ProviderInstanceConfig};
+    use bytes::Bytes;
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    use reqwest::StatusCode;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct FakeTransport {
+        request: Mutex<Option<HttpRequest>>,
+        response: Mutex<Option<Result<HttpResponse, ProtocolError>>>,
+    }
+
+    #[async_trait]
+    impl KimiModelsTransport for FakeTransport {
+        async fn send(
+            &self,
+            request: HttpRequest,
+        ) -> crate::protocol::ProtocolResultValue<HttpResponse> {
+            *self.request.lock().unwrap() = Some(request);
+            self.response.lock().unwrap().take().unwrap()
+        }
+    }
+
+    fn instance() -> ProviderInstanceConfig {
+        ProviderInstanceConfig {
+            provider_instance_name: "kimi-main".to_owned(),
+            provider_profile_id: KIMI_PROVIDER_PROFILE_ID.to_owned(),
+            protocol_adapter_id: KIMI_CHAT_ADAPTER_ID.to_owned(),
+            base_url: kimi_known_provider().base_url,
+            operation_base_urls: BTreeMap::new(),
+            credential: CredentialReference {
+                reference: "secret://kimi".to_owned(),
+            },
+            credential_kind: None,
+            provider_rules_id: Some(KIMI_PROVIDER_PROFILE_ID.to_owned()),
+            region: Some("global".to_owned()),
+            workspace: None,
+            account: None,
+            request_timeout: Duration::from_secs(120),
+            auto_sync_models: true,
+            instance_rules: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_rules_and_machine_discovery_are_stable() {
+        let transport = Arc::new(FakeTransport {
+            request: Mutex::new(None),
+            response: Mutex::new(Some(Ok(HttpResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::from_iter([(
+                    ETAG,
+                    HeaderValue::from_static("models-1"),
+                )]),
+                body: Bytes::from_static(
+                    br#"{"object":"list","data":[{"id":"kimi-model","object":"model","supports_image_in":true,"supports_video_in":false,"supports_reasoning":true}]}"#,
+                ),
+                request_id: "request-1".to_owned(),
+                retry_after: None,
+            }))),
+        });
+        let discovery = KimiDiscovery::with_transport(transport.clone());
+        let profile = kimi_profile();
+        let instance = instance();
+        let credential = ResolvedCredential::bearer("secret://kimi", "secret").unwrap();
+        let snapshot = discovery
+            .discover(&DiscoveryContext {
+                profile: &profile,
+                instance: &instance,
+                credential: &credential,
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.revision.as_deref(), Some("models-1"));
+        assert_eq!(snapshot.models.len(), 1);
+        assert!(!snapshot.models[0]
+            .unsupported_features
+            .contains(features::VISION));
+        assert!(snapshot.models[0].supported_features.is_none());
+        let request = transport.request.lock().unwrap().take().unwrap();
+        assert_eq!(request.url, "https://api.moonshot.ai/v1/models");
+        assert_eq!(request.headers[AUTHORIZATION], "Bearer secret");
+        assert_eq!(
+            kimi_provider_rules(7)
+                .patterns
+                .iter()
+                .find_map(|rule| rule.operations.get("llm")),
+            Some(&OPENAI_CHAT_COMPLETIONS_OPERATION_ID.to_owned())
+        );
+        assert!(kimi_provider_rules(7).static_inventory_models.is_empty());
+        assert_eq!(kimi_known_provider().base_url, "https://api.moonshot.ai/v1");
+        let known = kimi_known_provider();
+        assert_eq!(
+            known.ui_hints["instance_fields"]["region"]["mode"],
+            "required"
+        );
+        assert!(known.ui_hints["instance_fields"]["region"]
+            .get("default_value")
+            .is_none());
+        assert_eq!(
+            known.ui_hints["access_endpoints"]["china"]["label"],
+            "China"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_and_http_errors_are_explicit() {
+        assert_eq!(
+            models_endpoint("https://api.moonshot.ai").unwrap(),
+            "https://api.moonshot.ai/v1/models"
+        );
+        assert!(models_endpoint("relative/path").is_err());
+        let transport = FakeTransport {
+            request: Mutex::new(None),
+            response: Mutex::new(Some(Ok(HttpResponse {
+                status: StatusCode::UNAUTHORIZED,
+                headers: HeaderMap::new(),
+                body: Bytes::new(),
+                request_id: "request-denied".to_owned(),
+                retry_after: None,
+            }))),
+        };
+        assert!(
+            super::super::openai_responses_compatible::discover_model_ids(
+                &transport,
+                HttpRequest::new(Method::GET, "https://example.com/models"),
+                KIMI_PROVIDER_PROFILE_ID,
+                true
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+use crate::protocol::{HttpResponse, OPENAI_CHAT_COMPLETIONS_OPERATION_ID};

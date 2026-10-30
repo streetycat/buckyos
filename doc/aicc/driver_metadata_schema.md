@@ -1,214 +1,352 @@
-# AICC Driver Metadata Schema
+# AICC Model Driver Metadata Schema
 
-Driver metadata turns provider-discovered model ids into AICC `ModelMetadata`.
-Provider `/models` discovery is only the id source; the resolver owns capability,
-API type, mount, cost, latency, and conservative fallback decisions.
+Implemented contract: Model Driver **2.1**, 2026-09-27. Revision 1 adds explicit
+additional specification bindings to the Model Driver v2 contract.
+Provider Rules, Known Provider and the system-config envelope keep their existing
+versions. Implementation, offline coverage and remaining Provider integration are
+recorded in [the implementation report](model_driver_v2_implementation.md).
 
-## Source Priority
+## LLM target contract: vendor specifications and model families
 
-The resolver loads metadata in this override order:
+The implemented tree is `task -> vendor specification -> family:effort -> instance`.
+Model Driver metadata describes official identities and capabilities. It neither
+registers Providers nor promises that a channel can execute every supported effort.
 
-1. builtin metadata bundled under `src/frame/aicc/driver_metadata/`
-2. latest complete cloud activation under `$BUCKYOS_ROOT/data/srv/aicc/driver_metadata/remote_cache/v1/<source-key>/`
-3. local override: `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/<driver>.json`
-4. system-config override materialized at `$BUCKYOS_ROOT/etc/aicc/driver_metadata/system-config/<driver>.json`
-
-For each model id, match priority is:
-
-1. exact `models[].id`
-2. wildcard `patterns[].pattern`
-3. `defaults`
-4. conservative fallback
-
-Exact matches win before patterns, even if the pattern comes from a higher
-priority override.
-
-`origin_mappings` is a provider-level rule set, not an incremental patch. The
-resolver uses the complete list from the highest-priority metadata document
-that defines it and does not merge mappings from lower-priority documents.
-Therefore, an override document that defines `origin_mappings` must include the
-provider's complete mapping list.
-
-## Document
+### Document and model fields
 
 ```json
 {
-  "format": "buckyos.aicc.provider-driver-metadata",
-  "schema_version": 3,
-  "schema_revision": 0,
-  "provider_driver": "openai",
-  "revision_seq": 1,
+  "format": "buckyos.aicc.model-driver-catalog",
+  "schema_version": 2,
+  "schema_revision": 1,
+  "model_driver_id": "openai",
+  "revision_seq": 6,
   "required_features": [],
-  "origin_provider_aliases": {},
-  "origin_mappings": [],
-  "models": [],
+  "specs": [
+    { "id": "gpt-pro", "direct_only": true },
+    { "id": "gpt-standard", "direct_only": true },
+    { "id": "gpt-codex", "direct_only": true }
+  ],
+  "models": [{
+    "id": "gpt-6-sol",
+    "api_types": ["llm"],
+    "capabilities": { "tool_call": true, "max_context_tokens": 1050000 },
+    "llm": {
+      "spec": "gpt-pro",
+      "effort": "high",
+      "additional_specs": [
+        { "spec": "gpt-standard", "effort": "medium", "weight": 60 },
+        { "spec": "gpt-codex", "effort": "xhigh", "weight": 60 }
+      ],
+      "default_effort": "medium",
+      "supported_efforts": ["none", "low", "medium", "high", "xhigh", "max"],
+      "stability": "stable",
+      "weight": 60
+    }
+  }],
   "patterns": [],
-  "capability_overrides": [],
-  "defaults": {},
-  "variants": [],
-  "signature": null
+  "defaults": {}
 }
 ```
 
-Fields:
+This abbreviated example illustrates fields, not the complete capability table.
+The reviewed [OpenAI builtin](../../src/frame/aicc/driver_metadata/models/openai.model.json)
+is the complete repository fixture. Every origin vendor has one document; the
+filename does not change the stable `model_driver_id` (Anthropic uses `claude`).
 
- - `format`: fixed to `buckyos.aicc.provider-driver-metadata`.
- - `schema_version`: incompatible schema major, currently `3`.
- - `schema_revision`: additive schema revision, currently `0`.
- - `provider_driver`: driver id such as `openai`, `openrouter`, `claude`,
-  `google-gemini`, `fal`, or `minimax`.
- - `revision_seq`: monotonically increasing unsigned integer for this provider.
- - `required_features`: features that a reader must understand; unknown values reject the document.
- - `origin_provider_aliases`: optional map from provider-specific origin slugs to
-  canonical BuckyOS driver names.
- - `origin_mappings`: optional ordered rules that derive the physical origin
-  `driver` and `model` from the provider-native model id.
-- `models`: exact rules keyed by `id`.
-- `patterns`: wildcard rules keyed by `pattern`; `*` is the only wildcard.
-- `capability_overrides`: ordered capability-only patches selected by model
-  `pattern` and, optionally, `api_types`. All matching rules are applied after
-  the model's exact/pattern/default rule. Documents are applied from lower to
-  higher source priority, and rules within a document are applied in array
-  order, so later patches take precedence.
-- `defaults`: default rule when no exact or pattern rule matches.
-- `variants`: optional provider option variants. The resolver expands each
-  matching base model into additional AICC exact models whose provider model id
-  is `<base>:<mount_suffix>`, while provider calls are lowered back to the base
-  provider model plus `provider_options`.
-- `signature`: deprecated compatibility field. Cloud trust comes from the NDN PathObject and FileObject chain.
-
-The beta 2.2 schema is the first compatibility baseline. Future optional fields
-with a safe default increment `schema_revision`; incompatible changes increment
-`schema_version` and are published on a compatible protocol track.
-
-Cloud and local override documents use the same strict parser. Unknown fields,
-unsupported features, schema/provider identity mismatches, and statically invalid
-rules are rejected before they can participate in inventory construction.
-
-## Rule
-
-Rules support these fields:
-
-- `id`: exact provider model id for `models`.
-- `pattern`: wildcard provider model id pattern for `patterns`.
-- `model_driver`: optional per-model metadata driver. Defaults to the resolved
-  origin driver. A rule can override it when metadata attribution differs from
-  the physical model origin.
-- `exclude`: drops the provider model from inventory.
-- `parameter_scale`: optional display/classification string.
-- `api_types`: AICC API types, for example `llm.chat`, `image.txt2img`, `audio.asr`.
-- `logical_mounts`: logical mounts. Templates `{driver}`, `{model}`,
-  `{provider_driver}`, and `{provider_model_id}` are expanded by the resolver.
-  The first pair identifies the physical origin; the second pair identifies the
-  current delivery channel.
-- `capabilities`: partial capability patch: `streaming`, `tool_call`, `json_schema`, `web_search`, `vision`, `max_context_tokens`, `max_output_tokens`, `unsupported_feature_combinations`. Each entry in `unsupported_feature_combinations` is a set of two or more otherwise-supported features that cannot be used in the same request, for example `[["tool_calling", "web_search"]]`. Supported feature names are `streaming`, `tool_calling`, `json_output`, `web_search`, and `vision`.
-- `pricing`: optional monetary data object. `currency` identifies the ISO 4217
-  currency; `input_token`, `output_token`, and `cache_input_token` are optional
-  per-token prices; `estimated_cost` is the default scheduler cost estimate.
-- `estimated_latency_ms`: default scheduler latency estimate.
-- `quality_score`, `latency_class`, `cost_class`: routing attributes.
-
-All exact ids and wildcard patterns, including
-`version_rules[].model_pattern`, match the complete channel-local
-`provider_model_id`. Origin fields are only used for metadata attribution and
-mount template expansion. For example, OpenAI uses `gpt-*`, while OpenRouter
-uses `openai/gpt-*` for the same origin model family.
-
-Unknown fallback is intentionally conservative: it does not declare
-`tool_call`, `web_search`, `vision`, or `json_schema`.
-
-## Origin Identity Mappings
-
-Provider model ids are channel-local. An origin provider such as OpenAI can use
-the fallback identity `openai` / `gpt-5.5`. An aggregator such as OpenRouter
-returns a channel id such as `openai/gpt-5.5`, which must resolve to the same
-physical identity before logical mounts and semantic family rules are applied.
-The resolver stores the resolved model component in
-`ModelMetadata.origin_model_id`; consumers must use this field instead of
-inferring an origin model from provider-specific id syntax.
-
-Schema v2 defines these template variables:
-
-| Variable | Meaning |
+| Field | Contract |
 | --- | --- |
-| `{driver}` | resolved physical origin driver, for example `openai` |
-| `{model}` | resolved physical origin model, for example `gpt-5.5` |
-| `{provider_driver}` | current channel driver, for example `openrouter` |
-| `{provider_model_id}` | current channel model id, for example `openai/gpt-5.5` |
+| `specs[].id` | Unique normalized path segment; declares `llm.{id}` independently of inventory. |
+| `specs[].direct_only` | Defaults to false. A specification must have a task reference or explicitly set this flag. Task/fallback references cannot bypass it. |
+| `models[].id` | Official origin identity, preserved for matching. Provider channel IDs remain separate. |
+| `llm.spec` | Required primary specification declared by the same Model Driver. |
+| `llm.additional_specs` | Optional array of additional `{spec, effort, weight}` bindings; nonempty arrays require `schema_revision: 1`. All specs must be declared by the same driver and unique across primary and additional bindings. |
+| `llm.family_id` | Optional normalized segment used only to resolve family naming conflicts. |
+| `llm.effort` | Fixed effort of the primary specification's family reference. Each additional binding declares its own fixed effort. |
+| `llm.default_effort` | Effort used when selecting the family without a suffix. |
+| `llm.supported_efforts` | Nonempty, unique list containing the default effort and every specification binding's effort. |
+| `llm.stability` | Required `stable` or `experimental`. Admission only: experimental families need explicit permission; stability adds no ranking. |
+| `llm.weight` | Required finite, non-negative default weight of the primary specification-to-family item. Each additional binding requires its own weight under the same rules. Compared only against other families of the same specification. |
 
-Mappings are evaluated by ascending `priority`; the first successful rule wins.
-If no rule succeeds, the resolver uses `provider_driver` and
-`provider_model_id` as the origin identity.
+Bindings share one official model identity and one family node. Each specification
+references that family once, with its declared effort and weight. Adding a binding
+does not change `default_effort` or create a Provider model. Missing channel efforts
+yield no candidate for that binding; lower-weight families may still be selected.
+If any binding is `direct_only`, fallback directly to the family or its physical
+instances remains forbidden. Explicit task references to other, non-direct specs
+remain valid.
+
+GPT-6 builtin routing uses the following project policy; OpenAI documents supported
+efforts and capabilities, not these BuckyOS specification assignments:
+
+| Specification | Official model | Fixed effort | Weight |
+| --- | --- | --- | ---: |
+| `gpt-nano` | `gpt-6-luna` | `none` | 60 |
+| `gpt-mini` | `gpt-6-luna` | `low` | 60 |
+| `gpt-standard` | `gpt-6-sol` | `medium` | 60 |
+| `gpt-pro` | `gpt-6-sol` | `high` | 60 |
+| `gpt-max` | `gpt-6-astra` | `high` | 60 |
+| `gpt-codex` | `gpt-6-sol` | `xhigh` | 60 |
+
+Luna provides the low-cost tiers, Sol covers general work and stronger reasoning,
+and Astra supplies the highest-capability tier. Codex uses Sol with a larger
+reasoning budget for complex coding. These are initial routing choices, not
+benchmark-derived equivalences. Sources: [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna),
+[Sol](https://developers.openai.com/api/docs/models/gpt-6-sol),
+[Astra](https://developers.openai.com/api/docs/models/gpt-6-astra).
+
+Efforts are `native`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+and `thinking`. Each non-native effort derives the semantic variant identity
+`reasoning-{effort}`. `native` selects the base model without inventing a variant
+or parameter. `thinking` describes a thinking toggle, not a numeric medium tier.
+Supported effort facts are not Provider parameter templates.
+
+Family paths normalize `.`, `/`, `_`, and `-` separators to lowercase hyphenated
+segments. `gpt-5.6-sol` becomes `llm.gpt-5-6-sol`; the official ID stays unchanged.
+Families, specifications and task names must not collide, even with no inventory.
+
+### Matching and validation
+
+Model Driver membership is a finite exact ID set. Literal patterns and finite
+`origin_model_id` arrays expand into exact entries during compilation; explicit
+`models[]` entries win. All wildcard model membership is rejected, including
+non-LLM membership. Defaults only supply missing semantics to an existing exact
+entry. `resolve_model(driver, model)` rejects unknown IDs.
+
+Inventory identity is resolved across all loaded drivers: instance
+`model_driver_overrides` → Provider Rules `model_driver_overrides` → optional Provider matcher → exact ID → longest bounded
+case-insensitive containment. A containment match must begin at a non-alphanumeric
+boundary and end at the string end or a date-shaped suffix (`-YYYY-MM-DD`,
+`-YYYYMMDD`, `-YYMMDD`, `-MMDD`). Equal longest candidates are ambiguous.
+Provider failure and invalid overrides are terminal for that model. Unknown and
+ambiguous IDs produce diagnostics and never enter the routable inventory.
+
+Every effective, non-excluded LLM rule requires `llm`; non-LLM rules cannot carry
+it. LLM ownership cannot redirect to a different driver. Duplicate specifications or bindings,
+invalid efforts, undeclared membership, invalid normalized names and name collisions
+fail catalog construction without Providers. Task references, `direct_only` and
+graph cycles are validated when assembling the tree.
+
+LLM rules cannot declare nonempty `logical_mounts`. Their admission belongs to
+task-to-specification references. Independent non-LLM models retain mounts,
+capabilities and canonical mappings. Non-LLM tasks served by an LLM explicitly
+reference a specification in the builtin overlay; the leaf must support the
+requested API. An LLM is never automatically admitted solely for its capabilities.
+
+The parser rejects schema v1 and removed fields: Model Driver `variants`,
+`version_rules`, `version_order`, `model_pricing` and inline `pricing`. No alias,
+upgrade path, old-directory redirect or default-price slot remains. Pricing
+structures shared with Provider Rules remain exclusively for that contract.
+Missing channel price remains unknown, never zero or an origin price estimate.
+
+### Family weights and selection
+
+Model Driver metadata declares version preference directly as `llm.weight` or
+`llm.additional_specs[].weight` for each binding. The
+Registry writes the declared value, unchanged, into the default
+specification-to-family item. Routing does not parse versions from model names
+or compare version tuples, so a model whose name has no recognizable version
+still routes by its declared weight. The builtin drivers use `major * 10 + minor`
+of the official release (`gpt-5.6 = 56`, `claude-opus-4-8 = 48`), but any
+non-negative number is valid. A weight only needs to order families within its
+specification; different specifications or vendors may reuse the same value
+(`gpt-5.5` and `claude-opus-5-5` are both `55`) without conflict.
+
+System, user and session overlays may override the weight through
+`item_overrides` on the specification node (`llm.gpt-pro` item `llm.gpt-5-5`),
+and the instance weight on the family node. An override only changes the
+weight: membership and targets stay inventory facts. Raising `gpt-5.5` to `60`
+selects it, setting it equal to `gpt-5.6` expands both, and `0` disables it.
+Removing the override restores the metadata value. An override for a family or
+instance that is currently absent is ignored until it returns.
+
+Selection is uniform across API types. At each node, only the highest-weight
+group of available items expands; ties expand together. A lower group is tried
+only when no item in a higher group yields a candidate that passes admission and
+hard filters. The expanded instances form one pool, and the scheduler profile
+selects within it; exact ties keep the default order (families by path,
+instances by exact model name). Additional instances do not duplicate the
+specification reference or its weight. Experimental families require the
+internal `RoutingRequest.allow_experimental` policy (false by default); once
+allowed, they are not ranked behind stable families. No public RPC field was
+added in this change.
+
+### Static and dynamic trees
+
+`ModelRegistry::build` creates definitions and all declared specifications before
+registering inventory. A model-only `CatalogDocuments` with empty Provider Rules
+and Known Providers is valid. With inventory `[]`, all task/specification views
+are queryable, references and weights remain visible, and exact candidates are
+empty. No families or executable models are invented.
+
+A family is materialized from the intersection of catalog identity and inventory.
+Its candidates additionally intersect supported efforts with inventory variants.
+A missing effort has no candidate; it does not substitute another effort or base
+model. Removing the final instance removes its family and incoming dynamic edge,
+while preserving tasks, specifications and task weights. Other channels retain
+the same family when the original channel disappears.
+
+`:high` is a virtual family selector, not a `.high` directory. A family without a
+suffix uses `default_effort`; a specification fixes `effort`. Tree expansion and
+request routing retain that selected exact variant. Final wire parameter locking
+is separate Provider/Adapter work.
+
+LLM directories require Manual admission. The `llm` root is a namespace and
+`llm.fallback` starts empty. Tasks, specifications and families have no implicit
+Parent fallback. Explicit fallback retains original task/request requirements.
+Legacy `llm.{driver}.{model}` names are not aliases.
+
+Overlays retain `factory -> system -> user -> session` precedence. Item and
+fallback graphs are checked together for cycles. Rebuilds are deterministic;
+RuntimeState publishes only complete valid snapshots and preserves the previous
+snapshot on catalog or tree validation failure. Directory RPC shapes are unchanged.
+
+## Source priority
+
+Metadata has four independent sources. From highest to lowest priority they are:
+
+1. system-config key `services/aicc/driver_metadata`
+2. `$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/`
+3. the current cloud source delivered and replaced by NDN
+4. builtin metadata compiled into AICC by the metadata source manager
+
+Selection is performed independently for each `(catalog_kind, catalog_id)`.
+When the same identity exists in more than one source, the resolver selects the
+highest-priority complete JSON document. It never merges fields, rules, arrays,
+or defaults across source documents. A higher-priority source only shadows the
+identities that it actually contains; it does not replace the effective catalog
+set as a whole. For example, if cloud contains `openai.provider.json` but not
+`minimax.provider.json`, cloud OpenAI and builtin MiniMax are both effective.
+
+The effective catalog set is the union of these per-identity winners. Only after
+this source-selection step does AICC validate references and build the immutable
+catalog snapshot. `models/`, `providers/`, and `known-providers/` use the same
+selection rule. A Known Provider file is atomic by `catalog_id`; independently
+overridable providers therefore need independently stable catalog IDs/files.
+
+## Production source loading
+
+The builtin source has no production runtime path. Its source files are kept in
+exactly these three development directories and are compiled into AICC once by
+the metadata source manager using `include_bytes!` or `include_str!`:
+
+```text
+src/frame/aicc/driver_metadata/models/
+src/frame/aicc/driver_metadata/providers/
+src/frame/aicc/driver_metadata/known-providers/
+```
+
+The metadata source manager owns the complete embedded file list, parses every document as
+`MetadataSource::Builtin`, and rejects the complete builtin set when a document
+is malformed or a catalog identity is duplicated. Provider-specific modules
+must not embed, enumerate or expose their own copies of these files.
+
+The local source enumerates direct `*.json` files from exactly three directories:
+
+```text
+$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/models/
+$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/providers/
+$BUCKYOS_ROOT/etc/aicc/driver_metadata/local/known-providers/
+```
+
+The directory name determines the catalog kind. Nested directories, symlinks and
+non-JSON entries are rejected. A reload reads the complete tree twice and accepts
+it only when both reads are identical. Its opaque revision is the SHA-256 digest
+of the sorted relative paths and file contents.
+
+The system-config source is one atomic value at key
+`services/aicc/driver_metadata`:
 
 ```json
 {
-  "origin_provider_aliases": {
-    "google": "google-gemini",
-    "x-ai": "xai"
-  },
-  "origin_mappings": [
-    {
-      "mapping_key": "openrouter-path-id",
-      "priority": 100,
-      "match": {
-        "source": "provider_model_id",
-        "regex": "^(?<driver>[^/]+)/(?<model>.+)$"
-      },
-      "transforms": {
-        "driver": [
-          { "op": "lowercase" },
-          { "op": "alias", "table": "origin_provider_aliases", "on_missing": "keep" }
-        ],
-        "model": [
-          { "op": "trim" }
-        ]
-      }
-    }
-  ]
+  "schema_version": 1,
+  "model_drivers": [],
+  "provider_rules": [],
+  "known_providers": []
 }
 ```
 
-The regex must use named `driver` and `model` captures. Supported transforms
-are `trim`, `lowercase`, and `alias`; alias lookup only accepts the
-`origin_provider_aliases` table and `on_missing: keep`. Unknown fields, invalid
-regular expressions, missing named captures, unsupported sources or transforms,
-and invalid transform options reject the complete metadata document before
-activation. Dynamic provider aliases such as `~x-ai/grok-latest` and router models
-such as `openrouter/auto` should be excluded with ordinary model or pattern
-rules. Aggregators that only admit base OpenAI model ids should place
-`openai/*:*` and `openai/*latest*` exclusion patterns before family allow
-patterns so provider variants and moving aliases cannot inherit base-model
-metadata.
+Each array contains complete catalog documents of the corresponding kind. The
+system-config key revision is the source revision; using one key prevents a
+reload from observing a mixture of independently updated documents. A missing
+key means an empty system-config source at revision `0`.
 
-## Variants
+`service.reload_settings` captures a fresh local content revision and a fresh
+system-config key revision while preparing its invisible runtime candidate. Any
+I/O error, malformed document, unsupported envelope version or source change
+rejects the candidate and preserves the currently published RuntimeSnapshot.
+Cloud `metadata_target_seq` remains independent of these two revisions.
 
-Variants describe provider options that must be part of the AICC exact model
-identity instead of ordinary request parameters. They currently apply to LLM
-models.
+All model parameters belonging to one origin vendor must be collected in that
+vendor's single standalone file. The lowercase vendor slug is stable and must
+not be split by model, API generation, or Provider Instance. Provider-vendor
+parameters, including both origin vendors and aggregators, use one
+`<provider-vendor-lowercase>.provider.json` file per vendor under a separate
+`providers/` directory as specified by `provider_profile_schema.md`. Runtime
+code must not compensate for missing metadata by branching on model names,
+model-name prefixes, or Provider-vendor names.
 
-```json
-{
-  "name": "reasoning.high",
-  "model_pattern": "gpt-*",
-  "mount_suffix": "reasoning-high",
-  "provider_options": {
-    "reasoning": {
-      "effort": "high"
-    }
-  }
-}
-```
+For one origin model, the compiled exact entry overlays Model Driver defaults.
+Rules from shadowed source documents do not participate.
 
-`model_pattern` matches the complete channel-local `provider_model_id`. It can
-scope variants by origin within an aggregator, for example `openai/*` in
-OpenRouter metadata. When omitted, the variant applies to every otherwise
-eligible model in that driver metadata document.
+## Provider integration boundary
 
-For a discovered OpenAI model `gpt-5.1`, the resolver emits:
+The Provider upgrade is implemented separately from the v2 model kernel.
+`static_inventory_models` is explicit channel inventory; neither Model Driver
+membership nor Provider technical/pricing rules imply availability. Dynamic
+success may only be supplemented for explicitly declared uncovered APIs via
+`supplemental_inventory_api_types`. `catalog-only` profiles can further narrow
+`static_inventory_models` per instance through `instance_rules.
+enabled_inventory_models`, because a declarative channel may still only be
+provisioned for a subset of them; discovery results are never filtered by it.
+All inputs use the same identity resolver.
 
-- base exact model: `gpt-5.1@openai-primary`
-- variant exact model: `gpt-5.1:reasoning-high@openai-primary`
+Executable presets are the intersection of `supported_efforts`, compiled Provider
+mappings and observed channel restrictions. Inventory and lowering use the same
+mapping lookup. `native` uses base; all other efforts use `reasoning-{effort}`,
+including `reasoning-minimal` and `reasoning-thinking`. Invalid exact/cached
+variants are rejected. A selected preset owns its thinking parameters after
+canonical and request-rule rewrites.
 
-Route output for the variant uses `provider_model_id = "gpt-5.1"` and returns
-the variant `provider_options`. Provider adapters receive the same lowered base
-model and options even when callers invoke the variant exact model directly.
+Inventory schema 2 exposes `identity_source`, `inventory_source`,
+`unmatched_models` and `unavailable_presets`. `list_providers` includes identity,
+preset and unpriced diagnostics; refresh replies include `unmatched_count`.
+Old inventory caches and removed Provider fields are rejected.
+
+Pricing belongs to Provider Rules/discovery and supports `source_url`,
+`verified_at`, `ratio_exception`, cache reads/writes (including one-hour writes),
+audio/image token rates, tiers and time windows. Discovery and catalog share
+validation. Output/input token price ratios above 500 require a non-empty
+`ratio_exception`; a ratio of exactly 500 is accepted. Cache read prices above
+input prices and cache write prices above 10 times input prices also require an
+explanation. Missing active rates or uncovered tiers return unknown. `AiUsage`
+input/output totals include cache/reasoning tokens; modality/cache counts are
+subsets. Undeclared provider `reported_cost` is never assumed USD.
+
+A Known Provider catalog may carry `exchange_rates` with `source_url`,
+`observed_at_ms`, `expires_at_ms`, and `usd_per_unit`. Rates are usable only in the
+half-open observation/expiry interval. Routing uses a 1,000 input / 1,000 output
+reference (request estimates override it), the same tier/time-window resolver as
+settlement, and valid USD conversions. Within the expanded pool, the default
+`cost_first` profile ranks by comparable USD price only; latency and error
+observations never rank candidates. Unknown quotes are last and fail a hard cost
+budget. Specification and family weights only decide which branches expand.
+
+See [Provider upgrade implementation](provider_upgrade_implementation.md) for
+verified sources, regional scope, remaining channel gaps and validation.
+
+## Decision capability keys（2026-09-25）
+
+有限模型 `typesafe/jev-1.13.0` 的 `api_types` 为 `["decision"]`，沿用非 LLM logical_mounts。布尔 capabilities：`decision.choice`、`decision.score`、`decision.boolean`、`decision.probabilities`、`decision.structured_state`、`decision.structured_rules`；数值上限：`decision.max_questions`、`decision.max_options`、`decision.max_levels`、`decision.max_input_bytes`、`decision.max_state_question_bytes`。请求实际要求超限或缺失上限时拒绝。Jev 字节限制是本地保守限制，不能据此估算 token。完整契约、示例及核验来源见 [Decision API](decision_api.md)。
+
+OpenRouter Jev 渠道通过 Provider Rules `capability_limits` 将上述模型事实收窄到
+32000 context tokens 和 32000 input/state+question bytes；只对已有整数上限取 min，
+不添加模型能力。字段完整契约见 [Provider schema](provider_profile_schema.md#56-能力收窄)。
+
+## Video generation contract（2026-10-22）
+
+`video.generate` 模型必须在 `capabilities.video_generation` 声明厂商官方云 API 的合同（条件种类与
+数量、关键帧位置、时长/比例/档位/尺寸/fps、音轨、组合规则）；Provider Rules 的同名字段声明渠道的真实
+子集并整体替换它，OpenRouter discovery 再用 `/api/v1/videos/models` 的事实覆盖输出字段。三处使用同一
+校验，未知字段拒绝；没有合同的模型不进入 `video.generate` 路由。合同字段、执行顺序与 Provider 支持矩阵
+见 [统一视频生成协议](video_generation.md)。

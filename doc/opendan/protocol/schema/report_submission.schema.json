@@ -1,0 +1,117 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ReportArtifact": {
+      "description": "One artifact of a report: a file of the work directory (`path`, copied to `reference`), a named object (`path` is its id) or a bucket object (`path` is its `obj://bucket/...`). `obj_id` is what leaves the session: the submitted id, or what the host's object store keeps (`None`: the host has no object store); `url` is the host's bucket binding that retains it, after which the copy at `reference` is removed.",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "obj_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ReportSource": {
+      "oneOf": [
+        {
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "tool"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "call_id",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "behavior"
+              ],
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "accepted_at_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "artifacts": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/ReportArtifact"
+      },
+      "type": "array"
+    },
+    "id": {
+      "type": "string"
+    },
+    "is_end": {
+      "type": "boolean"
+    },
+    "report": {
+      "type": "string"
+    },
+    "result": true,
+    "run_id": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/definitions/ReportSource"
+    }
+  },
+  "required": [
+    "accepted_at_ms",
+    "id",
+    "is_end",
+    "report",
+    "run_id",
+    "source"
+  ],
+  "title": "ReportSubmission",
+  "type": "object"
+}

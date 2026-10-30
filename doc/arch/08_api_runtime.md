@@ -28,11 +28,12 @@ buckyos-api-runtime 的定位是“每个进程自己的调用运行时”：
 notepads 给出的分层在代码里对应为：优先兼容，逐步提速（`new_doc/ref/notepads/buckyos-api-runtime.md`）。
 
 1) 公网/通用：`https://$zone_host/kapi/<service_name>`
-- 典型场景：AppClient（本机没有 NodeGateway）。
-- 代码路径：`src/kernel/buckyos-api/src/runtime.rs` 的 `BuckyOSRuntime::get_zone_service_url()`，`BuckyOSRuntimeType::AppClient` 分支直接返回 `https?://{zone_id.to_host_name()}/kapi/<service>`。
+- 典型场景：AppClient 未显式配置 NodeGateway。
+- 代码路径：`src/kernel/buckyos-api/src/runtime.rs` 的 `BuckyOSRuntime::get_zone_service_url()`，`BuckyOSRuntimeType::AppClient` 在 `BUCKYOS_HOST_GATEWAY` 缺失、为空或只有空白时返回 `https?://{zone_id.to_host_name()}/kapi/<service>`。`get_system_config_url()` 使用相同规则，不根据设备是否为 OOD 推断当前进程的网络路径。
 
 2) 最大兼容：`http://127.0.0.1:3180/kapi/<service_name>`（NodeGateway）
 - 典型场景：AppService 运行在节点上，本机一定有 cyfs-gateway / NodeGateway。
+- AppClient 显式设置 `BUCKYOS_HOST_GATEWAY` 时，通过该 host 的 NodeGateway 访问 system-config 和其它 kRPC 服务；容器内可以继承 node-daemon 注入的网关地址，宿主机可设置为 `127.0.0.1`。
 - 常量锚点：`DEFAULT_NODE_GATEWAY_PORT: u16 = 3180`（`src/kernel/buckyos-api/src/runtime.rs`）。
 - 运行时字段：`BuckyOSRuntime.node_gateway_port`（默认为 3180，可被配置覆盖）。
 
@@ -75,7 +76,7 @@ pub struct BuckyOSRuntime {
 
 代码关键点：
 - `fill_policy_by_load_config()`：读取 machine.json 类策略（如 `force_https`、web3 bridge）。（`src/kernel/buckyos-api/src/runtime.rs`）
-- `fill_by_load_config()`：按 runtime 类型读取 `node_identity.json` / `node_private_key.pem` / `user_config.json` / `user_private_key.pem` 等。（`src/kernel/buckyos-api/src/runtime.rs`）
+- `fill_by_load_config()`：按 runtime 类型读取 `node_identity.json`（`buckyos.node_identity.v2`）/ `security/<device host>/authentication.private.pem` / `user_config.json` / `user_private_key.pem` 等。（`src/kernel/buckyos-api/src/runtime.rs`）
 - `fill_by_env_var()`：为服务类 runtime（KernelService / AppService 等）从环境变量读取启动 token；未配置会直接报错。（`src/kernel/buckyos-api/src/runtime.rs`）
 - `init()` 本身不会注册全局 runtime，也不会启动 keep-alive 后台任务；只有 `set_buckyos_api_runtime()` 成功后，全局 runtime 才可被 `get_buckyos_api_runtime()` 访问。
 
@@ -90,9 +91,9 @@ global_runtime = get_buckyos_api_runtime()?
 
 `init()` 到 `login()` 之间允许存在 `app_id/user_id` 等“声明身份”，但它们还不是已经认证的身份。
 
-token 环境变量名规则：`get_session_token_env_key()`（`src/kernel/buckyos-api/src/lib.rs`）：
-- 先把 full_app_id upper-case 并把 `-` 替换为 `_`。
-- service 默认读 `<APP>_SESSION_TOKEN`，AppService 读 `<APP>_TOKEN`。
+token 环境变量规则（`src/kernel/buckyos-api/src/lib.rs`）：
+- Kernel/Frame 系统服务通过 `get_service_session_token_env_key()` 读取 `<SERVICE>_SESSION_TOKEN`。
+- 普通 AppService 固定读取 `BUCKYOS_APP_TOKEN`，并用 `BUCKYOS_APP_DID/APP_ID/APP_INSTANCE_ID/OWNER_USER_ID` 校验当前语义身份。
 
 ## login：检查 token + 拉取 zone_config + 启动 keep-alive
 
@@ -102,7 +103,7 @@ token 环境变量名规则：`get_session_token_env_key()`（`src/kernel/buckyo
 - 如果 token 为空：
   - AppClient 优先尝试用 `user_private_key` 生成 token；否则尝试用 `device_private_key` 生成 token。
   - 仍为空则失败：`session_token is empty!`。
-- 如果 token 不为空：解析 token 并检查 token 中 appid 与 `self.app_id` 一致，否则失败。
+- 如果 token 不为空：解析 token；普通 AppService 同时精确比较 `appid`、`app_instance_id` 和 `app_owner_user_id`，任一不一致即失败。
 
 2) 连接 control-panel 并读取 `zone_config`
 - 代码路径：`get_control_panel_client()` → `load_zone_config()`（`src/kernel/buckyos-api/src/runtime.rs`）。
@@ -122,6 +123,8 @@ token 环境变量名规则：`get_session_token_env_key()`（`src/kernel/buckyo
 ```text
 get_zone_service_url(service):
   if runtime_type == AppClient:
+    if BUCKYOS_HOST_GATEWAY is nonempty after trimming:
+      return http://<resolved_host_gateway>:<node_gateway_port>/kapi/<service>
     return https?://<zone_host>/kapi/<service>
 
   if runtime_type in {AppService, FrameService}:
@@ -145,7 +148,8 @@ get_zone_service_url(service):
 典型的系统服务调用写法在大量服务里复用（例如 repo-service / smb-service）：
 - repo-service：`src/frame/repo_service/src/main.rs`
 - smb-service：`src/frame/smb_service/src/main.rs`
-- buckycli：`src/tools/buckycli/src/main.rs`
+- 系统 Tool：由 SDK artifact 提供，分发入口见
+  [`buckyos-websdk/doc/distribution.md`](https://github.com/buckyos/buckyos-websdk/blob/main/doc/distribution.md)
 
 runtime 提供的“标准拼装”是：`get_zone_service_krpc_client()`（`src/kernel/buckyos-api/src/runtime.rs`）。
 
@@ -191,30 +195,26 @@ process_main():
 - 这意味着：NodeGateway 不是“可选加速层”，在 AppService 的兼容模式下它是主链路。
 - 对应 notepads 的提醒：NodeGateway down 会导致大量 app/service 暂时不可用（`new_doc/ref/notepads/buckyos-api-runtime.md`）。
 
-### 2) token 刷新语义：有两套刷新路径，别混淆
+### 2) LoginAssertion 兑换与 refresh token 刷新不能混淆
 
 代码里同时存在两种“续命”方式：
 
 - `renew_token_from_verify_hub()`：
-  - 只有当当前 token 非空且接近过期时才会触发（`exp` 小于当前时间 + 30s）。
-  - 如果 token 的 `iss` 不是 `verify-hub` 也会触发刷新。
-  - 刷新方式是调用 `verify_hub_client.login_by_jwt(old_token)` 并把返回的 token 写回 `self.session_token`。
+  - 非 Verify Hub issuer 的启动材料是一次性 LoginAssertion，只能在明确的 exchange 路径调用 `login_by_jwt`。
+  - Verify Hub session/refresh token 都携带严格 `token_use + AuthTarget`；普通本地 session verifier 会拒绝 LoginAssertion 和 refresh token。
+  - 已取得 token pair 后，正常续签只用 refresh token 调用 `refresh_token`；若 refresh material 缺失，可以重新生成一份新的 LoginAssertion 走 exchange，但绝不能把 session token 重新提交到 `login_by_jwt`。
   - 触发点是 keep-alive 定时任务（`login()` 启动的 5s timer）。
   - 代码路径：`src/kernel/buckyos-api/src/runtime.rs`。
 
-- `get_session_token()`：
-  - 在获取 token 时，如果发现 token 即将过期（`exp` 小于当前时间 + 10s），会尝试用 `device_private_key` 重新生成一个 JWT 并覆盖内存里的 token。
-  - 这条路径不依赖 verify-hub 在线，但要求本进程有 device private key。
-  - 代码路径：`src/kernel/buckyos-api/src/runtime.rs`。
+- `get_session_token()` 返回当前业务 session；设备/用户私钥直接签发的材料不再能作为普通 session 使用。
 
 实际影响：
-- 你可能看到“verify-hub 暂时不可用但调用仍能继续一段时间”，因为 `get_session_token()` 还能本地续签（前提是有 device private key）。
-- 也可能看到“token 看起来没过期但仍然会 refresh”，因为 `iss != verify-hub` 会触发刷新（例如某些自签 token 场景）。
+- Verify Hub 暂时不可用时，已有 session 在自身 TTL 内仍可本地验签使用；无法用设备私钥绕过 Verify Hub 续签普通 session。
 
 ### 3) 环境变量 token 缺失会导致服务启动直接失败
 
 - 对 KernelService / FrameService / AppService，`fill_by_env_var()` 会按规则寻找 token env；缺失会直接返回 error（`load session_token from env var failed`）。
-- 这通常发生在：node-daemon 拉起服务但没有把 token 注入到环境里，或者 env key 名称没按 `get_session_token_env_key()` 规则生成。
+- 这通常发生在：node-daemon 拉起普通 AppService 时没有注入 `BUCKYOS_APP_TOKEN`，或拉起系统服务时没有按 `get_service_session_token_env_key()` 注入 `<SERVICE>_SESSION_TOKEN`。
 
 ### 4) trust_keys 不刷新会导致 enforce 误判
 

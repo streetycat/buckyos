@@ -1,0 +1,103 @@
+# Jarvis agent package. Loaded by the OpenDAN Agent Loader (src/frame/opendan);
+# session templates are read by libopendan (SessionTemplate).
+
+[runtime]
+language = "zh"
+
+# Base `.llm_context` of the sessions the Loader creates. A behavior lays its
+# own model / loop / tools / budget over it.
+[llm_context]
+model = "llm.chat"
+max_tokens = 8192
+
+[llm_context.provider]
+type = "buckyos"
+
+[llm_context.tools]
+enabled = true
+
+[loader]
+agent_state_service = true
+webui = true
+idle_unload_secs = 900
+
+[[loader.ui]]
+on = "msg.chat"
+session_class = "ui"
+sid_strategy = "per_peer"
+idle_unload_secs = 900
+
+# Reached only by the owner's @ while the owner allows group chat; the
+# request comes with the group's latest messages as context.
+[[loader.ui]]
+on = "msg.group"
+session_class = "group"
+sid_strategy = "per_group"
+idle_unload_secs = 900
+
+[loader.self_check]
+enabled = false
+
+# Goals of the agent: the Loader creates one Goal Session per goal and epoch
+# and offers scheduled run opportunities (local schedule).
+[loader.goals]
+enabled = true
+
+# A UI session's objective is the built-in design intent of a conversation
+# (`objective = "..."` replaces it); its command manuals are frozen with it.
+[session.ui]
+default_behavior = "chat_route"
+default_cmd_skills = ["ui_core"]
+max_process_depth = 4
+
+[session.group]
+base = "ui"
+default_behavior = "groupchat_route"
+default_cmd_skills = ["ui_core"]
+max_process_depth = 4
+
+# A work session's command manuals are chosen when it is created
+# (`create-worksession --cmd-skill`); there is no default.
+[session.work]
+default_behavior = "plan"
+max_process_depth = 8
+# A work session asks its user through a notification and waits this long
+# for the answer (0: work sessions do not ask).
+ask_user_timeout_secs = 10800
+
+# A work session that plans with a TodoList and runs every Todo in a sub
+# session of its own, in one Turn, with native function calls; its result is
+# an explicit final report. Chosen explicitly:
+# `agent-session create-worksession --class plan_simple --objective "..."`.
+[session.plan_simple]
+base = "work"
+default_behavior = "plan_simple"
+completion = "explicit_report"
+max_process_depth = 8
+ask_user_timeout_secs = 10800
+
+# Goal Sessions: every activation is one Turn; what a goal leaves out of its
+# budget and schedule comes from here.
+[session.goal]
+default_behavior = "goal"
+max_sub_sessions = 4
+min_interval_secs = 60
+
+[session.goal.budget.activation]
+max_total_tokens = 300000
+max_runs = 6
+
+[session.goal.budget.period]
+window_secs = 86400
+max_works = 24
+
+# The agent's default Memory maintenance Goal (lifecycle maintain, built in,
+# key `builtin:memory_maintenance`): consolidates perceptions into
+# cognitions every 30 minutes when there is material (a 2 hour baseline
+# check otherwise). Its own budget is set when it is seeded; `decision`
+# is the optional model pre-check (off until the AICC decision provider is
+# wired).
+[session.goal.maintenance]
+enabled = true
+decision = "off"
+behavior = "memory_maintenance"

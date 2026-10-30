@@ -1,0 +1,768 @@
+//! The history part of the next llm_context (§4.4).
+//!
+//! Read order is fixed: `summary.json` first, then the worklog **backwards**
+//! from the committed end down to `summary.start_offset`, stopping early when
+//! the budget runs out (then compaction moves the start point first, so the
+//! summary and the raw records never leave a gap). The runtime never scans
+//! the whole worklog.
+//!
+//! Rendering is deterministic for a renderer version
+//! (`libopendan.mechanical/3`): same summary.json + worklog → same bytes.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use buckyos_api::{AiMessage, AiRole};
+
+use llm_context::deps::{LlmClient, LlmInferenceRequest};
+use llm_context::InferenceAbortToken;
+
+use crate::error::{OpenDanError, Result};
+use crate::lock::Lease;
+use crate::protocol::*;
+use crate::session::Session;
+
+pub(super) async fn build_chat_history(
+    session: &mut Session,
+    lease: &Lease,
+    summarizer: &dyn Summarizer,
+    budget: u32,
+) -> Result<Vec<AiMessage>> {
+    let sm = session.summary()?;
+    if sm.start_offset == 0 && sm.history_summary.is_empty() {
+        if let Some(run_id) = session.state.last_run.as_deref() {
+            let (record, snapshot) = session.dir.runs().load_checked(run_id)?;
+            let ended_turn = crate::session::runs::finish_info(&record)
+                .is_some_and(|f| !f["turn_end"].is_null());
+            if record.config.loop_model == agent_tool::xllm::LoopModel::FunctionCall && ended_turn {
+                let snapshot = snapshot.ok_or_else(|| {
+                    OpenDanError::blocked("the previous chat run has no snapshot", Some(run_id))
+                })?;
+                if super::receipts::snapshot_host_meta(&snapshot).process_entry
+                    == session.state.process_entry
+                {
+                    let messages: Vec<_> = snapshot
+                        .state
+                        .accumulated
+                        .into_iter()
+                        .skip_while(|m| m.role == AiRole::System)
+                        .collect();
+                    let used = llm_context::context_window::estimate_messages(
+                        &llm_context::deps::ByteHeuristicTokenizer,
+                        &messages,
+                    );
+                    if used <= u64::from(budget) {
+                        return Ok(messages);
+                    }
+                    log::info!(
+                        "opendan.context.compaction.triggered {}",
+                        serde_json::json!({
+                            "session_id": session.sid(),
+                            "phase": "build_chat_history",
+                            "reason": "history_budget",
+                            "budget_tokens": budget,
+                            "raw_tokens": used,
+                        })
+                    );
+                    let keep = read_window(session, &sm, budget / 2)?;
+                    let (cut, cut_seq) = match (keep.oldest_offset, keep.oldest_seq) {
+                        (Some(cut), Some(seq)) if !keep.reached_start && cut > sm.start_offset => {
+                            (cut, seq)
+                        }
+                        _ => (
+                            session.state.worklog.committed_bytes,
+                            session.state.worklog.committed_seq + 1,
+                        ),
+                    };
+                    compact(session, lease, summarizer, cut, cut_seq, "context_limit").await?;
+                }
+            }
+        }
+    }
+    Ok(build_history(session, lease, Some(summarizer), budget)
+        .await?
+        .0
+        .into_iter()
+        .collect())
+}
+
+/// Rough token estimate (bytes / 4), same heuristic as the waist.
+pub fn tokens(s: &str) -> u32 {
+    ((s.len() as u64 + 3) / 4).min(u32::MAX as u64) as u32
+}
+
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let t: String = s.chars().take(max).collect();
+    format!("{t}…")
+}
+
+fn input_list(inputs: &[InputRef], events: &[String]) -> String {
+    let ins: Vec<String> = inputs.iter().map(|i| i.id()).collect();
+    format!(
+        "{}{}",
+        if ins.is_empty() {
+            String::new()
+        } else {
+            format!(" inputs: {}", ins.join(","))
+        },
+        if events.is_empty() {
+            String::new()
+        } else {
+            format!(" events: {}", events.join(","))
+        }
+    )
+}
+
+/// `true` for the entries that count as one model response in
+/// `MechanicalCompress.recent_full_responses`.
+fn is_response(body: &WorklogBody) -> bool {
+    matches!(
+        body,
+        WorklogBody::Step { .. } | WorklogBody::AssistantMessage { .. }
+    )
+}
+
+fn render_calls(s: &mut String, calls: &[ActionEntry], limit: impl Fn(&str, u32) -> String) {
+    for a in calls {
+        s.push_str(&format!(
+            "\n  → {}({}) #{}",
+            a.tool,
+            limit(&a.args.to_string(), 400),
+            a.call_id
+        ));
+    }
+}
+
+/// Render one worklog entry. `age` counts model responses (`step` /
+/// `assistant_message`) already rendered, newest first: the
+/// `recent_full_responses` newest responses and the entries after them are
+/// full, older ones are truncated to `summary_chars`.
+pub fn render_entry(e: &WorklogEntry, age: u32, cfg: &MechanicalCompress) -> Option<String> {
+    if cfg.drop_kinds.iter().any(|k| k == e.body.kind()) {
+        return None;
+    }
+    let full = age < cfg.recent_full_responses;
+    let limit = |s: &str, full_max: u32| -> String {
+        if full {
+            trunc(s, full_max as usize)
+        } else {
+            trunc(s, cfg.summary_chars as usize)
+        }
+    };
+    Some(match &e.body {
+        WorklogBody::ReportDelivery { assistant, .. } => {
+            format!("[assistant] {}", limit(assistant, cfg.max_result_chars))
+        }
+        WorklogBody::Created { objective, .. } => format!("[created] {objective}"),
+        WorklogBody::TurnStarted {
+            turn,
+            inputs,
+            events,
+            hook,
+            ..
+        } => format!(
+            "── turn {turn}{}{} ──",
+            hook.as_ref().map(|h| format!(" ({h})")).unwrap_or_default(),
+            input_list(inputs, events)
+        ),
+        WorklogBody::InputBatch {
+            inputs,
+            events,
+            hook,
+            ..
+        } => format!(
+            "── {}{} ──",
+            hook.as_deref().unwrap_or("input"),
+            input_list(inputs, events)
+        ),
+        // A message that stands for itself in one line once it is history
+        // (the Goal header of an earlier Activation).
+        WorklogBody::UserMessage {
+            brief: Some(brief), ..
+        } => format!("[input] {brief}"),
+        WorklogBody::UserMessage { content, .. } => {
+            format!("[input] {}", limit(content, cfg.max_result_chars))
+        }
+        WorklogBody::AssistantMessage {
+            assistant,
+            tool_calls,
+            ..
+        } => {
+            let mut s = format!("[assistant] {}", limit(assistant, cfg.max_result_chars));
+            render_calls(&mut s, tool_calls, &limit);
+            s
+        }
+        WorklogBody::Step {
+            step_index,
+            assistant,
+            actions,
+            behavior,
+            correction,
+            ..
+        } => {
+            let mut s = format!(
+                "[step {step_index}{}{}] {}",
+                behavior
+                    .as_ref()
+                    .map(|b| format!(" {b}"))
+                    .unwrap_or_default(),
+                if *correction { " correction" } else { "" },
+                limit(assistant, cfg.max_result_chars)
+            );
+            render_calls(&mut s, actions, &limit);
+            s
+        }
+        WorklogBody::ActionResult {
+            call_id,
+            status,
+            result,
+            ..
+        } => format!(
+            "[result #{call_id} {status}] {}",
+            limit(result, cfg.max_result_chars)
+        ),
+        WorklogBody::Outcome {
+            kind,
+            next_behavior,
+            report,
+            ..
+        } => format!(
+            "[outcome {kind}{}]{}",
+            next_behavior
+                .as_ref()
+                .map(|b| format!(" → {b}"))
+                .unwrap_or_default(),
+            report
+                .as_ref()
+                .map(|r| format!(" {}", limit(r, cfg.max_result_chars)))
+                .unwrap_or_default()
+        ),
+        WorklogBody::TurnEnded { turn, status, .. } => {
+            format!(
+                "── turn {turn} {} ──",
+                serde_json::to_value(status).ok()?.as_str()?
+            )
+        }
+        WorklogBody::Compaction { .. } => return None,
+        WorklogBody::Decide { decision, by, .. } => format!("[decide] {decision} by {by}"),
+        WorklogBody::InputRejected { input, reason, .. } => {
+            format!("[rejected {}] {reason}", input.id())
+        }
+        WorklogBody::EventDropped { input, reason } => {
+            format!("[event dropped {}] {reason}", input.id())
+        }
+        WorklogBody::ControlApplied { command, .. } => format!("[control] {command}"),
+    })
+}
+
+/// Run a transcript entry belongs to (`None`: session level entries).
+fn entry_run(body: &WorklogBody) -> Option<&str> {
+    match body {
+        WorklogBody::InputBatch { run_id, .. }
+        | WorklogBody::UserMessage { run_id, .. }
+        | WorklogBody::AssistantMessage { run_id, .. }
+        | WorklogBody::ReportDelivery { run_id, .. }
+        | WorklogBody::Step { run_id, .. }
+        | WorklogBody::ActionResult { run_id, .. }
+        | WorklogBody::Outcome { run_id, .. } => Some(run_id),
+        _ => None,
+    }
+}
+
+/// Sub contexts that returned (`process_done`): their transcript stays in
+/// the worklog for audit, but a history built for another context only
+/// carries what they handed back — the `process_done` outcome with its
+/// result. Without this a caller rebuilt from the session history would get
+/// the child's whole transcript mixed into its own.
+#[derive(Default)]
+struct ReturnedChildren {
+    children: std::collections::HashSet<String>,
+    deliveries: std::collections::HashMap<String, ReportSource>,
+}
+
+impl ReturnedChildren {
+    fn note(&mut self, body: &WorklogBody) {
+        if let WorklogBody::ReportDelivery {
+            run_id, submission, ..
+        } = body
+        {
+            self.deliveries
+                .insert(run_id.clone(), submission.source.clone());
+        }
+        if let WorklogBody::Outcome { run_id, kind, .. } = body {
+            if kind == "process_done" {
+                self.children.insert(run_id.clone());
+            }
+        }
+    }
+
+    fn render(&self, entry: &WorklogEntry, age: u32, cfg: &MechanicalCompress) -> Option<String> {
+        let mut entry = entry.clone();
+        if let WorklogBody::AssistantMessage {
+            run_id, tool_calls, ..
+        } = &mut entry.body
+        {
+            if let Some(ReportSource::Tool { call_id }) = self.deliveries.get(run_id) {
+                for call in tool_calls.iter_mut().filter(|c| &c.call_id == call_id) {
+                    call.args = serde_json::json!({"delivery": "report_delivery"});
+                }
+            }
+        }
+        render_entry(&entry, age, cfg)
+    }
+
+    /// The entry is part of a returned child's transcript (not its result).
+    fn hides(&self, body: &WorklogBody) -> bool {
+        if matches!(body, WorklogBody::Outcome { kind, .. } if kind == "process_done") {
+            return false;
+        }
+        if let WorklogBody::Step {
+            run_id, step_index, ..
+        } = body
+        {
+            if self.deliveries.get(run_id)
+                == Some(&ReportSource::Behavior {
+                    step_index: *step_index,
+                })
+            {
+                return true;
+            }
+        }
+        entry_run(body).is_some_and(|r| self.children.contains(r))
+    }
+}
+
+/// Rendered history window.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryWindow {
+    /// Rendered entries, oldest first.
+    pub lines: Vec<String>,
+    pub tokens: u32,
+    /// `true` when the reverse read reached `start_offset`.
+    pub reached_start: bool,
+    /// Byte offset of the oldest rendered entry.
+    pub oldest_offset: Option<u64>,
+    pub oldest_seq: Option<u64>,
+    /// Bytes read from the worklog (bounded by the window, not file size).
+    pub bytes_read: u64,
+}
+
+/// Reverse-read the committed worklog within `budget` tokens.
+pub fn read_window(
+    session: &Session,
+    summary: &SessionSummary,
+    budget: u32,
+) -> Result<HistoryWindow> {
+    let wl = session.dir.worklog();
+    let end = session.state.worklog.committed_bytes;
+    let mut r = wl.reverse(end, summary.start_offset)?;
+    let mut out = HistoryWindow {
+        reached_start: true,
+        ..Default::default()
+    };
+    let mut rev: Vec<String> = Vec::new();
+    let mut age = 0u32;
+    let mut pending_age_bump = false;
+    let mut children = ReturnedChildren::default();
+    loop {
+        let Some((offset, e)) = r.next_json::<WorklogEntry>()? else {
+            break;
+        };
+        // Read backwards: a child's `process_done` comes before its entries.
+        children.note(&e.body);
+        if children.hides(&e.body) {
+            continue;
+        }
+        if pending_age_bump {
+            age += 1;
+            pending_age_bump = false;
+        }
+        let Some(text) = children.render(&e, age, &summary.mechanical) else {
+            // Dropped kinds still count as read.
+            continue;
+        };
+        let t = tokens(&text) + 1;
+        if out.tokens + t > budget {
+            out.reached_start = false;
+            break;
+        }
+        out.tokens += t;
+        out.oldest_offset = Some(offset);
+        out.oldest_seq = Some(e.seq);
+        rev.push(text);
+        if is_response(&e.body) {
+            pending_age_bump = true;
+        }
+    }
+    out.bytes_read = r.bytes_read;
+    rev.reverse();
+    out.lines = rev;
+    Ok(out)
+}
+
+/// The history message (summary + raw records), `None` when empty.
+pub fn history_message(summary: &SessionSummary, window: &HistoryWindow) -> Option<AiMessage> {
+    if summary.history_summary.trim().is_empty() && window.lines.is_empty() {
+        return None;
+    }
+    let mut s = String::from("<session_history>\n");
+    if !summary.history_summary.trim().is_empty() {
+        s.push_str(&format!(
+            "<summary upto_seq=\"{}\">\n{}\n</summary>\n",
+            summary.start_seq,
+            summary.history_summary.trim()
+        ));
+    }
+    for l in &window.lines {
+        s.push_str(l);
+        s.push('\n');
+    }
+    s.push_str("</session_history>");
+    Some(AiMessage::text(AiRole::User, s))
+}
+
+/// Produces the summary text of compaction.
+#[async_trait]
+pub trait Summarizer: Send + Sync {
+    async fn summarize(&self, previous: &str, segment: &str) -> Result<String>;
+}
+
+pub const SUMMARIZE_MARKER: &str = "[libopendan:summarize]";
+
+/// LLM based summarizer (uses the session's model).
+pub struct LlmSummarizer {
+    pub llm: Arc<dyn LlmClient>,
+    pub model: String,
+}
+
+#[async_trait]
+impl Summarizer for LlmSummarizer {
+    async fn summarize(&self, previous: &str, segment: &str) -> Result<String> {
+        let prompt = format!(
+            "{SUMMARIZE_MARKER}\nSummarize the work history below into a concise, factual summary that preserves decisions, results, file names, open problems and user requests. Merge it with the previous summary.\n\n<previous_summary>\n{previous}\n</previous_summary>\n\n<history>\n{segment}\n</history>"
+        );
+        let req = LlmInferenceRequest {
+            trace_id: None,
+            messages: vec![
+                AiMessage::text(
+                    AiRole::System,
+                    "You compress agent work logs. Reply with the summary text only.",
+                ),
+                AiMessage::text(AiRole::User, prompt),
+            ],
+            model_alias: self.model.clone(),
+            fallbacks: Vec::new(),
+            temperature: None,
+            max_completion_tokens: Some(2048),
+            force_json: false,
+            json_schema: None,
+            provider_options: None,
+            disable_capabilities: Vec::new(),
+            tool_specs: Vec::new(),
+            allow_tool_calls: false,
+            abort: InferenceAbortToken::noop(),
+        };
+        let resp = self
+            .llm
+            .infer(req)
+            .await
+            .map_err(|e| OpenDanError::Llm(format!("summarize: {e}")))?;
+        let text = resp.message.text_content();
+        if text.trim().is_empty() {
+            return Err(OpenDanError::Llm("summarize: empty summary".into()));
+        }
+        Ok(text.trim().to_string())
+    }
+}
+
+/// Compaction (§4.4): summarize `[start_offset, cut_offset)` into a new
+/// summary.json (start point moves to `cut_offset`), then append the audit
+/// entry and commit. The worklog is never rewritten.
+pub async fn compact(
+    session: &mut Session,
+    lease: &Lease,
+    summarizer: &dyn Summarizer,
+    cut_offset: u64,
+    cut_seq: u64,
+    made_by: &str,
+) -> Result<SessionSummary> {
+    let started = Instant::now();
+    let mut event = serde_json::json!({
+        "session_id": session.sid(),
+        "reason": made_by,
+        "start_seq": null,
+        "cut_seq": cut_seq,
+        "start_offset": null,
+        "cut_offset": cut_offset,
+        "range_bytes": null,
+        "segment_tokens": null,
+        "summary_tokens_before": null,
+        "summary_tokens_after": null,
+        "elapsed_ms": 0,
+    });
+    let sm = session.summary().map_err(|error| {
+        event["error"] = serde_json::json!(error.to_string());
+        event["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+        log::warn!("opendan.context.compaction.failed {}", event);
+        error
+    })?;
+    event["start_seq"] = serde_json::json!(sm.start_seq);
+    event["start_offset"] = serde_json::json!(sm.start_offset);
+    event["range_bytes"] = serde_json::json!(cut_offset.saturating_sub(sm.start_offset));
+    event["summary_tokens_before"] = serde_json::json!(tokens(&sm.history_summary));
+    if cut_offset <= sm.start_offset {
+        event["skip_reason"] = serde_json::json!("no_compactable_range");
+        log::debug!("opendan.context.compaction.skipped {}", event);
+        return Ok(sm);
+    }
+    log::info!("opendan.context.compaction.started {}", event);
+    let result: Result<SessionSummary> = async {
+        // The only forward read: the bounded range being summarized.
+        let segment_entries = session
+            .dir
+            .worklog()
+            .read_range(sm.start_offset, cut_offset)?;
+        let full = MechanicalCompress {
+            recent_full_responses: u32::MAX,
+            ..sm.mechanical.clone()
+        };
+        let mut children = ReturnedChildren::default();
+        for (_, e) in &segment_entries {
+            children.note(&e.body);
+        }
+        let segment: Vec<String> = segment_entries
+            .iter()
+            .filter(|(_, e)| !children.hides(&e.body))
+            .filter_map(|(_, e)| children.render(e, 0, &full))
+            .collect();
+        let segment = segment.join("\n");
+        event["segment_tokens"] = serde_json::json!(tokens(&segment));
+        let summary_text = summarizer.summarize(&sm.history_summary, &segment).await?;
+        event["summary_tokens_after"] = serde_json::json!(tokens(&summary_text));
+        let new = SessionSummary {
+            schema: SESSION_SUMMARY_SCHEMA.to_string(),
+            history_summary: summary_text,
+            start_seq: cut_seq,
+            start_offset: cut_offset,
+            mechanical: sm.mechanical.clone(),
+            renderer: MECHANICAL_RENDERER.to_string(),
+            made_at_seq: session.state.worklog.committed_seq,
+            made_by: made_by.to_string(),
+            updated_at_ms: crate::now_ms(),
+        };
+        session.write_summary(lease, &new)?;
+        session.append_worklog(
+            lease,
+            vec![WorklogBody::Compaction {
+                summary_start_seq: cut_seq,
+                made_by: made_by.to_string(),
+            }],
+        )?;
+        session.commit_state(lease)?;
+        Ok(new)
+    }
+    .await;
+    event["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+    match &result {
+        Ok(_) => log::info!("opendan.context.compaction.completed {}", event),
+        Err(error) => {
+            event["error"] = serde_json::json!(error.to_string());
+            log::warn!("opendan.context.compaction.failed {}", event);
+        }
+    }
+    result
+}
+
+/// History messages for a new llm_context: compacts first when the budget is
+/// exhausted before the start point (no gap between summary and records).
+pub async fn build_history(
+    session: &mut Session,
+    lease: &Lease,
+    summarizer: Option<&dyn Summarizer>,
+    budget: u32,
+) -> Result<(Option<AiMessage>, HistoryWindow)> {
+    let mut sm = session.summary()?;
+    let summary_cost = tokens(&sm.history_summary);
+    let mut window = read_window(session, &sm, budget.saturating_sub(summary_cost))?;
+    if !window.reached_start {
+        let mut event = serde_json::json!({
+            "session_id": session.sid(),
+            "phase": "build_history",
+            "reason": "history_budget",
+            "budget_tokens": budget,
+            "summary_tokens": summary_cost,
+            "raw_tokens": window.tokens,
+            "raw_tokens_lower_bound": !window.reached_start,
+            "reached_start": window.reached_start,
+        });
+        log::info!("opendan.context.compaction.triggered {}", event);
+        let Some(s) = summarizer else {
+            event["failure_reason"] = serde_json::json!("missing_summarizer");
+            log::warn!("opendan.context.compaction.unavailable {}", event);
+            return Err(OpenDanError::Other(
+                "history exceeds the budget and no summarizer is configured".into(),
+            ));
+        };
+        // New start = the oldest entry that still fits.
+        let cut = window
+            .oldest_offset
+            .unwrap_or(session.state.worklog.committed_bytes);
+        let cut_seq = window
+            .oldest_seq
+            .unwrap_or(session.state.worklog.committed_seq + 1);
+        sm = compact(session, lease, s, cut, cut_seq, "context_limit").await?;
+        let summary_cost = tokens(&sm.history_summary);
+        window = read_window(session, &sm, budget.saturating_sub(summary_cost))?;
+        if !window.reached_start {
+            log::warn!(
+                "opendan.context.compaction.budget_exceeded {}",
+                serde_json::json!({
+                    "session_id": session.sid(),
+                    "phase": "build_history",
+                    "reason": "history_budget",
+                    "budget_tokens": budget,
+                    "summary_tokens": summary_cost,
+                    "raw_tokens": window.tokens,
+                    "raw_tokens_lower_bound": !window.reached_start,
+                    "reached_start": window.reached_start,
+                })
+            );
+            return Err(OpenDanError::Other(
+                "history still exceeds the budget after compaction".into(),
+            ));
+        }
+    } else {
+        log::debug!(
+            "opendan.context.compaction.skipped {}",
+            serde_json::json!({
+                "session_id": session.sid(),
+                "phase": "build_history",
+                "skip_reason": "within_history_budget",
+                "budget_tokens": budget,
+                "summary_tokens": summary_cost,
+                "raw_tokens": window.tokens,
+                "reached_start": window.reached_start,
+            })
+        );
+    }
+    Ok((history_message(&sm, &window), window))
+}
+
+/// Mid-run compaction at the context limit (§4.4): the run's history so far
+/// is already in the worklog. The start point moves so that at most `keep`
+/// tokens of raw records remain, then the history message is rebuilt within
+/// `budget`.
+pub async fn compact_for_limit(
+    session: &mut Session,
+    lease: &Lease,
+    summarizer: &dyn Summarizer,
+    budget: u32,
+    keep: u32,
+) -> Result<Option<AiMessage>> {
+    let sm = session.summary()?;
+    let window = read_window(session, &sm, keep)?;
+    if !window.reached_start {
+        log::info!(
+            "opendan.context.compaction.triggered {}",
+            serde_json::json!({
+                "session_id": session.sid(),
+                "phase": "context_limit",
+                "reason": "context_limit",
+                "budget_tokens": budget,
+                "summary_tokens": tokens(&sm.history_summary),
+                "raw_tokens": window.tokens,
+                "raw_tokens_lower_bound": !window.reached_start,
+                "reached_start": window.reached_start,
+                "keep_tokens": keep,
+            })
+        );
+        let cut = window
+            .oldest_offset
+            .unwrap_or(session.state.worklog.committed_bytes);
+        let cut_seq = window
+            .oldest_seq
+            .unwrap_or(session.state.worklog.committed_seq + 1);
+        compact(session, lease, summarizer, cut, cut_seq, "context_limit").await?;
+    } else {
+        log::debug!(
+            "opendan.context.compaction.skipped {}",
+            serde_json::json!({
+                "session_id": session.sid(),
+                "phase": "context_limit",
+                "skip_reason": "within_keep_budget",
+                "budget_tokens": budget,
+                "summary_tokens": tokens(&sm.history_summary),
+                "raw_tokens": window.tokens,
+                "reached_start": window.reached_start,
+                "keep_tokens": keep,
+            })
+        );
+    }
+    Ok(build_history(session, lease, Some(summarizer), budget)
+        .await?
+        .0)
+}
+
+/// After a run: compact when the history occupies more than `ratio` of the
+/// budget, keeping about half of the budget as raw records.
+pub async fn maybe_compact(
+    session: &mut Session,
+    lease: &Lease,
+    summarizer: Option<&dyn Summarizer>,
+    budget: u32,
+    ratio: f32,
+) -> Result<bool> {
+    let Some(s) = summarizer else {
+        log::warn!(
+            "opendan.context.compaction.unavailable {}",
+            serde_json::json!({
+                "session_id": session.sid(),
+                "phase": "after_run",
+                "reason": "missing_summarizer",
+                "budget_tokens": budget,
+                "ratio": ratio,
+                "threshold_tokens": ratio * budget as f32,
+            })
+        );
+        return Ok(false);
+    };
+    let sm = session.summary()?;
+    let full = read_window(session, &sm, budget)?;
+    let used = full.tokens + tokens(&sm.history_summary);
+    let mut event = serde_json::json!({
+        "session_id": session.sid(),
+        "phase": "after_run",
+        "reason": "ratio",
+        "budget_tokens": budget,
+        "summary_tokens": tokens(&sm.history_summary),
+        "raw_tokens": full.tokens,
+        "raw_tokens_lower_bound": !full.reached_start,
+        "reached_start": full.reached_start,
+        "keep_tokens": budget / 2,
+        "ratio": ratio,
+        "threshold_tokens": ratio * budget as f32,
+    });
+    if full.reached_start && (used as f32) <= ratio * budget as f32 {
+        event["skip_reason"] = serde_json::json!("below_threshold");
+        log::debug!("opendan.context.compaction.skipped {}", event);
+        return Ok(false);
+    }
+    let keep = read_window(session, &sm, budget / 2)?;
+    let (Some(cut), Some(cut_seq)) = (keep.oldest_offset, keep.oldest_seq) else {
+        event["skip_reason"] = serde_json::json!("no_retained_history");
+        log::debug!("opendan.context.compaction.skipped {}", event);
+        return Ok(false);
+    };
+    if cut <= sm.start_offset {
+        event["skip_reason"] = serde_json::json!("no_compactable_range");
+        log::debug!("opendan.context.compaction.skipped {}", event);
+        return Ok(false);
+    }
+    log::info!("opendan.context.compaction.triggered {}", event);
+    compact(session, lease, s, cut, cut_seq, "ratio").await?;
+    Ok(true)
+}

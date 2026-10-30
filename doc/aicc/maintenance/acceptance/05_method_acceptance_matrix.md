@@ -8,21 +8,18 @@
 
 本节同时覆盖标准 AI 推理 method、分层 API method 和控制/管理 method。`method` 是 kRPC schema discriminator；`api_type` 只用于 `route.resolve`、Provider inventory 和逻辑目录过滤。
 
-当前实现里的 canonical `ApiType` 序列化值以代码枚举为准：LLM 为 `llm`，不是 `llm.chat`；chat 的真实调用 method 仍是 `llm.chat`。验收用例必须同时验证：
+canonical `ApiType` 序列化值以协议 schema 为准：LLM chat 为 `llm`，chat 的 typed inference method 为 `chat.completions.create`。验收用例必须验证：
 
 - `route.resolve(api_type="llm")` 可路由到支持 chat 的模型。
-- `route.resolve(api_type="llm.chat")` 的行为必须与当前协议约定一致：若实现尚未接受该别名，应返回稳定、可判断的错误，并在报告中标注为命名兼容缺口。
 - `embedding.multilingual`、`embedding.code` 当前不是正式 `ApiType` 枚举项；如文档或 inventory 中出现，应作为 capability / logical mount / metadata 标签处理，不能当作已支持的标准 `api_type` 误判为缺测。
 
 ### 1.1 LLM
 
 | Method | 必测输入 | 必测输出 | 异常 |
 |---|---|---|---|
-| `route.resolve` | `api_type`、逻辑模型名 `logical_model`、requirements、disable、policy | `selected_exact_model`、provider 信息、`provider_options`、`fallback_attempts`、`enabled/disabled_capabilities`、`route_trace` | 传入 exact model 被拒（错误码明确）、无候选 |
-| `chat.completions.create` | `exact_model`、content-block `messages`、tools、response_format、provider_options | `message: AiMessage`、`tool_calls`、`finish_reason`、usage、route trace | 传入逻辑模型名被拒、primary quota exhausted 不 fallback |
+| `route.resolve` | `api_type`、逻辑模型名 `logical_model`、requirements、disable、policy | selected ModelUID/exact model、Provider/Profile/adapter、Model Driver/origin、原始 provider model、operation、fallback、capabilities、trace | 传入 exact model 被拒、无匹配、多 Driver 冲突 |
+| `chat.completions.create` | `exact_model`、content-block `messages`、tools、response_format | `message: AiMessage`、`tool_calls`、`finish_reason`、usage、route trace | 传入逻辑模型名被拒、primary quota exhausted 不 fallback、无注册 operation |
 | `helper.llm_chat` | 逻辑模型名 + messages | 等价于 `route.resolve` + `chat.completions.create` | 与两阶段行为一致性 |
-| `llm.chat`（legacy） | content-block messages、image/document/tool_use block、tools、response_format JSON schema、generation params | `text`/`message`、`tool_calls`、`finish_reason`、usage、route trace | tool schema 非法、JSON schema 不满足、context too long、feature unsupported |
-| `llm.completion`（legacy） | `prompt`、`suffix` | `text`、`finish_reason` | legacy wrapper 到 chat 失败、空 prompt |
 
 ### 1.2 Embedding / Rerank
 
@@ -38,7 +35,6 @@
 |---|---|---|---|
 | `images.generate`（typed inference） | `exact_model`、prompt、negative_prompt、size、quality、seed、output | image artifacts，FileObject meta 写 media type / size | 传入逻辑模型名被拒、primary 不 fallback |
 | `helper.text_to_image` | 逻辑模型名 + prompt | 等价于 `route.resolve` + `images.generate` | 与两阶段行为一致性 |
-| `image.txt2img`（legacy） | prompt、negative_prompt、n、aspect_ratio、quality、seed、output | image artifacts，FileObject meta 写 media type / size | output media type 不支持、预算超限 |
 | `image.img2img` | source image、prompt、strength、output | image artifacts | source image invalid、strength 越界 |
 | `image.inpaint` | image、mask、prompt、mask_semantics | image artifacts | mask 缺失、mask semantics 不兼容 |
 | `image.upscale` | image、scale、target size、preserve_faces | image artifact | 目标分辨率不满足、fallback 不能满足硬约束 |
@@ -52,19 +48,21 @@
 
 | Method | 必测输入 | 必测输出 | 异常 |
 |---|---|---|---|
-| `audio.tts` | text、voice contract、speed、output | audio artifact | voice_id 不可 fallback、sample_rate 不支持 |
+| `audio.tts` | text、voice contract、speed、output | audio artifact | voice contract 映射失败、Provider voice ID 不可出现在公开接口、sample_rate 不支持 |
 | `audio.asr` | audio、language、timestamps、diarization、output_formats | transcript、segments、vtt/srt/json artifacts | output format 不支持、音频 meta 缺失 |
 | `audio.music` | prompt、duration、instrumental、lyrics、seed、output | async task、audio artifact、structure | duration 越界、异步任务失败 |
 | `audio.enhance` | audio、task、strength、return_stems | enhanced audio artifact、stems | task 不支持 |
-| `video.txt2video` | prompt、duration、aspect_ratio、resolution、generate_audio、seed | async task、video artifact | operation timeout、Provider started 后不跨 Provider 重试 |
-| `video.img2video` | image、prompt、duration、resolution | async task、video artifact | image invalid |
-| `video.video2video` | video、prompt、preserve_motion、time_range | async task、video artifact | time_range 越界 |
-| `video.extend` | video、prompt、continuation_handle、duration | async task、video artifact | continuation_handle 缺失或不匹配 |
-| `video.upscale` | video、target_resolution、denoise、sharpen、output | async task、video artifact | target_resolution 不支持 |
+| `video.generate`（纯文本） | prompt、`output`（duration_seconds、aspect_ratio、size、fps、audio、media_type）、negative_prompt、seed | async task、`videos[]`（resource、provider_metadata、measured_metadata、deviations） | operation timeout、Provider started 后不跨 Provider 重试；prompt 为空且无条件报 `invalid_request`；模型不支持的显式规格、negative_prompt 或 seed 报 `unsupported_operation`，不改写、不丢弃 |
+| `video.generate`（首帧 / 首尾帧） | prompt、`keyframe{position:start}`、`keyframe start + end`、output | async task、`videos[]` | keyframe 图片无效、同一 position 重复、模型不支持尾帧或首尾帧 |
+| `video.generate`（多素材参考） | prompt 以 `@{id}` 引用多个 `reference_image` / `reference_video`（time_range、include_audio）/ `reference_audio` | async task、`videos[]`、执行记录 `video_plan` | 引用不存在的 `@{id}`、id 重复、超出模型参考数量或时长上限、关键帧与参考混用不支持、time_range 越界或无法精确裁剪、`include_audio=true` 而源视频无音轨 |
+| `helper.video_generate` | 逻辑模型名 + `video.generate` 业务字段 + `requirements.video` | 带素材事实复核路由后执行 `video.generate` | 调用方 `requirements.video.output` 与请求 `output` 冲突；无合格候选时在下载/探测素材前失败 |
+| `video.edit` | video、prompt、output | async task、`videos[]` | 模型无编辑合同时拒绝、prompt 为空 |
+| `video.extend` | video、prompt、continuation_handle、duration | async task、`videos[]` | continuation_handle 缺失或不匹配 |
+| `video.upscale` | video、target_resolution、denoise、sharpen、output | async task、`videos[]` | target_resolution 不支持 |
 
 ### 1.5 Agent Runtime Support
 
-`agent.computer_use` 当前作为占位方向，不作为普通 AICC v0 模型调用的强制真实 Provider 验收项。Mock 阶段只验证 schema、路由目录和安全约束：
+`agent.computer_use` 已对 OpenAI GPT-5.6 通过 Responses `computer` tool 开放。T1/T1.5 必须验证 schema、路由目录、安全约束和官方 wire；真实桌面/浏览器环境的 T2/T3 仍只在当次授权并配置受控环境后执行：
 
 - screenshot resource。
 - viewport。
@@ -77,26 +75,29 @@
 | Method | 必测输入 | 必测输出 | 异常 |
 |---|---|---|---|
 | `cancel` | `task_id`、tenant/session 上下文 | accepted / rejected、原 task 状态可观察、task data / event 记录 cancel 语义 | unknown task、跨 tenant cancel、provider 不支持取消、已完成任务重复取消 |
-| `reload_settings` | 空 params 或兼容旧调用 | reload 结果、Provider registry / ModelRegistry 重建摘要 | settings 非法、凭据缺失、保留上一版可用配置 |
-| `service.reload_settings` | 同 `reload_settings` | 同 `reload_settings` | 同 `reload_settings` |
-| `models.list` | 空 params、可选诊断过滤参数 | Provider inventory、exact model、`api_types`、`logical_mounts`、逻辑目录、legacy aliases、health 摘要 | registry 为空、敏感字段泄露、损坏 metadata 不应导致服务不可诊断 |
-| `service.models.list` | 同 `models.list` | 同 `models.list` | 同 `models.list` |
+| `service.reload_settings` | 空 params | reload 结果、Provider registry / ModelRegistry 重建摘要；被禁用、移除或替换的实例收到库存定时循环 `Stop` 并优雅退出 | settings 非法、凭据缺失、保留当前有效配置、孤儿定时器或迟到写入；`reload_settings` 和错误拼写必须被拒绝 |
+| `models.list` | 空 params、可选诊断过滤参数 | Provider inventory、完整模型/渠道身份、operations、逻辑目录、health 摘要 | registry 为空、敏感字段泄露、损坏 catalog 不应导致服务不可诊断 |
 | `usage.query` | 时间窗口、provider/model/method/api_type 过滤 | 聚合 usage、明细数量、成本/usage 字段、空结果 | 非法时间窗口、无权限、重复幂等记录不应重复计费 |
-| `quota.query` | capability / method、tenant/session 上下文 | 剩余额度、预算状态、限制来源 | 未配置 quota、跨 tenant 查询、非法 method |
-| `provider.list` | 可选 provider/type/driver 过滤 | Provider 列表、inventory 摘要、health、capability、pricing 脱敏视图 | 无权限、凭据泄露、Provider 状态异常仍可诊断 |
-| `provider.health` | provider instance / driver | health 状态、最近错误摘要、latency / quota / availability | Provider 不存在、health 过期、敏感错误未脱敏 |
-| `provider.validate` | provider settings 草案、base_url、auth mode、模型声明 | schema 校验结果、可连接性 / mock 可达性、脱敏诊断 | 凭据缺失、base_url 非法、未知 driver、不得写入 system_config |
+| `quota.query` | capability / method、tenant/session 上下文 | 剩余额度、预算状态、限制来源 | 未配置或不支持时返回 `unknown`、跨 tenant 查询、非法 method |
+| `provider.list` | 可选 instance/profile/adapter 过滤 | Provider 列表、inventory 摘要、health、capability、pricing 脱敏视图 | 无权限、凭据泄露、Provider 状态异常仍可诊断 |
+| `provider.health` | Provider Instance | health 状态、最近错误摘要、latency / quota / availability | Provider 不存在、health 过期、敏感错误未脱敏 |
+| `provider.validate` | Provider Instance 草案、base_url、Profile、Adapter、auth | schema 校验结果、可连接性 / mock 可达性、脱敏诊断 | 凭据缺失、base_url 非法、未知 Profile/Adapter、不得写入 system_config |
 | `provider.add` | provider settings、tenant/session 上下文 | system_config 写入、reload 后 `models.list` 可见、审计记录 | 重名冲突、无权限、schema 非法、写入失败回滚 |
-| `provider.delete` | provider instance name、tenant/session 上下文 | system_config 删除、reload 后候选消失、相关 routing 诊断 | 删除不存在、仍被 policy 锁定引用、无权限 |
-| `provider.refresh_models` | provider instance / driver、刷新策略 | inventory 更新、metadata resolver 生效、`models.list` 反映新 revision | Provider 不可达、返回损坏 metadata、刷新失败不破坏旧 inventory |
+| `provider.update` | Provider Instance、enabled/base_url/credential/Profile/Adapter/discovery patch | revision CAS 写入；enable/disable 与实例替换生命周期正确 | 实例不存在、revision 冲突、非法 patch、停止失败、旧 generation 迟到写入 |
+| `provider.delete` | provider instance name、tenant/session 上下文 | system_config 删除、库存定时循环收到幂等 `Stop` 并优雅退出、reload 后候选消失、相关 routing 诊断 | 删除不存在、仍被 policy 锁定引用、无权限、孤儿定时器或停止后迟到写入 |
+| `provider.refresh_models` | Provider Instance、刷新策略 | model 列表变化时更新库存；target/applied seq 不同时触发所有落后 Provider 收敛；列表未变且 seq 相同时只探测 | Provider 不可达、重建失败不推进 applied seq、目标在刷新中再次变化 |
 
 ## 2. 真实模型判定规则
+
+Protocol Adapter 的结构验收同时是发布门禁：OpenAI、Claude、Gemini 必须覆盖官方新接口；历史 API 代际只在首个真实 Provider 需求出现时按需实现，注册后由所有兼容 Provider 共享。每个实际注册的 API 代际使用不同 `protocol_adapter_id`，但只运行一套共享 contract test；第二、第三个 Provider 不得复制历史 wire protocol 实现或整套 contract test。不同 API 代际 Adapter 不得相互 fallback，只允许复用协议中立组件。自定义 Provider 必须验证接入测试优先选择新接口、按序尝试已注册历史接口、非协议错误停止探测并持久化 resolved Adapter；用户不选择 API 代际。派生 Adapter 必须暴露独立 ID 和 `base_adapter_id`，并只测试渠道差异及委托关系。SN 必须分别通过 API Key、动态登录、token 过期刷新和认证失败测试，并通过“移除 SN 后 `openai-responses` 测试与行为不变”的删除性测试。
+
+Adapter review checklist 还必须逐项检查：所有 provider-native 二进制响应字段是否在 decode 阶段转成 `ResourceRef`；同一原生 item 被保留为 ProviderState 时是否复用该引用；同坐标 replay 是否按字段要求选择 bytes 或 URL 并恢复官方 wire 形态；物化后的 typed output、artifact metadata 和 ProviderState 是否都不存在 inline payload；大结果是否在 usage/billing、staging 和 `runner_complete` 之前被公共大小门禁拦截。未知 opaque block 不得用“看起来像 base64”的正则误判，但新增官方二进制字段必须补 schema-aware fixture。
 
 真实模型输出不可完全确定，验收断言必须避开自然语言全文匹配。
 
 | 类型 | 可稳定断言 | 不应断言 |
 |---|---|---|
-| `llm.chat` | status、非空 text 或 tool_calls、usage、finish_reason、route trace | 回答全文、具体措辞 |
+| `chat.completions.create` | status、非空 text 或 tool_calls、usage、finish_reason、route trace | 回答全文、具体措辞 |
 | JSON schema | JSON 可解析、包含 required 字段、字段类型正确 | 字段内容完全一致 |
 | tool call | tool name 在允许集合内、args 可解析、required args 存在 | args 的自然语言细节完全一致 |
 | image/audio/video artifact | artifact 存在、media type 正确、可读取、size > 0 | 视觉/听觉内容完全一致 |

@@ -82,6 +82,7 @@ export function emitAndExit(result: AgentToolResult, exitCode: number): never {
 export function classifyAiccError(message: string): number {
   const lowered = message.toLowerCase();
   if (
+    lowered.includes("no_candidate_model") ||
     lowered.includes("no_provider_available") ||
     lowered.includes("no route candidate generated") ||
     lowered.includes("provider_unavailable") ||
@@ -110,8 +111,51 @@ export function bailRuntimeError(tool: string, err: unknown): never {
   );
 }
 
+/** AICC token quota / resource policy refusals (AI Center Quota PRD §7.4). */
+const AICC_REFUSAL_CODES = [
+  "quota_exhausted",
+  "quota_budget_exceeded",
+  "quota_unavailable",
+  "resource_not_permitted",
+  "attribution_unavailable",
+];
+
+/** The refusal carried by a structured kRPC error: its wire `code` and the AICC `details`. */
+export function aiccRefusal(err: unknown): { code: string; details?: JsonValue } | undefined {
+  const e = err as { code?: unknown; data?: unknown } | null;
+  if (typeof e?.code !== "string" || !AICC_REFUSAL_CODES.includes(e.code)) return undefined;
+  return { code: e.code, details: (e.data as { details?: JsonValue } | undefined)?.details };
+}
+
 export function bailAiccError(tool: string, method: string, err: unknown): never {
   const msg = err instanceof Error ? err.message : String(err);
+  // Refused under the token quota or the resource policy: the code says what
+  // to do (wait for the reset, lower the budget, ask the owner); never retry it at once.
+  const refusal = aiccRefusal(err);
+  if (refusal) {
+    emitAndExit(
+      errorResult(tool, `${tool} => ${refusal.code}`, msg, {
+        method,
+        error: msg,
+        error_code: refusal.code,
+        ...(refusal.details === undefined ? {} : { details: refusal.details }),
+      }),
+      EXIT_AICC_FAILED,
+    );
+  }
+  // A wait timeout (AiccWaitTimeout) names the task that keeps running.
+  const taskId = (err as { taskId?: unknown } | null)?.taskId;
+  if (typeof taskId === "string") {
+    emitAndExit(
+      errorResult(tool, `${tool} => wait_timeout`, msg, {
+        method,
+        task_id: taskId,
+        still_running: true,
+        error: msg,
+      }),
+      EXIT_TIMEOUT,
+    );
+  }
   emitAndExit(
     errorResult(tool, `${tool} => aicc_call_failed`, msg, { method, error: msg }),
     classifyAiccError(msg),

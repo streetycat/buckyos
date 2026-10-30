@@ -1,105 +1,159 @@
-// gen_video — video.txt2video
-// Doc: aicc_agent_cli_tools.md §6.1
-// 单 artifact 输出配方。视频类调用通常阻塞较久——靠 callAicc 内部对
-// task-manager 轮询即可，CLI 不需要做额外处理。
+// gen_video — video.generate (helper.video_generate for a logical model)
+// Doc: aicc_agent_cli_tools.md §6.1, protocol doc/aicc/video_generation.md
+// 单 artifact 输出配方。文本、首尾帧、参考图/视频/音频都是同一个请求的
+// conditions；视频类调用通常阻塞较久——靠 callAicc 内部对 task-manager
+// 轮询即可，CLI 不需要做额外处理。
 
 import { ndm_proxy } from "buckyos";
 
-import { ArgError, bailArgError, COMMON_OPTIONS_HELP, flagBool, flagInt, parseArgvOrExit, requireString } from "../lib/cli.ts";
-import { initRuntime } from "../lib/runtime.ts";
-import { callAicc, commonPolicyOptions, describeFailure, requestNamedObjectOutput } from "../lib/aicc.ts";
-import { pickArtifact, saveArtifactToPath, suffixPathByMime } from "../lib/io.ts";
 import {
-  bailAiccError, bailAiccFailed, bailIoError, bailNoArtifact, bailRuntimeError,
-  emitAndExit, errorResult, EXIT_ARG_ERROR, EXIT_SUCCESS, successResult,
+  ArgError,
+  bailArgError,
+  COMMON_OPTIONS_HELP,
+  DELIVERY_HELP,
+  flagInt,
+  parseArgvOrExit,
+  requireString,
+} from "../lib/cli.ts";
+import { initRuntime } from "../lib/runtime.ts";
+import { callAicc, commonPolicyOptions, describeFailure } from "../lib/aicc.ts";
+import type { TypedRequestMap } from "../lib/aicc.ts";
+import { deliverArtifact, deliveredSummary } from "../lib/io.ts";
+import {
+  pickVideo,
+  takeRepeatedFlags,
+  VIDEO_CONDITION_FLAGS,
+  VIDEO_OUTPUT_HELP,
+  videoConditions,
+  videoOutputSpec,
+} from "../lib/video.ts";
+import {
+  bailAiccError,
+  bailAiccFailed,
+  bailIoError,
+  bailNoArtifact,
+  bailRuntimeError,
+  emitAndExit,
+  errorResult,
+  EXIT_ARG_ERROR,
+  EXIT_SUCCESS,
+  successResult,
 } from "../lib/result.ts";
 
 const TOOL = "gen_video";
-const METHOD = "video.txt2video";
+const METHOD = "video.generate";
 
-export const HELP = `Usage: gen_video <prompt> <output_video> [options]
+export const HELP = `Usage: gen_video <prompt> [output_video] [options]
 
-Options:
-  --duration <seconds>
-  --aspect <16:9|9:16|1:1>
-  --resolution <720p|1080p|4k>
-  --audio
-  --seed <int>
-  --fps <int>
-  --format <mp4|webm>
-${COMMON_OPTIONS_HELP}`;
+The prompt names a material as @{id} (write @@ for a literal @). Say what a
+reference is for in the prompt; the model sees it as "image 1", "video 2"...
+A prompt may be "" when the conditions say enough.
 
-const ASPECT = new Set(["16:9", "9:16", "1:1"]);
-const RESOLUTION = new Set(["720p", "1080p", "4k"]);
+Conditions:
+  --first-frame <image>           start keyframe (id "first")
+  --last-frame <image>            end keyframe (id "last")
+  --ref-image <id>=<image>        reference image; repeatable
+  --ref-video <id>=<video>        reference video; repeatable
+  --ref-audio <id>=<audio>        reference audio; repeatable
+  --with-audio <id>               let the model hear a --ref-video's own audio
+  --clip <id>=<start>-<end>       seconds of a reference video/audio to use
+                                  (AICC does not trim yet: a range shorter than
+                                  the clip is refused)
+  A material is a local path, an http(s) URL or named_object:<obj_id>.
+  Keyframes and references cannot be mixed on most models.
 
-function formatToMime(f: string | undefined): string | undefined {
-  if (!f) return undefined;
-  if (f === "mp4") return "video/mp4";
-  if (f === "webm") return "video/webm";
-  throw new ArgError(`--format invalid: ${f}`);
-}
+${VIDEO_OUTPUT_HELP}
+  --negative <text>               negative prompt (only some models)
+  --seed <int>                    (only some models)
+
+An option the chosen model cannot honour is refused, never dropped.
+${COMMON_OPTIONS_HELP}${DELIVERY_HELP}`;
 
 export async function run(argv: string[]): Promise<never> {
-  const parsed = parseArgvOrExit(TOOL, HELP, argv);
-  if (parsed.positional.length < 2) {
-    emitAndExit(errorResult(TOOL, `${TOOL} => arg_error`, HELP, { error: "missing positional" }), EXIT_ARG_ERROR);
+  let repeated;
+  try {
+    repeated = takeRepeatedFlags(argv, VIDEO_CONDITION_FLAGS);
+  } catch (err) {
+    bailArgError(TOOL, err as Error);
+  }
+  const parsed = parseArgvOrExit(TOOL, HELP, repeated.rest);
+  if (parsed.positional.length < 1) {
+    emitAndExit(
+      errorResult(TOOL, `${TOOL} => arg_error`, HELP, {
+        error: "missing positional",
+      }),
+      EXIT_ARG_ERROR,
+    );
   }
   const [prompt, outputPath] = parsed.positional;
 
-  const input: Record<string, unknown> = { prompt };
+  const request: TypedRequestMap[typeof METHOD] = {};
+  if (prompt.trim()) request.prompt = prompt;
   try {
-    const duration = flagInt(parsed.flags, "duration");
-    if (duration !== undefined) input.duration = duration;
-    const aspect = requireString(parsed.flags, "aspect");
-    if (aspect !== undefined) {
-      if (!ASPECT.has(aspect)) throw new ArgError(`--aspect invalid: ${aspect}`);
-      input.aspect_ratio = aspect;
-    }
-    const resolution = requireString(parsed.flags, "resolution");
-    if (resolution !== undefined) {
-      if (!RESOLUTION.has(resolution)) throw new ArgError(`--resolution invalid: ${resolution}`);
-      input.resolution = resolution;
-    }
-    if (flagBool(parsed.flags, "audio")) input.audio = true;
+    const conditions = await videoConditions(repeated.values, {
+      start: requireString(parsed.flags, "first-frame"),
+      end: requireString(parsed.flags, "last-frame"),
+    });
+    if (conditions.length) request.conditions = conditions;
+    const output = videoOutputSpec(parsed.flags);
+    if (output) request.output = output;
+    const negative = requireString(parsed.flags, "negative");
+    if (negative !== undefined) request.negative_prompt = negative;
     const seed = flagInt(parsed.flags, "seed");
-    if (seed !== undefined) input.seed = seed;
-    const fps = flagInt(parsed.flags, "fps");
-    if (fps !== undefined) input.fps = fps;
-    const mime = formatToMime(requireString(parsed.flags, "format"));
-    if (mime) input.output = { media_type: mime };
+    if (seed !== undefined) request.seed = seed;
   } catch (err) {
     if (err instanceof ArgError) bailArgError(TOOL, err);
-    throw err;
+    bailIoError(TOOL, undefined, err);
   }
 
   let runtime;
-  try { runtime = await initRuntime(); } catch (err) { bailRuntimeError(TOOL, err); }
+  try {
+    runtime = await initRuntime();
+  } catch (err) {
+    bailRuntimeError(TOOL, err);
+  }
   let call;
   try {
     call = await callAicc(runtime, {
-      capability: "video",
       method: METHOD,
-      modelAlias: parsed.common.model ?? METHOD,
-      inputJson: requestNamedObjectOutput(input),
+      model: parsed.common.model ?? METHOD,
+      request,
       ...commonPolicyOptions(parsed.common),
     });
-  } catch (err) { bailAiccError(TOOL, METHOD, err); }
+  } catch (err) {
+    bailAiccError(TOOL, METHOD, err);
+  }
   if (call.status === "failed" || !call.summary) {
     bailAiccFailed(TOOL, METHOD, call.taskId, describeFailure(call));
   }
 
-  const artifact = pickArtifact(call.summary, "video");
+  let artifact;
+  try {
+    artifact = pickVideo(call.summary);
+  } catch (err) {
+    bailAiccFailed(TOOL, METHOD, call.taskId, (err as Error).message);
+  }
   if (!artifact) bailNoArtifact(TOOL, METHOD, call.taskId);
   // deno-lint-ignore no-explicit-any
   const ndmProxy = (ndm_proxy as any).createNdmProxyClient();
   let saved;
-  try { saved = await saveArtifactToPath(artifact, suffixPathByMime(outputPath, "video/mp4"), ndmProxy); }
-  catch (err) { bailIoError(TOOL, call.taskId, err); }
+  try {
+    saved = await deliverArtifact(runtime, call.summary, artifact, ndmProxy, {
+      tool: TOOL,
+      path: outputPath,
+      defaultMime: artifact.mime ?? "video/mp4",
+    });
+  } catch (err) {
+    bailIoError(TOOL, call.taskId, err);
+  }
 
   emitAndExit(
-    successResult(TOOL, `${TOOL} => done`, `${TOOL} wrote ${saved.path}`, {
-      method: METHOD, capability: "video", task_id: call.taskId,
-      files: [{ path: saved.path, mime: saved.mime ?? null, bytes: saved.bytes, source_kind: saved.source_kind }],
+    successResult(TOOL, `${TOOL} => done`, deliveredSummary(TOOL, [saved]), {
+      method: METHOD,
+      capability: "video",
+      task_id: call.taskId,
+      files: [saved],
+      video: artifact.metadata ?? null,
     }),
     EXIT_SUCCESS,
   );

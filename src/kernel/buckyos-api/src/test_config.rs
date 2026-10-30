@@ -1,4 +1,7 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -13,6 +16,7 @@ use package_lib::PackageId;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
@@ -22,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     build_device_did, device_identity_paths_for_roots, new_device_config_by_jwk_with_did,
     save_local_device_identity_for_roots, AppDoc, LocalAppInstanceConfig, LocalNodeIdentityConfig,
-    ServiceInstanceState, ServiceSpecConfig, MSG_CENTER_SERVICE_UNIQUE_ID,
+    ServiceInstanceState, ServiceSpecConfig, APP_DOC_SCHEMA_VERSION, MSG_CENTER_SERVICE_UNIQUE_ID,
     OPENDAN_SERVICE_UNIQUE_ID, SCHEDULER_SERVICE_UNIQUE_ID, SMB_SERVICE_UNIQUE_ID,
     VERIFY_HUB_UNIQUE_ID, WORKFLOW_SERVICE_UNIQUE_ID,
 };
@@ -33,7 +37,13 @@ use crate::{
 
 const BASE_TIME: u64 = 1743478939; // 2025-04-01
 const DEFAULT_EXP_YEARS: u64 = 10;
-const ADMIN_PASSWORD_HASH: &str = "o8XyToejrbCYou84h/VkF4Tht0BeQQbuX3XKG+8+GQ4="; // bucky2025
+const DEFAULT_ADMIN_PASSWORD: &str = "bucky2025";
+
+fn admin_password_hash_for(username: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}{}.buckyos", DEFAULT_ADMIN_PASSWORD, username).as_bytes());
+    STANDARD.encode(hasher.finalize())
+}
 
 struct DevSnDb {
     path: PathBuf,
@@ -421,11 +431,11 @@ pub fn gen_kernel_service_docs() -> HashMap<DID, EncodedDocument> {
     let mut docs = HashMap::new();
     let verify_hub_doc = crate::generate_verify_hub_service_doc();
     let verify_hub_json = serde_json::to_string(&verify_hub_doc).unwrap();
-    let verify_hub_did = PackageId::unique_name_to_did(VERIFY_HUB_UNIQUE_ID);
+    let verify_hub_did = PackageId::unique_name_to_did(VERIFY_HUB_UNIQUE_ID).unwrap();
 
     let scheduler_doc = crate::generate_scheduler_service_doc();
     let scheduler_json = serde_json::to_string(&scheduler_doc).unwrap();
-    let scheduler_did = PackageId::unique_name_to_did(SCHEDULER_SERVICE_UNIQUE_ID);
+    let scheduler_did = PackageId::unique_name_to_did(SCHEDULER_SERVICE_UNIQUE_ID).unwrap();
 
     // let repo_doc = crate::generate_repo_service_doc();
     // let repo_did = PackageId::unique_name_to_did(REPO_SERVICE_UNIQUE_ID);
@@ -433,19 +443,19 @@ pub fn gen_kernel_service_docs() -> HashMap<DID, EncodedDocument> {
 
     let smb_doc = crate::generate_smb_service_doc();
     let smb_json = serde_json::to_string(&smb_doc).unwrap();
-    let smb_did = PackageId::unique_name_to_did(SMB_SERVICE_UNIQUE_ID);
+    let smb_did = PackageId::unique_name_to_did(SMB_SERVICE_UNIQUE_ID).unwrap();
 
     let msg_center_doc = crate::generate_msg_center_service_doc();
     let msg_center_json = serde_json::to_string(&msg_center_doc).unwrap();
-    let msg_center_did = PackageId::unique_name_to_did(MSG_CENTER_SERVICE_UNIQUE_ID);
+    let msg_center_did = PackageId::unique_name_to_did(MSG_CENTER_SERVICE_UNIQUE_ID).unwrap();
 
     let opendan_doc = crate::generate_opendan_service_doc();
     let opendan_json = serde_json::to_string(&opendan_doc).unwrap();
-    let opendan_did = PackageId::unique_name_to_did(OPENDAN_SERVICE_UNIQUE_ID);
+    let opendan_did = PackageId::unique_name_to_did(OPENDAN_SERVICE_UNIQUE_ID).unwrap();
 
     let workflow_doc = crate::generate_workflow_service_doc();
     let workflow_json = serde_json::to_string(&workflow_doc).unwrap();
-    let workflow_did = PackageId::unique_name_to_did(WORKFLOW_SERVICE_UNIQUE_ID);
+    let workflow_did = PackageId::unique_name_to_did(WORKFLOW_SERVICE_UNIQUE_ID).unwrap();
     docs.insert(
         verify_hub_did,
         EncodedDocument::from_str(verify_hub_json).unwrap(),
@@ -758,7 +768,7 @@ impl<'a> UserEnvScope<'a> {
 
         if device_name.starts_with("ood") {
             let start_config = json!({
-                "admin_password_hash": ADMIN_PASSWORD_HASH,
+                "admin_password_hash": admin_password_hash_for(self.username),
                 "ood_jwt": device_jwt.to_string(),
                 "friend_passcode": "sdfsdfsdf",
                 "gateway_type": "PortForward",
@@ -1297,9 +1307,10 @@ pub fn create_applist() -> Result<HashMap<String, LocalAppInstanceConfig>, Strin
     let mut app_list = HashMap::new();
 
     let cyfs_gateway_doc_json = json!({
+        "schema_version": APP_DOC_SCHEMA_VERSION,
         "did": "did:bns:cyfs-gateway.buckyos.ai",
         "doc_type": "app",
-        "name": "cyfs-gateway",
+        "app_type": "service",
         "show_name": "CYFS Gateway",
         "presentation": {
             "title": {},
@@ -1313,23 +1324,23 @@ pub fn create_applist() -> Result<HashMap<String, LocalAppInstanceConfig>, Strin
         },
         "selector_type": "single",
         "version": "0.5.1",
-        "author": "buckyos.ai",
+        "author": "did:web:buckyos.ai",
         "owner": "did:web:buckyos.ai",
+        "controller": "did:web:buckyos.ai",
         "create_time": buckyos_kit::buckyos_get_unix_timestamp(),
         "last_update_time": buckyos_kit::buckyos_get_unix_timestamp(),
-        "description": {
-            "detail": "CYFS Gateway Service"
-        },
-        "categories": ["sys_module","local_app"],
         "exp": buckyos_kit::buckyos_get_unix_timestamp() + 3600 * 24 * 30,
         "pkg_list": {
             "amd64_win_app": {
-                "pkg_id": "nightly-windows-amd64.cyfs-gateway#0.5.1",
+                "pkg_id": "nightly-windows-amd64.bin.cyfs-gateway.buckyos.ai.bns.did#0.5.1",
+                "pkg_objid": "pkg:1111111111111111111111111111111111111111111111111111111111111111"
             },
             "aarch64_apple_app": {
-                "pkg_id": "nightly-apple-aarch64.cyfs-gateway#0.5.1"
+                "pkg_id": "nightly-apple-aarch64.bin.cyfs-gateway.buckyos.ai.bns.did#0.5.1",
+                "pkg_objid": "pkg:2222222222222222222222222222222222222222222222222222222222222222"
             }
-        }
+        },
+        "service_config_tips": {}
     });
 
     let cyfs_gateway_doc: AppDoc = serde_json::from_value(cyfs_gateway_doc_json).unwrap();
@@ -1588,7 +1599,7 @@ mod tests {
             get_jwk(&owner_keys.public_key_x),
         );
         let start_config = json!({
-            "admin_password_hash": ADMIN_PASSWORD_HASH,
+            "admin_password_hash": admin_password_hash_for("devtest"),
             "friend_passcode": "sdfsdfsdf",
             "gateway_type": "PortForward",
             "guest_access": true,
@@ -1801,5 +1812,30 @@ mod tests {
         let app_list = create_applist().unwrap();
         let app_list_json = serde_json::to_string_pretty(&app_list).unwrap();
         println!("app_list:\n{}", app_list_json);
+    }
+}
+
+#[cfg(test)]
+mod admin_password_hash_tests {
+    use super::*;
+
+    #[test]
+    fn derives_the_legacy_devtest_hash() {
+        assert_eq!(
+            admin_password_hash_for("devtest"),
+            "o8XyToejrbCYou84h/VkF4Tht0BeQQbuX3XKG+8+GQ4="
+        );
+    }
+
+    #[test]
+    fn hash_is_bound_to_the_account_name() {
+        assert_eq!(
+            admin_password_hash_for("alice"),
+            "YaaDqMk7FOSXWcYIEFN0L4mnKOodxgi8spA7TkAkpRI="
+        );
+        assert_ne!(
+            admin_password_hash_for("alice"),
+            admin_password_hash_for("bob")
+        );
     }
 }

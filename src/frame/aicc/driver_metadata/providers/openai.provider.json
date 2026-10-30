@@ -1,0 +1,730 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 1,
+  "revision_seq": 5,
+  "provider_profile_id": "openai",
+  "custom_provider_adapters": ["openai-responses", "openai-chat-completions"],
+  "models": [
+    {
+      "id": "gpt-6-astra",
+      "operations": {
+        "llm": "responses.create",
+        "vision.ocr": "responses.create",
+        "vision.caption": "responses.create",
+        "image.txt2img": "responses.create",
+        "image.img2img": "responses.create",
+        "agent.computer_use": "responses.create"
+      },
+      "request_rules": [
+        {
+          "remove": [
+            "/temperature",
+            "/top_p",
+            "/logprobs",
+            "/top_logprobs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "gpt-4o-mini-tts",
+      "operations": {
+        "audio.tts": "audio.speech"
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "openai_tts_voice_v2",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    }
+  ],
+  "patterns": [
+    {
+      "match": "gpt-5*",
+      "operations": {
+        "llm": "responses.create",
+        "vision.ocr": "responses.create",
+        "vision.caption": "responses.create",
+        "image.txt2img": "responses.create",
+        "image.img2img": "responses.create",
+        "agent.computer_use": "responses.create"
+      },
+      "request_rules": [
+        {
+          "when": {
+            "/reasoning/effort": {
+              "not": "none"
+            }
+          },
+          "remove": [
+            "/temperature",
+            "/top_p"
+          ]
+        }
+      ]
+    },
+    {
+      "match": {
+        "origin_model_id": ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]
+      },
+      "operations": {
+        "llm": "responses.create",
+        "vision.ocr": "responses.create",
+        "vision.caption": "responses.create",
+        "image.txt2img": "responses.create",
+        "image.img2img": "responses.create",
+        "agent.computer_use": "responses.create"
+      },
+      "request_rules": [
+        {
+          "when": {
+            "/reasoning/effort": {
+              "not": "none"
+            }
+          },
+          "remove": [
+            "/temperature",
+            "/top_p",
+            "/logprobs",
+            "/top_logprobs"
+          ]
+        }
+      ]
+    },
+    {
+      "match": "tts-*",
+      "operations": {
+        "audio.tts": "audio.speech"
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "openai_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "match": "*",
+      "operations": {
+        "llm": "responses.create",
+        "embedding.text": "embeddings.create",
+        "image.txt2img": "images.generate",
+        "image.img2img": "images.edit",
+        "image.inpaint": "images.edit",
+        "audio.tts": "audio.speech",
+        "audio.asr": "audio.transcriptions",
+        "video.generate": "videos.create",
+        "video.edit": "videos.create"
+      }
+    }
+  ],
+  "variants": [
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-none",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.4-nano",
+          "gpt-5.6-terra",
+          "gpt-5.4-mini",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.6-sol",
+          "gpt-5.6"
+        ],
+        "variant": "reasoning-none"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "none"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-low",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.4-nano",
+          "gpt-5.6-terra",
+          "gpt-5.4-mini",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.6-sol",
+          "gpt-5.6",
+          "gpt-5.3-codex"
+        ],
+        "variant": "reasoning-low"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "low"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-medium",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.4-nano",
+          "gpt-5.6-terra",
+          "gpt-5.4-mini",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.6-sol",
+          "gpt-5.6",
+          "gpt-5.5-pro",
+          "gpt-5.4-pro",
+          "gpt-5.3-codex"
+        ],
+        "variant": "reasoning-medium"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "medium"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-high",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.4-nano",
+          "gpt-5.6-terra",
+          "gpt-5.4-mini",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.6-sol",
+          "gpt-5.6",
+          "gpt-5.5-pro",
+          "gpt-5.4-pro",
+          "gpt-5.3-codex"
+        ],
+        "variant": "reasoning-high"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "high"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-xhigh",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.4-nano",
+          "gpt-5.6-terra",
+          "gpt-5.4-mini",
+          "gpt-5.5",
+          "gpt-5.4",
+          "gpt-5.6-sol",
+          "gpt-5.6",
+          "gpt-5.5-pro",
+          "gpt-5.4-pro",
+          "gpt-5.3-codex"
+        ],
+        "variant": "reasoning-xhigh"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "xhigh"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-max",
+      "match": {
+        "origin_model_id": [
+          "gpt-6.1-terra",
+          "gpt-6-luna",
+          "gpt-6.1-sol",
+          "gpt-6-sol",
+          "gpt-5.6-luna",
+          "gpt-5.6-terra",
+          "gpt-5.6-sol",
+          "gpt-5.6"
+        ],
+        "variant": "reasoning-max"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "max"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-low",
+      "match": {
+        "origin_model_id": "gpt-6-astra",
+        "variant": "reasoning-low"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "low"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-medium",
+      "match": {
+        "origin_model_id": "gpt-6-astra",
+        "variant": "reasoning-medium"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "medium"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-high",
+      "match": {
+        "origin_model_id": "gpt-6-astra",
+        "variant": "reasoning-high"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "high"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-xhigh",
+      "match": {
+        "origin_model_id": "gpt-6-astra",
+        "variant": "reasoning-xhigh"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "xhigh"
+        }
+      }
+    },
+    {
+      "model_driver": "openai",
+      "variant": "reasoning-max",
+      "match": {
+        "origin_model_id": "gpt-6-astra",
+        "variant": "reasoning-max"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "max"
+        }
+      }
+    }
+  ],
+  "model_pricing": [
+    {
+      "id": "gpt-6.1-sol",
+      "pricing": {
+        "currency": "USD",
+        "input_token": 0.000002,
+        "output_token": 0.00001,
+        "cache_input_token": 0.0000001,
+        "cache_write_input_token": 0.0000025,
+        "tiers": {
+          "dimension": "input_tokens",
+          "mode": "volume",
+          "steps": [
+            {"up_to": 272001},
+            {
+              "input_token": 0.000004,
+              "output_token": 0.000015,
+              "cache_input_token": 0.0000002,
+              "cache_write_input_token": 0.000005
+            }
+          ]
+        },
+        "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+        "verified_at": "2026-10-26"
+      }
+    },
+    {
+      "id": "gpt-6.1-terra",
+      "pricing": {
+        "currency": "USD",
+        "input_token": 0.000001,
+        "output_token": 0.000005,
+        "cache_input_token": 0.00000005,
+        "cache_write_input_token": 0.00000125,
+        "tiers": {
+          "dimension": "input_tokens",
+          "mode": "volume",
+          "steps": [
+            {"up_to": 272001},
+            {
+              "input_token": 0.000002,
+              "output_token": 0.0000075,
+              "cache_input_token": 0.0000001,
+              "cache_write_input_token": 0.0000025
+            }
+          ]
+        },
+        "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+        "verified_at": "2026-10-26"
+      }
+    },
+    {
+      "id": "gpt-6-astra",
+      "pricing": {
+        "currency": "USD",
+        "input_token": 1e-05,
+        "output_token": 5e-05,
+        "cache_input_token": 1e-06,
+        "cache_write_input_token": 1.25e-05,
+        "tiers": {
+          "dimension": "input_tokens",
+          "mode": "volume",
+          "steps": [
+            {
+              "up_to": 272001
+            },
+            {
+              "input_token": 2e-05,
+              "output_token": 7.5e-05,
+              "cache_input_token": 2e-06,
+              "cache_write_input_token": 2.5e-05
+            }
+          ]
+        },
+        "source_url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+        "verified_at": "2026-09-25"
+      }
+    },
+    {
+      "id": "gpt-5.6",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000004,
+        "output_token": 0.00002,
+        "cache_input_token": 4e-7,
+        "cache_write_input_token": 0.000005
+      }
+    },
+    {
+      "id": "gpt-image-2",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000005,
+        "image_input_token": 0.000008,
+        "image_output_token": 0.00003,
+        "cache_input_token": 0.00000125
+      }
+    },
+    {
+      "id": "text-embedding-3-large",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 1.3e-7
+      }
+    },
+    {
+      "id": "text-embedding-3-small",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 2e-8
+      }
+    },
+    {
+      "id": "text-embedding-ada-002",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 1e-7
+      }
+    },
+    {
+      "id": "whisper-1",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.0001,
+        "unit": "audio_second"
+      }
+    },
+    {
+      "id": "gpt-transcribe",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.000075,
+        "unit": "audio_second"
+      }
+    },
+    {
+      "id": "gpt-4o-transcribe",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.0000025,
+        "output_token": 0.00001
+      }
+    },
+    {
+      "id": "gpt-4o-mini-transcribe",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.00000125,
+        "output_token": 0.000005
+      }
+    },
+    {
+      "id": "gpt-4o-mini-tts",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 6e-7,
+        "audio_output_token": 0.000012
+      }
+    },
+    {
+      "id": "tts-1",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.000015,
+        "unit": "character"
+      }
+    },
+    {
+      "id": "tts-1-hd",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.00003,
+        "unit": "character"
+      }
+    },
+    {
+      "id": "sora-2",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.1,
+        "unit": "video_second"
+      }
+    },
+    {
+      "id": "sora-2-pro",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "amount": 0.3,
+        "unit": "video_second"
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "gpt-5.6-sol*"
+      },
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000004,
+        "cache_input_token": 4e-7,
+        "cache_write_input_token": 0.000005,
+        "output_token": 0.00002
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "gpt-5.6-terra*"
+      },
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000002,
+        "cache_input_token": 2e-7,
+        "cache_write_input_token": 0.0000025,
+        "output_token": 0.000012
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": "gpt-5.6-luna*"
+      },
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 2e-7,
+        "cache_input_token": 2e-8,
+        "cache_write_input_token": 2.5e-7,
+        "output_token": 0.0000012
+      }
+    },
+    {
+      "id": "gpt-5.5",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000005,
+        "output_token": 0.00003,
+        "cache_input_token": 5e-7
+      }
+    },
+    {
+      "id": "gpt-5.5-pro",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.00003,
+        "output_token": 0.00018
+      }
+    },
+    {
+      "id": "gpt-5.4",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.0000025,
+        "output_token": 0.000015,
+        "cache_input_token": 2.5e-7
+      }
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 7.5e-7,
+        "output_token": 0.0000045,
+        "cache_input_token": 7.5e-8
+      }
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 2e-7,
+        "output_token": 0.00000125,
+        "cache_input_token": 2e-8
+      }
+    },
+    {
+      "id": "gpt-5.4-pro",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.00003,
+        "output_token": 0.00018
+      }
+    },
+    {
+      "id": "gpt-5.3-codex",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.00000175,
+        "output_token": 0.000014,
+        "cache_input_token": 1.75e-7
+      }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000004,
+        "output_token": 0.00002,
+        "cache_input_token": 4e-7,
+        "cache_write_input_token": 0.000005
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 0.000002,
+        "output_token": 0.000012,
+        "cache_input_token": 2e-7,
+        "cache_write_input_token": 0.0000025
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "pricing": {
+        "source_url": "https://developers.openai.com/api/docs/pricing",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 2e-7,
+        "output_token": 0.0000012,
+        "cache_input_token": 2e-8,
+        "cache_write_input_token": 2.5e-7
+      }
+    }
+  ]
+}

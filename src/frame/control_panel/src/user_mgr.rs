@@ -1,21 +1,23 @@
+use crate::agent_mgr::{AgentKv, ZoneKv};
+use crate::image_data_url::{validate_image_data_url, MAX_AVATAR_PX};
 use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{kRPC, RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use buckyos_api::{
-    get_buckyos_api_runtime, ProfileLink, SchedulerClient, SystemConfigClient, SystemConfigError,
-    UserContactSettings, UserPrivateProfile, UserProfile, UserSettings, UserState,
-    UserTunnelBinding, UserType, SCHEDULER_SERVICE_SERVICE_PORT,
+    get_buckyos_api_runtime, AccessDenial, DenyReason, PasswordState, ProfileLink, SchedulerClient,
+    SystemConfigClient, SystemConfigError, UserContactSettings, UserPrivateProfile, UserProfile,
+    UserSettings, UserState, UserTunnelBinding, UserType, CONTROL_PANEL_SERVICE_UNIQUE_ID,
+    SCHEDULER_SERVICE_SERVICE_PORT,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, KVAction};
 use jsonwebtoken::jwk::Jwk;
 use log::*;
-use name_lib::{generate_ed25519_key_pair, AgentDocument, OwnerDocument, DID};
+use name_lib::{generate_ed25519_key_pair, OwnerDocument, DID};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const DEFAULT_USERS_GROUP: &str = "users";
 const USER_INVITE_PREFIX: &str = "services/control_panel/user_invites";
 const PROFILE_SYSTEM_CONTACT_KEY: &str = "system_contact";
 
@@ -44,25 +46,14 @@ struct UserInviteRecord {
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-fn is_admin_or_root(user_type: &UserType) -> bool {
-    matches!(user_type, UserType::Admin | UserType::Root)
-}
-
 /// Resolve the target user_id from the request; defaults to the caller.
 fn resolve_target_user_id(req: &RPCRequest, principal: &RpcAuthPrincipal) -> String {
     ControlPanelServer::param_str(req, "user_id").unwrap_or_else(|| principal.username.clone())
 }
 
 /// Build a fresh `SystemConfigClient` authenticated with the *caller's* RPC
-/// session token (instead of the control_panel service's own token).
-///
-/// This is required for any read/write under `users/...` and `agents/...`:
-/// per `rootfs/etc/scheduler/boot.template.toml`, the `ood` device only has
-/// `read|write` for `users/*/apps/*` and `users/*/agents/*` — it cannot
-/// touch `users/{uid}/doc`, `users/{uid}/settings`, or `agents/{id}/doc`.
-/// Those keys are gated by `p, admin,/config/users/*,read|write,allow` and
-/// `p, admin,/config/agents/*/...,read|write,allow`, so the request must be
-/// signed by the admin caller, not by the service.
+/// session token, so user records are read and written under the caller's
+/// own RBAC permissions instead of the control_panel service identity.
 async fn system_config_client_for_caller(
     req: &RPCRequest,
 ) -> Result<SystemConfigClient, RPCErrors> {
@@ -80,7 +71,7 @@ fn require_self_or_admin(
     principal: &RpcAuthPrincipal,
     target_user_id: &str,
 ) -> Result<(), RPCErrors> {
-    if is_admin_or_root(&principal.user_type) || principal.username == target_user_id {
+    if principal.user_type.is_privileged() || principal.username == target_user_id {
         Ok(())
     } else {
         Err(RPCErrors::ReasonError(
@@ -89,8 +80,8 @@ fn require_self_or_admin(
     }
 }
 
-fn require_admin(principal: &RpcAuthPrincipal) -> Result<(), RPCErrors> {
-    if is_admin_or_root(&principal.user_type) {
+pub(crate) fn require_admin(principal: &RpcAuthPrincipal) -> Result<(), RPCErrors> {
+    if principal.user_type.is_privileged() {
         Ok(())
     } else {
         Err(RPCErrors::ReasonError(
@@ -99,7 +90,19 @@ fn require_admin(principal: &RpcAuthPrincipal) -> Result<(), RPCErrors> {
     }
 }
 
-fn validate_username(name: &str) -> Result<(), RPCErrors> {
+/// Admin methods that write with the Control Panel service identity: only from
+/// the administrator's Control Panel session, never from an App holding it.
+pub(crate) fn require_control_panel_admin(principal: &RpcAuthPrincipal) -> Result<(), RPCErrors> {
+    require_admin(principal)?;
+    if !principal.is_control_panel_session {
+        return Err(RPCErrors::NoPermission(
+            "this admin method needs a Control Panel session".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_username(name: &str) -> Result<(), RPCErrors> {
     if name.is_empty() || name.len() > 64 {
         return Err(RPCErrors::ParseRequestError(
             "user_id must be 1-64 characters".to_string(),
@@ -124,7 +127,7 @@ fn validate_username(name: &str) -> Result<(), RPCErrors> {
     Ok(())
 }
 
-fn validate_password_hash(password_hash: &str) -> Result<(), RPCErrors> {
+pub(crate) fn validate_password_hash(password_hash: &str) -> Result<(), RPCErrors> {
     let decoded = STANDARD.decode(password_hash).map_err(|_| {
         RPCErrors::ParseRequestError(
             "password_hash must be a base64-encoded SHA-256 digest".to_string(),
@@ -138,17 +141,118 @@ fn validate_password_hash(password_hash: &str) -> Result<(), RPCErrors> {
     Ok(())
 }
 
+/// Only the assignable account types (admin, user, limited) are accepted.
 fn parse_user_type(s: &str) -> Result<UserType, RPCErrors> {
-    match s.to_lowercase().as_str() {
-        "admin" => Ok(UserType::Admin),
-        "user" => Ok(UserType::User),
-        "limited" => Ok(UserType::Limited),
-        "guest" => Ok(UserType::Guest),
-        _ => Err(RPCErrors::ParseRequestError(format!(
-            "Invalid user_type: {}",
-            s
-        ))),
+    UserType::parse(s.trim().to_lowercase().as_str())
+        .filter(|user_type| user_type.is_assignable())
+        .ok_or_else(|| {
+            RPCErrors::ParseRequestError(format!(
+                "Invalid user_type: {} (expected admin, user or limited)",
+                s
+            ))
+        })
+}
+
+/// `groups` names system user groups; each must be defined.
+pub(crate) async fn parse_system_groups(req: &RPCRequest) -> Result<Vec<String>, RPCErrors> {
+    let Some(value) = req.params.get("groups") else {
+        return Ok(Vec::new());
+    };
+    let mut groups: Vec<String> = serde_json::from_value(value.clone()).map_err(|e| {
+        RPCErrors::ParseRequestError(format!("groups must be a list of group ids: {}", e))
+    })?;
+    groups.sort();
+    groups.dedup();
+    if groups.is_empty() {
+        return Ok(groups);
     }
+    let defined = crate::user_group_mgr::load_user_group_directory()
+        .await?
+        .defined_group_ids();
+    for group in &groups {
+        if !defined.contains(group) {
+            return Err(RPCErrors::ParseRequestError(format!(
+                "user group '{}' does not exist",
+                group
+            )));
+        }
+    }
+    Ok(groups)
+}
+
+/// P-2: an invitation brings in a User or Limited account; Admin comes from
+/// `user.change_type`.
+fn invite_user_type(raw: Option<&str>) -> Result<UserType, RPCErrors> {
+    let user_type = raw
+        .map(parse_user_type)
+        .transpose()?
+        .unwrap_or(UserType::User);
+    if !matches!(user_type, UserType::User | UserType::Limited) {
+        return Err(RPCErrors::ParseRequestError(
+            "user.invite.create invites User or Limited accounts; promote to Admin with user.change_type".to_string(),
+        ));
+    }
+    Ok(user_type)
+}
+
+/// PRE-04: who may replace an account's password with `user.change_password`,
+/// always from a Control Panel session (an App-target session never changes a
+/// password). The account itself when its override (or type default) allows it
+/// and it already has a password (the first one goes through
+/// `auth.invite.set_password`): a User or Admin re-proves the password with a
+/// sudo session, as the system-config rule it replaces required; a Limited
+/// account cannot sudo and relies on its override. An administrator changes
+/// another account's password with a sudo session.
+fn password_change_allowed(
+    principal: &RpcAuthPrincipal,
+    target: &str,
+    settings: &UserSettings,
+) -> Result<(), RPCErrors> {
+    if principal.session.is_external || !principal.is_control_panel_session {
+        return Err(AccessDenial::new(DenyReason::SessionKindNotAllowed)
+            .at(CONTROL_PANEL_SERVICE_UNIQUE_ID, "user.change_password")
+            .into_rpc_error());
+    }
+    if principal.username == target {
+        if !settings.password_state.is_set() {
+            return Err(AccessDenial::new(DenyReason::CredentialState)
+                .at(CONTROL_PANEL_SERVICE_UNIQUE_ID, "user.change_password")
+                .with_detail("password_unset")
+                .into_rpc_error());
+        }
+        if !settings.can_change_password() {
+            return Err(RPCErrors::NoPermission(
+                "This account is not allowed to change its password".to_string(),
+            ));
+        }
+        if !principal.is_restricted() && !principal.session.is_sudo {
+            return Err(RPCErrors::NoPermission(
+                "changing your password needs a sudo session".to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    if !principal.user_type.is_privileged() || principal.is_restricted() {
+        return Err(RPCErrors::NoPermission(
+            "Only admin or the user themselves can perform this operation".to_string(),
+        ));
+    }
+    if !principal.session.is_sudo {
+        return Err(RPCErrors::NoPermission(
+            "changing another account's password needs a sudo session".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn settings_options_value(settings: &UserSettings) -> Value {
+    json!({
+        "groups": settings.groups,
+        "allow_password_change": settings.allow_password_change,
+        "allow_contact_edit": settings.allow_contact_edit,
+        "can_change_password": settings.can_change_password(),
+        "can_edit_contacts": settings.can_edit_contacts(),
+    })
 }
 
 fn parse_user_state(s: &str) -> Result<UserState, RPCErrors> {
@@ -156,40 +260,10 @@ fn parse_user_state(s: &str) -> Result<UserState, RPCErrors> {
         .map_err(|_| RPCErrors::ParseRequestError(format!("Invalid user state: {}", s)))
 }
 
-fn validate_agent_id(agent_id: &str) -> Result<(), RPCErrors> {
-    if agent_id.is_empty() || agent_id.len() > 96 {
-        return Err(RPCErrors::ParseRequestError(
-            "agent_id must be 1-96 characters".to_string(),
-        ));
-    }
-    if !agent_id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(RPCErrors::ParseRequestError(
-            "agent_id contains invalid characters (allowed: a-z, 0-9, _, -, .)".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn default_contact_settings(did: Option<String>) -> UserContactSettings {
     UserContactSettings {
         did,
-        note: None,
-        groups: vec![DEFAULT_USERS_GROUP.to_string()],
-        tags: Vec::new(),
-        bindings: Vec::new(),
-    }
-}
-
-fn ensure_default_users_group(contact: &mut UserContactSettings) {
-    if !contact
-        .groups
-        .iter()
-        .any(|group| group == DEFAULT_USERS_GROUP)
-    {
-        contact.groups.push(DEFAULT_USERS_GROUP.to_string());
+        ..Default::default()
     }
 }
 
@@ -243,7 +317,7 @@ fn profile_from_user_id(user_id: &str) -> UserPrivateProfile {
     ))
 }
 
-fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSettings> {
+pub(crate) fn profile_system_contact(profile: &UserPrivateProfile) -> Option<UserContactSettings> {
     profile
         .private_extra
         .get(PROFILE_SYSTEM_CONTACT_KEY)
@@ -262,22 +336,84 @@ fn set_profile_system_contact(
     Ok(())
 }
 
+/// The locally saved profile is the explicit setting; the DID document only fills fields it leaves empty.
 fn merge_profile_values(local_profile: Option<Value>, did_profile: Option<Value>) -> Value {
     let mut merged = match local_profile {
-        Some(profile) => profile,
-        None => json!({}),
+        Some(Value::Object(profile)) => profile,
+        _ => serde_json::Map::new(),
     };
-    if let Some(Value::Object(remote)) = did_profile {
-        if !merged.is_object() {
-            merged = json!({});
-        }
-        if let Some(target) = merged.as_object_mut() {
-            for (key, value) in remote {
-                target.insert(key, value);
+    if let Some(Value::Object(document)) = did_profile {
+        for (key, value) in document {
+            let unset = merged.get(&key).map_or(true, |current| {
+                current.is_null() || current.as_str().is_some_and(|text| text.trim().is_empty())
+            });
+            if unset {
+                merged.insert(key, value);
             }
         }
     }
-    merged
+    Value::Object(merged)
+}
+
+fn apply_profile_text_patch(
+    profile: &mut UserPrivateProfile,
+    req: &RPCRequest,
+) -> Result<(), RPCErrors> {
+    let avatar_key = if req.params.get("avatar").is_some() {
+        "avatar"
+    } else {
+        "avatar_url"
+    };
+    if let Some(avatar) = ControlPanelServer::param_text_patch(req, avatar_key)? {
+        if let Some(value) = avatar.as_deref() {
+            validate_image_data_url("avatar", value, MAX_AVATAR_PX)?;
+        }
+        profile.avatar = avatar;
+    }
+    for (key, slot) in [
+        ("display_name", &mut profile.display_name),
+        ("name", &mut profile.name),
+        ("headline", &mut profile.headline),
+        ("title", &mut profile.title),
+        ("bio", &mut profile.bio),
+        ("location", &mut profile.location),
+        ("organization", &mut profile.organization),
+        ("birthday", &mut profile.birthday),
+        ("bkg_image", &mut profile.bkg_image),
+    ] {
+        if let Some(value) = ControlPanelServer::param_text_patch(req, key)? {
+            *slot = value;
+        }
+    }
+    if let Some(website) = ControlPanelServer::param_text_patch(req, "website")? {
+        match website {
+            Some(url) => {
+                profile.links.insert(
+                    "website".to_string(),
+                    ProfileLink {
+                        label: "Website".to_string(),
+                        url,
+                    },
+                );
+            }
+            None => {
+                profile.links.remove("website");
+            }
+        }
+    }
+    for key in ["email", "phone"] {
+        if let Some(value) = ControlPanelServer::param_text_patch(req, key)? {
+            match value {
+                Some(text) => {
+                    profile.extra.insert(key.to_string(), Value::String(text));
+                }
+                None => {
+                    profile.extra.remove(key);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn public_profile_value(profile: &UserPrivateProfile) -> Value {
@@ -301,6 +437,157 @@ fn parse_owner_config_value(value: &Value) -> Result<OwnerDocument, RPCErrors> {
             "owner_config must be a JSON object or string".to_string(),
         )),
     }
+}
+
+fn require_invite_owner_session(
+    principal: Option<&RpcAuthPrincipal>,
+    owner_did: &DID,
+) -> Result<(), RPCErrors> {
+    let principal = ControlPanelServer::require_rpc_principal(principal)?;
+    if !principal.is_user_session
+        || !principal.is_control_panel_session
+        || principal.session.auth_method != Some(buckyos_api::AuthMethod::DidFederation)
+        || principal.owner_did != owner_did.to_string()
+    {
+        return Err(RPCErrors::NoPermission(
+            "accepting an invitation requires a DID federation session for its owner_config DID"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn accept_user_invitation(
+    kv: &dyn AgentKv,
+    invite_id: &str,
+    owner_config: &OwnerDocument,
+    password_hash: &str,
+    now: u64,
+) -> Result<(String, UserInviteRecord), RPCErrors> {
+    let invite_path = format!("{USER_INVITE_PREFIX}/{invite_id}");
+    let (raw, version) = kv
+        .get(&invite_path)
+        .await?
+        .ok_or_else(|| RPCErrors::ReasonError(format!("Invite '{invite_id}' not found")))?;
+    let mut invite: UserInviteRecord = serde_json::from_str(&raw)
+        .map_err(|error| RPCErrors::ReasonError(format!("Corrupted invite: {error}")))?;
+    if invite.state != "pending" {
+        return Err(RPCErrors::ReasonError(format!(
+            "Invite '{invite_id}' is not pending"
+        )));
+    }
+    if invite
+        .expires_at
+        .map(|expires| expires < now)
+        .unwrap_or(false)
+    {
+        return Err(RPCErrors::ReasonError(format!(
+            "Invite '{invite_id}' has expired"
+        )));
+    }
+    if let Some(target_did) = invite.target_did.as_ref() {
+        if target_did != &owner_config.id.to_string() {
+            return Err(RPCErrors::ReasonError(format!(
+                "Invite target '{target_did}' does not match owner_config '{}'",
+                owner_config.id.to_string()
+            )));
+        }
+    }
+
+    let user_id = invite
+        .target_user_id
+        .clone()
+        .unwrap_or_else(|| owner_config.name.trim().to_lowercase());
+    validate_username(&user_id)?;
+    if !password_hash.is_empty() {
+        validate_password_hash(password_hash)?;
+    }
+    let settings_path = format!("users/{user_id}/settings");
+    let existing = kv.get(&settings_path).await?;
+    let new_account = existing.is_none();
+    let mut settings = match existing {
+        Some((raw, _)) => {
+            let mut settings: UserSettings = serde_json::from_str(&raw).map_err(|error| {
+                RPCErrors::ReasonError(format!("Corrupted user settings: {error}"))
+            })?;
+            if invite.target_user_id.as_deref() != Some(user_id.as_str())
+                || !matches!(settings.state, UserState::Pending)
+            {
+                return Err(RPCErrors::ReasonError(format!(
+                    "User '{user_id}' already exists or is reserved by another invitation"
+                )));
+            }
+            settings.user_type = invite.default_user_type;
+            settings.groups = invite.groups.clone();
+            if !password_hash.is_empty() {
+                settings.password = password_hash.to_string();
+            }
+            settings.state = UserState::Active;
+            settings.is_local = false;
+            settings
+        }
+        None => UserSettings {
+            user_id: user_id.clone(),
+            user_type: invite.default_user_type,
+            password: password_hash.to_string(),
+            state: UserState::Active,
+            res_pool_id: "default".to_string(),
+            is_local: false,
+            allow_password_change: None,
+            allow_contact_edit: None,
+            groups: invite.groups.clone(),
+            password_state: PasswordState::Unset,
+        },
+    };
+    settings.password_state = if settings.password.is_empty() {
+        PasswordState::Unset
+    } else {
+        PasswordState::Set
+    };
+    let mut profile = profile_from_owner_config(owner_config);
+    profile.display_name = Some(
+        invite
+            .show_name
+            .clone()
+            .unwrap_or_else(|| owner_config.display_name.clone()),
+    );
+    set_profile_system_contact(
+        &mut profile,
+        &default_contact_settings(Some(owner_config.id.to_string())),
+    )?;
+    invite.state = "accepted".to_string();
+    invite.accepted_at = Some(now);
+    invite.accepted_user_id = Some(user_id.clone());
+
+    let settings_json = to_json(&settings)?;
+    let profile_json = to_json(&profile)?;
+    let tx = HashMap::from([
+        (
+            settings_path,
+            if new_account {
+                KVAction::Create(settings_json)
+            } else {
+                KVAction::Update(settings_json)
+            },
+        ),
+        (
+            format!("users/{user_id}/doc"),
+            KVAction::Create(to_json(owner_config)?),
+        ),
+        (
+            format!("users/{user_id}/profile"),
+            if new_account {
+                KVAction::Create(profile_json)
+            } else {
+                KVAction::Update(profile_json)
+            },
+        ),
+        (invite_path.clone(), KVAction::Update(to_json(&invite)?)),
+    ]);
+    kv.exec_tx(tx, Some((invite_path, version)))
+        .await
+        .map_err(|error| RPCErrors::ReasonError(format!("Failed to accept invite: {error}")))?;
+    Ok((user_id, invite))
 }
 
 fn parse_user_profile_payload(
@@ -348,10 +635,14 @@ fn owner_is_bound_to_zone(owner_config: &OwnerDocument, zone_did: &DID) -> bool 
         .unwrap_or(false)
 }
 
+/// A Zone-hosted OwnerDocument (`<user>.<zone>`) and its private key. Only
+/// accounts this Zone is the canonical zone of name it as the default zone;
+/// exclusive-invite and self-registered accounts never do (D-2).
 fn generated_owner_config(
     user_id: &str,
     show_name: &str,
     zone_did: &DID,
+    canonical_here: bool,
 ) -> Result<(OwnerDocument, String), RPCErrors> {
     let (private_key, public_key) = generate_ed25519_key_pair();
     let public_key: Jwk = serde_json::from_value(public_key)
@@ -366,8 +657,67 @@ fn generated_owner_config(
         show_name.to_string(),
         public_key,
     );
-    owner_config.set_default_zone_did(zone_did.clone());
+    if canonical_here {
+        owner_config.set_default_zone_did(zone_did.clone());
+    }
     Ok((owner_config, private_key))
+}
+
+fn to_json<T: Serialize>(value: &T) -> Result<String, RPCErrors> {
+    serde_json::to_string(value)
+        .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))
+}
+
+/// The records of a new local account (settings, OwnerDocument, key, profile),
+/// all `Create` so a concurrent account of the same name fails the transaction.
+/// Returns them with the account DID.
+pub(crate) fn new_account_actions(
+    settings: &UserSettings,
+    show_name: &str,
+    zone_did: &DID,
+    canonical_here: bool,
+) -> Result<(HashMap<String, KVAction>, DID), RPCErrors> {
+    let user_id = settings.user_id.as_str();
+    let (owner_config, private_key) =
+        generated_owner_config(user_id, show_name, zone_did, canonical_here)?;
+    let user_did = owner_config.id.clone();
+    let settings_json = to_json(settings)?;
+    let doc_json = to_json(&owner_config)?;
+    let mut profile = profile_from_owner_config(&owner_config);
+    set_profile_system_contact(
+        &mut profile,
+        &default_contact_settings(Some(user_did.to_string())),
+    )?;
+    let profile_json = to_json(&profile)?;
+    let actions = HashMap::from([
+        (
+            format!("users/{user_id}/settings"),
+            KVAction::Create(settings_json),
+        ),
+        (format!("users/{user_id}/doc"), KVAction::Create(doc_json)),
+        (
+            format!("security/{user_id}/key"),
+            KVAction::Create(private_key),
+        ),
+        (
+            format!("users/{user_id}/profile"),
+            KVAction::Create(profile_json),
+        ),
+    ]);
+    Ok((actions, user_did))
+}
+
+/// After a committed account: RBAC places it in its type group and msg-center
+/// learns it. The RBAC result is returned; a failed msg-center reload only warns.
+pub(crate) async fn after_account_created(user_id: &str, reason: &str) -> Result<(), RPCErrors> {
+    let refresh_result = refresh_rbac_by_scheduler(reason).await;
+    if let Err(error) = &refresh_result {
+        warn!("User '{user_id}' was committed but scheduler RBAC refresh failed: {error}");
+    }
+    if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+        warn!("msg-center reload after creating {user_id} failed: {error}");
+    }
+    refresh_result
 }
 
 async fn load_user_settings(
@@ -383,7 +733,7 @@ async fn load_user_settings(
         .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))
 }
 
-async fn load_user_profile(
+pub(crate) async fn load_user_profile(
     client: &SystemConfigClient,
     user_id: &str,
 ) -> Result<Option<UserPrivateProfile>, RPCErrors> {
@@ -417,7 +767,7 @@ async fn save_user_profile(
     Ok(())
 }
 
-async fn refresh_rbac_by_scheduler(reason: &str) -> Result<(), RPCErrors> {
+pub(crate) async fn refresh_rbac_by_scheduler(reason: &str) -> Result<(), RPCErrors> {
     let runtime = get_buckyos_api_runtime()?;
     let scheduler_url = format!(
         "http://127.0.0.1:{}/kapi/scheduler",
@@ -463,100 +813,79 @@ fn user_create_result(
     result
 }
 
-async fn load_agent_runtime_info(agent_id: &str) -> Value {
-    let runtime = match get_buckyos_api_runtime() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return json!({
-                "available": false,
-                "error": error.to_string(),
-            });
+async fn require_user_not_deleted(kv: &dyn AgentKv, user_id: &str) -> Result<(), RPCErrors> {
+    if let Some((raw, _)) = kv.get(&format!("users/{user_id}/settings")).await? {
+        let settings: UserSettings = serde_json::from_str(&raw)
+            .map_err(|error| RPCErrors::ReasonError(format!("Corrupted user settings: {error}")))?;
+        if matches!(settings.state, UserState::Deleted) {
+            return Err(crate::agent_mgr::reason(
+                "user_deleted",
+                format!(
+                    "User '{user_id}' was deleted; restore the existing account with user.change_state (state: active). Its identity, credentials, permissions and data are retained."
+                ),
+            ));
         }
-    };
-    let client = match runtime.get_opendan_client().await {
-        Ok(client) => client,
-        Err(error) => {
-            return json!({
-                "available": false,
-                "error": error.to_string(),
-            });
-        }
-    };
-    match client.list_agent_sessions(agent_id, Some(100), None).await {
-        Ok(result) => json!({
-            "available": true,
-            "ui_session_count": result.items.len(),
-            "work_session_count": result.items.len(),
-            "workspace_count": null,
-            "recent_session_ids": result.items,
-            "next_cursor": result.next_cursor,
-            "total": result.total,
-        }),
-        Err(error) => json!({
-            "available": false,
-            "error": error.to_string(),
-        }),
     }
+    Ok(())
 }
 
-async fn load_agent_service_spec(
-    client: &SystemConfigClient,
-    user_ids: &[String],
-    agent_id: &str,
-) -> Option<Value> {
-    for user_id in user_ids {
-        let spec_path = format!("users/{}/agents/{}/spec", user_id, agent_id);
-        match client.get(&spec_path).await {
-            Ok(spec_val) => match serde_json::from_str::<Value>(&spec_val.value) {
-                Ok(spec) => return Some(spec),
-                Err(error) => warn!("Failed to parse agent spec `{}`: {}", spec_path, error),
-            },
-            Err(_) => continue,
+async fn save_user_state(
+    kv: &dyn AgentKv,
+    principal: &RpcAuthPrincipal,
+    target: &str,
+    new_state: UserState,
+) -> Result<UserState, RPCErrors> {
+    require_admin(principal)?;
+    if !matches!(new_state, UserState::Active) {
+        if target == "root" {
+            return Err(RPCErrors::ReasonError(
+                "Cannot change root user state to non-active".to_string(),
+            ));
+        }
+        if target == principal.username {
+            return Err(RPCErrors::ReasonError(
+                "Cannot change your own state to non-active".to_string(),
+            ));
         }
     }
-    None
+    let path = format!("users/{target}/settings");
+    let (raw, version) = kv
+        .get(&path)
+        .await?
+        .ok_or_else(|| RPCErrors::ReasonError(format!("User '{target}' not found")))?;
+    let mut settings: UserSettings = serde_json::from_str(&raw)
+        .map_err(|error| RPCErrors::ReasonError(format!("Corrupted user settings: {error}")))?;
+    if matches!(settings.user_type, UserType::Root) && !matches!(new_state, UserState::Active) {
+        return Err(RPCErrors::ReasonError(
+            "Cannot change root user state to non-active".to_string(),
+        ));
+    }
+    settings.state = new_state;
+    kv.exec_tx(
+        HashMap::from([(path.clone(), KVAction::Update(to_json(&settings)?))]),
+        Some((path, version)),
+    )
+    .await?;
+    Ok(settings.state)
 }
 
-fn has_non_empty_string(value: &Value, key: &str) -> bool {
-    value
-        .get(key)
-        .and_then(|item| item.as_str())
-        .map(|item| !item.trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn merge_agent_service_spec(agent_info: &mut Value, spec: &Value) {
-    agent_info["spec"] = spec.clone();
-
-    if let Some(app_doc) = spec.get("app_doc") {
-        agent_info["app_doc"] = app_doc.clone();
-        if !has_non_empty_string(agent_info, "display_name") {
-            if let Some(show_name) = app_doc.get("show_name") {
-                agent_info["display_name"] = show_name.clone();
-            }
-        }
-        if agent_info.get("app_id").is_none() {
-            if let Some(app_id) = app_doc.get("name") {
-                agent_info["app_id"] = app_id.clone();
-            }
-        }
-        if agent_info.get("version").is_none() {
-            if let Some(version) = app_doc.get("version") {
-                agent_info["version"] = version.clone();
-            }
-        }
+fn user_state_result(
+    user_id: &str,
+    state: &UserState,
+    refresh_result: Result<(), RPCErrors>,
+) -> Value {
+    let mut result = json!({
+        "ok": true,
+        "user_id": user_id,
+        "state": state,
+        "rbac_refreshed": refresh_result.is_ok(),
+    });
+    if let Err(error) = refresh_result {
+        let warning = format!("User state was saved, but RBAC refresh is pending: {error}");
+        warn!("User '{user_id}': {warning}");
+        result["warning"] = Value::String(warning);
     }
-
-    if agent_info.get("state").is_none() {
-        if let Some(state) = spec.get("state") {
-            agent_info["state"] = state.clone();
-        }
-    }
-    if agent_info.get("owner_user_id").is_none() {
-        if let Some(user_id) = spec.get("user_id") {
-            agent_info["owner_user_id"] = user_id.clone();
-        }
-    }
+    result
 }
 
 // ─── User management handlers ──────────────────────────────────────────────
@@ -594,16 +923,26 @@ impl ControlPanelServer {
                             continue;
                         }
                         let mut info = settings.to_user_info();
+                        let mut public_profile = None;
                         if let Ok(Some(profile)) = load_user_profile(&client, uid).await {
+                            public_profile = Some(profile.to_public_profile());
                             if let Some(show_name) = profile.display_name.or(profile.name) {
                                 info.show_name = show_name;
                             }
                         }
                         if let Ok(mut v) = serde_json::to_value(&info) {
+                            if let Some(public_profile) = public_profile {
+                                v["did"] = Value::String(public_profile.did.to_string());
+                                if let Some(avatar) = public_profile.avatar {
+                                    v["avatar"] = Value::String(avatar);
+                                }
+                            }
                             v["is_local"] = Value::Bool(settings.is_local);
-                            v["allow_password_change"] =
-                                serde_json::to_value(settings.allow_password_change)
-                                    .unwrap_or(Value::Null);
+                            if let (Value::Object(target), Value::Object(options)) =
+                                (&mut v, settings_options_value(&settings))
+                            {
+                                target.extend(options);
+                            }
                             users.push(v);
                         }
                     }
@@ -646,15 +985,15 @@ impl ControlPanelServer {
         require_self_or_admin(principal, &target)?;
 
         // Build response – hide password; profile fields live in users/{user}/profile.
-        let include_contact =
-            is_admin_or_root(&principal.user_type) || principal.username == target;
         let mut result = json!({
             "user_id": settings.user_id,
-            "user_type": settings.user_type.clone(),
+            "user_type": settings.user_type,
             "state": settings.state.clone(),
             "res_pool_id": settings.res_pool_id,
             "is_local": settings.is_local,
-            "allow_password_change": settings.allow_password_change.unwrap_or(!matches!(settings.user_type, UserType::Limited)),
+            "groups": settings.groups,
+            "allow_password_change": settings.can_change_password(),
+            "allow_contact_edit": settings.can_edit_contacts(),
         });
 
         let local_profile = load_user_profile(&client, &target).await?;
@@ -662,11 +1001,6 @@ impl ControlPanelServer {
             result["local_profile"] = serde_json::to_value(profile).unwrap_or(json!(null));
             result["profile"] =
                 serde_json::to_value(profile.to_public_profile()).unwrap_or(json!(null));
-            if include_contact {
-                if let Some(contact) = profile_system_contact(profile) {
-                    result["contact"] = serde_json::to_value(contact).unwrap_or(json!(null));
-                }
-            }
         } else {
             result["profile"] = json!({});
         }
@@ -708,74 +1042,40 @@ impl ControlPanelServer {
             .map(|s| parse_user_type(&s))
             .transpose()?
             .unwrap_or(UserType::User);
-        let allow_password_change =
-            Some(Self::param_bool(&req, "allow_password_change").unwrap_or(true));
+        let allow_password_change = Self::param_bool(&req, "allow_password_change");
+        let allow_contact_edit = Self::param_bool(&req, "allow_contact_edit");
 
-        if !matches!(user_type, UserType::User) {
+        if !matches!(user_type, UserType::User | UserType::Limited) {
             return Err(RPCErrors::ParseRequestError(
-                "user.create only supports the ordinary User type".to_string(),
+                "user.create supports the User and Limited types; promote to Admin with user.change_type".to_string(),
             ));
         }
+        let groups = parse_system_groups(&req).await?;
 
-        let client = system_config_client_for_caller(&req).await?;
+        let kv = ZoneKv::with_client(system_config_client_for_caller(&req).await?);
         let runtime = get_buckyos_api_runtime()?;
-        let (owner_config, private_key) =
-            generated_owner_config(&user_id, &show_name, &runtime.zone_id)?;
-        let user_did = owner_config.id.to_string();
-
-        // Check if user already exists
-        let settings_path = format!("users/{}/settings", user_id);
-        if client.get(&settings_path).await.is_ok() {
-            return Err(RPCErrors::ReasonError(format!(
-                "User '{}' already exists",
-                user_id
-            )));
-        }
+        require_user_not_deleted(&kv, &user_id).await?;
+        crate::agent_mgr::ensure_name_available(&runtime.zone_id, &user_id).await?;
 
         // Build UserSettings
         let new_settings = UserSettings {
             user_id: user_id.clone(),
-            user_type: user_type.clone(),
+            user_type,
             password: password_hash,
             state: UserState::Active,
             res_pool_id: "default".to_string(),
             is_local: true,
             allow_password_change,
+            allow_contact_edit,
+            groups,
+            password_state: buckyos_api::PasswordState::Set,
         };
-        let settings_json = serde_json::to_string(&new_settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-
-        let doc_json = serde_json::to_string(&owner_config)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        let mut profile = profile_from_owner_config(&owner_config);
-        let mut contact = default_contact_settings(Some(user_did));
-        ensure_default_users_group(&mut contact);
-        set_profile_system_contact(&mut profile, &contact)?;
-        let profile_json = serde_json::to_string(&profile)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-
-        // Execute as transaction
-        let doc_path = format!("users/{}/doc", user_id);
-        let key_path = format!("security/{}/key", user_id);
-        let profile_path = format!("users/{}/profile", user_id);
-        let mut tx = HashMap::new();
-        tx.insert(settings_path, KVAction::Create(settings_json));
-        tx.insert(doc_path, KVAction::Create(doc_json));
-        tx.insert(key_path, KVAction::Create(private_key));
-        tx.insert(profile_path, KVAction::Create(profile_json));
-
-        client
-            .exec_tx(tx, None)
+        let (tx, _) = new_account_actions(&new_settings, &show_name, &runtime.zone_id, true)?;
+        kv.exec_tx(tx, None)
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to create user: {}", e)))?;
 
-        let refresh_result = refresh_rbac_by_scheduler("user.create").await;
-        if let Err(error) = &refresh_result {
-            warn!(
-                "User '{}' was committed but scheduler RBAC refresh failed: {}",
-                user_id, error
-            );
-        }
+        let refresh_result = after_account_created(&user_id, "user.create").await;
 
         info!("User '{}' created by '{}'", user_id, principal.username);
 
@@ -811,6 +1111,9 @@ impl ControlPanelServer {
             profile.display_name = Some(show_name);
         }
         save_user_profile(&client, &target, &profile).await?;
+        if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+            warn!("msg-center reload after updating {target} failed: {error}");
+        }
 
         info!("User '{}' updated by '{}'", target, principal.username);
 
@@ -850,10 +1153,10 @@ impl ControlPanelServer {
         if let Some(note) = Self::param_str(&req, "note") {
             contact.note = Some(note);
         }
-        if let Some(groups) = req.params.get("groups") {
-            if let Ok(g) = serde_json::from_value::<Vec<String>>(groups.clone()) {
-                contact.groups = g;
-            }
+        if req.params.get("groups").is_some() {
+            return Err(RPCErrors::ParseRequestError(
+                "groups was removed from contact settings; system user groups are managed by user_group.set_members".to_string(),
+            ));
         }
         if let Some(tags) = req.params.get("tags") {
             if let Ok(t) = serde_json::from_value::<Vec<String>>(tags.clone()) {
@@ -865,8 +1168,6 @@ impl ControlPanelServer {
                 contact.bindings = b;
             }
         }
-        ensure_default_users_group(&mut contact);
-
         set_profile_system_contact(&mut profile, &contact)?;
         save_user_profile(&client, &target, &profile).await?;
 
@@ -938,63 +1239,19 @@ impl ControlPanelServer {
             None => profile_from_user_id(&target),
         };
         let fallback_did = fallback_profile.did.clone();
+        let previous_avatar = fallback_profile.avatar.clone();
         let mut profile = if let Some(value) = req.params.get("profile") {
             parse_user_profile_payload(value, &fallback_did)?
         } else {
             fallback_profile
         };
+        if profile.avatar != previous_avatar {
+            if let Some(avatar) = profile.avatar.as_deref() {
+                validate_image_data_url("avatar", avatar, MAX_AVATAR_PX)?;
+            }
+        }
 
-        if let Some(value) = Self::param_str(&req, "display_name") {
-            profile.display_name = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "name") {
-            profile.name = Some(value);
-        }
-        if let Some(value) =
-            Self::param_str(&req, "avatar").or_else(|| Self::param_str(&req, "avatar_url"))
-        {
-            profile.avatar = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "headline") {
-            profile.headline = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "title") {
-            profile.title = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "bio") {
-            profile.bio = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "location") {
-            profile.location = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "organization") {
-            profile.organization = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "birthday") {
-            profile.birthday = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "bkg_image") {
-            profile.bkg_image = Some(value);
-        }
-        if let Some(value) = Self::param_str(&req, "website") {
-            profile.links.insert(
-                "website".to_string(),
-                ProfileLink {
-                    label: "Website".to_string(),
-                    url: value,
-                },
-            );
-        }
-        if let Some(value) = Self::param_str(&req, "email") {
-            profile
-                .extra
-                .insert("email".to_string(), Value::String(value));
-        }
-        if let Some(value) = Self::param_str(&req, "phone") {
-            profile
-                .extra
-                .insert("phone".to_string(), Value::String(value));
-        }
+        apply_profile_text_patch(&mut profile, &req)?;
         if let Some(tags) = req.params.get("tags") {
             profile.tags = serde_json::from_value(tags.clone()).map_err(|e| {
                 RPCErrors::ParseRequestError(format!("Invalid profile tags payload: {}", e))
@@ -1012,6 +1269,9 @@ impl ControlPanelServer {
         }
 
         save_user_profile(&client, &target, &profile).await?;
+        if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+            warn!("msg-center reload after profile update of {target} failed: {error}");
+        }
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1033,7 +1293,15 @@ impl ControlPanelServer {
         require_self_or_admin(principal, &target)?;
 
         let platform = Self::require_param_str(&req, "platform")?;
-        let account_id = Self::require_param_str(&req, "account_id")?;
+        let mut account_id = Self::require_param_str(&req, "account_id")?;
+        if platform == "telegram" {
+            account_id = crate::agent_mgr::bare_telegram_account(&account_id).to_string();
+        }
+        if account_id.trim().is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "account_id cannot be empty".to_string(),
+            ));
+        }
         let display_id = Self::param_str(&req, "display_id");
         let tunnel_instance_id = Self::param_str(&req, "tunnel_instance_id");
         let status = Self::param_str(&req, "status");
@@ -1070,9 +1338,11 @@ impl ControlPanelServer {
         } else {
             contact.bindings.push(binding);
         }
-        ensure_default_users_group(&mut contact);
         set_profile_system_contact(&mut profile, &contact)?;
         save_user_profile(&client, &target, &profile).await?;
+        if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+            warn!("msg-center reload after binding {platform} for {target} failed: {error}");
+        }
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1113,7 +1383,6 @@ impl ControlPanelServer {
                 platform, target
             )));
         }
-        ensure_default_users_group(&mut contact);
         set_profile_system_contact(&mut profile, &contact)?;
         save_user_profile(&client, &target, &profile).await?;
 
@@ -1154,26 +1423,11 @@ impl ControlPanelServer {
         }
         let target_did = Self::param_str(&req, "target_did");
         let show_name = Self::param_str(&req, "show_name");
-        let default_user_type = Self::param_str(&req, "user_type")
-            .map(|s| parse_user_type(&s))
-            .transpose()?
-            .unwrap_or(UserType::User);
-        if matches!(default_user_type, UserType::Root) {
-            return Err(RPCErrors::ReasonError(
-                "Cannot invite root users".to_string(),
-            ));
-        }
+        let default_user_type = invite_user_type(Self::param_str(&req, "user_type").as_deref())?;
         let now = buckyos_get_unix_timestamp();
         let expires_at = Self::param_u64(&req, "expires_at")
             .or_else(|| Self::param_u64(&req, "ttl_secs").map(|ttl| now.saturating_add(ttl)));
-        let mut groups: Vec<String> = req
-            .params
-            .get("groups")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default();
-        if !groups.iter().any(|group| group == DEFAULT_USERS_GROUP) {
-            groups.push(DEFAULT_USERS_GROUP.to_string());
-        }
+        let groups = parse_system_groups(&req).await?;
         if req.params.get("app_ids").is_some() {
             return Err(RPCErrors::ParseRequestError(
                 "app_ids was removed; App access is managed by apps.availability.set".to_string(),
@@ -1189,7 +1443,7 @@ impl ControlPanelServer {
             target_user_id: target_user_id.clone(),
             target_did: target_did.clone(),
             show_name: show_name.clone(),
-            default_user_type: default_user_type.clone(),
+            default_user_type,
             groups: groups.clone(),
             accepted_at: None,
             accepted_user_id: None,
@@ -1218,12 +1472,15 @@ impl ControlPanelServer {
             }
             let pending_settings = UserSettings {
                 user_id: user_id.clone(),
-                user_type: default_user_type.clone(),
+                user_type: default_user_type,
                 password: String::new(),
                 state: UserState::Pending,
                 res_pool_id: "default".to_string(),
                 is_local: false,
                 allow_password_change: None,
+                allow_contact_edit: None,
+                groups: groups.clone(),
+                password_state: buckyos_api::PasswordState::Unset,
             };
             let settings_json = serde_json::to_string(&pending_settings)
                 .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
@@ -1243,14 +1500,7 @@ impl ControlPanelServer {
                 None,
                 HashMap::new(),
             ));
-            let mut contact = UserContactSettings {
-                did: target_did.clone(),
-                note: None,
-                groups: groups.clone(),
-                tags: Vec::new(),
-                bindings: Vec::new(),
-            };
-            ensure_default_users_group(&mut contact);
+            let contact = default_contact_settings(target_did.clone());
             set_profile_system_contact(&mut profile, &contact)?;
             let profile_json = serde_json::to_string(&profile)
                 .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
@@ -1306,7 +1556,7 @@ impl ControlPanelServer {
     pub(crate) async fn handle_user_invite_accept(
         &self,
         req: RPCRequest,
-        _principal: Option<&RpcAuthPrincipal>,
+        principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
         let invite_id = Self::require_param_str(&req, "invite_id")?;
         let owner_config_value = req
@@ -1314,6 +1564,7 @@ impl ControlPanelServer {
             .get("owner_config")
             .ok_or_else(|| RPCErrors::ParseRequestError("Missing owner_config".to_string()))?;
         let owner_config = parse_owner_config_value(owner_config_value)?;
+        require_invite_owner_session(principal, &owner_config.id)?;
         let runtime = get_buckyos_api_runtime()?;
         if !owner_is_bound_to_zone(&owner_config, &runtime.zone_id) {
             return Err(RPCErrors::ReasonError(format!(
@@ -1323,121 +1574,21 @@ impl ControlPanelServer {
             )));
         }
 
-        let client = runtime.get_system_config_client().await?;
-        let invite_path = format!("{}/{}", USER_INVITE_PREFIX, invite_id);
-        let invite_val = client.get(&invite_path).await.map_err(|e| {
-            RPCErrors::ReasonError(format!("Invite '{}' not found: {}", invite_id, e))
-        })?;
-        let mut invite: UserInviteRecord = serde_json::from_str(&invite_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted invite: {}", e)))?;
-        if invite.state != "pending" {
-            return Err(RPCErrors::ReasonError(format!(
-                "Invite '{}' is not pending",
-                invite_id
-            )));
-        }
-        let now = buckyos_get_unix_timestamp();
-        if invite.expires_at.map(|exp| exp < now).unwrap_or(false) {
-            return Err(RPCErrors::ReasonError(format!(
-                "Invite '{}' has expired",
-                invite_id
-            )));
-        }
-        if let Some(target_did) = invite.target_did.as_ref() {
-            if target_did != &owner_config.id.to_string() {
-                return Err(RPCErrors::ReasonError(format!(
-                    "Invite target '{}' does not match owner_config '{}'",
-                    target_did,
-                    owner_config.id.to_string()
-                )));
-            }
-        }
-
-        let user_id = invite
-            .target_user_id
-            .clone()
-            .unwrap_or_else(|| owner_config.name.trim().to_lowercase());
-        validate_username(&user_id)?;
+        let kv = ZoneKv::connect().await?;
         let password_hash = Self::param_str(&req, "password_hash").unwrap_or_default();
-        let mut contact = default_contact_settings(Some(owner_config.id.to_string()));
-        for group in invite.groups.iter() {
-            if !contact.groups.iter().any(|existing| existing == group) {
-                contact.groups.push(group.clone());
-            }
-        }
-        ensure_default_users_group(&mut contact);
-        let mut profile = profile_from_owner_config(&owner_config);
-        let show_name = invite
-            .show_name
-            .clone()
-            .unwrap_or_else(|| owner_config.display_name.clone());
-        profile.display_name = Some(show_name.clone());
-        set_profile_system_contact(&mut profile, &contact)?;
-
-        let settings_path = format!("users/{}/settings", user_id);
-        let mut settings = match client.get(&settings_path).await {
-            Ok(val) => {
-                let mut settings: UserSettings = serde_json::from_str(&val.value).map_err(|e| {
-                    RPCErrors::ReasonError(format!("Corrupted user settings: {}", e))
-                })?;
-                if !matches!(settings.state, UserState::Pending) {
-                    return Err(RPCErrors::ReasonError(format!(
-                        "User '{}' already exists and is not pending",
-                        user_id
-                    )));
-                }
-                settings.user_type = invite.default_user_type.clone();
-                if !password_hash.is_empty() {
-                    settings.password = password_hash.clone();
-                }
-                settings.state = UserState::Active;
-                settings.is_local = false;
-                settings
-            }
-            Err(_) => UserSettings {
-                user_id: user_id.clone(),
-                user_type: invite.default_user_type.clone(),
-                password: password_hash.clone(),
-                state: UserState::Active,
-                res_pool_id: "default".to_string(),
-                is_local: false,
-                allow_password_change: None,
-            },
-        };
-        settings.state = UserState::Active;
-
-        let settings_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        if client.set(&settings_path, &settings_json).await.is_err() {
-            client
-                .create(&settings_path, &settings_json)
-                .await
-                .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user: {}", e)))?;
-        }
-
-        let doc_path = format!("users/{}/doc", user_id);
-        let doc_json = serde_json::to_string(&owner_config)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        if client.set(&doc_path, &doc_json).await.is_err() {
-            client
-                .create(&doc_path, &doc_json)
-                .await
-                .map_err(|e| RPCErrors::ReasonError(format!("Failed to save user doc: {}", e)))?;
-        }
-
-        save_user_profile(&client, &user_id, &profile).await?;
-
-        invite.state = "accepted".to_string();
-        invite.accepted_at = Some(now);
-        invite.accepted_user_id = Some(user_id.clone());
-        let invite_json = serde_json::to_string(&invite)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&invite_path, &invite_json)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to update invite: {}", e)))?;
+        let (user_id, invite) = accept_user_invitation(
+            &kv,
+            &invite_id,
+            &owner_config,
+            &password_hash,
+            buckyos_get_unix_timestamp(),
+        )
+        .await?;
 
         refresh_rbac_by_scheduler("user.invite_accept").await?;
+        if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+            warn!("msg-center reload after invite accept of {user_id} failed: {error}");
+        }
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
@@ -1462,36 +1613,9 @@ impl ControlPanelServer {
 
         let target = Self::require_param_str(&req, "user_id")?;
         let target = target.trim().to_lowercase();
-
-        if target == "root" {
-            return Err(RPCErrors::ReasonError(
-                "Cannot delete root user".to_string(),
-            ));
-        }
-        if target == principal.username {
-            return Err(RPCErrors::ReasonError("Cannot delete yourself".to_string()));
-        }
-
-        let client = system_config_client_for_caller(&req).await?;
-
-        // Mark user as deleted rather than physically removing
-        let settings_path = format!("users/{}/settings", target);
-        let settings_val = client
-            .get(&settings_path)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("User '{}' not found: {}", target, e)))?;
-        let mut settings: UserSettings = serde_json::from_str(&settings_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
-
-        settings.state = UserState::Deleted;
-        let updated_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&settings_path, &updated_json)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to delete user: {}", e)))?;
-
-        refresh_rbac_by_scheduler("user.delete").await?;
+        let kv = ZoneKv::with_client(system_config_client_for_caller(&req).await?);
+        let state = save_user_state(&kv, principal, &target, UserState::Deleted).await?;
+        let refresh_result = refresh_rbac_by_scheduler("user.delete").await;
 
         info!(
             "User '{}' marked as deleted by '{}'",
@@ -1499,10 +1623,7 @@ impl ControlPanelServer {
         );
 
         Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "user_id": target,
-            })),
+            RPCResult::Success(user_state_result(&target, &state, refresh_result)),
             req.seq,
         ))
     }
@@ -1516,41 +1637,42 @@ impl ControlPanelServer {
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let target = resolve_target_user_id(&req, principal);
-        require_self_or_admin(principal, &target)?;
-
         let new_password_hash = Self::require_param_str(&req, "new_password_hash")?;
-        if new_password_hash.is_empty() {
-            return Err(RPCErrors::ParseRequestError(
-                "new_password_hash cannot be empty".to_string(),
-            ));
-        }
+        validate_password_hash(&new_password_hash)?;
 
-        let client = system_config_client_for_caller(&req).await?;
-
+        // Checked here, written with the service identity: accounts have no
+        // system-config write right on their own settings.
+        let kv = ZoneKv::connect().await?;
         let settings_path = format!("users/{}/settings", target);
-        let settings_val = client
+        let (raw, version) = kv
             .get(&settings_path)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("User '{}' not found: {}", target, e)))?;
-        let mut settings: UserSettings = serde_json::from_str(&settings_val.value)
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError(format!("User '{}' not found", target)))?;
+        let mut settings: UserSettings = serde_json::from_str(&raw)
             .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
-        if principal.username == target
-            && !settings
-                .allow_password_change
-                .unwrap_or(!matches!(settings.user_type, UserType::Limited))
-        {
-            return Err(RPCErrors::ReasonError(
-                "This account is not allowed to change its password".to_string(),
-            ));
-        }
+        password_change_allowed(principal, &target, &settings)?;
 
+        let first_password = !settings.password_state.is_set();
         settings.password = new_password_hash;
-        let updated_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&settings_path, &updated_json)
+        settings.password_state = PasswordState::Set;
+        let mut tx =
+            HashMap::from([(settings_path.clone(), KVAction::Update(to_json(&settings)?))]);
+        if first_password {
+            tx.extend(
+                crate::exclusive_invite::consume_invite_actions(
+                    &kv,
+                    &target,
+                    buckyos_get_unix_timestamp(),
+                )
+                .await?,
+            );
+        }
+        kv.exec_tx(tx, Some((settings_path, version)))
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to change password: {}", e)))?;
+        if first_password {
+            crate::exclusive_invite::revoke_invite_families(&target, None).await;
+        }
 
         info!(
             "Password changed for user '{}' by '{}'",
@@ -1574,34 +1696,12 @@ impl ControlPanelServer {
         require_admin(principal)?;
 
         let target = Self::require_param_str(&req, "user_id")?;
+        let target = target.trim().to_lowercase();
         let state_str = Self::require_param_str(&req, "state")?;
         let new_state = parse_user_state(&state_str)?;
-
-        if target == "root" && !matches!(new_state, UserState::Active) {
-            return Err(RPCErrors::ReasonError(
-                "Cannot change root user state to non-active".to_string(),
-            ));
-        }
-
-        let client = system_config_client_for_caller(&req).await?;
-
-        let settings_path = format!("users/{}/settings", target);
-        let settings_val = client
-            .get(&settings_path)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("User '{}' not found: {}", target, e)))?;
-        let mut settings: UserSettings = serde_json::from_str(&settings_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted user settings: {}", e)))?;
-
-        settings.state = new_state;
-        let updated_json = serde_json::to_string(&settings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        client
-            .set(&settings_path, &updated_json)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to change state: {}", e)))?;
-
-        refresh_rbac_by_scheduler("user.change_state").await?;
+        let kv = ZoneKv::with_client(system_config_client_for_caller(&req).await?);
+        let state = save_user_state(&kv, principal, &target, new_state).await?;
+        let refresh_result = refresh_rbac_by_scheduler("user.change_state").await;
 
         info!(
             "User '{}' state changed to '{}' by '{}'",
@@ -1609,11 +1709,7 @@ impl ControlPanelServer {
         );
 
         Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "user_id": target,
-                "state": state_str,
-            })),
+            RPCResult::Success(user_state_result(&target, &state, refresh_result)),
             req.seq,
         ))
     }
@@ -1631,10 +1727,6 @@ impl ControlPanelServer {
         let target = Self::require_param_str(&req, "user_id")?;
         let type_str = Self::require_param_str(&req, "user_type")?;
         let new_type = parse_user_type(&type_str)?;
-
-        if matches!(new_type, UserType::Root) {
-            return Err(RPCErrors::ReasonError("Cannot promote to root".to_string()));
-        }
 
         let client = system_config_client_for_caller(&req).await?;
 
@@ -1661,6 +1753,9 @@ impl ControlPanelServer {
             .map_err(|e| RPCErrors::ReasonError(format!("Failed to change type: {}", e)))?;
 
         refresh_rbac_by_scheduler("user.change_type").await?;
+        if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+            warn!("msg-center reload after changing the type of {target} failed: {error}");
+        }
 
         info!(
             "User '{}' type changed to '{}' by '{}'",
@@ -1671,582 +1766,72 @@ impl ControlPanelServer {
             RPCResult::Success(json!({
                 "ok": true,
                 "user_id": target,
-                "user_type": type_str,
+                "user_type": new_type,
             })),
             req.seq,
         ))
     }
 
-    // ─── Agent management handlers ──────────────────────────────────────
+    // ── user.set_account_options ───────────────────────────────────────
+    // Per-user overrides of the UserType defaults; `null` returns to the default.
 
-    // ── agent.list ──────────────────────────────────────────────────────
-
-    pub(crate) async fn handle_agent_list(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let _principal = Self::require_rpc_principal(principal)?;
-        let include_deleted = Self::param_bool(&req, "include_deleted").unwrap_or(false);
-        let include_runtime = Self::param_bool(&req, "include_runtime").unwrap_or(false);
-        // See handle_user_list for why we use the service token for the
-        // directory enumeration here; individual `get` calls below can
-        // run with the caller's token but we already have a broad-read
-        // client, so we keep using it for the whole handler.
-        let runtime = get_buckyos_api_runtime()?;
-        let client = runtime.get_system_config_client().await?;
-
-        let agent_ids = client
-            .list("agents")
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to list agents: {}", e)))?;
-        let user_ids = match client.list("users").await {
-            Ok(user_ids) => user_ids,
-            Err(error) => {
-                warn!("Failed to list users while loading agent specs: {}", error);
-                Vec::new()
-            }
-        };
-
-        let mut agents: Vec<Value> = Vec::new();
-        for agent_id in &agent_ids {
-            let doc_path = format!("agents/{}/doc", agent_id);
-            let mut agent_info = match client.get(&doc_path).await {
-                Ok(val) => {
-                    if let Ok(doc) = serde_json::from_str::<Value>(&val.value) {
-                        doc
-                    } else {
-                        json!({ "agent_id": agent_id })
-                    }
-                }
-                Err(_) => {
-                    json!({ "agent_id": agent_id })
-                }
-            };
-            if agent_info.get("agent_id").is_none() {
-                agent_info["agent_id"] = json!(agent_id);
-            }
-            let settings_path = format!("agents/{}/settings", agent_id);
-            if let Ok(settings_val) = client.get(&settings_path).await {
-                if let Ok(settings) = serde_json::from_str::<Value>(&settings_val.value) {
-                    if !include_deleted
-                        && settings
-                            .get("state")
-                            .and_then(|value| value.as_str())
-                            .map(|state| state == "deleted")
-                            .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    agent_info["settings"] = settings;
-                }
-            }
-            if let Some(spec) = load_agent_service_spec(&client, &user_ids, agent_id).await {
-                merge_agent_service_spec(&mut agent_info, &spec);
-            }
-            if include_runtime {
-                agent_info["runtime"] = load_agent_runtime_info(agent_id).await;
-            }
-            agents.push(agent_info);
-        }
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "total": agents.len(),
-                "agents": agents,
-            })),
-            req.seq,
-        ))
-    }
-
-    // ── agent.get ───────────────────────────────────────────────────────
-
-    pub(crate) async fn handle_agent_get(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let _principal = Self::require_rpc_principal(principal)?;
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-
-        let client = system_config_client_for_caller(&req).await?;
-
-        let doc_path = format!("agents/{}/doc", agent_id);
-        let doc_val = client.get(&doc_path).await.map_err(|e| {
-            RPCErrors::ReasonError(format!("Agent '{}' not found: {}", agent_id, e))
-        })?;
-        let mut agent_doc: Value = serde_json::from_str(&doc_val.value)
-            .map_err(|e| RPCErrors::ReasonError(format!("Corrupted agent doc: {}", e)))?;
-
-        agent_doc["agent_id"] = json!(agent_id);
-
-        // Load agent settings if available (best-effort)
-        let settings_path = format!("agents/{}/settings", agent_id);
-        if let Ok(settings_val) = client.get(&settings_path).await {
-            if let Ok(settings) = serde_json::from_str::<Value>(&settings_val.value) {
-                agent_doc["settings"] = settings;
-            }
-        }
-        agent_doc["runtime"] = load_agent_runtime_info(&agent_id).await;
-
-        Ok(RPCResponse::new(RPCResult::Success(agent_doc), req.seq))
-    }
-
-    pub(crate) async fn handle_agent_create(
+    pub(crate) async fn handle_user_set_account_options(
         &self,
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         require_admin(principal)?;
+        let target = Self::require_param_str(&req, "user_id")?;
+        let option = |key: &str| -> Result<Option<Option<bool>>, RPCErrors> {
+            match req.params.get(key) {
+                None => Ok(None),
+                Some(Value::Null) => Ok(Some(None)),
+                Some(Value::Bool(value)) => Ok(Some(Some(*value))),
+                Some(_) => Err(RPCErrors::ParseRequestError(format!(
+                    "{key} must be a boolean or null"
+                ))),
+            }
+        };
+        let allow_password_change = option("allow_password_change")?;
+        let allow_contact_edit = option("allow_contact_edit")?;
 
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        let agent_id = agent_id.trim().to_lowercase();
-        validate_agent_id(&agent_id)?;
-        let display_name =
-            Self::param_str(&req, "display_name").unwrap_or_else(|| agent_id.clone());
-        let owner_user_id = Self::param_str(&req, "owner_user_id")
-            .unwrap_or_else(|| principal.username.clone())
-            .trim()
-            .to_lowercase();
-        validate_username(&owner_user_id)?;
-        let description = Self::param_str(&req, "description");
-        let profile: Option<Value> = req.params.get("profile").cloned();
-        let settings_payload: Value = req
-            .params
-            .get("settings")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        if !settings_payload.is_object() {
-            return Err(RPCErrors::ParseRequestError(
-                "settings must be a JSON object".to_string(),
+        let client = system_config_client_for_caller(&req).await?;
+        let settings_path = format!("users/{}/settings", target);
+        let mut settings = load_user_settings(&client, &target).await?;
+        if matches!(settings.user_type, UserType::Root) {
+            return Err(RPCErrors::ReasonError(
+                "Cannot change root account options".to_string(),
             ));
         }
-
-        let runtime = get_buckyos_api_runtime()?;
-        let (private_key, public_key) = generate_ed25519_key_pair();
-        let public_key: Jwk = serde_json::from_value(public_key)
-            .map_err(|e| RPCErrors::ReasonError(format!("Invalid generated public key: {}", e)))?;
-        let agent_did = Self::param_str(&req, "agent_did")
-            .map(|value| {
-                DID::from_str(value.as_str())
-                    .map_err(|e| RPCErrors::ParseRequestError(format!("Invalid agent_did: {}", e)))
-            })
-            .transpose()?
-            .unwrap_or_else(|| {
-                DID::new(
-                    runtime.zone_id.method.as_str(),
-                    format!("{}.{}", agent_id, runtime.zone_id.id).as_str(),
-                )
-            });
-        let owner_did = DID::new("bns", &owner_user_id);
-        let mut agent_doc = AgentDocument::new(agent_did, owner_did, public_key);
-        agent_doc.public_description = description.clone();
-        agent_doc
-            .extra_info
-            .insert("agent_id".to_string(), json!(agent_id.clone()));
-        agent_doc
-            .extra_info
-            .insert("display_name".to_string(), json!(display_name.clone()));
-        if let Some(profile) = profile.clone() {
-            agent_doc.extra_info.insert("profile".to_string(), profile);
+        if let Some(value) = allow_password_change {
+            settings.allow_password_change = value;
         }
-
-        let client = system_config_client_for_caller(&req).await?;
-        let doc_path = format!("agents/{}/doc", agent_id);
-        if client.get(&doc_path).await.is_ok() {
-            return Err(RPCErrors::ReasonError(format!(
-                "Agent '{}' already exists",
-                agent_id
-            )));
+        if let Some(value) = allow_contact_edit {
+            settings.allow_contact_edit = value;
         }
-        let key_path = format!("agents/{}/key", agent_id);
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj = settings_payload;
-        settings_obj["state"] = json!("active");
-        settings_obj["owner_user_id"] = json!(owner_user_id);
-        settings_obj["display_name"] = json!(display_name);
-        if let Some(description) = description {
-            settings_obj["description"] = json!(description);
-        }
-        if let Some(profile) = profile {
-            settings_obj["profile"] = profile;
-        }
-
-        let mut tx = HashMap::new();
-        tx.insert(
-            doc_path,
-            KVAction::Create(
-                serde_json::to_string(&agent_doc)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?,
-            ),
-        );
-        tx.insert(key_path, KVAction::Create(private_key));
-        tx.insert(
-            settings_path,
-            KVAction::Create(
-                serde_json::to_string(&settings_obj)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?,
-            ),
-        );
-        client
-            .exec_tx(tx, None)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("Failed to create agent: {}", e)))?;
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "agent_id": agent_id,
-                "doc": agent_doc,
-                "settings": settings_obj,
-            })),
-            req.seq,
-        ))
-    }
-
-    pub(crate) async fn handle_agent_update(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        require_admin(principal)?;
-
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        validate_agent_id(&agent_id)?;
-        let client = system_config_client_for_caller(&req).await?;
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj: Value = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str(&val.value).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        if !settings_obj.is_object() {
-            settings_obj = json!({});
-        }
-        if let Some(display_name) = Self::param_str(&req, "display_name") {
-            settings_obj["display_name"] = json!(display_name);
-        }
-        if let Some(description) = Self::param_str(&req, "description") {
-            settings_obj["description"] = json!(description);
-        }
-        if let Some(state) = Self::param_str(&req, "state") {
-            settings_obj["state"] = json!(state);
-        }
-        if let Some(profile) = req.params.get("profile") {
-            settings_obj["profile"] = profile.clone();
-        }
-        if let Some(settings_patch) = req.params.get("settings") {
-            let patch = settings_patch.as_object().ok_or_else(|| {
-                RPCErrors::ParseRequestError("settings must be a JSON object".to_string())
-            })?;
-            if let Some(target) = settings_obj.as_object_mut() {
-                for (key, value) in patch {
-                    target.insert(key.clone(), value.clone());
-                }
-            }
-        }
-        let settings_json = serde_json::to_string(&settings_obj)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        if client.set(&settings_path, &settings_json).await.is_err() {
-            client
-                .create(&settings_path, &settings_json)
-                .await
-                .map_err(|e| RPCErrors::ReasonError(format!("Failed to update agent: {}", e)))?;
-        }
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "agent_id": agent_id,
-                "settings": settings_obj,
-            })),
-            req.seq,
-        ))
-    }
-
-    pub(crate) async fn handle_agent_delete(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        require_admin(principal)?;
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        validate_agent_id(&agent_id)?;
-
-        let client = system_config_client_for_caller(&req).await?;
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj: Value = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str(&val.value).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        if !settings_obj.is_object() {
-            settings_obj = json!({});
-        }
-        settings_obj["state"] = json!("deleted");
-        settings_obj["deleted_at"] = json!(buckyos_get_unix_timestamp());
-        settings_obj["deleted_by"] = json!(principal.username.clone());
-        let settings_json = serde_json::to_string(&settings_obj)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        if client.set(&settings_path, &settings_json).await.is_err() {
-            client
-                .create(&settings_path, &settings_json)
-                .await
-                .map_err(|e| RPCErrors::ReasonError(format!("Failed to delete agent: {}", e)))?;
-        }
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "agent_id": agent_id,
-                "state": "deleted",
-            })),
-            req.seq,
-        ))
-    }
-
-    pub(crate) async fn handle_agent_profile_get(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let _principal = Self::require_rpc_principal(principal)?;
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        validate_agent_id(&agent_id)?;
-        let client = system_config_client_for_caller(&req).await?;
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let local_profile = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str::<Value>(&val.value)
-                .ok()
-                .and_then(|settings| settings.get("profile").cloned()),
-            Err(_) => None,
-        };
-        let doc_profile = match client
-            .get(format!("agents/{}/doc", agent_id).as_str())
-            .await
-        {
-            Ok(val) => serde_json::from_str::<Value>(&val.value)
-                .ok()
-                .and_then(|doc| profile_value_from_doc(&doc)),
-            Err(_) => None,
-        };
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "agent_id": agent_id,
-                "profile": merge_profile_values(local_profile.clone(), doc_profile.clone()),
-                "local_profile": local_profile,
-                "did_profile": doc_profile,
-            })),
-            req.seq,
-        ))
-    }
-
-    pub(crate) async fn handle_agent_profile_set(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        require_admin(principal)?;
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        validate_agent_id(&agent_id)?;
-        let profile = req
-            .params
-            .get("profile")
-            .cloned()
-            .ok_or_else(|| RPCErrors::ParseRequestError("Missing profile".to_string()))?;
-        if !profile.is_object() {
-            return Err(RPCErrors::ParseRequestError(
-                "profile must be a JSON object".to_string(),
-            ));
-        }
-
-        let client = system_config_client_for_caller(&req).await?;
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj: Value = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str(&val.value).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        if !settings_obj.is_object() {
-            settings_obj = json!({});
-        }
-        settings_obj["profile"] = profile.clone();
-        let settings_json = serde_json::to_string(&settings_obj)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        if client.set(&settings_path, &settings_json).await.is_err() {
-            client
-                .create(&settings_path, &settings_json)
-                .await
-                .map_err(|e| {
-                    RPCErrors::ReasonError(format!("Failed to save agent profile: {}", e))
-                })?;
-        }
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "agent_id": agent_id,
-                "profile": profile,
-            })),
-            req.seq,
-        ))
-    }
-
-    // ── agent.set_msg_tunnel ────────────────────────────────────────────
-    // Adds or updates a message tunnel binding for an agent.
-    // This delegates to the system config store (not MessageCenter),
-    // because agent tunnel bindings are part of the agent's system-level config.
-
-    pub(crate) async fn handle_agent_set_msg_tunnel(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        require_admin(principal)?;
-
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        let platform = Self::require_param_str(&req, "platform")?;
-        let account_id = Self::require_param_str(&req, "account_id")?;
-
-        let display_id = Self::param_str(&req, "display_id");
-        let tunnel_instance_id = Self::param_str(&req, "tunnel_instance_id");
-        let status = Self::param_str(&req, "status");
-        let last_sync_at = Self::param_u64(&req, "last_sync_at");
-        let meta: HashMap<String, String> = req
-            .params
-            .get("meta")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let binding = UserTunnelBinding {
-            platform: platform.clone(),
-            account_id,
-            display_id,
-            tunnel_instance_id,
-            status,
-            last_sync_at,
-            meta,
-        };
-
-        let client = system_config_client_for_caller(&req).await?;
-
-        // Store bindings inside agents/{agent_id}/settings under the "bindings"
-        // field. RBAC in boot.template.toml grants admin read|write on
-        // `agents/*/settings` but NOT on a separate `bindings` key, so we
-        // colocate the data here.
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj: Value = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str(&val.value).unwrap_or_else(|_| json!({})),
-            Err(_) => json!({}),
-        };
-        let mut bindings: Vec<UserTunnelBinding> = settings_obj
-            .get("bindings")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        // Replace existing binding for the same platform or add new
-        if let Some(pos) = bindings.iter().position(|b| b.platform == platform) {
-            bindings[pos] = binding;
-        } else {
-            bindings.push(binding);
-        }
-
-        settings_obj["bindings"] = serde_json::to_value(&bindings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        let settings_json = serde_json::to_string(&settings_obj)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-
-        // Try set, fall back to create if the settings key doesn't exist yet
-        if client.set(&settings_path, &settings_json).await.is_err() {
-            client
-                .create(&settings_path, &settings_json)
-                .await
-                .map_err(|e| {
-                    RPCErrors::ReasonError(format!("Failed to save agent bindings: {}", e))
-                })?;
-        }
-
-        info!(
-            "Agent '{}' tunnel binding for '{}' set by '{}'",
-            agent_id, platform, principal.username
-        );
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(json!({
-                "ok": true,
-                "agent_id": agent_id,
-                "platform": platform,
-                "total_bindings": bindings.len(),
-            })),
-            req.seq,
-        ))
-    }
-
-    // ── agent.remove_msg_tunnel ─────────────────────────────────────────
-
-    pub(crate) async fn handle_agent_remove_msg_tunnel(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        require_admin(principal)?;
-
-        let agent_id = Self::require_param_str(&req, "agent_id")?;
-        let platform = Self::require_param_str(&req, "platform")?;
-
-        let client = system_config_client_for_caller(&req).await?;
-
-        // Bindings live inside agents/{id}/settings under the "bindings" key
-        // (see handle_agent_set_msg_tunnel for RBAC rationale).
-        let settings_path = format!("agents/{}/settings", agent_id);
-        let mut settings_obj: Value = match client.get(&settings_path).await {
-            Ok(val) => serde_json::from_str(&val.value).unwrap_or_else(|_| json!({})),
-            Err(_) => {
-                return Err(RPCErrors::ReasonError(format!(
-                    "No bindings found for agent '{}'",
-                    agent_id
-                )));
-            }
-        };
-        let mut bindings: Vec<UserTunnelBinding> = settings_obj
-            .get("bindings")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-
-        let original_len = bindings.len();
-        bindings.retain(|b| b.platform != platform);
-
-        if bindings.len() == original_len {
-            return Err(RPCErrors::ReasonError(format!(
-                "No binding for platform '{}' found on agent '{}'",
-                platform, agent_id
-            )));
-        }
-
-        settings_obj["bindings"] = serde_json::to_value(&bindings)
-            .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
-        let settings_json = serde_json::to_string(&settings_obj)
+        let updated_json = serde_json::to_string(&settings)
             .map_err(|e| RPCErrors::ReasonError(format!("Serialize error: {}", e)))?;
         client
-            .set(&settings_path, &settings_json)
+            .set(&settings_path, &updated_json)
             .await
-            .map_err(|e| {
-                RPCErrors::ReasonError(format!("Failed to update agent bindings: {}", e))
-            })?;
-
+            .map_err(|e| RPCErrors::ReasonError(format!("Failed to save options: {}", e)))?;
+        if allow_contact_edit.is_some() {
+            if let Err(error) = crate::agent_mgr::reload_msg_center().await {
+                warn!("msg-center reload after options of {target} failed: {error}");
+            }
+        }
         info!(
-            "Agent '{}' tunnel binding for '{}' removed by '{}'",
-            agent_id, platform, principal.username
+            "User '{}' account options changed by '{}'",
+            target, principal.username
         );
 
         Ok(RPCResponse::new(
             RPCResult::Success(json!({
                 "ok": true,
-                "agent_id": agent_id,
-                "platform": platform,
-                "remaining_bindings": bindings.len(),
+                "user_id": target,
+                "allow_password_change": settings.can_change_password(),
+                "allow_contact_edit": settings.can_edit_contacts(),
             })),
             req.seq,
         ))
@@ -2256,6 +1841,565 @@ impl ControlPanelServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_data_url::png_data_url;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct InviteKv {
+        data: Mutex<HashMap<String, (String, u64)>>,
+        failed_read: Option<String>,
+        before_commit: Mutex<Option<(String, String)>>,
+        guard: Mutex<Option<(String, u64)>>,
+        tx_calls: AtomicUsize,
+    }
+
+    impl InviteKv {
+        fn put<T: Serialize>(&self, key: &str, value: &T) {
+            self.data
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), (to_json(value).unwrap(), 1));
+        }
+
+        fn snapshot(&self) -> HashMap<String, (String, u64)> {
+            self.data.lock().unwrap().clone()
+        }
+
+        fn read<T: serde::de::DeserializeOwned>(&self, key: &str) -> T {
+            serde_json::from_str(&self.data.lock().unwrap()[key].0).unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentKv for InviteKv {
+        async fn get(&self, key: &str) -> Result<Option<(String, u64)>, RPCErrors> {
+            if self.failed_read.as_deref() == Some(key) {
+                return Err(RPCErrors::ReasonError("read unavailable".to_string()));
+            }
+            Ok(self.data.lock().unwrap().get(key).cloned())
+        }
+
+        async fn list(&self, _key: &str) -> Result<Vec<String>, RPCErrors> {
+            unreachable!()
+        }
+
+        async fn exec_tx(
+            &self,
+            actions: HashMap<String, KVAction>,
+            main_key: Option<(String, u64)>,
+        ) -> Result<(), RPCErrors> {
+            self.tx_calls.fetch_add(1, Ordering::SeqCst);
+            *self.guard.lock().unwrap() = main_key.clone();
+            let mut data = self.data.lock().unwrap();
+            if let Some((key, value)) = self.before_commit.lock().unwrap().take() {
+                let version = data.get(&key).map_or(0, |(_, version)| *version) + 1;
+                data.insert(key, (value, version));
+            }
+            if let Some((key, expected)) = main_key {
+                if data.get(&key).map_or(0, |(_, version)| *version) != expected {
+                    return Err(RPCErrors::ReasonError("revision mismatch".to_string()));
+                }
+            }
+            for (key, action) in &actions {
+                if matches!(action, KVAction::Create(_)) && data.contains_key(key) {
+                    return Err(RPCErrors::ReasonError(format!("{key} exists")));
+                }
+            }
+            for (key, action) in actions {
+                let version = data.get(&key).map_or(0, |(_, version)| *version) + 1;
+                match action {
+                    KVAction::Create(value) | KVAction::Update(value) => {
+                        data.insert(key, (value, version));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn invitation_fixture() -> (UserInviteRecord, OwnerDocument) {
+        let owner = generated_owner_config("alice", "Alice", &DID::new("bns", "home"), false)
+            .unwrap()
+            .0;
+        let invite = UserInviteRecord {
+            invite_id: "invite-alice".to_string(),
+            created_by: "admin".to_string(),
+            created_at: 1,
+            expires_at: Some(100),
+            state: "pending".to_string(),
+            target_user_id: None,
+            target_did: Some(owner.id.to_string()),
+            show_name: Some("Invited Alice".to_string()),
+            default_user_type: UserType::User,
+            groups: vec!["family".to_string()],
+            accepted_at: None,
+            accepted_user_id: None,
+        };
+        (invite, owner)
+    }
+
+    #[tokio::test]
+    async fn invite_accept_creates_all_records_and_consumes_invite_in_one_cas() {
+        let (invite, owner) = invitation_fixture();
+        let kv = InviteKv::default();
+        let path = format!("{USER_INVITE_PREFIX}/{}", invite.invite_id);
+        kv.put(&path, &invite);
+        let password = STANDARD.encode([7u8; 32]);
+        let (user_id, accepted) =
+            accept_user_invitation(&kv, &invite.invite_id, &owner, &password, 50)
+                .await
+                .unwrap();
+
+        assert_eq!(user_id, "alice");
+        assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*kv.guard.lock().unwrap(), Some((path.clone(), 1)));
+        assert_eq!(kv.snapshot().len(), 4);
+        let settings: UserSettings = kv.read("users/alice/settings");
+        assert!(matches!(settings.state, UserState::Active));
+        assert_eq!(settings.password, password);
+        assert!(settings.password_state.is_set());
+        assert!(!settings.is_local);
+        assert_eq!(settings.groups, invite.groups);
+        let document: OwnerDocument = kv.read("users/alice/doc");
+        assert_eq!(document.id, owner.id);
+        let profile: UserPrivateProfile = kv.read("users/alice/profile");
+        assert_eq!(profile.did, owner.id);
+        assert_eq!(profile.display_name.as_deref(), Some("Invited Alice"));
+        assert_eq!(accepted.state, "accepted");
+        assert_eq!(accepted.accepted_at, Some(50));
+        let saved: UserInviteRecord = kv.read(&path);
+        assert_eq!(saved.accepted_user_id.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn invite_accept_activates_only_its_own_reserved_pending_account() {
+        let (mut invite, owner) = invitation_fixture();
+        invite.target_user_id = Some("reserved".to_string());
+        let kv = InviteKv::default();
+        kv.put(
+            &format!("{USER_INVITE_PREFIX}/{}", invite.invite_id),
+            &invite,
+        );
+        let mut pending = account(UserType::Limited, None, PasswordState::Unset);
+        pending.user_id = "reserved".to_string();
+        pending.state = UserState::Pending;
+        pending.password.clear();
+        kv.put("users/reserved/settings", &pending);
+        kv.put("users/reserved/profile", &profile_from_user_id("reserved"));
+
+        let (user_id, _) = accept_user_invitation(&kv, &invite.invite_id, &owner, "", 50)
+            .await
+            .unwrap();
+        assert_eq!(user_id, "reserved");
+        assert_eq!(kv.snapshot().len(), 4);
+        let settings: UserSettings = kv.read("users/reserved/settings");
+        assert!(matches!(settings.state, UserState::Active));
+        assert_eq!(settings.user_type, UserType::User);
+        assert!(!settings.password_state.is_set());
+        assert_eq!(kv.read::<OwnerDocument>("users/reserved/doc").id, owner.id);
+    }
+
+    #[tokio::test]
+    async fn invite_accept_cannot_claim_another_reservation_or_existing_account() {
+        for reserved_by_this_invite in [false, true] {
+            let (mut invite, owner) = invitation_fixture();
+            if reserved_by_this_invite {
+                invite.target_user_id = Some("alice".to_string());
+            }
+            let kv = InviteKv::default();
+            kv.put(
+                &format!("{USER_INVITE_PREFIX}/{}", invite.invite_id),
+                &invite,
+            );
+            let mut settings = account(UserType::User, None, PasswordState::Unset);
+            settings.user_id = "alice".to_string();
+            settings.state = if reserved_by_this_invite {
+                UserState::Active
+            } else {
+                UserState::Pending
+            };
+            kv.put("users/alice/settings", &settings);
+            let before = kv.snapshot();
+
+            assert!(
+                accept_user_invitation(&kv, &invite.invite_id, &owner, "", 50)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(kv.snapshot(), before);
+            assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_accept_preserves_all_records_when_a_read_fails() {
+        let (invite, owner) = invitation_fixture();
+        let path = format!("{USER_INVITE_PREFIX}/{}", invite.invite_id);
+        for key in [&path, "users/alice/settings"] {
+            let kv = InviteKv {
+                failed_read: Some(key.to_string()),
+                ..Default::default()
+            };
+            kv.put(&path, &invite);
+            kv.put(
+                "users/alice/settings",
+                &account(UserType::Admin, None, PasswordState::Set),
+            );
+            let before = kv.snapshot();
+
+            let error = accept_user_invitation(&kv, &invite.invite_id, &owner, "", 50)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("read unavailable"));
+            assert_eq!(kv.snapshot(), before);
+            assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_accept_rejects_wrong_did_expiry_replay_and_bad_password_before_writing() {
+        for condition in ["wrong_did", "expired", "accepted", "bad_password"] {
+            let (mut invite, owner) = invitation_fixture();
+            let password = match condition {
+                "wrong_did" => {
+                    invite.target_did = Some("did:bns:bob".to_string());
+                    ""
+                }
+                "expired" => {
+                    invite.expires_at = Some(49);
+                    ""
+                }
+                "accepted" => {
+                    invite.state = "accepted".to_string();
+                    ""
+                }
+                _ => "not-a-password-hash",
+            };
+            let kv = InviteKv::default();
+            kv.put(
+                &format!("{USER_INVITE_PREFIX}/{}", invite.invite_id),
+                &invite,
+            );
+            let before = kv.snapshot();
+
+            assert!(
+                accept_user_invitation(&kv, &invite.invite_id, &owner, password, 50)
+                    .await
+                    .is_err(),
+                "{condition}"
+            );
+            assert_eq!(kv.snapshot(), before, "{condition}");
+            assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0, "{condition}");
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_accept_record_collision_rolls_back_every_invitation_write() {
+        for suffix in ["settings", "doc", "profile"] {
+            let (invite, owner) = invitation_fixture();
+            let path = format!("{USER_INVITE_PREFIX}/{}", invite.invite_id);
+            let collision_key = format!("users/alice/{suffix}");
+            let collision_value = "concurrently created record".to_string();
+            let kv = InviteKv {
+                before_commit: Mutex::new(Some((collision_key.clone(), collision_value.clone()))),
+                ..Default::default()
+            };
+            kv.put(&path, &invite);
+            let mut expected = kv.snapshot();
+            expected.insert(collision_key, (collision_value, 1));
+
+            assert!(
+                accept_user_invitation(&kv, &invite.invite_id, &owner, "", 50)
+                    .await
+                    .is_err(),
+                "{suffix}"
+            );
+            assert_eq!(kv.snapshot(), expected, "{suffix}");
+            assert_eq!(kv.read::<UserInviteRecord>(&path).state, "pending");
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_accept_cas_rejects_an_invitation_consumed_after_reading() {
+        let (invite, mut owner) = invitation_fixture();
+        owner.name = "second-account".to_string();
+        let path = format!("{USER_INVITE_PREFIX}/{}", invite.invite_id);
+        let mut consumed = invite.clone();
+        consumed.state = "accepted".to_string();
+        consumed.accepted_user_id = Some("first-account".to_string());
+        let kv = InviteKv {
+            before_commit: Mutex::new(Some((path.clone(), to_json(&consumed).unwrap()))),
+            ..Default::default()
+        };
+        kv.put(&path, &invite);
+
+        let error = accept_user_invitation(&kv, &invite.invite_id, &owner, "", 50)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision mismatch"));
+        assert_eq!(kv.snapshot().len(), 1);
+        assert_eq!(
+            kv.read::<UserInviteRecord>(&path)
+                .accepted_user_id
+                .as_deref(),
+            Some("first-account")
+        );
+        assert_eq!(*kv.guard.lock().unwrap(), Some((path, 1)));
+    }
+
+    #[test]
+    fn local_profile_fields_win_over_did_document_defaults() {
+        let merged = merge_profile_values(
+            Some(
+                json!({ "did": "did:bns:alice", "avatar": "data:image/png;base64,LOCAL", "bio": " " }),
+            ),
+            Some(
+                json!({ "avatar": "https://doc/a.png", "bio": "From doc", "display_name": "Alice" }),
+            ),
+        );
+        assert_eq!(merged["avatar"], "data:image/png;base64,LOCAL");
+        assert_eq!(merged["bio"], "From doc");
+        assert_eq!(merged["display_name"], "Alice");
+        assert_eq!(merged["did"], "did:bns:alice");
+
+        let cleared = merge_profile_values(
+            Some(json!({ "did": "did:bns:alice" })),
+            Some(json!({ "avatar": "https://doc/a.png" })),
+        );
+        assert_eq!(cleared["avatar"], "https://doc/a.png");
+    }
+
+    #[test]
+    fn profile_patch_distinguishes_keep_set_and_clear() {
+        let mut profile = profile_from_user_id("alice");
+        profile.bio = Some("Old bio".to_string());
+        profile.avatar = Some("https://old/avatar.png".to_string());
+        let avatar = png_data_url(96, 96);
+        let req = RPCRequest::new(
+            "user.profile.set",
+            json!({ "avatar": avatar, "display_name": " Alice ", "website": "https://a.example" }),
+        );
+        apply_profile_text_patch(&mut profile, &req).unwrap();
+        assert_eq!(profile.avatar.as_deref(), Some(avatar.as_str()));
+        assert_eq!(profile.display_name.as_deref(), Some("Alice"));
+        assert_eq!(profile.bio.as_deref(), Some("Old bio"));
+        assert_eq!(profile.links["website"].url, "https://a.example");
+
+        let req = RPCRequest::new(
+            "user.profile.set",
+            json!({ "avatar": null, "bio": "", "website": null }),
+        );
+        apply_profile_text_patch(&mut profile, &req).unwrap();
+        assert_eq!(profile.avatar, None);
+        assert_eq!(profile.bio, None);
+        assert!(!profile.links.contains_key("website"));
+        assert_eq!(profile.display_name.as_deref(), Some("Alice"));
+
+        let req = RPCRequest::new(
+            "user.profile.set",
+            json!({ "avatar": "https://example.com/a.png" }),
+        );
+        assert!(apply_profile_text_patch(&mut profile, &req).is_err());
+        let req = RPCRequest::new("user.profile.set", json!({ "bio": 1 }));
+        assert!(apply_profile_text_patch(&mut profile, &req).is_err());
+    }
+
+    #[test]
+    fn only_assignable_user_types_are_accepted() {
+        assert_eq!(parse_user_type("Admin").unwrap(), UserType::Admin);
+        assert_eq!(parse_user_type("user").unwrap(), UserType::User);
+        assert_eq!(parse_user_type(" limited ").unwrap(), UserType::Limited);
+        for raw in ["root", "guest", "external", ""] {
+            assert!(parse_user_type(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn account_options_report_overrides_and_effective_values() {
+        let mut settings = UserSettings {
+            user_id: "carol".to_string(),
+            user_type: UserType::Limited,
+            password: String::new(),
+            state: UserState::Active,
+            res_pool_id: "default".to_string(),
+            is_local: true,
+            allow_password_change: None,
+            allow_contact_edit: None,
+            groups: vec!["customer".to_string()],
+            password_state: buckyos_api::PasswordState::Set,
+        };
+        let value = settings_options_value(&settings);
+        assert_eq!(value["groups"], json!(["customer"]));
+        assert_eq!(value["allow_contact_edit"], Value::Null);
+        assert_eq!(value["can_edit_contacts"], false);
+        assert_eq!(value["can_change_password"], false);
+        settings.allow_contact_edit = Some(true);
+        assert_eq!(settings_options_value(&settings)["can_edit_contacts"], true);
+        assert!(default_contact_settings(None).tags.is_empty());
+    }
+
+    #[test]
+    fn invitations_bring_in_user_or_limited_accounts_only() {
+        assert_eq!(invite_user_type(None).unwrap(), UserType::User);
+        assert_eq!(
+            invite_user_type(Some("limited")).unwrap(),
+            UserType::Limited
+        );
+        for raw in ["admin", "Admin", "root"] {
+            assert!(
+                matches!(
+                    invite_user_type(Some(raw)),
+                    Err(RPCErrors::ParseRequestError(_))
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    fn caller(user: &str, user_type: UserType, sudo: bool) -> RpcAuthPrincipal {
+        RpcAuthPrincipal {
+            username: user.to_string(),
+            owner_user_id: user.to_string(),
+            authenticated_app_id: "control-panel".to_string(),
+            user_type,
+            owner_did: String::new(),
+            is_user_session: true,
+            is_control_panel_session: true,
+            principal_kind: buckyos_api::TokenPrincipalKind::User,
+            agent_permission_mode: None,
+            session: crate::PrincipalSession {
+                ceiling: buckyos_api::SessionCeiling::for_user_type(user_type),
+                is_sudo: sudo,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn invite_accept_requires_the_document_owners_federated_user_session() {
+        let did = DID::new("bns", "alice");
+        assert!(require_invite_owner_session(None, &did).is_err());
+        let mut principal = caller("alice", UserType::User, false);
+        principal.owner_did = did.to_string();
+        for method in [
+            None,
+            Some(buckyos_api::AuthMethod::Password),
+            Some(buckyos_api::AuthMethod::ExclusiveInvite),
+            Some(buckyos_api::AuthMethod::Assertion),
+        ] {
+            principal.session.auth_method = method;
+            assert!(require_invite_owner_session(Some(&principal), &did).is_err());
+        }
+        principal.session.auth_method = Some(buckyos_api::AuthMethod::DidFederation);
+        assert!(require_invite_owner_session(Some(&principal), &did).is_ok());
+        assert!(require_invite_owner_session(Some(&principal), &DID::new("bns", "bob")).is_err());
+        principal.session.is_external = true;
+        principal.session.ceiling = buckyos_api::SessionCeiling::external();
+        assert!(require_invite_owner_session(Some(&principal), &did).is_ok());
+        principal.is_control_panel_session = false;
+        assert!(require_invite_owner_session(Some(&principal), &did).is_err());
+        principal.is_control_panel_session = true;
+        principal.is_user_session = false;
+        assert!(require_invite_owner_session(Some(&principal), &did).is_err());
+    }
+
+    fn account(user_type: UserType, allow: Option<bool>, state: PasswordState) -> UserSettings {
+        UserSettings {
+            user_id: "carol".to_string(),
+            user_type,
+            password: "x".to_string(),
+            state: UserState::Active,
+            res_pool_id: "default".to_string(),
+            is_local: true,
+            allow_password_change: allow,
+            allow_contact_edit: None,
+            groups: Vec::new(),
+            password_state: state,
+        }
+    }
+
+    #[test]
+    fn password_change_needs_a_control_panel_session_the_override_and_sudo() {
+        let set = PasswordState::Set;
+        let carol = |user_type| caller("carol", user_type, false);
+        // Limited: refused by default, allowed by the override, without sudo.
+        assert!(matches!(
+            password_change_allowed(
+                &carol(UserType::Limited),
+                "carol",
+                &account(UserType::Limited, None, set)
+            ),
+            Err(RPCErrors::NoPermission(_))
+        ));
+        assert!(password_change_allowed(
+            &carol(UserType::Limited),
+            "carol",
+            &account(UserType::Limited, Some(true), set)
+        )
+        .is_ok());
+        // A User re-proves the password with sudo.
+        assert!(matches!(
+            password_change_allowed(
+                &carol(UserType::User),
+                "carol",
+                &account(UserType::User, None, set)
+            ),
+            Err(RPCErrors::NoPermission(_))
+        ));
+        assert!(password_change_allowed(
+            &caller("carol", UserType::User, true),
+            "carol",
+            &account(UserType::User, None, set)
+        )
+        .is_ok());
+        // Never from a session of another target (an App holding the user's session).
+        let mut app_session = caller("carol", UserType::User, true);
+        app_session.is_control_panel_session = false;
+        let error =
+            password_change_allowed(&app_session, "carol", &account(UserType::User, None, set))
+                .unwrap_err();
+        assert_eq!(
+            AccessDenial::from_rpc_error(&error).map(|denial| denial.reason),
+            Some(DenyReason::SessionKindNotAllowed)
+        );
+        assert!(matches!(
+            password_change_allowed(
+                &carol(UserType::User),
+                "carol",
+                &account(UserType::User, Some(false), set)
+            ),
+            Err(RPCErrors::NoPermission(_))
+        ));
+        // The first password is not a change.
+        let error = password_change_allowed(
+            &carol(UserType::Limited),
+            "carol",
+            &account(UserType::Limited, Some(true), PasswordState::Unset),
+        )
+        .unwrap_err();
+        assert_eq!(
+            AccessDenial::from_rpc_error(&error).map(|denial| denial.reason),
+            Some(DenyReason::CredentialState)
+        );
+        // Another account: an admin with a sudo session only.
+        let target = account(UserType::Limited, None, set);
+        assert!(password_change_allowed(
+            &caller("devtest", UserType::Admin, true),
+            "carol",
+            &target
+        )
+        .is_ok());
+        assert!(matches!(
+            password_change_allowed(&caller("devtest", UserType::Admin, false), "carol", &target),
+            Err(RPCErrors::NoPermission(_))
+        ));
+        assert!(matches!(
+            password_change_allowed(&caller("bob", UserType::User, true), "carol", &target),
+            Err(RPCErrors::NoPermission(_))
+        ));
+    }
 
     #[test]
     fn password_hash_must_be_a_sha256_digest() {
@@ -2279,5 +2423,176 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("RBAC refresh is pending"));
+    }
+
+    #[tokio::test]
+    async fn deletion_reserves_the_name_and_restoration_preserves_the_account() {
+        let kv = InviteKv::default();
+        let mut original = account(UserType::User, Some(true), PasswordState::Set);
+        original.groups = vec!["family".to_string()];
+        let (actions, _) =
+            new_account_actions(&original, "Carol", &DID::new("bns", "home"), true).unwrap();
+        kv.exec_tx(actions, None).await.unwrap();
+        kv.put("users/carol/apps/notes/spec", &json!({"owner": "carol"}));
+        let before = kv.snapshot();
+        let admin = caller("devtest", UserType::Admin, true);
+
+        let state = save_user_state(&kv, &admin, "carol", UserState::Deleted)
+            .await
+            .unwrap();
+        assert!(matches!(state, UserState::Deleted));
+        assert!(matches!(
+            kv.read::<UserSettings>("users/carol/settings").state,
+            UserState::Deleted
+        ));
+        let error = require_user_not_deleted(&kv, "carol").await.unwrap_err();
+        assert!(error.to_string().contains("user_deleted:"));
+        assert!(error.to_string().contains("user.change_state"));
+        let deleted = kv.snapshot();
+        for (key, value) in &before {
+            if key != "users/carol/settings" {
+                assert_eq!(deleted.get(key), Some(value), "{key}");
+            }
+        }
+        let (replacement, _) =
+            new_account_actions(&original, "New Carol", &DID::new("bns", "home"), true).unwrap();
+        assert!(kv.exec_tx(replacement, None).await.is_err());
+        assert_eq!(kv.snapshot(), deleted);
+
+        let state = save_user_state(&kv, &admin, "carol", UserState::Active)
+            .await
+            .unwrap();
+        assert!(matches!(state, UserState::Active));
+        let restored = kv.snapshot();
+        assert_eq!(restored.len(), before.len());
+        for (key, (value, version)) in before {
+            assert_eq!(restored[&key].0, value, "{key}");
+            assert_eq!(
+                restored[&key].1,
+                version + u64::from(key == "users/carol/settings") * 2,
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn state_changes_require_admin_and_protect_root_and_self() {
+        for target in ["root", "devtest", "owner"] {
+            for state in [
+                UserState::Deleted,
+                UserState::Suspended("test".to_string()),
+                UserState::Banned("test".to_string()),
+                UserState::Pending,
+            ] {
+                let kv = InviteKv::default();
+                let user_type = if target == "devtest" {
+                    UserType::Admin
+                } else {
+                    UserType::Root
+                };
+                let mut settings = account(user_type, None, PasswordState::Set);
+                settings.user_id = target.to_string();
+                kv.put(&format!("users/{target}/settings"), &settings);
+                let before = kv.snapshot();
+                assert!(save_user_state(
+                    &kv,
+                    &caller("devtest", UserType::Admin, true),
+                    target,
+                    state
+                )
+                .await
+                .is_err());
+                assert_eq!(kv.snapshot(), before);
+                assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+        for user_type in [UserType::User, UserType::Limited] {
+            let kv = InviteKv::default();
+            let mut deleted = account(UserType::User, None, PasswordState::Set);
+            deleted.state = UserState::Deleted;
+            kv.put("users/carol/settings", &deleted);
+            let before = kv.snapshot();
+            assert!(save_user_state(
+                &kv,
+                &caller("bob", user_type, true),
+                "carol",
+                UserState::Active
+            )
+            .await
+            .is_err());
+            assert_eq!(kv.snapshot(), before);
+            assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn state_change_does_not_overwrite_a_concurrent_account_change() {
+        let mut updated = account(UserType::Limited, Some(false), PasswordState::Set);
+        updated.password = "new password".to_string();
+        let path = "users/carol/settings";
+        let updated_json = to_json(&updated).unwrap();
+        let kv = InviteKv {
+            before_commit: Mutex::new(Some((path.to_string(), updated_json.clone()))),
+            ..Default::default()
+        };
+        kv.put(path, &account(UserType::User, None, PasswordState::Set));
+        let error = save_user_state(
+            &kv,
+            &caller("devtest", UserType::Admin, true),
+            "carol",
+            UserState::Deleted,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("revision mismatch"));
+        assert_eq!(kv.snapshot()[path], (updated_json, 2));
+    }
+
+    #[tokio::test]
+    async fn state_changes_and_deleted_name_checks_fail_closed_on_read_errors() {
+        let path = "users/carol/settings";
+        let kv = InviteKv {
+            failed_read: Some(path.to_string()),
+            ..Default::default()
+        };
+        kv.put(path, &account(UserType::User, None, PasswordState::Set));
+        let before = kv.snapshot();
+        assert!(save_user_state(
+            &kv,
+            &caller("devtest", UserType::Admin, true),
+            "carol",
+            UserState::Deleted
+        )
+        .await
+        .is_err());
+        assert!(require_user_not_deleted(&kv, "carol").await.is_err());
+        assert_eq!(kv.snapshot(), before);
+        assert_eq!(kv.tx_calls.load(Ordering::SeqCst), 0);
+        assert!(require_user_not_deleted(&InviteKv::default(), "carol")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn committed_state_changes_report_pending_rbac_refresh_as_success() {
+        for state in [UserState::Deleted, UserState::Active] {
+            let result = user_state_result(
+                "carol",
+                &state,
+                Err(RPCErrors::ReasonError("scheduler unavailable".to_string())),
+            );
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["user_id"], "carol");
+            assert_eq!(result["state"], json!(state));
+            assert_eq!(result["rbac_refreshed"], false);
+            let warning = result["warning"].as_str().unwrap();
+            assert!(warning.contains("RBAC refresh is pending"));
+            assert!(warning.contains("scheduler unavailable"));
+            let result = user_state_result("carol", &state, Ok(()));
+            assert_eq!(result["ok"], true);
+            assert_eq!(result["state"], json!(state));
+            assert_eq!(result["rbac_refreshed"], true);
+            assert!(result.get("warning").is_none());
+        }
     }
 }

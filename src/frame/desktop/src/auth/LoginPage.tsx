@@ -1,41 +1,32 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { buckyos } from 'buckyos'
+import { accessDenialOf, ANONYMOUS_IDENTITY, DENY_REASONS, type AccessDenial, type DenyReason } from 'buckyos'
 import {
   Alert,
   Box,
   Button,
-  Checkbox,
   CircularProgress,
-  Container,
-  FormControlLabel,
   IconButton,
   InputAdornment,
   Link,
-  Paper,
   TextField,
   Typography,
 } from '@mui/material'
-import { Eye, EyeOff, Lock, ExternalLink } from 'lucide-react'
-
-const APP_ID = 'control-panel'
-
-const resolveZoneDisplayName = (): string => {
-  let zoneHost: string | null = null
-  try {
-    zoneHost = buckyos.getZoneHostName()?.trim() ?? null
-  } catch {
-    zoneHost = null
-  }
-  if (zoneHost) return zoneHost
-
-  const currentHost = window.location.hostname.toLowerCase()
-  return currentHost.startsWith('sys.')
-    ? currentHost.slice(4)
-    : currentHost || 'BuckyOS'
-}
+import { Eye, EyeOff, ExternalLink, Fingerprint } from 'lucide-react'
+import { requestServiceLaunch } from '../api/app_launch'
+import { describeLoginTarget, fetchSsoConfig } from '../api/sso'
+import { onWorkspaceHost } from '../app/aiworkspace/links'
+import { useI18n } from '../i18n/provider'
+import { useDocumentTitle } from '../presentation/documentHead'
+import { useZonePresentation } from '../presentation/zone'
+import { denialText } from '../sso/denial'
+import { loadCurrentIdentity } from '../sso/identity'
+import { DidLoginForm } from '../sso/DidLoginForm'
+import { AuthPageFrame } from './AuthPageFrame'
+import { loginWithPassword } from './passwordLogin'
 
 type LoginError =
+  | { kind: 'denied'; denial: AccessDenial }
   | { kind: 'empty_fields' }
   | { kind: 'invalid_redirect' }
   | { kind: 'init_failed'; detail: string }
@@ -49,6 +40,8 @@ type LoginError =
   | { kind: 'unknown'; detail: string }
 
 const classifyError = (error: unknown): LoginError => {
+  const denial = accessDenialOf(error)
+  if (denial) return { kind: 'denied', denial }
   const message =
     error instanceof Error ? error.message : String(error ?? '')
   const lower = message.toLowerCase()
@@ -59,10 +52,25 @@ const classifyError = (error: unknown): LoginError => {
   if (lower.includes('user not found') || lower.includes('user_not_found')) {
     return { kind: 'user_not_found', username: '' }
   }
-  if (lower.includes('locked') || lower.includes('disabled')) {
+  // Redirect-target problems (e.g. "http redirect_url is disabled" when the
+  // zone forces https) must be classified before the generic "disabled"
+  // check below, which would otherwise report a locked account.
+  if (lower.includes('redirect_url') || lower.includes('redirect url')) {
+    return { kind: 'invalid_redirect' }
+  }
+  if (
+    /\b(account|user)\b.*\b(locked|disabled)\b/.test(lower) ||
+    /\b(locked|disabled)\b/.test(lower)
+  ) {
     return { kind: 'account_locked', username: '' }
   }
-  if (lower.includes('rate') || lower.includes('too many') || lower.includes('429')) {
+  // "rate" alone also matches "generate"/"certificate"; require the phrase.
+  if (
+    lower.includes('rate limit') ||
+    lower.includes('rate_limit') ||
+    lower.includes('too many') ||
+    lower.includes('429')
+  ) {
     return { kind: 'rate_limited' }
   }
   if (lower.includes('timeout') || lower.includes('timed out')) {
@@ -82,7 +90,7 @@ const classifyError = (error: unknown): LoginError => {
   return { kind: 'unknown', detail: message }
 }
 
-const errorMessage = (err: LoginError): string => {
+const errorMessage = (err: Exclude<LoginError, { kind: 'denied' }>): string => {
   switch (err.kind) {
     case 'empty_fields':
       return 'Please enter your username and password.'
@@ -113,69 +121,89 @@ const errorMessage = (err: LoginError): string => {
   }
 }
 
-const buildSsoCallbackUrl = (
-  redirectUrl: string,
-  nonce: number,
-): string => {
-  // Callback must be served on the redirect target origin so Set-Cookie applies to that host
-  // (gateway matches path /sso_callback and forwards to control_panel for any app host).
-  const target = new URL(redirectUrl, window.location.origin)
-  const callback = new URL('/sso_callback', target.origin)
-  callback.searchParams.set('nonce', String(nonce))
-  callback.searchParams.set('redirect_url', redirectUrl)
-  return callback.toString()
+/** `did_error` codes the DID callback sends back: a denial reason, or one of the flow outcomes below. */
+function useDidErrorText(code: string): string | null {
+  const { t } = useI18n()
+  if (!code) return null
+  if (code === 'canonical_unavailable') {
+    return t('sso.login.didError.canonicalUnavailable', 'The home Zone of your DID could not be reached. Try again later.')
+  }
+  if (code === 'access_denied') return t('sso.login.didError.cancelled', 'DID sign-in was cancelled on your home Zone.')
+  if (code === 'identity_conflict') return t('sso.login.didError.identityConflict', 'This browser is signed in as someone else. Sign out first, then use DID sign-in again.')
+  if ((DENY_REASONS as readonly string[]).includes(code)) {
+    return denialText(t, { reason: code as DenyReason, adjust: { party: 'none' } })
+  }
+  return t('sso.login.didError.failed', 'DID sign-in did not complete. Try again.')
 }
 
 const LoginPage = () => {
+  const { t } = useI18n()
   const [searchParams] = useSearchParams()
   const redirectUrl = useMemo(
     () => searchParams.get('redirect_url') ?? '',
     [searchParams],
   )
-  const appid = useMemo(
-    () => searchParams.get('appid') ?? APP_ID,
-    [searchParams],
-  )
-  const zoneDisplayName = useMemo(resolveZoneDisplayName, [])
+  const didErrorText = useDidErrorText(searchParams.get('did_error') ?? '')
+  const zone = useZonePresentation()
 
-  const sourceAppId = useMemo(() => {
-    if (!redirectUrl) return null
-    try {
-      const url = new URL(redirectUrl)
-      const host = url.hostname.toLowerCase()
-      // Extract subdomain prefix as app identifier
-      // e.g. "myapp.zone.buckyos.io" => "myapp"
-      const parts = host.split('.')
-      if (parts.length >= 3) {
-        const sub = parts[0]
-        if (sub !== 'www' && sub !== 'sys') return sub
-      }
-      return host
-    } catch {
-      return null
-    }
-  }, [redirectUrl])
-
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [rememberMe, setRememberMe] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
-  const [error, setError] = useState<LoginError | null>(null)
+  const [requester, setRequester] = useState<{ url: string; name: string } | null>(null)
+  const requesterName = requester?.url === redirectUrl ? requester.name : null
 
   useEffect(() => {
-    document.title = 'BuckyOS | Login'
+    if (!redirectUrl) return
+    let live = true
+    void describeLoginTarget(redirectUrl).then(({ data }) => {
+      if (live) setRequester(data ? { url: redirectUrl, name: data.display_name } : null)
+    })
+    return () => { live = false }
+  }, [redirectUrl])
+
+  const [username, setUsername] = useState(() => searchParams.get('username') ?? '')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<LoginError | null>(null)
+  const [didLoginEnabled, setDidLoginEnabled] = useState(false)
+  const [showDidLogin, setShowDidLogin] = useState(false)
+  const [didErrorOpen, setDidErrorOpen] = useState(true)
+
+  useDocumentTitle('Sign in')
+
+  useEffect(() => {
+    let live = true
+    void fetchSsoConfig().then(({ data }) => {
+      if (live) setDidLoginEnabled(data?.did_login_enabled === true)
+    })
+    return () => { live = false }
   }, [])
+
+  // A page on a Workspace's own origin (`aiws-<id>.<zone>`, AI Workspace T4-8) sent its visitor here: someone
+  // already signed in on this host is handed over through the Control Panel's launch — the one-time callback on
+  // that origin signs them in there — without seeing the form. Anyone else signs in as usual.
+  const [handoff, setHandoff] = useState(() => {
+    try { return !!redirectUrl && onWorkspaceHost(new URL(redirectUrl).host) } catch { return false }
+  })
+  useEffect(() => {
+    if (!handoff) return
+    let live = true
+    void (async () => {
+      const identity = await loadCurrentIdentity().catch(() => ANONYMOUS_IDENTITY)
+      if (!live) return
+      const launch = identity.kind === 'anonymous' ? null : await requestServiceLaunch('aiworkspace', redirectUrl).catch(() => null)
+      if (!live) return
+      if (launch?.status === 'ready') window.location.replace(launch.callback_url)
+      else setHandoff(false)
+    })()
+    return () => { live = false }
+  }, [handoff, redirectUrl])
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault()
-      // console.log('[login] handleSubmit fired, submitting =', submitting)
       if (submitting) return
 
       const trimmedUsername = username.trim()
       if (!trimmedUsername || !password) {
-        // console.log('[login] empty fields, aborting')
         setError({ kind: 'empty_fields' })
         return
       }
@@ -184,51 +212,10 @@ const LoginPage = () => {
       setSubmitting(true)
 
       try {
-        const nonce = Date.now()
-        // console.log('[login] hashing password for', trimmedUsername, 'nonce =', nonce)
-        const passwordHash = buckyos.hashPassword(
-          trimmedUsername,
-          password,
-          nonce,
-        )
-        // console.log('[login] passwordHash done')
-        // 注意这里是一个特殊的krpc client，不是通过getXXXServiceRpcClient创建的（因为这个调用必定不会用runtime的session token）
-        const rpcClient = new buckyos.kRPCClient('/kapi/control-panel')
-        rpcClient.setSeq(nonce)
-        console.log('[login] calling auth.login...', redirectUrl)
-
-        const response = (await rpcClient.call('auth.login', {
-          username: trimmedUsername,
-          password: passwordHash,
-          appid,
-          login_nonce: nonce,
-          remember_me: rememberMe,
-          ...(redirectUrl ? { redirect_url: redirectUrl } : {}),
-        })) as Record<string, unknown>
-        // console.log('[login] response', response)
-
-        const sessionToken =
-          typeof response.session_token === 'string'
-            ? response.session_token.trim()
-            : ''
-        if (!sessionToken) {
-          throw new Error('Login succeeded but no session token returned')
-        }
-
-        const ssoNonce =
-          typeof response.sso_nonce === 'number' ? response.sso_nonce : 0
-        // console.log('[login] sessionToken ok, ssoNonce =', ssoNonce, 'redirectUrl =', redirectUrl)
-
-        if (redirectUrl && ssoNonce > 0) {
-          // const callbackUrl = buildSsoCallbackUrl(redirectUrl, ssoNonce)
-          // console.log('[login] callbackUrl =', callbackUrl)
-          // alert(callbackUrl)
-          window.location.href = buildSsoCallbackUrl(redirectUrl, ssoNonce)
-        } else if (redirectUrl) {
-          window.location.href = redirectUrl
-        } else {
-          window.location.href = '/'
-        }
+        window.location.href = await loginWithPassword(trimmedUsername, password, redirectUrl)
+        // Keep the form disabled: the navigation above is asynchronous and a
+        // re-enabled button would allow a second login round-trip (new nonce,
+        // second pending SSO login on the server) before the page unloads.
       } catch (err) {
         console.error('[login] error caught:', err)
         const classified = classifyError(err)
@@ -239,242 +226,197 @@ const LoginPage = () => {
           ;(classified as { username: string }).username = trimmedUsername
         }
         setError(classified)
-      } finally {
         setSubmitting(false)
       }
     },
-    [username, password, submitting, appid, redirectUrl, rememberMe],
+    [username, password, submitting, redirectUrl],
   )
 
   const disabled = submitting
+  // DID login comes back to the page that asked for sign-in, or to the Desktop.
+  const didRedirectUrl = redirectUrl || new URL('/', window.location.origin).href
+
+  if (handoff) {
+    return (
+      <Box sx={{ minHeight: '100dvh', display: 'grid', placeItems: 'center' }} data-testid="login-handoff">
+        <CircularProgress size={28} />
+      </Box>
+    )
+  }
 
   return (
-    <Box
-      sx={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: { xs: 'flex-start', sm: 'center' },
-        justifyContent: 'center',
-        background:
-          'linear-gradient(135deg, var(--cp-bg) 0%, var(--cp-bg-strong) 100%)',
-        px: 2,
-        pt: { xs: 6, sm: 4 },
-        pb: 4,
-      }}
-    >
-      <Container maxWidth="xs" disableGutters>
-        <Paper
-          elevation={0}
-          sx={{
-            p: { xs: 3, sm: 4 },
-            borderRadius: 4,
-            border: '1px solid var(--cp-border)',
-            backdropFilter: 'blur(24px)',
-            boxShadow: 'var(--cp-panel-shadow)',
-          }}
-        >
-          <Box
-            sx={{
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              mb: 3,
-            }}
-          >
-            <Box
-              sx={{
-                width: 48,
-                height: 48,
-                borderRadius: 3,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                bgcolor: 'primary.main',
-                color: 'white',
-                mb: 2,
-              }}
-            >
-              <Lock size={24} />
-            </Box>
-            <Typography
-              variant="h5"
-              sx={{ fontWeight: 700, fontFamily: '"Space Grotesk", sans-serif' }}
-            >
-              Sign in to {zoneDisplayName}
-            </Typography>
+    <AuthPageFrame
+      title={<>Sign in to {zone.title}</>}
+      header={
+        <>
+          {zone.description && (
             <Typography
               variant="body2"
               color="text.secondary"
-              sx={{ mt: 0.5 }}
+              sx={{ mt: 0.5, textAlign: 'center' }}
+              data-testid="login-zone-description"
             >
-              Enter your credentials to continue
+              {zone.description}
             </Typography>
-            {sourceAppId && (
-              <Box
-                sx={{
-                  mt: 1.5,
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: 0.75,
-                  px: 1.5,
-                  py: 0.5,
-                  borderRadius: 2,
-                  bgcolor: 'color-mix(in srgb, var(--cp-accent-soft) 18%, transparent)',
-                  border: '1px solid color-mix(in srgb, var(--cp-accent) 20%, var(--cp-border))',
-                }}
-              >
-                <ExternalLink size={14} style={{ opacity: 0.6 }} />
-                <Typography variant="caption" color="text.secondary">
-                  Requested by <strong>{sourceAppId}</strong>
-                </Typography>
-              </Box>
-            )}
-          </Box>
-
-          {error && (
-            <Alert
-              severity={
-                error.kind === 'rate_limited' || error.kind === 'account_locked'
-                  ? 'warning'
-                  : 'error'
-              }
-              sx={{ mb: 2.5 }}
-              onClose={() => setError(null)}
-            >
-              {errorMessage(error)}
-            </Alert>
           )}
-
-          <Box component="form" onSubmit={handleSubmit} noValidate>
-            <TextField
-              label="Username"
-              autoComplete="username"
-              autoFocus
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              disabled={disabled}
-              error={
-                error?.kind === 'empty_fields' && !username.trim()
-                  ? true
-                  : error?.kind === 'user_not_found'
-              }
-              sx={{ mb: 2 }}
-            />
-
-            <TextField
-              label="Password"
-              type={showPassword ? 'text' : 'password'}
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={disabled}
-              error={
-                error?.kind === 'empty_fields' && !password
-                  ? true
-                  : error?.kind === 'invalid_password'
-              }
-              slotProps={{
-                input: {
-                  endAdornment: (
-                    <InputAdornment position="end">
-                      <IconButton
-                        size="small"
-                        onClick={() => setShowPassword((v) => !v)}
-                        edge="end"
-                        sx={{ border: 'none' }}
-                      >
-                        {showPassword ? (
-                          <EyeOff size={18} />
-                        ) : (
-                          <Eye size={18} />
-                        )}
-                      </IconButton>
-                    </InputAdornment>
-                  ),
-                },
-              }}
-              sx={{ mb: 1.5 }}
-            />
-
+          <Typography
+            variant="body2"
+            color="text.secondary"
+            sx={{ mt: 0.5 }}
+          >
+            Enter your credentials to continue
+          </Typography>
+          {requesterName && (
             <Box
               sx={{
-                display: 'flex',
+                mt: 1.5,
+                display: 'inline-flex',
                 alignItems: 'center',
-                justifyContent: 'space-between',
-                mb: 2.5,
+                gap: 0.75,
+                px: 1.5,
+                py: 0.5,
+                borderRadius: 2,
+                bgcolor: 'color-mix(in srgb, var(--cp-accent-soft) 18%, transparent)',
+                border: '1px solid color-mix(in srgb, var(--cp-accent) 20%, var(--cp-border))',
               }}
             >
-              <FormControlLabel
-                control={
-                  <Checkbox
-                    size="small"
-                    checked={rememberMe}
-                    onChange={(e) => setRememberMe(e.target.checked)}
-                    disabled={disabled}
-                  />
-                }
-                label={
-                  <Typography variant="body2" color="text.secondary">
-                    Remember me for 30 days
-                  </Typography>
-                }
-              />
-              <Link
-                href="#"
-                variant="body2"
-                underline="hover"
-                onClick={(e) => {
-                  e.preventDefault()
-                  // TODO: navigate to forgot-password flow
-                }}
-                sx={{ whiteSpace: 'nowrap' }}
-              >
-                Forgot password?
-              </Link>
+              <ExternalLink size={14} style={{ opacity: 0.6 }} />
+              <Typography variant="caption" color="text.secondary">
+                Requested by <strong>{requesterName}</strong>
+              </Typography>
             </Box>
+          )}
+        </>
+      }
+    >
+      {didErrorText && didErrorOpen && (
+        <Alert severity="error" sx={{ mb: 2.5 }} onClose={() => setDidErrorOpen(false)} data-testid="login-did-error">
+          {didErrorText}
+        </Alert>
+      )}
 
-            <Button
-              type="submit"
-              fullWidth
-              size="large"
-              disabled={disabled}
-              sx={{ position: 'relative' }}
-            >
-              {submitting ? (
-                <CircularProgress size={22} color="inherit" />
-              ) : (
-                'Sign In'
-              )}
-            </Button>
-          </Box>
+      {error && (
+        <Alert
+          severity={
+            error.kind === 'rate_limited' || error.kind === 'account_locked'
+              ? 'warning'
+              : 'error'
+          }
+          sx={{ mb: 2.5 }}
+          onClose={() => setError(null)}
+          data-testid="login-error"
+        >
+          {error.kind === 'denied' ? denialText(t, error.denial) : errorMessage(error)}
+        </Alert>
+      )}
 
-          <Typography
-            variant="caption"
-            color="text.secondary"
+      {showDidLogin ? (
+        <DidLoginForm redirectUrl={didRedirectUrl} onCancel={() => setShowDidLogin(false)} />
+      ) : (
+        <Box component="form" onSubmit={handleSubmit} noValidate>
+          <TextField
+            label="Username"
+            autoComplete="username"
+            slotProps={{ htmlInput: { autoCapitalize: 'none', autoCorrect: 'off', spellCheck: false } }}
+            autoFocus
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={disabled}
+            error={
+              error?.kind === 'empty_fields' && !username.trim()
+                ? true
+                : error?.kind === 'user_not_found'
+            }
+            sx={{ mb: 2 }}
+          />
+
+          <TextField
+            label="Password"
+            type={showPassword ? 'text' : 'password'}
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            disabled={disabled}
+            error={
+              error?.kind === 'empty_fields' && !password
+                ? true
+                : error?.kind === 'invalid_password'
+            }
+            slotProps={{
+              input: {
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      size="small"
+                      onClick={() => setShowPassword((v) => !v)}
+                      edge="end"
+                      sx={{ border: 'none' }}
+                    >
+                      {showPassword ? (
+                        <EyeOff size={18} />
+                      ) : (
+                        <Eye size={18} />
+                      )}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              },
+            }}
+            sx={{ mb: 1.5 }}
+          />
+
+          <Box
             sx={{
-              display: 'block',
-              textAlign: 'center',
-              mt: 3,
-              lineHeight: 1.6,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              mb: 2.5,
             }}
           >
-            Powered by{' '}
             <Link
-              href="https://github.com/buckyos/buckyos/"
-              target="_blank"
-              rel="noreferrer noopener"
-              color="inherit"
+              href="#"
+              variant="body2"
               underline="hover"
-              aria-label="BuckyOS on GitHub (opens in a new tab)"
-              sx={{ fontWeight: 600 }}
+              onClick={(e) => {
+                e.preventDefault()
+                // TODO: navigate to forgot-password flow
+              }}
+              sx={{ whiteSpace: 'nowrap' }}
             >
-              BuckyOS
+              Forgot password?
             </Link>
-            , an open-source AI operating system.
-          </Typography>
-        </Paper>
-      </Container>
-    </Box>
+          </Box>
+
+          <Button
+            type="submit"
+            fullWidth
+            size="large"
+            disabled={disabled}
+            sx={{ position: 'relative' }}
+          >
+            {submitting ? (
+              <CircularProgress size={22} color="inherit" />
+            ) : (
+              'Sign In'
+            )}
+          </Button>
+
+          {didLoginEnabled && (
+            <Button
+              fullWidth
+              variant="text"
+              startIcon={<Fingerprint size={16} />}
+              disabled={disabled}
+              onClick={() => setShowDidLogin(true)}
+              sx={{ mt: 1.5 }}
+              data-testid="login-use-did"
+            >
+              {t('sso.login.useDid', 'Sign in with a DID')}
+            </Button>
+          )}
+        </Box>
+      )}
+    </AuthPageFrame>
   )
 }
 

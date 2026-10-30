@@ -7,10 +7,13 @@
 //! OneShot) sit above and below this waist but do not appear here.
 
 pub mod behavior_loop;
+pub mod context_derive;
 pub mod context_loop;
+pub mod context_window;
 pub mod deps;
 pub mod error;
 pub mod interrupt;
+pub mod json_check;
 pub mod msg_parser;
 pub mod observation;
 pub mod outcome;
@@ -21,33 +24,39 @@ pub mod request;
 pub mod snapshot_overrides;
 pub mod state;
 pub mod step_record;
+pub mod suspension;
+pub mod tasks;
 pub mod xml_behavior;
+mod xml_util;
 
 pub use behavior_loop::{
-    HistorySummaryRecord, LLMBehaviorResult, LLMResultParser, StepCompressionLevel, StepMeta,
-    StepRecord, StepRenderer, StepResultHook, StepResultHookOutput,
+    DecisionVerdict, HistorySummaryRecord, LLMBehaviorResult, LLMResultParser,
+    StepCompressionLevel, StepDecision, StepMeta, StepRecord, StepRenderer, StepResultHook,
+    StepResultHookOutput,
+};
+pub use context_derive::{
+    derive_child, fork_snapshot, DeriveError, DerivedContext, ForkOptions, ForkPoint,
+    InheritBoundary, InheritHistory,
 };
 pub use context_loop::LLMContext;
+pub use context_window::ContextLimits;
 pub use deps::{
-    AllowAllPolicy, ByteHeuristicTokenizer, LLMContextDeps, LlmClient, LlmInferenceRequest,
-    NoopWorklogSink, PolicyEngine, Tokenizer, ToolManager, ToolSpecLite, TurnHook, WorkEvent,
-    WorklogSink,
+    AllowAllPolicy, ByteHeuristicTokenizer, CancelCause, CheckpointHook, InferenceHook, Injection,
+    InjectionPosition, LLMContextDeps, LlmClient, LlmInferenceRequest, NoopWorklogSink,
+    OutputValidator, PolicyEngine, Tokenizer, ToolCallCtx, ToolDispatchError, ToolManager, ToolSpecLite, WorkEvent,
+    WorklogSink, MAX_INJECTIONS_PER_BOUNDARY,
 };
-pub use error::LLMComputeError;
+pub use error::{CheckpointStage, ErrorSource, LLMComputeError, ProviderFailure, RefusalKind};
 pub use interrupt::{InferenceAbortToken, InferenceAbortTrace, LLMContextInterruptHandle};
 pub use msg_parser::{
-    ai_message_to_msg_object, ai_message_to_msg_object_with_base,
-    ai_message_to_msg_object_with_base_validated,
-    ai_message_to_msg_object_with_base_validated_async,
-    ai_message_to_msg_object_with_base_validated_with_options, msg_object_control_command,
-    msg_object_to_ai_message, msg_object_to_ai_message_text_attachments,
-    msg_object_to_ai_message_with_role, msg_object_to_ai_message_with_role_text_attachments,
-    parse_msg_object, parse_msg_object_text_attachments, AttachmentTag, AttachmentValidation,
-    AttachmentValidator, LocalFileResolver, MsgEgressOptions, MsgParseOutput, MsgParserError,
-    PermissiveAttachmentValidator, SystemControlCommand,
+    ai_message_to_msg_object_with_base_validated_async, attachment_kind, attachment_mime,
+    msg_object_to_ai_message_structured, parse_msg_object_structured, AttachmentTag,
+    AttachmentValidation, AttachmentValidator, LocalFileResolver, MsgEgressOptions, MsgParseOutput,
+    MsgParserError, PermissiveAttachmentValidator, SystemControlCommand, PROVIDER_MSG_METADATA,
 };
 pub use observation::{
-    Observation, PendingToolCall, ToolExecRecord, ToolResultStatusView, ToolResultView,
+    Observation, PendingToolCall, ToolExecRecord, ToolExecStatus, ToolResultStatusView,
+    ToolResultView,
 };
 pub use outcome::{
     BudgetKind, ContextLimitKind, ContextOutput, ContextRunTrace, LLMContextOutcome, ResumeFill,
@@ -57,8 +66,9 @@ pub use prompt_compose::{
     compose, CompositionError, CompositionOutcome, CompositionRequest, SectionSpec,
 };
 pub use prompt_engine::{
-    EngineConfig, NullValueLoader, PromptRenderEngine, RenderError, RenderResult, RenderStats,
-    RenderVars, ValueLoader,
+    escape_xml_attr, escape_xml_text, EngineConfig, NullValueLoader, PromptRenderEngine,
+    RenderError, RenderExtensions, RenderResult, RenderStats, RenderValueFn, RenderVars,
+    ValueLoader,
 };
 pub use request::{
     BudgetAction, BudgetSpec, ContextOwnerRef, ContextThreshold, ErrorClass, ErrorPolicy,
@@ -67,9 +77,26 @@ pub use request::{
 pub use snapshot_overrides::{
     apply_overrides_to_snapshot, build_fresh, rebuild_with_inherit, RequestOverrides,
 };
-pub use state::{LLMContextSnapshot, LLMContextState};
+pub use state::{
+    ActionStep, LLMContextSnapshot, LLMContextState, Suspension, ToolBatch, SNAPSHOT_FORMAT_VERSION,
+};
 pub use step_record::XmlStepRenderer;
+pub use suspension::{is_thinking, strip_snapshot_thinking, strip_thinking};
+pub use tasks::{
+    next_step_hint, render_background_env, render_background_env_via, task_state_observation,
+    task_state_observation_via, CancelUnsupported, TaskFollowup,
+    RunningTaskResolver, TaskBrief, TaskResult, TaskState, DEFAULT_TASK_WAIT_MS,
+    MAX_IN_TOOL_WAIT_MS,
+};
 pub use xml_behavior::{XmlBehaviorParser, XML_BEHAVIOR_RESULT_PROTOCOL_PROMPT};
+
+/// Current time in ms since the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests;

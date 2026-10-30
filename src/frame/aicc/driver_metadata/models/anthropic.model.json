@@ -1,0 +1,350 @@
+{
+  "format": "buckyos.aicc.model-driver-catalog",
+  "schema_version": 2,
+  "schema_revision": 0,
+  "model_driver_id": "claude",
+  "revision_seq": 5,
+  "required_features": [],
+  "models": [
+    {
+      "id": "claude-fable-5-1",
+      "parameter_scale": "fable",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-fable",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 51
+      }
+    },
+    {
+      "id": "claude-fable-5",
+      "parameter_scale": "fable",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-fable",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 50
+      }
+    },
+    {
+      "id": "claude-opus-5-5",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 55
+      }
+    },
+    {
+      "id": "claude-opus-5",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 50
+      }
+    },
+    {
+      "id": "claude-sonnet-5",
+      "parameter_scale": "sonnet",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-sonnet",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 50
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "parameter_scale": "sonnet",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-sonnet",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 55
+      }
+    },
+    {
+      "id": "claude-opus-4-8",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 48
+      }
+    },
+    {
+      "id": "claude-opus-4-7",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 47
+      }
+    },
+    {
+      "id": "claude-opus-4-6",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "max"],
+        "stability": "stable",
+        "weight": 46
+      }
+    },
+    {
+      "id": "claude-opus-4-5-20251101",
+      "parameter_scale": "opus",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 200000,
+        "max_output_tokens": 64000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-opus",
+        "effort": "none",
+        "default_effort": "none",
+        "supported_efforts": ["none", "thinking"],
+        "stability": "stable",
+        "weight": 45
+      }
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "parameter_scale": "sonnet",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-sonnet",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high", "max"],
+        "stability": "stable",
+        "weight": 46
+      }
+    },
+    {
+      "id": "claude-sonnet-4-5-20250929",
+      "parameter_scale": "sonnet",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 200000,
+        "max_output_tokens": 64000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-sonnet",
+        "effort": "none",
+        "default_effort": "none",
+        "supported_efforts": ["none", "thinking"],
+        "stability": "stable",
+        "weight": 45
+      }
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "parameter_scale": "haiku",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "json_schema": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-haiku",
+        "effort": "medium",
+        "default_effort": "medium",
+        "supported_efforts": ["low", "medium", "high", "xhigh", "max"],
+        "stability": "stable",
+        "weight": 55
+      }
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "parameter_scale": "haiku",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "max_context_tokens": 200000,
+        "max_output_tokens": 64000,
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "claude-haiku",
+        "effort": "none",
+        "default_effort": "none",
+        "supported_efforts": ["none", "thinking"],
+        "stability": "stable",
+        "weight": 45
+      }
+    }
+  ],
+  "patterns": [],
+  "defaults": {
+    "api_types": [],
+    "capabilities": {}
+  },
+  "specs": [
+    {
+      "id": "claude-fable"
+    },
+    {
+      "id": "claude-haiku"
+    },
+    {
+      "id": "claude-opus"
+    },
+    {
+      "id": "claude-sonnet"
+    }
+  ]
+}

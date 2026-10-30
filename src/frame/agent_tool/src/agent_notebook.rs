@@ -27,7 +27,9 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use thiserror::Error;
@@ -64,6 +66,8 @@ pub enum NotebookError {
     ItemSearchUnavailable(String),
     #[error("storage_error: {0}")]
     Storage(String),
+    #[error("storage_error: unsupported schema: {0}")]
+    UnsupportedSchema(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
@@ -83,7 +87,11 @@ impl NotebookError {
             Self::VersionConflict(_) => "version_conflict",
             Self::LimitExceeded(_) => "limit_exceeded",
             Self::ItemSearchUnavailable(_) => "item_search_unavailable",
-            Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) | Self::Json(_) => "storage_error",
+            Self::Storage(_)
+            | Self::UnsupportedSchema(_)
+            | Self::Io(_)
+            | Self::Sqlite(_)
+            | Self::Json(_) => "storage_error",
         }
     }
 }
@@ -120,7 +128,7 @@ impl NotebookKind {
             other => {
                 return Err(NotebookError::Storage(format!(
                     "bad notebook kind: {other}"
-                )))
+                )));
             }
         })
     }
@@ -143,7 +151,7 @@ impl NotebookStatus {
             other => {
                 return Err(NotebookError::Storage(format!(
                     "bad notebook status: {other}"
-                )))
+                )));
             }
         })
     }
@@ -584,7 +592,7 @@ impl NotebookItemRemarkStatus {
             other => {
                 return Err(NotebookError::Storage(format!(
                     "bad item remark status: {other}"
-                )))
+                )));
             }
         })
     }
@@ -770,10 +778,10 @@ impl AgentNotebook {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
+        ensure_schema(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        ensure_schema(&conn)?;
         Ok(Self {
             cfg,
             conn: Mutex::new(conn),
@@ -2171,7 +2179,7 @@ impl AgentNotebook {
 
     pub fn build_notebook_hints(&self, input: BuildHintsInput) -> Result<HintsContext> {
         let topic_tags = match &input.topic_tags {
-            Some(t) => normalize_tags(t)?,
+            Some(t) => filter_recall_tags(t),
             None => Vec::new(),
         };
         let max_hints = input.max_hints.unwrap_or(DEFAULT_MAX_HINTS);
@@ -2349,140 +2357,159 @@ impl AgentNotebook {
 
 // ============================================================ free helpers
 
+const SCHEMA_SQL: &str = "CREATE TABLE notebooks (
+        id                 TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        description        TEXT NOT NULL DEFAULT '',
+        status             TEXT NOT NULL DEFAULT 'active',
+        revision           INTEGER NOT NULL DEFAULT 0,
+        version            TEXT NOT NULL,
+        latest_item_id     TEXT,
+        latest_title       TEXT,
+        latest_updated_at  TEXT,
+        entry_count        INTEGER NOT NULL DEFAULT 0,
+        active_entry_count INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        archived_at        TEXT,
+        PRIMARY KEY(id)
+     );
+     CREATE TABLE notebook_items (
+        item_id            TEXT PRIMARY KEY,
+        notebook_id        TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        content            TEXT NOT NULL,
+        source_excerpt     TEXT,
+        source_ref         TEXT,
+        source_session_id  TEXT,
+        write_reason       TEXT NOT NULL,
+        confidence         TEXT NOT NULL DEFAULT 'medium',
+        status             TEXT NOT NULL DEFAULT 'active',
+        valid_from         TEXT,
+        valid_until        TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL,
+        item_revision      INTEGER NOT NULL DEFAULT 1,
+        content_hash       TEXT NOT NULL
+     );
+     CREATE INDEX idx_items_nb_status_upd
+        ON notebook_items(notebook_id, status, updated_at DESC);
+     CREATE INDEX idx_items_title
+        ON notebook_items(notebook_id, title);
+     CREATE TABLE notebook_item_tags (
+        item_id TEXT NOT NULL,
+        tag     TEXT NOT NULL,
+        PRIMARY KEY(item_id, tag)
+     );
+     CREATE INDEX idx_item_tags_tag ON notebook_item_tags(tag);
+     CREATE TABLE notebook_item_edges (
+        from_item_id TEXT NOT NULL,
+        to_item_id   TEXT NOT NULL,
+        edge_type    TEXT NOT NULL,
+        reason       TEXT,
+        created_at   TEXT NOT NULL,
+        created_by   TEXT,
+        PRIMARY KEY(from_item_id, to_item_id, edge_type)
+     );
+     CREATE TABLE notebook_item_remarks (
+        remark_id       TEXT PRIMARY KEY,
+        item_id         TEXT NOT NULL,
+        remark_type     TEXT NOT NULL,
+        content         TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'active',
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+     );
+     CREATE INDEX idx_item_remarks_item_type_status
+        ON notebook_item_remarks(item_id, remark_type, status, created_at);
+     CREATE TABLE notebook_events (
+        event_id          TEXT PRIMARY KEY,
+        seq               INTEGER NOT NULL,
+        event_type        TEXT NOT NULL,
+        notebook_id       TEXT NOT NULL,
+        item_id           TEXT,
+        actor_session_id  TEXT,
+        title             TEXT,
+        summary           TEXT,
+        tags              TEXT,
+        notebook_version  TEXT NOT NULL,
+        notebook_revision INTEGER NOT NULL,
+        created_at        TEXT NOT NULL
+     );
+     CREATE INDEX idx_events_seq ON notebook_events(seq);
+     CREATE INDEX idx_events_nb_seq
+        ON notebook_events(notebook_id, seq);
+     CREATE TABLE session_reads (
+        session_id        TEXT NOT NULL,
+        notebook_id       TEXT NOT NULL,
+        read_scope_hash   TEXT NOT NULL,
+        mode              TEXT NOT NULL,
+        read_scope        TEXT NOT NULL,
+        notebook_version  TEXT NOT NULL,
+        notebook_revision INTEGER NOT NULL,
+        returned_item_ids TEXT NOT NULL,
+        max_bytes         INTEGER,
+        read_at           TEXT NOT NULL,
+        PRIMARY KEY(session_id, notebook_id, read_scope_hash)
+     );
+     CREATE INDEX idx_session_reads_nb
+        ON session_reads(session_id, notebook_id);
+     CREATE TABLE session_watermarks (
+        session_id     TEXT NOT NULL,
+        last_seen_seq  INTEGER NOT NULL DEFAULT 0,
+        last_seen_at   TEXT NOT NULL,
+        PRIMARY KEY(session_id)
+     );";
+
 fn ensure_schema(conn: &Connection) -> Result<()> {
-    if table_has_column(conn, "notebooks", "owner_user_id")?
-        || table_has_column(conn, "notebook_items", "actor_kind")?
-        || table_has_column(conn, "notebook_items", "metadata")?
-    {
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS session_watermarks;
-             DROP TABLE IF EXISTS session_reads;
-             DROP TABLE IF EXISTS notebook_events;
-             DROP TABLE IF EXISTS notebook_item_remarks;
-             DROP TABLE IF EXISTS notebook_item_edges;
-             DROP TABLE IF EXISTS notebook_item_tags;
-             DROP TABLE IF EXISTS notebook_items;
-             DROP TABLE IF EXISTS notebooks;",
-        )?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let found = schema_signature(&tx)?;
+    if found.is_empty() {
+        tx.execute_batch(SCHEMA_SQL)?;
+    } else {
+        let current = Connection::open_in_memory()?;
+        current.execute_batch(SCHEMA_SQL)?;
+        if found != schema_signature(&current)? {
+            return Err(NotebookError::UnsupportedSchema(format!(
+                "notebook.sqlite does not match notebook schema {SCHEMA_VERSION}"
+            )));
+        }
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS notebooks (
-            id                 TEXT NOT NULL,
-            kind               TEXT NOT NULL,
-            title              TEXT NOT NULL,
-            description        TEXT NOT NULL DEFAULT '',
-            status             TEXT NOT NULL DEFAULT 'active',
-            revision           INTEGER NOT NULL DEFAULT 0,
-            version            TEXT NOT NULL,
-            latest_item_id     TEXT,
-            latest_title       TEXT,
-            latest_updated_at  TEXT,
-            entry_count        INTEGER NOT NULL DEFAULT 0,
-            active_entry_count INTEGER NOT NULL DEFAULT 0,
-            created_at         TEXT NOT NULL,
-            updated_at         TEXT NOT NULL,
-            archived_at        TEXT,
-            PRIMARY KEY(id)
-         );
-         CREATE TABLE IF NOT EXISTS notebook_items (
-            item_id            TEXT PRIMARY KEY,
-            notebook_id        TEXT NOT NULL,
-            title              TEXT NOT NULL,
-            content            TEXT NOT NULL,
-            source_excerpt     TEXT,
-            source_ref         TEXT,
-            source_session_id  TEXT,
-            write_reason       TEXT NOT NULL,
-            confidence         TEXT NOT NULL DEFAULT 'medium',
-            status             TEXT NOT NULL DEFAULT 'active',
-            valid_from         TEXT,
-            valid_until        TEXT,
-            created_at         TEXT NOT NULL,
-            updated_at         TEXT NOT NULL,
-            item_revision      INTEGER NOT NULL DEFAULT 1,
-            content_hash       TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_items_nb_status_upd
-            ON notebook_items(notebook_id, status, updated_at DESC);
-         CREATE INDEX IF NOT EXISTS idx_items_title
-            ON notebook_items(notebook_id, title);
-         CREATE TABLE IF NOT EXISTS notebook_item_tags (
-            item_id TEXT NOT NULL,
-            tag     TEXT NOT NULL,
-            PRIMARY KEY(item_id, tag)
-         );
-         CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON notebook_item_tags(tag);
-         CREATE TABLE IF NOT EXISTS notebook_item_edges (
-            from_item_id TEXT NOT NULL,
-            to_item_id   TEXT NOT NULL,
-            edge_type    TEXT NOT NULL,
-            reason       TEXT,
-            created_at   TEXT NOT NULL,
-            created_by   TEXT,
-            PRIMARY KEY(from_item_id, to_item_id, edge_type)
-         );
-         CREATE TABLE IF NOT EXISTS notebook_item_remarks (
-            remark_id       TEXT PRIMARY KEY,
-            item_id         TEXT NOT NULL,
-            remark_type     TEXT NOT NULL,
-            content         TEXT NOT NULL,
-            status          TEXT NOT NULL DEFAULT 'active',
-            created_at      TEXT NOT NULL,
-            updated_at      TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_item_remarks_item_type_status
-            ON notebook_item_remarks(item_id, remark_type, status, created_at);
-         CREATE TABLE IF NOT EXISTS notebook_events (
-            event_id          TEXT PRIMARY KEY,
-            seq               INTEGER NOT NULL,
-            event_type        TEXT NOT NULL,
-            notebook_id       TEXT NOT NULL,
-            item_id           TEXT,
-            actor_session_id  TEXT,
-            title             TEXT,
-            summary           TEXT,
-            tags              TEXT,
-            notebook_version  TEXT NOT NULL,
-            notebook_revision INTEGER NOT NULL,
-            created_at        TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_events_seq ON notebook_events(seq);
-         CREATE INDEX IF NOT EXISTS idx_events_nb_seq
-            ON notebook_events(notebook_id, seq);
-         CREATE TABLE IF NOT EXISTS session_reads (
-            session_id        TEXT NOT NULL,
-            notebook_id       TEXT NOT NULL,
-            read_scope_hash   TEXT NOT NULL,
-            mode              TEXT NOT NULL,
-            read_scope        TEXT NOT NULL,
-            notebook_version  TEXT NOT NULL,
-            notebook_revision INTEGER NOT NULL,
-            returned_item_ids TEXT NOT NULL,
-            max_bytes         INTEGER,
-            read_at           TEXT NOT NULL,
-            PRIMARY KEY(session_id, notebook_id, read_scope_hash)
-         );
-         CREATE INDEX IF NOT EXISTS idx_session_reads_nb
-            ON session_reads(session_id, notebook_id);
-         CREATE TABLE IF NOT EXISTS session_watermarks (
-            session_id     TEXT NOT NULL,
-            last_seen_seq  INTEGER NOT NULL DEFAULT 0,
-            last_seen_at   TEXT NOT NULL,
-            PRIMARY KEY(session_id)
-         );",
-    )?;
+    tx.commit()?;
     Ok(())
 }
 
-fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for row in rows {
-        if row? == column_name {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+type SchemaRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn schema_signature(conn: &Connection) -> Result<Vec<SchemaRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT m.type, m.name, c.name, c.type, c.\"notnull\", c.dflt_value, c.pk
+         FROM sqlite_master m
+         LEFT JOIN pragma_table_info(m.name) c ON m.type = 'table'
+         WHERE m.name NOT LIKE 'sqlite_%'
+         ORDER BY m.type, m.name, c.cid",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn validate_notebook_id(id: &str) -> Result<String> {
@@ -2567,7 +2594,7 @@ fn default_kind_for_id(id: &str) -> NotebookKind {
 /// 1. trim leading/trailing whitespace,
 /// 2. collapse internal whitespace runs to a single space,
 /// 3. lowercase,
-/// 4. only ASCII [A-Za-z0-9 -], at least one alphanumeric,
+/// 4. only Unicode alphanumeric plus space/dash, at least one alphanumeric,
 /// 5. UTF-8 byte length 2–32,
 /// 6. de-dupe and sort (tag order is irrelevant per §2.6, so a canonical
 ///    sorted form gives us a stable read_scope_hash).
@@ -2592,6 +2619,20 @@ pub fn normalize_tags(raw: &[String]) -> Result<Vec<String>> {
     Ok(set.into_keys().collect())
 }
 
+fn filter_recall_tags(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in raw {
+        match normalize_tags(std::slice::from_ref(tag)) {
+            Ok(mut normalized) => out.append(&mut normalized),
+            Err(error) => log::warn!(
+                "notebook recall: ignoring invalid filter tag {tag:?}: {}",
+                error
+            ),
+        }
+    }
+    out
+}
+
 fn validate_tag(tag: &str) -> Result<()> {
     let len = tag.as_bytes().len();
     if len < MIN_TAG_BYTES || len > MAX_TAG_BYTES {
@@ -2602,14 +2643,14 @@ fn validate_tag(tag: &str) -> Result<()> {
     }
     let mut has_alnum = false;
     for c in tag.chars() {
-        let ok = matches!(c, 'a'..='z' | '0'..='9' | ' ' | '-');
+        let ok = c.is_alphanumeric() || matches!(c, ' ' | '-');
         if !ok {
             return Err(NotebookError::InvalidTag(format!(
                 "tag has forbidden character {:?}: {:?}",
                 c, tag
             )));
         }
-        if c.is_ascii_alphanumeric() {
+        if c.is_alphanumeric() {
             has_alnum = true;
         }
     }
@@ -3634,6 +3675,77 @@ mod tests {
     }
 
     #[test]
+    fn reopen_keeps_current_store() {
+        let tmp = TempDir::new().unwrap();
+        let item_id = {
+            let n = AgentNotebook::open(AgentNotebookConfig::new(tmp.path())).unwrap();
+            append(&n, "proj", "first", "kept", &["alpha"])
+        };
+        let n = AgentNotebook::open(AgentNotebookConfig::new(tmp.path())).unwrap();
+        let read = n
+            .read_notebook(ReadNotebookInput {
+                notebook_id: "proj".into(),
+                item_ids: Some(vec![item_id.clone()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let NotebookReadResult::Ok { entries, .. } = read else {
+            panic!("expected ok");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].item_id, item_id);
+    }
+
+    fn assert_open_rejected_and_untouched(root: &Path) {
+        let db_path = root.join("notebook.sqlite");
+        let before = std::fs::read(&db_path).unwrap();
+        let err = AgentNotebook::open(AgentNotebookConfig::new(root))
+            .err()
+            .expect("unsupported store must be rejected");
+        assert!(matches!(err, NotebookError::UnsupportedSchema(_)), "{err}");
+        assert_eq!(std::fs::read(&db_path).unwrap(), before);
+    }
+
+    #[test]
+    fn open_rejects_old_layout_without_dropping_tables() {
+        let tmp = TempDir::new().unwrap();
+        let conn = Connection::open(tmp.path().join("notebook.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notebooks (id TEXT PRIMARY KEY, owner_user_id TEXT NOT NULL);
+             CREATE TABLE notebook_items (item_id TEXT PRIMARY KEY, actor_kind TEXT, metadata TEXT);
+             INSERT INTO notebooks VALUES ('proj', 'alice');
+             INSERT INTO notebook_items VALUES ('it-1', 'agent', '{}');",
+        )
+        .unwrap();
+        drop(conn);
+        assert_open_rejected_and_untouched(tmp.path());
+        let conn = Connection::open(tmp.path().join("notebook.sqlite")).unwrap();
+        let owner: String = conn
+            .query_row(
+                "SELECT owner_user_id FROM notebooks WHERE id = 'proj'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, "alice");
+    }
+
+    #[test]
+    fn open_rejects_store_missing_current_table() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let n = AgentNotebook::open(AgentNotebookConfig::new(tmp.path())).unwrap();
+            append(&n, "proj", "first", "kept", &["alpha"]);
+        }
+        let conn = Connection::open(tmp.path().join("notebook.sqlite")).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); DROP TABLE notebook_item_remarks;")
+            .unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(conn);
+        assert_open_rejected_and_untouched(tmp.path());
+    }
+
+    #[test]
     fn latest_active_item_update_secs_tracks_items_and_remark_bumps() {
         let (_t, n) = open_tmp();
         // Empty notebook → 0.
@@ -3670,8 +3782,11 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(ok, vec!["phone case".to_string()]); // dedup + drop "*"
+        assert_eq!(
+            normalize_tags(&["绘画创作".to_string()]).unwrap(),
+            vec!["绘画创作".to_string()]
+        );
         assert!(normalize_tags(&["bad\"tag".to_string()]).is_err());
-        assert!(normalize_tags(&["中文".to_string()]).is_err());
         assert!(normalize_tags(&["x".to_string()]).is_err()); // too short
     }
 
@@ -4027,13 +4142,12 @@ mod tests {
                 detect_conflicts: true,
             })
             .unwrap();
-        assert!(r
-            .possible_conflicts
-            .iter()
-            .any(|c| c.reason == ConflictReason::TagOverlap
+        assert!(r.possible_conflicts.iter().any(|c| {
+            c.reason == ConflictReason::TagOverlap
                 && c.matched_tags
                     .as_ref()
-                    .is_some_and(|m| m.contains(&"tone".to_string()))));
+                    .is_some_and(|m| m.contains(&"tone".to_string()))
+        }));
     }
 
     #[test]
@@ -4210,6 +4324,31 @@ mod tests {
             .suppressed
             .iter()
             .any(|s| s.reason == HintSuppressionReason::AlreadyReadUnchanged));
+    }
+
+    #[test]
+    fn topic_hints_ignore_invalid_filter_tags_instead_of_failing() {
+        let (_t, n) = open_tmp();
+        append(&n, "user/prefs", "theme", "dark mode", &["focus"]);
+        let h = n
+            .build_notebook_hints(BuildHintsInput {
+                session_id: "S".into(),
+                topic_tags: Some(vec!["gen_image".into(), "focus".into()]),
+                candidate_notebook_ids: None,
+                max_hints: Some(3),
+            })
+            .unwrap();
+        assert!(h.hints.iter().any(|x| x.notebook_id == "user/prefs"));
+
+        let none = n
+            .build_notebook_hints(BuildHintsInput {
+                session_id: "S".into(),
+                topic_tags: Some(vec!["gen_image".into()]),
+                candidate_notebook_ids: None,
+                max_hints: Some(3),
+            })
+            .unwrap();
+        assert!(none.hints.is_empty());
     }
 
     #[test]

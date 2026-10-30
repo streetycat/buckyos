@@ -792,7 +792,7 @@ Caller-owned step/mirror task (可选)
 - link 协议就是不可变的 `dispatch_id + target_task_id` 双向引用：
   `get_dispatch(dispatch_id)` 给出 `target_task_id`；Target Task 的
   `data.request.dispatch_id` 反向指回。
-- Caller 对目标 Task 只做只读观察（`task_mgr.get_task` + 订阅 `/task_mgr/{task_id}`）。
+- Caller 对目标 Task 只做只读观察（`task_mgr.get_task` + 订阅 `/obj/taskmgr/{task_id}/changed`）。
   可见性由 Target 建 Task 时的 owner 与 permissions 决定：如 OpenDAN 以
   `user_id = on_behalf_of 业务用户` 建 Task，read scope `User` 即可让委托人观察。
 - 取消、暂停、恢复、审批等对**当前 Task**的写操作调用 Target 的业务接口（如 OpenDAN 的
@@ -847,7 +847,7 @@ Jarvis 当前可能暂时离线，因此走 Dispatcher，而不是直接调 Open
 ```
 
 `owner_user_id` / `owner_app_id` 由服务端从 OpenDAN 的验签 token 写入（`opendan`），
-payload 不能冒充。Jarvis 的 AgentRuntime 上线后 `attach_instance`，周期
+payload 不能冒充。加载 Jarvis Agent 的 OpenDAN 上线后 `attach_instance`，周期
 `renew_instance` 上报 `available_capacity`。
 
 **2. Workflow（zone 可信调用者）提交 dispatch**

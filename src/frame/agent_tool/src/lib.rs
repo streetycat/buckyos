@@ -22,7 +22,9 @@ use tokio::time::{timeout, Duration};
 pub mod agent_attention_signal;
 pub mod agent_memory;
 pub mod agent_notebook;
+pub mod aicc_model_tools;
 pub mod dcrontab_tool;
+pub mod exec_tracking;
 pub mod file_tools;
 pub mod glob_tool;
 pub mod grep_tool;
@@ -32,14 +34,17 @@ pub mod llm_compress;
 pub mod llm_explore;
 pub mod llm_tool_carft;
 pub mod llm_understand_media;
-pub mod local_llm_context;
 pub mod path_utils;
+pub mod read_tool;
 pub mod run_local_llm;
+pub mod runtime;
 pub mod runtime_context;
-pub mod skills_mgr;
+pub mod task_bridge;
+pub mod tasks;
+pub mod tasks_zone;
 pub mod todo_tools;
 pub mod tool;
-pub mod workspace;
+pub mod xllm;
 
 pub use tool::{
     BasicToolHost, CallingConventions, CliInvocation, ContentInput, NullToolHost, ToolCtx,
@@ -59,8 +64,11 @@ pub use agent_attention_signal::{
 };
 pub use agent_memory::{
     AgentMemory, AgentMemoryConfig, AgentMemoryError, Envelope as AgentMemoryEnvelope, LoadItem,
-    LoadOptions, MemoryHint, MemoryHintBudget, MemoryHintType, MemoryRecallOptions, Preamble,
-    VerifyReport,
+    LoadOptions, VerifyReport,
+};
+pub use aicc_model_tools::{
+    MakeExactModelArgs, MakeExactModelOutput, MakeExactModelTool, ParseExactModelArgs,
+    ParseExactModelOutput, ParseExactModelTool, TOOL_MAKE_EXACT_MODEL, TOOL_PARSE_EXACT_MODEL,
 };
 pub use dcrontab_tool::{DcrontabTool, TOOL_DCRONTAB};
 pub use file_tools::{
@@ -76,8 +84,19 @@ pub use json_args::{
     u64_to_usize_arg,
 };
 pub use llm_bash::{
-    BashRunOutput, BashRunRequest, BashRunner, BashTarget, BashTargetSpec, BinOverlayConfig,
-    ExecBashTool, LlmBashConfig, LocalProcessBashRunner, TOOL_EXEC_BASH,
+    kill_running_bash_process_groups, BashRunOutput, BashRunRequest, BashRunner, BashTarget,
+    BashTargetSpec, BinOverlayConfig, CommandHandle, CommandProgress, LlmBashConfig,
+    LocalProcessBashRunner, RunBinding, RunBindingSlot, ShellMode, ShellRuntimeNote, ShellTool,
+    TOOL_SHELL,
+};
+pub use tasks::{
+    exec_dir_state, task_tools, CancelTaskTool, CompositeTaskResolver, GetTaskStateTool,
+    InProcessTaskManager, LocalTask, ShellTask, ShellTaskContext, ShellTaskManager, WaitTaskTool,
+    TOOL_CANCEL_TASK, TOOL_GET_TASK_STATE, TOOL_WAIT_TASK,
+};
+pub use tasks_zone::{
+    MemoryShellTaskBackend, ShellTaskBackend, ShellTaskCreate, ShellTaskRecord,
+    ZoneShellTaskBackend, ZoneShellTasks, ZONE_TASK_PREFIX,
 };
 pub use path_utils::{
     normalize_abs_path, normalize_root_path, resolve_path_from_root, resolve_path_under_root,
@@ -88,19 +107,10 @@ pub use runtime_context::{
     AgentIdentity, RuntimeContext, RuntimeContextSource, BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV,
     OPENDAN_AGENT_ROOT_ENV, OPENDAN_SESSION_ID_ENV, OPENDAN_TRACE_ID_ENV,
 };
-pub use skills_mgr::{
-    CreateCandidateInput as SkillCreateCandidateInput, InstallResult as SkillInstallResult,
-    LifecycleState as SkillLifecycleState, ListSkillsInput, OwnerScope as SkillOwnerScope,
-    PromptFragment as SkillPromptFragment, RenderSelectedInput as SkillRenderSelectedInput,
-    RiskLevel as SkillRiskLevel, SelectedSkillSet, SkillHint, SkillPackageFile,
-    SkillPackageSummary, SkillSelectionValidation, SkillSourceType, SkillTaskResult, SkillType,
-    SkillUsage, SkillUsageCost, SkillsMgr, SkillsMgrConfig, SkillsMgrError, UsageMode,
-    UserFeedback, ValidateSelectionInput as SkillValidateSelectionInput, VerificationStatus,
-};
 pub use todo_tools::{
-    DelegateTaskArgs, DelegateTaskOutput, DelegateTaskTool, StubTaskDelegator, TaskDelegator,
-    TaskEntry, TaskListItem, TodoArgs, TodoListItem, TodoOutput, TodoRecord, TodoStatus, TodoTool,
-    TodoToolConfig, TodoView, TOOL_DELEGATE_TASK, TOOL_TODO,
+    CallRef, ChildObservation, NewTodo, ReportRef, ReviewState, ReviewVerdict, SerialPick,
+    TodoAttempt, TodoList, TodoMode, TodoRecord, TodoStatus, TodoStore, TODO_LIST_FILE,
+    TODO_LIST_SCHEMA,
 };
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -109,18 +119,14 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-pub use llm_compress::{compress, LlmSummarizeCompressor, DEFAULT_KEEP_RECENT_MESSAGES};
+pub use llm_compress::{compress, LlmSummarizeCompressor};
 pub use llm_understand_media::{LlmUnderstandMediaTool, TOOL_LLM_UNDERSTAND_MEDIA};
-pub use local_llm_context::{
-    Compressor, FileSnapshotStore, LocalLLMContext, OneShotRequest, RunMetaState, RunStatus,
-    SnapshotStore, SuspendKind, DEFAULT_CONTEXT_YIELD_RATIO, DEFAULT_MAX_CONSECUTIVE_ERRORS,
-};
-pub use workspace::{
-    ExternalWorkspaceBinding, ExternalWorkspaceRuntimeBackend, ExternalWorkspaceServiceConfig,
-    LocalWorkspaceLock, LocalWorkspaceSessionBinding, ManagedExternalWorkspaceBackend,
-    ManagedWorkspaceRecord, ManagedWorkspaceToolBackend, SessionWorkspaceBindingView,
-    WorkspaceErrorSummary, WorkspaceOwner, WorkspaceRecordView, WorkspaceRuntimeBackend,
-    WorkspaceStatus, WorkspaceType,
+pub use xllm::{
+    AiccLlmClient, Attachment, DefaultLlmClientFactory, EffectiveConfig, EffectiveTools,
+    ExtractedValue, LlmClientFactory, LoopModel, OpenAiLlmClient, ProviderKind, ResultFormat,
+    ResumeLimits, ResumeStart, RunEvent, RunLogLevel, RunObserver, RunOutcome, RunPhase, RunRecord,
+    RunStatus, RunStore, RunSummary, TaskInput, TaskOverrides, XllmDeps, XllmError, XllmResult,
+    XllmRun, XllmTask, DEFAULT_CONTEXT_YIELD_RATIO, DEFAULT_MAX_CONSECUTIVE_ERRORS,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,7 +134,11 @@ pub struct SessionRuntimeContext {
     pub trace_id: String,
     pub agent_name: String,
     pub behavior: String,
-    pub step_idx: u32,
+    /// Sequence number of this tool call within the run, set by the
+    /// dispatcher on every call. Not a behavior Step index
+    /// (`StepRecord.meta.step_index`) and not a Turn number; identify a call
+    /// by its `call_id`.
+    pub tool_call_index: u32,
     pub wakeup_id: String,
     pub session_id: String,
     #[serde(default = "default_read_token_limit")]
@@ -154,10 +164,6 @@ impl SessionRuntimeContext {
 pub const TOOL_GET_SESSION: &str = "get_session";
 pub const TOOL_READ: &str = "read";
 pub const TOOL_LIST_SESSION: &str = "list_session";
-pub const TOOL_LIST_EXTERNAL_WORKSPACES: &str = "list_external_workspaces";
-pub const TOOL_BIND_EXTERNAL_WORKSPACE: &str = "bind_external_workspace";
-pub const TOOL_CREATE_WORKSPACE: &str = "create_workspace";
-pub const TOOL_BIND_WORKSPACE: &str = "bind_workspace";
 pub const TOOL_LOAD_MEMORY: &str = "load_memory";
 pub const TOOL_SET_MEMORY: &str = "set_memory";
 pub const TOOL_REMOVE_MEMORY: &str = "remove_memory";
@@ -338,6 +344,20 @@ pub enum AgentToolError {
     ExecFailed(String),
     #[error("timeout")]
     Timeout,
+    #[error("runtime transport: {message}")]
+    Transport {
+        message: String,
+        effect_unknown: bool,
+    },
+    /// The call was cancelled by the run (interrupt, graceful finish or
+    /// deadline, see `llm_context::ToolCallCtx`). `effect_unknown = false`:
+    /// the work was stopped or is known to continue, as `message` says;
+    /// `true`: the work was abandoned while running.
+    #[error("cancelled: {message}")]
+    Cancelled {
+        message: String,
+        effect_unknown: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -396,7 +416,6 @@ pub enum AgentToolStatus {
 pub enum AgentToolPendingReason {
     LongRunning,
     UserApproval,
-    #[serde(alias = "external_callback")]
     WaitForInstall,
 }
 
@@ -1042,7 +1061,9 @@ pub fn cli_exit_code_for_error(err: &AgentToolError) -> i32 {
         AgentToolError::InvalidArgs(_) | AgentToolError::NotFound(_) => CLI_EXIT_USAGE,
         AgentToolError::AlreadyExists(_)
         | AgentToolError::ExecFailed(_)
-        | AgentToolError::Timeout => CLI_EXIT_ERROR,
+        | AgentToolError::Timeout
+        | AgentToolError::Transport { .. }
+        | AgentToolError::Cancelled { .. } => CLI_EXIT_ERROR,
     }
 }
 
@@ -1064,6 +1085,14 @@ pub trait AgentTool: Send + Sync {
     fn spec(&self) -> ToolSpec;
 
     fn calling(&self) -> CallingConventions;
+
+    /// Whether the tool stops its work when the call's `ToolCallCtx` fires
+    /// and answers with `AgentToolError::Cancelled`. Default `false`: the
+    /// dispatcher cannot cancel the work and abandons the call on an
+    /// interrupt (effect unknown); a graceful finish waits for it.
+    fn cancellable(&self) -> bool {
+        false
+    }
 
     async fn call(
         &self,
@@ -1284,469 +1313,6 @@ pub struct WorklogTool {
 impl WorklogTool {
     pub fn new(backend: Arc<dyn WorklogActionBackend>) -> Self {
         Self { backend }
-    }
-}
-
-#[async_trait]
-pub trait WorkspaceToolBackend: Send + Sync {
-    async fn create_workspace(
-        &self,
-        ctx: &SessionRuntimeContext,
-        name: String,
-        summary: String,
-    ) -> Result<Json, AgentToolError>;
-
-    async fn resolve_workspace_id(
-        &self,
-        workspace_ref: &str,
-        shell_cwd: Option<&Path>,
-    ) -> Result<String, AgentToolError>;
-
-    async fn bind_workspace(
-        &self,
-        ctx: &SessionRuntimeContext,
-        session_id: &str,
-        workspace_id: &str,
-    ) -> Result<Json, AgentToolError>;
-}
-
-#[derive(Clone)]
-pub struct CreateWorkspaceTool {
-    backend: Arc<dyn WorkspaceToolBackend>,
-}
-
-impl CreateWorkspaceTool {
-    pub fn new(backend: Arc<dyn WorkspaceToolBackend>) -> Self {
-        Self { backend }
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct CreateWorkspaceArgs {
-    pub name: String,
-    pub summary: String,
-}
-
-#[async_trait]
-impl TypedTool for CreateWorkspaceTool {
-    type Args = CreateWorkspaceArgs;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        TOOL_CREATE_WORKSPACE
-    }
-    fn description(&self) -> &str {
-        "创建session的wrokspace并设置为session的default workspace"
-    }
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("create_workspace <name> <summary>".to_string())
-    }
-
-    fn parse_bash_args(
-        &self,
-
-        tokens: &[String],
-
-        _shell_cwd: Option<&Path>,
-    ) -> Result<Json, AgentToolError> {
-        if tokens.len() < 2 {
-            return Err(AgentToolError::InvalidArgs(
-                "missing required arguments: <name> <summary>".to_string(),
-            ));
-        }
-        if tokens.len() > 2 {
-            return Err(AgentToolError::InvalidArgs(
-                "create_workspace only supports arguments: <name> <summary>".to_string(),
-            ));
-        }
-        let name = tokens[0].trim();
-        if name.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace name cannot be empty".to_string(),
-            ));
-        }
-        let summary = tokens[1].trim();
-        if summary.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace summary cannot be empty".to_string(),
-            ));
-        }
-        Ok(json!({ "name": name, "summary": summary }))
-    }
-
-    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        Some(format!(
-            "{TOOL_CREATE_WORKSPACE} {} {}",
-            args.name, args.summary
-        ))
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        let workspace = output
-            .get("workspace_id")
-            .or_else(|| output.pointer("/workspace/workspace_id"))
-            .or_else(|| output.get("id"))
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("workspace");
-        format!("created workspace {workspace}")
-    }
-
-    fn build_title(&self, output: &Self::Output) -> Option<String> {
-        let workspace = output
-            .get("workspace_id")
-            .or_else(|| output.pointer("/workspace/workspace_id"))
-            .or_else(|| output.get("id"))
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("workspace");
-        Some(format!("{TOOL_CREATE_WORKSPACE} {workspace} => created"))
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let name = args.name.trim();
-        let summary = args.summary.trim();
-        if name.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace name cannot be empty".to_string(),
-            ));
-        }
-        if summary.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace summary cannot be empty".to_string(),
-            ));
-        }
-        self.backend
-            .create_workspace(ctx.session(), name.to_string(), summary.to_string())
-            .await
-    }
-}
-
-#[derive(Clone)]
-pub struct BindWorkspaceTool {
-    backend: Arc<dyn WorkspaceToolBackend>,
-}
-
-impl BindWorkspaceTool {
-    pub fn new(backend: Arc<dyn WorkspaceToolBackend>) -> Self {
-        Self { backend }
-    }
-}
-
-#[async_trait]
-pub trait ExternalWorkspaceBackend: Send + Sync {
-    async fn bind_external_workspace(
-        &self,
-        agent_did: &str,
-        name: &str,
-        workspace_path: &str,
-    ) -> Result<Json, AgentToolError>;
-
-    async fn list_external_workspaces(&self, agent_did: &str) -> Result<Json, AgentToolError>;
-}
-
-#[derive(Clone)]
-pub struct BindExternalWorkspaceTool {
-    backend: Arc<dyn ExternalWorkspaceBackend>,
-}
-
-impl BindExternalWorkspaceTool {
-    pub fn new(backend: Arc<dyn ExternalWorkspaceBackend>) -> Self {
-        Self { backend }
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BindExternalWorkspaceArgs {
-    /// Local mount name.
-    pub name: String,
-    /// Absolute or relative source workspace path.
-    pub workspace_path: String,
-    /// Optional target agent DID. Defaults to current agent DID.
-    #[serde(default)]
-    pub agent_did: Option<String>,
-}
-
-#[async_trait]
-impl TypedTool for BindExternalWorkspaceTool {
-    type Args = BindExternalWorkspaceArgs;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        TOOL_BIND_EXTERNAL_WORKSPACE
-    }
-    fn description(&self) -> &str {
-        "Bind an external workspace directory so this agent can access it from runtime."
-    }
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH
-    }
-
-    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        let agent = args.agent_did.as_deref().map(str::trim).unwrap_or("");
-        let mut out = format!(
-            "{TOOL_BIND_EXTERNAL_WORKSPACE} {} {}",
-            args.name.trim(),
-            args.workspace_path.trim()
-        );
-        if !agent.is_empty() {
-            out.push_str(format!(" agent_did={agent}").as_str());
-        }
-        Some(out)
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        let name = output
-            .pointer("/binding/name")
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("external workspace");
-        format!("bound external workspace {name}")
-    }
-
-    fn build_title(&self, output: &Self::Output) -> Option<String> {
-        let name = output
-            .pointer("/binding/name")
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("external workspace");
-        Some(format!("{TOOL_BIND_EXTERNAL_WORKSPACE} {name} => bound"))
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let name = args.name.trim();
-        let workspace_path = args.workspace_path.trim();
-        if name.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "missing required arg `name`".to_string(),
-            ));
-        }
-        if workspace_path.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "missing required arg `workspace_path`".to_string(),
-            ));
-        }
-        let agent_did = args
-            .agent_did
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| ctx.session().agent_name.clone());
-        let binding = self
-            .backend
-            .bind_external_workspace(agent_did.as_str(), name, workspace_path)
-            .await?;
-        Ok(json!({ "ok": true, "binding": binding }))
-    }
-}
-
-#[derive(Clone)]
-pub struct ListExternalWorkspacesTool {
-    backend: Arc<dyn ExternalWorkspaceBackend>,
-}
-
-impl ListExternalWorkspacesTool {
-    pub fn new(backend: Arc<dyn ExternalWorkspaceBackend>) -> Self {
-        Self { backend }
-    }
-}
-
-#[derive(Default, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ListExternalWorkspacesArgs {
-    /// Optional agent DID. Defaults to current agent DID.
-    #[serde(default)]
-    pub agent_did: Option<String>,
-}
-
-#[async_trait]
-impl TypedTool for ListExternalWorkspacesTool {
-    type Args = ListExternalWorkspacesArgs;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        TOOL_LIST_EXTERNAL_WORKSPACES
-    }
-    fn description(&self) -> &str {
-        "List bound external workspaces visible to current agent."
-    }
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH
-    }
-
-    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        let mut out = TOOL_LIST_EXTERNAL_WORKSPACES.to_string();
-        if let Some(agent) = args
-            .agent_did
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            out.push_str(format!(" agent_did={agent}").as_str());
-        }
-        Some(out)
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        let count = output
-            .get("workspaces")
-            .and_then(Json::as_array)
-            .map(|arr| arr.len())
-            .unwrap_or(0);
-        format!("listed {count} external workspace(s)")
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let agent_did = args
-            .agent_did
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| ctx.session().agent_name.clone());
-        let workspaces = self
-            .backend
-            .list_external_workspaces(agent_did.as_str())
-            .await?;
-        Ok(json!({ "ok": true, "workspaces": workspaces }))
-    }
-}
-
-#[derive(Deserialize, JsonSchema)]
-pub struct BindWorkspaceArgs {
-    pub workspace: String,
-}
-
-#[async_trait]
-impl TypedTool for BindWorkspaceTool {
-    type Args = BindWorkspaceArgs;
-    type Output = Json;
-
-    fn name(&self) -> &str {
-        TOOL_BIND_WORKSPACE
-    }
-    fn description(&self) -> &str {
-        "设置agent_session的当前workspace"
-    }
-    fn calling(&self) -> CallingConventions {
-        CallingConventions::BASH
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some("bind_workspace <workspace_id|workspace_path>".to_string())
-    }
-
-    fn parse_bash_args(
-        &self,
-
-        tokens: &[String],
-
-        _shell_cwd: Option<&Path>,
-    ) -> Result<Json, AgentToolError> {
-        if tokens.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "missing workspace argument".to_string(),
-            ));
-        }
-        if tokens.len() > 1 {
-            return Err(AgentToolError::InvalidArgs(
-                "bind_workspace only supports one argument: <workspace_id|workspace_path>"
-                    .to_string(),
-            ));
-        }
-        let raw_arg = tokens[0].trim();
-        let workspace = if let Some((key, value)) = raw_arg.split_once('=') {
-            match key.trim() {
-                "workspace" | "workspace_id" | "workspace_path" | "local_workspace_id" => {
-                    value.trim()
-                }
-                other => {
-                    return Err(AgentToolError::InvalidArgs(format!(
-                        "unsupported argument `{other}`; expected workspace/workspace_id/workspace_path"
-                    )));
-                }
-            }
-        } else {
-            raw_arg
-        };
-        if workspace.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace argument cannot be empty".to_string(),
-            ));
-        }
-        Ok(json!({ "workspace": workspace }))
-    }
-
-    fn build_cmd_line(&self, args: &Self::Args) -> Option<String> {
-        Some(format!("{TOOL_BIND_WORKSPACE} {}", args.workspace.trim()))
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        let workspace = output
-            .get("workspace_id")
-            .or_else(|| output.get("local_workspace_id"))
-            .or_else(|| output.pointer("/binding/local_workspace_id"))
-            .or_else(|| output.get("workspace"))
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("workspace");
-        format!("bound session to workspace {workspace}")
-    }
-
-    fn build_title(&self, output: &Self::Output) -> Option<String> {
-        let workspace = output
-            .get("workspace_id")
-            .or_else(|| output.get("local_workspace_id"))
-            .or_else(|| output.pointer("/binding/local_workspace_id"))
-            .or_else(|| output.get("workspace"))
-            .and_then(Json::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("workspace");
-        Some(format!("{TOOL_BIND_WORKSPACE} {workspace} => bound"))
-    }
-
-    async fn execute(
-        &self,
-        ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let workspace_ref = args.workspace.trim();
-        if workspace_ref.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace argument cannot be empty".to_string(),
-            ));
-        }
-        let session = ctx.session();
-        if session.session_id.trim().is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "session_id is required".to_string(),
-            ));
-        }
-        let workspace_id = self
-            .backend
-            .resolve_workspace_id(workspace_ref, ctx.shell_cwd())
-            .await?;
-        self.backend
-            .bind_workspace(session, session.session_id.as_str(), workspace_id.as_str())
-            .await
     }
 }
 
@@ -1987,7 +1553,7 @@ impl TypedTool for MCPTool {
             "jsonrpc": "2.0",
             "id": format!(
                 "{}:{}:{}:{}:{}",
-                ctx.trace_id, ctx.wakeup_id, ctx.behavior, ctx.step_idx, self.spec.name
+                ctx.trace_id, ctx.wakeup_id, ctx.behavior, ctx.tool_call_index, self.spec.name
             ),
             "method": "tools/call",
             "params": {
@@ -2365,17 +1931,22 @@ impl AgentToolManager {
             )));
         }
 
-        let call_id = format!("bash-cli-{}-{}", ctx.trace_id, ctx.step_idx);
+        let call_id = format!("bash-cli-{}-{}", ctx.trace_id, ctx.tool_call_index);
         info!(
             "opendan.tool_call: status=start tool={} call_id={} trace_id={} session_id={} source=bash",
             tool_name, call_id, ctx.trace_id, ctx.session_id
         );
         let result = tool.exec(ctx, line, shell_cwd).await;
-        if let Err(err) = &result {
-            warn!(
+        match &result {
+            Ok(result) if result.status == AgentToolStatus::Error => warn!(
+                "opendan.tool_call: status=failed tool={} call_id={} trace_id={} session_id={} source=bash err={}",
+                tool_name, call_id, ctx.trace_id, ctx.session_id, result.summary
+            ),
+            Err(err) => warn!(
                 "opendan.tool_call: status=failed tool={} call_id={} trace_id={} session_id={} source=bash err={}",
                 tool_name, call_id, ctx.trace_id, ctx.session_id, err
-            );
+            ),
+            _ => {}
         }
         let result = result.map_err(|err| {
             if let Some(usage) = usage.as_deref() {
@@ -2384,10 +1955,12 @@ impl AgentToolManager {
                 err
             }
         })?;
-        info!(
-            "opendan.tool_call: status=success tool={} call_id={} trace_id={} session_id={} source=bash",
-            tool_name, call_id, ctx.trace_id, ctx.session_id
-        );
+        if result.status != AgentToolStatus::Error {
+            info!(
+                "opendan.tool_call: status=success tool={} call_id={} trace_id={} session_id={} source=bash",
+                tool_name, call_id, ctx.trace_id, ctx.session_id
+            );
+        }
         Ok(Some(result))
     }
 
@@ -2416,6 +1989,10 @@ impl AgentToolManager {
 
         let result = tool.call(ctx, args).await;
         match &result {
+            Ok(result) if result.status == AgentToolStatus::Error => warn!(
+                "opendan.tool_call: status=failed tool={} call_id={} trace_id={} session_id={} err={}",
+                tool_name, call_id, ctx.trace_id, session_id, result.summary
+            ),
             Ok(_) => info!(
                 "opendan.tool_call: status=success tool={} call_id={} trace_id={} session_id={}",
                 tool_name, call_id, ctx.trace_id, session_id
@@ -2664,7 +2241,7 @@ mod tests {
             trace_id: "trace-1".to_string(),
             agent_name: "did:opendan:test".to_string(),
             behavior: "plan".to_string(),
-            step_idx: 3,
+            tool_call_index: 3,
             wakeup_id: "wake-1".to_string(),
             session_id: "session-1".to_string(),
             read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,

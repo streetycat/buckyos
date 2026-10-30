@@ -1,0 +1,65 @@
+{
+  "acceptance": "n/a",
+  "activity": {
+    "heartbeat_ms": 0,
+    "summary": ""
+  },
+  "bootstrap_done": false,
+  "inputs": {
+    "q": {
+      "acked_index": 1
+    }
+  },
+  "last_run": null,
+  "live_run": null,
+  "one_line_status": "",
+  "pending_events": [
+    {
+      "latest": {
+        "data_ref": null,
+        "event": "delivered",
+        "input": {
+          "index": 1,
+          "src": "q"
+        },
+        "key": "notify:nt-f006b89c94bb433a81b1d326063eb765:dm:did:bns:alice",
+        "received_at_ms": 1792976022586,
+        "seq": null,
+        "summary": "[notify nt-f006b89c94bb433a81b1d326063eb765] input/timely from session work-notify at 2026-10-02T00:00:00Z: Postgres or SQLite? (options: pg=Postgres, lite=SQLite) — check the current state with `agent-session notify show nt-f006b89c94bb433a81b1d326063eb765`"
+      },
+      "source": {
+        "id": "notify:nt-f006b89c94bb433a81b1d326063eb765",
+        "kind": "system"
+      },
+      "subscription_id": "_notify",
+      "superseded": 0,
+      "terminal": null
+    }
+  ],
+  "perception_seq": 0,
+  "recent_keys": [
+    "notify:nt-f006b89c94bb433a81b1d326063eb765:dm:did:bns:alice"
+  ],
+  "reported_rev": 1,
+  "rev": 2,
+  "run_state": "created",
+  "schema": "opendan.session_state/6",
+  "stop_requested": false,
+  "topic": {
+    "title": ""
+  },
+  "turn_seq": 0,
+  "turns_completed": 0,
+  "updated_at_ms": 1792976022586,
+  "worklog": {
+    "committed_bytes": 135,
+    "committed_seq": 1
+  },
+  "writer": {
+    "host": "${FIXTURE_HOST}",
+    "lock_epoch": 1,
+    "pid": 3019369,
+    "principal": "app:app2@alice",
+    "runner_id": "rn-d9c198d565194caa"
+  }
+}

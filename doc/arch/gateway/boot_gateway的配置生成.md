@@ -11,7 +11,10 @@ cyfs-gateway 上游已经完成 group forward 和 tunnel URL 状态查询后，B
 1. `src/rootfs/etc/boot_gateway.yaml`
    - 静态 boot 配置。
    - 定义 `node_rtcp`、`zone_gateway_http`、`node_gateway_http` 和 `node_gateway` HTTP server。
+   - `servers.node_gateway.response_timeout` 为 `900s`，覆盖 cyfs-gateway 的默认 `60s`，允许 AICC 同步推理等待模型完成。该值作用于整个 `node_gateway` 的上游响应头等待，从请求体发送完成起算；不改变请求体空闲超时。AICC kRPC 客户端默认等待 900 秒，xllm 单次模型调用和 AICC provider 请求默认均为 600 秒，各自独立计时；增大网关超时不会提高 xllm 的调用上限。
+   - `node_rtcp.bind` 使用 `node_gateway_params.json` 中的字符串参数 `rtcp_port`。激活、种子物化和 node-daemon 启动均从本机设备文档写入该端口，缺省为 `2980`；自定义端口（如 `2981`）与对端读取的设备文档一致。
    - 从 `node_gateway_info.json` 读取 `APP_INFO`、`SERVICE_INFO`、`ROUTES`（升级前为 `NODE_ROUTE_MAP`）、`TRUST_KEY`、`NODE_INFO`。
+   - 对私有 App 页面执行精确 SSO cookie 校验：route entry 的 AppId/AppInstanceId/owner 必须一致，token 必须来自 Verify Hub 且为 user session App target；System/refresh/sudo/旧格式 token 均 fail closed。`/sso_callback`、`/sso_refresh`、`/sso_logout` 先按 control-panel 服务路由，不被 App 页面 cookie 闸门拦截。
 2. `nodes/<node>/gateway_info`
    - scheduler 按 source node 生成。
    - node-daemon 拉取后落地为 `$BUCKYOS_ROOT/etc/node_gateway_info.json`。
@@ -590,7 +593,7 @@ Boot 阶段行为：
 6. 为其它 OOD 生成带 relay 的 tunnel URL，并把 direct route 标记为 primary、relay route 标记为 backup。
 7. 把需要长期保持的目标写入 RTCP `keep_tunnel`：
    - 其它 OOD direct candidate 或 direct 目标 DID。
-   - SN candidate，前提是本机不是稳定 WAN 可达。
+   - SN candidate：非 WAN 节点，以及没有 owner 签名固定 `DeviceConfig.ips` 的 WAN 节点，均保持 SN 隧道；`wan_dyn` 的动态地址尚未可解析时仍可通过显式 SN 回退访问。WAN 节点具有签名固定 IP 时保持直连策略，不新增 SN 保活。
    - ZoneGateway candidate，前提是该节点承担 relay/公网入口职责。
 8. 通过 cyfs-gateway 的 tunnel_mgr 批量查询接口，判断是否有足够多到其它 OOD 的 tunnel 已经建立。`2n+1` OOD 系统至少需要与 `n` 个其它 OOD 的 keep_tunnel 达到 `Reachable`，或在策略允许时达到 `Unknown/Probing` 并继续后台探测。
 9. 访问 `127.0.0.1:3180/kapi/system_config` 并获得 boot/config，这是进入后续 boot 流程的 gateway 闸门。

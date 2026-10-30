@@ -55,7 +55,7 @@ export interface SudoGrant {
   expiresInSeconds: number
   username: string
   appid: string
-  appInstanceId: string
+  appInstanceId?: string
   aud?: string
 }
 
@@ -69,6 +69,7 @@ export interface SudoDialogOptions {
   reason?: string
   confirmLabel?: string
   cancelLabel?: string
+  requestPassword?: (params: SudoByPasswordParams) => Promise<SudoGrant>
 }
 
 interface SudoByPasswordResponse {
@@ -126,12 +127,6 @@ function resolveAppId(appid?: string) {
   return appid?.trim() || buckyos.getAppId()?.trim() || DEFAULT_APP_ID
 }
 
-function resolveAppInstanceId(appid: string, appInstanceId?: string) {
-  const explicit = appInstanceId?.trim()
-  if (explicit) return explicit
-  return `${appid}@system`
-}
-
 function normalizeSudoError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error ?? '')
   const lower = message.toLowerCase()
@@ -155,6 +150,28 @@ function normalizeSudoError(error: unknown) {
   return message || 'Sudo request failed. Please try again.'
 }
 
+/**
+ * Maps a sudo failure to an `app22.error.*` dictionary code.
+ *
+ * Real Verify Hub failures arrive as `SudoRequestError` whose `message` is an
+ * English sentence, so keying the translation on the message never matched
+ * and the English fallback was shown in every locale. Mock stores throw plain
+ * `Error('INCORRECT_PASSWORD')`-style codes, which are used verbatim.
+ */
+function sudoErrorI18nCode(error: unknown) {
+  if (error instanceof SudoRequestError) {
+    const lower = error.message.toLowerCase()
+    if (lower.includes('invalidpassword') || lower.includes('invalid password')) {
+      return 'INCORRECT_PASSWORD'
+    }
+    if (lower.includes('no permission') || lower.includes('only admin')) {
+      return 'ADMIN_REQUIRED'
+    }
+    return error.code
+  }
+  return error instanceof Error ? error.message : 'request_failed'
+}
+
 export async function sudoByPassword({
   username,
   password,
@@ -164,7 +181,7 @@ export async function sudoByPassword({
 }: SudoByPasswordParams): Promise<SudoGrant> {
   const normalizedUsername = username.trim()
   const normalizedAppId = appid.trim()
-  const normalizedAppInstanceId = appInstanceId?.trim() || `${normalizedAppId}@system`
+  const normalizedAppInstanceId = appInstanceId?.trim()
 
   if (!normalizedUsername || !normalizedAppId) {
     throw new SudoRequestError(
@@ -188,8 +205,9 @@ export async function sudoByPassword({
       {
         username: normalizedUsername,
         password: passwordHash,
-        appid: normalizedAppId,
-        app_instance_id: normalizedAppInstanceId,
+        target: normalizedAppInstanceId
+          ? { kind: 'app', app_instance_id: normalizedAppInstanceId }
+          : { kind: 'system', service_id: normalizedAppId },
         ...(aud ? { aud } : {}),
         login_nonce: nonce,
       },
@@ -215,7 +233,7 @@ export async function sudoByPassword({
       expiresInSeconds,
       username: normalizedUsername,
       appid: normalizedAppId,
-      appInstanceId: normalizedAppInstanceId,
+      ...(normalizedAppInstanceId ? { appInstanceId: normalizedAppInstanceId } : {}),
       ...(aud ? { aud } : {}),
     }
   } catch (error) {
@@ -236,9 +254,11 @@ function SudoPasswordForm({
   controls,
   reason,
   username,
+  requestPassword = sudoByPassword,
 }: {
+  requestPassword?: (params: SudoByPasswordParams) => Promise<SudoGrant>
   appid: string
-  appInstanceId: string
+  appInstanceId?: string
   aud?: string
   cancelLabel: string
   confirmLabel: string
@@ -264,16 +284,18 @@ function SudoPasswordForm({
     setError(null)
 
     try {
-      const grant = await sudoByPassword({
+      const grant = await requestPassword({
         username,
         password,
         appid,
         appInstanceId,
         aud,
       })
+      setPassword('')
       controls.close(grant)
     } catch (submitError) {
-      setError(normalizeSudoError(submitError))
+      setPassword('')
+      setError(t(`app22.error.${sudoErrorI18nCode(submitError)}`, normalizeSudoError(submitError)))
       setSubmitting(false)
     }
   }
@@ -378,10 +400,10 @@ export function useSudoByPassword() {
 
   return useCallback(
     async (options: SudoDialogOptions = {}): Promise<SudoGrant | null> => {
-      const accountInfo = await buckyos.getAccountInfo()
+      const accountInfo = options.username ? null : await buckyos.getAccountInfo()
       const username = resolveUsername(accountInfo, options.username)
       const appid = resolveAppId(options.appid)
-      const appInstanceId = resolveAppInstanceId(appid, options.appInstanceId)
+      const appInstanceId = options.appInstanceId?.trim()
       const title = options.title ?? t('sudo.title', 'Administrator permission')
       const description =
         options.description ??
@@ -414,6 +436,7 @@ export function useSudoByPassword() {
             confirmLabel={confirmLabel}
             controls={controls}
             reason={options.reason}
+            requestPassword={options.requestPassword}
             username={username}
           />
         ),

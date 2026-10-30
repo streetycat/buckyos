@@ -83,8 +83,8 @@ token 有效期：
 
 ### verify_token：集中验证接口（可选路径）
 verify-hub 提供 `verify_token` 协议（`src/kernel/verify_hub/README.md`）：
-- request: `{ "method": "verify_token", "params": { "session_token": "$session_token", "appid": "notes", "app_instance_id": "notes@alice" } }`；两个期望目标字段可选，但业务 App 应同时提交。
-- response: `true`；签名、有效期、token 类型和期望 App 身份任一不匹配都会返回错误。用户 token 必须自带 `principal_kind=user`、`app_instance_id`，非系统 App 还必须带匹配的 `app_owner_user_id`。
+- request: `{ "method": "verify_token", "params": { "session_token": "$session_token", "expected_target": { "kind": "app", "app_instance_id": "notes@alice" } } }`。System 目标使用 `{ "kind": "system", "service_id": "control-panel" }`。
+- response: `true`；签名、有效期、Verify Hub issuer、`token_use=session` 和期望 AuthTarget 任一不匹配都会返回错误。App target 还会精确校验 AppId、AppInstanceId 与 owner。
 
 这条路径适用于“验证方不想/不能维护 trust keys”的场景：把 token 发给 verify-hub 由其验证。
 
@@ -107,12 +107,12 @@ call_other_service(req):
 service_handle(req):
   // 3) 先验证 token（两种模式）
   if local_has_trust_keys:
-     (userid, appid) = local_verify_jwt(req.session_token)
+     (userid, auth_target) = local_verify_verify_hub_session(req.session_token)
   else:
-     valid = verify_hub.verify_token(req.session_token, expected_appid, expected_app_instance_id)
+     valid = verify_hub.verify_token(req.session_token, expected_target)
 
   // 4) enforce
-  allowed = rbac.enforce(userid, appid, req.resource_path, req.action)
+  allowed = rbac.enforce(userid, auth_target.authorization_key(), req.resource_path, req.action)
   if !allowed:
      deny
 
@@ -178,12 +178,15 @@ notepads 已明确标注了传播延迟：`new_doc/ref/notepads/rbac.md`。
 - runtime 会在接近过期时尝试 renew：`renew_token_from_verify_hub()` 内对 `exp - 30` 做判断并触发 `login_by_jwt`（`src/kernel/buckyos-api/src/runtime.rs`）。
 
 ### 3) “刷新 token 后，旧 token 立刻不能用了”
-- verify-hub 的 refresh 使用 rolling nonce 并更新 `TOKEN_CACHE`（`src/kernel/verify_hub/src/main.rs`）。
-- 如果网络重试/响应丢失导致客户端没拿到新 token，会出现“持有旧 nonce 无法继续刷新”的现象。
+- verify-hub 的 refresh family 存在本地 SQLite（`data/var/verify-hub/sessions.db`，`src/kernel/verify_hub/src/family_store.rs`），每次 refresh 轮换 jti；被替换的旧 refresh 只在 10 秒宽限期内返回当前那对 token，之后再出示视为重用并撤销整条 family。
+- refresh 与宽限分支都会先复核账号状态、类型（会话上限只收窄不放宽）、来源（专属邀请未撤销）、联合会话的 30 天绝对期限和受限子会话的父 family。
 
 ### 4) “verify-hub 重启后，部分会话异常”
-- verify-hub 的 `TOKEN_CACHE` 是内存态静态 HashMap（`src/kernel/verify_hub/src/main.rs`），没有持久化/回收策略。
-- 服务重启意味着 cache 丢失：一些依赖 cache 语义的刷新/一次性校验会表现为失败或行为变化。
+- family 持久化后重启不影响 refresh；内存里只剩登录 nonce / 断言防重放缓存，重启后丢失。
+- verify-hub 单实例，`sessions.db` 不在 OOD 之间同步、也不进备份：调度到另一节点或恢复旧数据时删除该文件，所有会话重新登录。
+
+### 5) “受限账号调用某个服务被拒”
+- Limited、External 及其衍生会话的 token 带 `restricted: true` 与 `scopes`。`BuckyOSRuntime::verify_trusted_session_token` / `enforce` 默认拒绝受限会话（`access_denied` + `session_kind_not_allowed`），只有显式调用 `verify_session_token_opened` / `enforce_opened` 的方法开放；system-config 在自身入口单独实现同样的闸口。各服务开放清单见 [混合 SSO 技术契约](verify-hub/混合SSO技术契约.md) §3 与实施 TODO 的 SSO-04 审计表。
 
 ## 与类似系统的差异点（再强调一次）
 

@@ -44,12 +44,33 @@ export function createWindowRecord(
   }
 }
 
+/**
+ * Per-record memo so an unchanged `WindowRecord` maps to the same
+ * `DesktopWindowDataModel` object across recomputations. The window layer
+ * relies on this identity to skip re-rendering windows that did not move
+ * while a sibling is being dragged.
+ */
+const windowModelCache = new WeakMap<WindowRecord, DesktopWindowDataModel>()
+
+/**
+ * The layer model keeps `windows` in the store's (creation) order and never
+ * drops or reorders entries while a window is open:
+ *
+ * - Minimized windows stay in the list; the window layer hides them instead
+ *   of unmounting them.
+ * - Stacking is expressed only through each window's `zIndex` style, not
+ *   through render order. Reordering keyed siblings makes React move the DOM
+ *   nodes, and a moved `<iframe>` reloads its page.
+ *
+ * Both would otherwise make an embedded web app lose its state and restart
+ * every time the user minimizes/restores it or merely focuses another window.
+ * `topWindow` is the visible window with the highest `zIndex`.
+ */
 export function createDesktopWindowLayerDataModel(
   apps: DesktopAppItem[],
   windows: WindowRecord[],
 ): DesktopWindowLayerDataModel {
-  const visibleWindows = windows
-    .filter((windowItem) => windowItem.state !== 'minimized')
+  const layerWindows = windows
     .map((windowItem) => {
       const app = findDesktopAppById(apps, windowItem.appId)
 
@@ -57,16 +78,25 @@ export function createDesktopWindowLayerDataModel(
         return null
       }
 
-      return {
+      const cached = windowModelCache.get(windowItem)
+      if (cached && cached.app === app) {
+        return cached
+      }
+
+      const model: DesktopWindowDataModel = {
         ...windowItem,
         app,
       }
+      windowModelCache.set(windowItem, model)
+      return model
     })
     .filter((windowItem): windowItem is DesktopWindowDataModel => Boolean(windowItem))
-    .sort((left, right) => left.zIndex - right.zIndex)
 
-  return {
-    windows: visibleWindows,
-    topWindow: visibleWindows[visibleWindows.length - 1],
+  let topWindow: DesktopWindowDataModel | undefined
+  for (const windowItem of layerWindows) {
+    if (windowItem.state === 'minimized') continue
+    if (!topWindow || windowItem.zIndex >= topWindow.zIndex) topWindow = windowItem
   }
+
+  return { windows: layerWindows, topWindow }
 }

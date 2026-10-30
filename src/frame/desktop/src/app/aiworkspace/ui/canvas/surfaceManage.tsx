@@ -1,0 +1,149 @@
+/* eslint-disable react-refresh/only-export-components -- Surface operations with their dialog */
+/* Managing Surfaces (UI improvement §5): rename with the version seen when editing started (a concurrent
+ * rename is a conflict, never silently overwritten), the shared preset icon, and the delete pre-check
+ * (phase two §4.3: the BlockTree and the content folder go together; blocked references are listed,
+ * readable ones only). */
+
+import { useCallback, useState } from 'react'
+import { describeError } from '../../api/session'
+import { aiwsT } from '../../i18n'
+import { useAiwsText } from '../../useAiwsText'
+import { SYSTEM_IDS, type CommitOutcome, type EntityEnvelope, type Json, type Operation } from '../../api/types'
+import { useOverlayMounted } from '../shell/popover'
+import type { WorkspaceStore } from '../../state/store'
+import { useLoad, useStore, useVersion } from '../../state/hooks'
+import { surfacesOf } from './surfaceOps'
+
+export interface RenameBase { titleRev: number; metaRev: number }
+
+/** The versions a rename will expect: read when the user starts editing. */
+export async function renameBase(store: WorkspaceStore, surface: EntityEnvelope): Promise<RenameBase> {
+  const read = await store.session.read<{ payload: Record<string, Json>; key_revs: Record<string, number> }>(surface.entity_id)
+  return { titleRev: read.content.key_revs.title ?? 0, metaRev: read.meta_rev }
+}
+
+export function renameSurface(store: WorkspaceStore, surface: EntityEnvelope, title: string, base: RenameBase): Promise<CommitOutcome> {
+  const ops: Operation[] = [
+    { op: 'entity.set_keys', entity_id: surface.entity_id, keys: [{ key: 'title', value: title, expect: { rev: base.titleRev } }] },
+    { op: 'entity.rename', entity_id: surface.entity_id, name: title, expect: { rev: base.metaRev } },
+  ]
+  return store.submit({ editId: `surface:${surface.entity_id}:title`, label: aiwsT('aiworkspace.canvas.surface.renameLabel', { title }), mine: title, hasMine: true, operations: ops })
+}
+
+export async function setSurfaceIcon(store: WorkspaceStore, surface: EntityEnvelope, icon: string | null): Promise<CommitOutcome> {
+  const read = await store.session.read<{ payload: Record<string, Json>; key_revs: Record<string, number> }>(surface.entity_id)
+  const rev = read.content.key_revs.icon ?? 0
+  const op: Operation = icon
+    ? { op: 'entity.set_keys', entity_id: surface.entity_id, keys: [{ key: 'icon', value: icon, expect: { rev } }] }
+    : { op: 'entity.unset_keys', entity_id: surface.entity_id, keys: [{ key: 'icon', expect: { rev } }] }
+  return store.submit({ editId: `surface:${surface.entity_id}:icon`, label: aiwsT(icon ? 'aiworkspace.canvas.surface.iconLabel' : 'aiworkspace.canvas.surface.iconResetLabel'), operations: [op] })
+}
+
+/** A Surface's page settings (`config`, draw.io 导入 TODO §2.5): background colour and page size, read wide. */
+export interface SurfaceLook { background: string | null; pageSize: { w: number; h: number } | null; config: Record<string, Json>; rev: number }
+
+export function useSurfaceConfig(surfaceId: string): SurfaceLook {
+  const store = useStore()
+  const version = useVersion(`e:${surfaceId}`)
+  const load = useCallback(() => store.readBatched<{ payload: { config?: Record<string, Json> }; key_revs?: Record<string, number> }>(surfaceId), [store, surfaceId])
+  const read = useLoad(load, version)
+  const config = read.data?.entity_id === surfaceId ? read.data.content.payload.config ?? {} : {}
+  const bg = typeof config.background === 'string' && /^#[0-9a-f]{6}$/i.test(config.background) ? config.background.toLowerCase() : null
+  const size = config.page_size as { w?: unknown; h?: unknown } | undefined
+  const pageSize = size && typeof size.w === 'number' && typeof size.h === 'number' && size.w > 0 && size.h > 0 ? { w: size.w, h: size.h } : null
+  return { background: bg, pageSize, config, rev: read.data?.entity_id === surfaceId ? read.data.content.key_revs?.config ?? 0 : 0 }
+}
+
+/** Set (null: remove) the Surface's background colour. */
+export async function setSurfaceBackground(store: WorkspaceStore, surface: EntityEnvelope, background: string | null): Promise<CommitOutcome> {
+  const read = await store.session.read<{ payload: { config?: Record<string, Json> }; key_revs: Record<string, number> }>(surface.entity_id)
+  const config: Record<string, Json> = { ...(read.content.payload.config ?? {}) }
+  if (background) config.background = background
+  else delete config.background
+  const rev = read.content.key_revs.config ?? 0
+  const op: Operation = Object.keys(config).length
+    ? { op: 'entity.set_keys', entity_id: surface.entity_id, keys: [{ key: 'config', value: config, expect: { rev } }] }
+    : { op: 'entity.unset_keys', entity_id: surface.entity_id, keys: [{ key: 'config', expect: { rev } }] }
+  return store.submit({ editId: `surface:${surface.entity_id}:background`, label: aiwsT(background ? 'aiworkspace.canvas.surface.backgroundLabel' : 'aiworkspace.canvas.surface.backgroundResetLabel'), operations: [op] })
+}
+
+export function accepted(outcome: CommitOutcome): boolean {
+  return outcome.status === 'accepted' || outcome.status === 'saved_locally'
+}
+
+/** Why a Surface's own properties (name, icon) cannot be changed now, or null. */
+export function surfaceWriteReason(store: WorkspaceStore, surface: EntityEnvelope | null | undefined, viewOnly: boolean, readOnlyNow: string | null): string | null {
+  if (!surface) return aiwsT('aiworkspace.canvas.surface.none')
+  if (!surface.capabilities.includes('structure')) return aiwsT('aiworkspace.canvas.surface.noPermission')
+  if (readOnlyNow) return readOnlyNow
+  if (viewOnly) return aiwsT('aiworkspace.canvas.surface.notEditMode')
+  void store
+  return null
+}
+
+export function SurfaceDeleteDialog({ surface, onClose, onDeleted }: { surface: EntityEnvelope; onClose: () => void; onDeleted: (nextSurfaceId: string | null) => void }) {
+  const store = useStore()
+  const { t, clauses } = useAiwsText()
+  useOverlayMounted()
+  const [state, setState] = useState<{ referrers: { entity_id: string; target: string }[] | null; hidden: boolean; busy: boolean }>({ referrers: null, hidden: false, busy: true })
+  const [started, setStarted] = useState(false)
+  if (!started) {
+    setStarted(true)
+    const folderId = surface.content_folder_id ?? ''
+    const folder = folderId ? store.outline.get(folderId) : undefined
+    const blocks = store.outline.descendants(surface.entity_id).map((e) => e.entity_id)
+    const ops: Operation[] = [{ op: 'entity.delete', entity_id: surface.entity_id, ...(blocks.length ? { subtree: { delete: blocks } } : {}), expect: { rev: surface.life_rev } }]
+    if (folder) {
+      const inside = store.outline.descendants(folder.entity_id).map((e) => e.entity_id)
+      ops.push({ op: 'entity.delete', entity_id: folder.entity_id, ...(inside.length ? { subtree: { delete: inside } } : {}), expect: { rev: folder.life_rev } })
+    }
+    store.session.prepare(ops).then((result) => {
+      if (result.status === 'ok') { setState({ referrers: [], hidden: false, busy: false }); return }
+      const data = result.status === 'rejected' ? (result.errors?.[0]?.data as { referrers?: { entity_id: string; target: string }[]; hidden_referrers?: boolean } | undefined) : undefined
+      setState({ referrers: data?.referrers ?? [{ entity_id: result.code, target: '' }], hidden: Boolean(data?.hidden_referrers), busy: false })
+    }, (error: unknown) => {
+      store.notify('error', aiwsT('aiworkspace.canvas.surface.precheckFailed', { reason: describeError(error) }))
+      onClose()
+    })
+  }
+  const remove = async (moveFirst: boolean) => {
+    const folderId = surface.content_folder_id ?? ''
+    const folder = folderId ? store.outline.get(folderId) : undefined
+    const ops: Operation[] = []
+    if (moveFirst && folder) {
+      // "move to the data tree, then delete": the folder's children move under `data`
+      let key = store.outline.childrenOf('data').filter((e) => !SYSTEM_IDS.has(e.entity_id)).at(-1)?.order_key
+      for (const child of store.outline.childrenOf(folder.entity_id)) { key = store.core.order_key_between(key, undefined); ops.push({ op: 'tree.move', entity_id: child.entity_id, new_parent_id: 'data', order_key: key }) }
+    }
+    const blocks = store.outline.descendants(surface.entity_id).map((e) => e.entity_id)
+    ops.push({ op: 'entity.delete', entity_id: surface.entity_id, ...(blocks.length ? { subtree: { delete: blocks } } : {}), expect: { rev: surface.life_rev } })
+    if (folder) {
+      const rest = moveFirst ? [] : store.outline.descendants(folder.entity_id).map((e) => e.entity_id)
+      ops.push({ op: 'entity.delete', entity_id: folder.entity_id, ...(rest.length ? { subtree: { delete: rest } } : {}), expect: { rev: folder.life_rev } })
+    }
+    const outcome = await store.submit({ editId: `surface:${surface.entity_id}:delete`, label: aiwsT('aiworkspace.canvas.surface.deleteLabel', { name: surface.title ?? surface.name ?? '' }), operations: ops })
+    onClose()
+    if (accepted(outcome)) onDeleted(surfacesOf(store).find((s) => s.entity_id !== surface.entity_id)?.entity_id ?? null)
+  }
+  const blocked = state.referrers !== null && (state.referrers.length > 0 || state.hidden)
+  return (
+    <div className="aiws-modal-backdrop" onPointerDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      <div className="aiws-dialog" role="alertdialog" aria-modal="true" aria-label={t('aiworkspace.canvas.surface.delete')} data-testid="aiws-surface-delete-dialog" onKeyDown={(event) => { if (event.key === 'Escape') onClose() }}>
+        <b>{t('aiworkspace.canvas.surface.deleteTitle', { name: surface.title ?? surface.name ?? '' })}</b>
+        <div className="aiws-muted">{t('aiworkspace.canvas.surface.deleteNote')}</div>
+        {state.busy && <div className="aiws-muted">{t('aiworkspace.canvas.surface.prechecking')}</div>}
+        {state.referrers && state.referrers.length > 0 && (
+          <div className="aiws-warning" data-testid="aiws-surface-delete-blocked">
+            {t('aiworkspace.canvas.surface.deleteBlocked', { list: clauses([...state.referrers.map((r) => `${store.outline.get(r.entity_id)?.title ?? store.outline.get(r.entity_id)?.name ?? r.entity_id} → ${r.target}`), ...(state.hidden ? [t('aiworkspace.canvas.surface.hiddenReferrers')] : [])]) })}
+          </div>
+        )}
+        {state.referrers && state.referrers.length === 0 && state.hidden && <div className="aiws-warning">{t('aiworkspace.canvas.surface.restrictedReferrers')}</div>}
+        <div className="aiws-dialog-actions">
+          {state.referrers && !blocked && <button type="button" className="is-danger" data-testid="aiws-surface-delete-confirm" autoFocus onClick={() => { void remove(false) }}>{t('aiworkspace.canvas.surface.delete')}</button>}
+          {blocked && <button type="button" data-testid="aiws-surface-delete-move" onClick={() => { void remove(true) }}>{t('aiworkspace.canvas.surface.moveThenDelete')}</button>}
+          <button type="button" onClick={onClose}>{t('aiworkspace.common.cancel')}</button>
+        </div>
+      </div>
+    </div>
+  )
+}

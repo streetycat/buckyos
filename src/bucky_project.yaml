@@ -1,11 +1,14 @@
 name: buckyos
-version: "0.6.0"
+version: "0.7.0"
 base_dir: "."
 
 modules:
   node_daemon:
     type: rust
     name: node_daemon
+  buckyos_agent_daemon:
+    type: rust
+    name: buckyos_agent_daemon
   system_config:
     type: rust
     name: system_config
@@ -27,12 +30,18 @@ modules:
   smb_service:
     type: rust
     name: smb_service
+  nfs_server:
+    type: rust
+    name: nfs_server
+  aiworkspace:
+    type: rust
+    name: aiworkspace
+  homestation:
+    type: rust
+    name: homestation
   repo_service:
     type: rust
     name: repo_service
-  buckycli:
-    type: rust
-    name: buckycli
   node_active:
     type: web
     name: node_active
@@ -52,6 +61,13 @@ modules:
   agent_tool:
     type: rust
     name: agent_tool_cli_dev
+  xagent:
+    type: rust
+    name: libopendan
+  opendan_web:
+    type: web
+    name: opendan_web
+    src_dir: frame/opendan/web/
   # control_panel_web:
   #   type: web
   #   name: control_panel
@@ -62,8 +78,18 @@ modules:
     src_dir: frame/desktop/  
   buckyos_systest:
     type: web
+    format: pikg
     name: buckyos_systest
     src_dir: apps/sys_test
+  text_editor:
+    type: web
+    format: pikg
+    name: text_editor
+    src_dir: apps/text_editor
+  jarvis_agent:
+    format: pikg
+    name: jarvis_agent
+    src_dir: apps/jarvis_agent
 
 apps:
   buckyos:
@@ -77,6 +103,7 @@ apps:
     # 模块指向的 文件/文件夹，每次update的时候都会覆盖更新 
     modules:
       node_daemon: bin/node-daemon/
+      buckyos_agent_daemon: bin/buckyos-agent-daemon/
       system_config: bin/system-config/
       verify_hub: bin/verify-hub/
       scheduler: bin/scheduler/
@@ -86,34 +113,46 @@ apps:
       control_panel: bin/control-panel/
       #control_panel_web: bin/control-panel/web/
       smb_service: bin/smb-service/
+      nfs_server: bin/nfs-server/
+      aiworkspace: bin/aiworkspace/
+      homestation: bin/homestation/
       repo_service: bin/repo-service/
-      buckycli: bin/buckycli/
       node_active: bin/node-active/
-      buckyos_systest: bin/buckyos_systest/
       aicc: bin/aicc/
       msg_center: bin/msg-center/
       opendan: bin/opendan/
       agent_tool: bin/opendan/
+      xagent: bin/opendan/xagent
+      opendan_web: bin/opendan/web/
+      buckyos-tool-bin: bin/buckyos
+      buckyos-tool: libexec/buckyos-tool/
+      buckyos-agent: libexec/buckyos-agent/
       scheduler-etc: etc/scheduler/
       boot-gateway-config: etc/boot_gateway.yaml
-      devenv.json: etc/devenv.json
       util.py: bin/util.py
       stop.py: bin/stop.py
       stop.ps1: bin/stop.ps1
       stop_osx.sh: bin/stop_osx.sh
-      buckyos_jarvis: bin/buckyos_jarvis/
       desktop: bin/control-panel/web/
+      buckyos_systest: data/cache/buckyos-systest.buckyos.bns.did-0.5.1.pikg
+      text_editor: data/cache/text-editor.buckyos.bns.did-0.1.0.pikg
+      jarvis_agent: data/cache/jarvis.buckyos.bns.did-0.7.0.pikg
+      paios_images: bin/paios-images/
 
     # 数据路径，install_data 的时候如果目标存在，则不会复制，否则从rootfs复制到目标(覆盖安装逻辑)
     data_paths: 
     - bin/applist.json
     - etc/node_gateway_info.json
+    - etc/node_executor_acl.json
     - etc/user_gateway.yaml
     - etc/post_gateway.yaml
     - etc/node_gateway_params.json
     - etc/node_gateway.json
     - etc/cyfs_gateway.yaml
     - data/               # cyfs://$zone_id/ 映射根: home/, srv/, var/, cache/ 均在此下
+    - data/home/
+    - data/srv/library/
+    - data/srv/publish/
     - storage/            # 内核基础设施持久化存储 (chunks, named_store, dRDB)
     - local/              # host-node-local 服务数据
     - security/           # 身份私钥、keyref、signer descriptor 等敏感材料
@@ -128,15 +167,6 @@ apps:
     - security/           # 身份私钥、keyref、signer descriptor 等敏感材料
     - logs/
     - etc/                # 系统配置 (删除前自动执行身份备份)
-
-  buckycli:
-    name: buckycli
-    rootfs: rootfs/bin/buckycli/
-    default_target_rootfs: "~/buckycli/"
-    modules:
-      buckycli: buckycli
-    data_paths: []
-    clean_paths: []
 
 rust_env:
   OPENSSL_STATIC: '1'
@@ -164,12 +194,6 @@ publish:
         default_selected: true
         src: BuckyOS.app # PUBLISH_DIR/$appname/BuckyOS.app
         default_target: "/Applications/BuckyOS.app"
-      buckycli:
-        name: BuckyOS CLI
-        type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
-        optional: true
-        default_selected: true
-        default_target: "/usr/local/bin/"
       buckyos:
         name: BuckyOS Desktop Service
         type: app #基于本文件定义的app src rootfs is PUBLISH_DIR/$appname/
@@ -188,20 +212,14 @@ publish:
         optional: true
         default_selected: true
         src: buckyosapp.exe # PUBLISH_DIR/$appname/buckyosapp.exe
-        default_target: "C:\\BuckyOS\\BuckyOSApp" #window下运行用户选择安装位置
-      buckycli:
-        name: BuckyOS CLI
-        type: app
-        optional: true
-        default_selected: true
-        default_target: "%USERPROFILE%\\buckycli\\" #window下运行用户选择安装位置
+        default_target: "c:\\buckyos\\BuckyOSApp" #window下运行用户选择安装位置
       buckyos:
         name: BuckyOS Desktop Service
         type: app
         system_service: true
         optional: true
         default_selected: true
-        default_target: "C:\\BuckyOS\\" #window下运行用户选择安装位置
+        default_target: "c:\\buckyos" #window下运行用户选择安装位置
         deps:
           cyfs-gateway:
             type: buckyos_project

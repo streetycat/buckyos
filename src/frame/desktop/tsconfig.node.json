@@ -2,9 +2,10 @@
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "target": "ES2023",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
     "module": "ESNext",
-    "types": ["node"],
+    "types": ["node", "vite/client"],
+    "jsx": "react-jsx",
     "skipLibCheck": true,
 
     /* Bundler mode */
@@ -20,7 +21,11 @@
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedSideEffectImports": true
+    "noUncheckedSideEffectImports": true,
+
+    /* The shared draw.io importer and canvas geometry (src/frame/aiworkspace/import-drawio), the shared Block-controls
+       (src/frame/aiworkspace/controls: layout, outline conversion, catalogue) */
+    "paths": { "@drawio/*": ["../aiworkspace/import-drawio/*"], "@pdf/*": ["../aiworkspace/import-pdf/*"], "@controls/*": ["../aiworkspace/controls/*"] }
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts", "playwright.config.ts", "playwright.aiworkspace.config.ts", "tests/e2e/**/*.ts", "tests/aiworkspace/**/*.ts"]
 }

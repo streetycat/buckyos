@@ -1,0 +1,471 @@
+use super::super::{
+    validate_discovery, DiscoveryContext, ProviderDiscovery, ProviderDiscoverySnapshot,
+    ProviderError, ProviderHealthState, ProviderResult,
+};
+#[cfg(test)]
+use super::super::{DiscoveryMode, ProviderProfile};
+#[cfg(test)]
+use crate::catalog::{CurrentCatalogFile, ModelDriverCatalog, ProviderRulesCatalog};
+use crate::protocol::{CredentialKind, HttpRequest, HttpTransport};
+use async_trait::async_trait;
+#[cfg(test)]
+use reqwest::header::ETAG;
+use reqwest::{Method, Url};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub(crate) const OPENAI_PROVIDER_PROFILE_ID: &str = "openai";
+
+const MODELS_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+pub(crate) fn openai_profile() -> ProviderProfile {
+    super::builtin_profile(OPENAI_PROVIDER_PROFILE_ID, DiscoveryMode::MachineApi)
+}
+
+#[cfg(test)]
+pub(crate) fn openai_known_provider() -> crate::catalog::KnownProvider {
+    super::builtin_known_provider(OPENAI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn openai_provider_rules(_revision_seq: u64) -> ProviderRulesCatalog {
+    super::builtin_provider_rules(OPENAI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn openai_model_driver() -> ModelDriverCatalog {
+    super::builtin_model_driver(OPENAI_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn openai_catalog_files() -> Vec<CurrentCatalogFile> {
+    super::builtin_catalog_files(&[OPENAI_PROVIDER_PROFILE_ID])
+}
+
+use super::openai_responses_compatible::OpenAiCompatibleModelsTransport as OpenAiModelsTransport;
+
+#[derive(Clone)]
+pub(crate) struct OpenAiDiscovery {
+    transport: Arc<dyn OpenAiModelsTransport>,
+}
+
+impl OpenAiDiscovery {
+    pub(crate) fn new(transport: HttpTransport) -> Self {
+        Self {
+            transport: Arc::new(transport),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(transport: Arc<dyn OpenAiModelsTransport>) -> Self {
+        Self { transport }
+    }
+}
+
+#[async_trait]
+impl ProviderDiscovery for OpenAiDiscovery {
+    async fn discover(
+        &self,
+        context: &DiscoveryContext<'_>,
+    ) -> ProviderResult<ProviderDiscoverySnapshot> {
+        validate_openai_context(context)?;
+        let mut request =
+            HttpRequest::new(Method::GET, models_endpoint(&context.instance.base_url)?);
+        context
+            .credential
+            .apply(&mut request.headers)
+            .map_err(|error| ProviderError::Credential(error.to_string()))?;
+        request.timeout = Some(Duration::from_secs(30));
+        request.max_response_bytes = Some(MODELS_RESPONSE_LIMIT);
+
+        let (models, revision) = super::openai_responses_compatible::discover_model_ids(
+            self.transport.as_ref(),
+            request,
+            OPENAI_PROVIDER_PROFILE_ID,
+            true,
+        )
+        .await?;
+        let snapshot = ProviderDiscoverySnapshot {
+            revision,
+            discovered_at_ms: super::super::now_ms()?,
+            health: ProviderHealthState::Healthy,
+            models,
+        };
+        validate_discovery(&snapshot)?;
+        Ok(snapshot)
+    }
+}
+
+fn validate_openai_context(context: &DiscoveryContext<'_>) -> ProviderResult<()> {
+    if context.profile.provider_profile_id != OPENAI_PROVIDER_PROFILE_ID
+        || context.instance.provider_profile_id != OPENAI_PROVIDER_PROFILE_ID
+        || context.instance.protocol_adapter_id != context.profile.default_protocol_adapter_id
+    {
+        return Err(ProviderError::InvalidConfiguration(
+            "OpenAI discovery requires the OpenAI profile and Responses adapter".to_owned(),
+        ));
+    }
+    if context.credential.audit().kind != CredentialKind::Bearer {
+        return Err(ProviderError::Credential(
+            "OpenAI discovery requires a Bearer credential".to_owned(),
+        ));
+    }
+    Url::parse(&context.instance.base_url).map_err(|_| {
+        ProviderError::InvalidConfiguration("OpenAI base_url is invalid".to_owned())
+    })?;
+    Ok(())
+}
+
+fn models_endpoint(base_url: &str) -> ProviderResult<String> {
+    let mut url = Url::parse(base_url).map_err(|_| {
+        ProviderError::InvalidConfiguration("OpenAI base_url is invalid".to_owned())
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+        return Err(ProviderError::InvalidConfiguration(
+            "OpenAI base_url must be an absolute HTTP URL".to_owned(),
+        ));
+    }
+    let base_path = url.path().trim_end_matches('/');
+    let prefix = if base_path.is_empty() {
+        "/v1"
+    } else {
+        base_path
+    };
+    url.set_path(&format!("{prefix}/models"));
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{CatalogBuildOptions, CatalogSnapshot};
+    use crate::protocol::{
+        openai_responses_adapter, CodecRegistry, ProtocolError, OPENAI_AUDIO_SPEECH_OPERATION_ID,
+        OPENAI_AUDIO_TRANSCRIPTIONS_OPERATION_ID, OPENAI_EMBEDDINGS_OPERATION_ID,
+        OPENAI_RESPONSES_ADAPTER_ID, OPENAI_RESPONSES_OPERATION_ID, OPENAI_VIDEOS_OPERATION_ID,
+    };
+    use crate::protocol::{HttpBody, ResolvedCredential};
+    use crate::provider::{CredentialReference, InventoryBuilder, ProviderInstanceConfig};
+    use crate::settings::{MetadataFile, MetadataSource, MetadataSources};
+    use bytes::Bytes;
+    use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    use reqwest::StatusCode;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    struct FakeTransport {
+        response: Mutex<Option<Result<HttpResponse, ProtocolError>>>,
+        request: Mutex<Option<HttpRequest>>,
+    }
+
+    impl FakeTransport {
+        fn response(status: StatusCode, headers: HeaderMap, body: Value) -> Arc<Self> {
+            Arc::new(Self {
+                response: Mutex::new(Some(Ok(HttpResponse {
+                    status,
+                    headers,
+                    body: Bytes::from(serde_json::to_vec(&body).unwrap()),
+                    request_id: "request-1".to_owned(),
+                    retry_after: None,
+                }))),
+                request: Mutex::new(None),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OpenAiModelsTransport for FakeTransport {
+        async fn send(
+            &self,
+            request: HttpRequest,
+        ) -> crate::protocol::ProtocolResultValue<HttpResponse> {
+            *self.request.lock().unwrap() = Some(request);
+            self.response.lock().unwrap().take().unwrap()
+        }
+    }
+
+    fn instance() -> ProviderInstanceConfig {
+        let known = openai_known_provider();
+        ProviderInstanceConfig {
+            provider_instance_name: "openai-main".to_owned(),
+            provider_profile_id: OPENAI_PROVIDER_PROFILE_ID.to_owned(),
+            protocol_adapter_id: known.protocol_adapter_id,
+            base_url: known.base_url,
+            operation_base_urls: BTreeMap::new(),
+            credential: CredentialReference {
+                reference: "secret://openai/main".to_owned(),
+            },
+            credential_kind: None,
+            provider_rules_id: Some(OPENAI_PROVIDER_PROFILE_ID.to_owned()),
+            region: None,
+            workspace: None,
+            account: None,
+            request_timeout: Duration::from_secs(120),
+            auto_sync_models: true,
+            instance_rules: None,
+        }
+    }
+
+    fn context<'a>(
+        profile: &'a ProviderProfile,
+        instance: &'a ProviderInstanceConfig,
+        credential: &'a ResolvedCredential,
+    ) -> DiscoveryContext<'a> {
+        DiscoveryContext {
+            profile,
+            instance,
+            credential,
+        }
+    }
+
+    fn configured_catalog() -> Arc<CatalogSnapshot> {
+        let builtin = openai_catalog_files()
+            .into_iter()
+            .map(|file| {
+                MetadataFile::parse(MetadataSource::Builtin, file.kind, file.contents).unwrap()
+            })
+            .collect();
+        MetadataSources {
+            builtin,
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &CatalogBuildOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn builtin_identity_and_catalog_fixtures_are_stable() {
+        let profile = openai_profile();
+        let known = openai_known_provider();
+        let rules = openai_provider_rules(5);
+        let models = openai_model_driver();
+
+        assert_eq!(profile.provider_profile_id, "openai");
+        assert_eq!(profile.default_protocol_adapter_id, "openai-responses");
+        assert_eq!(profile.credential.kind, CredentialKind::Bearer);
+        assert_eq!(profile.discovery_mode, DiscoveryMode::MachineApi);
+        assert_eq!(known.base_url, "https://api.openai.com/v1");
+        assert_eq!(known.provider_rules_id.as_deref(), Some("openai"));
+        assert_eq!(
+            known.ui_hints["instance_fields"]["region"]["mode"],
+            "unsupported"
+        );
+        assert_eq!(rules.revision_seq, 5);
+        assert_eq!(
+            rules.patterns[0].operations["image.txt2img"],
+            OPENAI_RESPONSES_OPERATION_ID
+        );
+        assert_eq!(
+            rules.patterns[0].operations["image.img2img"],
+            OPENAI_RESPONSES_OPERATION_ID
+        );
+        assert!(rules.patterns[0]
+            .request_rules
+            .iter()
+            .any(|rule| rule.remove == ["/temperature", "/top_p"]));
+        let general = rules
+            .patterns
+            .iter()
+            .find(|rule| rule.operations.contains_key("video.generate"))
+            .unwrap();
+        assert_eq!(
+            general.operations["video.generate"],
+            OPENAI_VIDEOS_OPERATION_ID
+        );
+        assert_eq!(
+            general.operations["embedding.text"],
+            OPENAI_EMBEDDINGS_OPERATION_ID
+        );
+        assert_eq!(
+            general.operations["audio.tts"],
+            OPENAI_AUDIO_SPEECH_OPERATION_ID
+        );
+        assert_eq!(
+            general.operations["audio.asr"],
+            OPENAI_AUDIO_TRANSCRIPTIONS_OPERATION_ID
+        );
+        assert_eq!(models.model_driver_id, "openai");
+        let sol = models
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            sol.capabilities.as_ref().unwrap()["max_context_tokens"],
+            1_050_000
+        );
+        assert_eq!(sol.llm.as_ref().unwrap().spec, "gpt-pro");
+    }
+
+    #[test]
+    fn embedded_catalogs_build_through_the_builtin_metadata_source() {
+        let catalog = configured_catalog();
+
+        assert_eq!(
+            catalog.known_provider("openai").unwrap().display_name,
+            "OpenAI"
+        );
+        assert_eq!(catalog.provider_rules("openai").unwrap().revision_seq, 5);
+        assert_eq!(catalog.model_driver("openai").unwrap().revision_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn discovers_official_models_with_bearer_auth_and_etag() {
+        let mut headers = HeaderMap::new();
+        headers.insert(ETAG, HeaderValue::from_static("models-v1"));
+        let transport = FakeTransport::response(
+            StatusCode::OK,
+            headers,
+            json!({
+                "object": "list",
+                "data": [
+                    {"id": "gpt-5", "object": "model", "owned_by": "openai"},
+                    {"id": "text-embedding-3-small", "object": "model", "owned_by": "openai"}
+                ]
+            }),
+        );
+        let discovery = OpenAiDiscovery::with_transport(transport.clone());
+        let profile = openai_profile();
+        let instance = instance();
+        let credential = ResolvedCredential::bearer("secret://openai/main", "secret").unwrap();
+
+        let snapshot = discovery
+            .discover(&context(&profile, &instance, &credential))
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.revision.as_deref(), Some("models-v1"));
+        assert_eq!(snapshot.health, ProviderHealthState::Healthy);
+        assert_eq!(snapshot.models.len(), 2);
+        assert_eq!(snapshot.models[0].provider_model_id, "gpt-5");
+        let request = transport.request.lock().unwrap();
+        let request = request.as_ref().unwrap();
+        assert_eq!(request.method, Method::GET);
+        assert_eq!(request.url, "https://api.openai.com/v1/models");
+        assert!(matches!(request.body, HttpBody::Empty));
+        assert_eq!(request.max_response_bytes, Some(MODELS_RESPONSE_LIMIT));
+        assert_eq!(request.headers[AUTHORIZATION], "Bearer secret");
+        assert!(!format!("{request:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_profile_fields_and_official_errors() {
+        let transport = FakeTransport::response(
+            StatusCode::UNAUTHORIZED,
+            HeaderMap::new(),
+            json!({"error": {"message": "invalid API key"}}),
+        );
+        let discovery = OpenAiDiscovery::with_transport(transport);
+        let profile = openai_profile();
+        let instance = instance();
+        let credential = ResolvedCredential::bearer("secret://openai/main", "secret").unwrap();
+
+        let error = discovery
+            .discover(&context(&profile, &instance, &credential))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("401"));
+        assert!(error.to_string().contains("request request-1"));
+        assert!(error.to_string().contains("invalid API key"));
+    }
+
+    #[test]
+    fn configured_model_and_rules_build_inventory_without_a_dialect() {
+        let catalog = configured_catalog();
+        let (adapter, codecs) = openai_responses_adapter();
+        let mut registry = CodecRegistry::default();
+        registry.register_codecs(adapter, codecs).unwrap();
+        let inventory = InventoryBuilder::build(
+            &openai_profile(),
+            &instance(),
+            ProviderDiscoverySnapshot {
+                revision: Some("models-v1".to_owned()),
+                discovered_at_ms: 1,
+                health: ProviderHealthState::Healthy,
+                models: [
+                    "gpt-5.6",
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-5.6-luna",
+                    "gpt-6-luna",
+                    "gpt-6-sol",
+                    "gpt-6-astra",
+                    "gpt-6.1-sol",
+                    "gpt-6.1-terra",
+                ]
+                .into_iter()
+                .map(|model_id| DiscoveredModel {
+                    provider_model_id: model_id.to_owned(),
+                    api_types: None,
+                    supported_features: None,
+                    unsupported_features: std::collections::BTreeSet::new(),
+                    remote_methods: None,
+                    availability: ModelAvailability::Available,
+                    deprecated: false,
+                    pricing: None,
+                    video: None,
+                })
+                .collect(),
+            },
+            &catalog,
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(inventory.protocol_adapter_id, OPENAI_RESPONSES_ADAPTER_ID);
+        assert_eq!(inventory.models.len(), 9);
+        let model = inventory
+            .models
+            .iter()
+            .find(|model| model.provider_model_id == "gpt-6.1-sol")
+            .unwrap();
+        let operations = &model.operations;
+        assert_eq!(operations["llm"], OPENAI_RESPONSES_OPERATION_ID);
+        assert_eq!(operations["image.txt2img"], OPENAI_RESPONSES_OPERATION_ID);
+        assert_eq!(operations["image.img2img"], OPENAI_RESPONSES_OPERATION_ID);
+        assert_eq!(model.capabilities["tool_call"], true);
+        assert_eq!(model.capabilities["json_schema"], true);
+        assert_eq!(model.capabilities["max_context_tokens"], 1_050_000);
+        assert_eq!(catalog.model_driver("openai").unwrap().specs.len(), 6);
+        assert!(inventory.models.iter().all(|model| model
+            .logical_mounts
+            .iter()
+            .all(|mount| !mount.starts_with("llm"))));
+        let models = crate::model::llm_tests::gpt_registry(&[inventory.as_model_inventory()]);
+        for (spec, origin, effort) in [
+            ("gpt-nano", "gpt-6-luna", "none"),
+            ("gpt-mini", "gpt-6.1-terra", "low"),
+            ("gpt-standard", "gpt-6.1-sol", "medium"),
+            ("gpt-pro", "gpt-6.1-sol", "high"),
+            ("gpt-max", "gpt-6-astra", "high"),
+            ("gpt-codex", "gpt-6.1-sol", "xhigh"),
+        ] {
+            let candidates = models
+                .resolve_candidates(&format!("llm.{spec}"), buckyos_api::ApiType::Llm)
+                .unwrap()
+                .candidates;
+            assert_eq!(candidates.len(), 1, "{spec}");
+            assert_eq!(
+                candidates[0].model.identity.origin_model_id, origin,
+                "{spec}"
+            );
+            assert_eq!(
+                candidates[0].model.exact_model.to_string(),
+                format!("{origin}:reasoning-{effort}@openai-main"),
+                "{spec}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+use crate::protocol::HttpResponse;
+#[cfg(test)]
+use crate::provider::{DiscoveredModel, ModelAvailability};

@@ -6,7 +6,15 @@
 // public info). List those paths here so the login redirect is skipped for
 // them. The page itself is still responsible for working in a logged-out state.
 
-export const PUBLIC_ROUTE_PREFIXES = ['/login', '/userprofile'] as const
+export const PUBLIC_ROUTE_PREFIXES = ['/login', '/userprofile', '/sso'] as const
+
+/** Login-optional paths that are not prefixes: the prompter link of a show (`/workspace/<id>/show/<show>`),
+ * whose token is its only credential — but not `/workspace` itself, the signed-in user's list (a workspace's own
+ * page lives on `aiws-<id>.<zone>`, a page of its own); HomeStation portal pages (`/homestation/<user>`,
+ * `/homestation/<user>/<key>`, `/homestation/~zone`) — but not `/homestation` itself, the signed-in
+ * user's own app; the Message Hub guest page (`/messagehub/guest`), which sends a visitor without a
+ * session to the group's entry. */
+const PUBLIC_ROUTE_PATTERNS: readonly RegExp[] = [/^\/workspace\/[^/]+\/show\/[^/]+$/, /^\/homestation\/[^/]+(\/[^/]+)?$/, /^\/messagehub\/guest$/, /^\/users\/invite\/[^/]+$/]
 
 const normalizePath = (pathname: string) =>
   (pathname || '/').replace(/\/+$/, '') || '/'
@@ -19,5 +27,5 @@ export function isPublicRoute(pathname: string): boolean {
   const normalized = normalizePath(pathname)
   return PUBLIC_ROUTE_PREFIXES.some(
     (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`),
-  )
+  ) || PUBLIC_ROUTE_PATTERNS.some((pattern) => pattern.test(normalized))
 }

@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ PUBLISH_DIR = SRC_DIR / "publish"
 DESKTOP_APP_REPO_DIR = REPO_ROOT.parent / "BuckyOSApp"
 IGNORED_STAGE_NAMES = {".DS_Store", "__pycache__"}
 PROJECT_CONFIG_NAMES = ("bucky_project.yaml", "bucky_project.yml", "bucky_project.json")
+MACOS_RUNTIME_EXECUTABLE = Path("BuckyOS Runtime.app") / "Contents" / "MacOS" / "node_daemon"
 PLATFORM_PUBLISH_KEYS = (
     ("linux", "linux_pkg"),
     ("macos", "macos_pkg"),
@@ -124,7 +125,7 @@ def _parse_component_type(value: Any, *, field_name: str) -> str:
 def _expand_project_vars(raw: str, *, build_root: Path) -> str:
     out = os.path.expanduser(raw)
     replacements = {
-        "BUCKYOS_ROOT": os.environ.get("BUCKYOS_ROOT", "/opt/buckyos"),
+        "BUCKYOS_ROOT": os.environ.get("BUCKYOS_ROOT", r"c:\buckyos" if platform.system() == "Windows" else "/opt/buckyos"),
         "BUCKYOS_BUILD_ROOT": str(build_root),
         "APPDATA": os.environ.get("APPDATA") or "%APPDATA%",
         "LOCALAPPDATA": os.environ.get("LOCALAPPDATA") or "%LOCALAPPDATA%",
@@ -271,6 +272,10 @@ def _build_install_projects_from_config(
             raise RuntimeError(f"apps.{app_key}.clean_paths must be a list")
 
         staged_source_rootfs = (publish_root / str(app_key)).resolve()
+        # The product edition (`make_config --edition`) is part of the
+        # package: an upgrade replaces it like any module.
+        if (staged_source_rootfs / "etc" / "product.json").is_file():
+            modules = {**modules, "product_profile": "etc/product.json"}
 
         def build_item(item_key: str | None, raw_path: str) -> dict[str, Any]:
             item = _build_item_record(
@@ -688,9 +693,12 @@ def _infer_package_format_from_path(pkg_path: str) -> str | None:
 
 
 def _node_daemon_candidates(build_root: Path, target: TargetScript) -> list[Path]:
-    candidates = [build_root / "buckyos" / "bin" / "node-daemon" / "node_daemon"]
+    module_dir = build_root / "buckyos" / "bin" / "node-daemon"
+    if target.platform_key == "macos":
+        return [module_dir / MACOS_RUNTIME_EXECUTABLE]
+    candidates = [module_dir / "node_daemon"]
     if target.platform_key == "windows":
-        candidates.insert(0, build_root / "buckyos" / "bin" / "node-daemon" / "node_daemon.exe")
+        candidates.insert(0, module_dir / "node_daemon.exe")
     return candidates
 
 
@@ -1075,30 +1083,29 @@ def _prepare_common_build_root(
     skip_desktop_app_build: bool,
     rust_target: str | None = None,
     timings_dir: str | None = None,
+    edition: str = "full",
 ) -> None:
     buckyos_root = target.build_root / "buckyos"
-    buckycli_root = target.build_root / "buckycli"
-
     print(f"[prepare] platform={target.platform_key} arch={target.architecture} build_root={target.build_root}")
     if target.platform_key in ("macos", "windows"):
         print(f"[prepare] RUST_BUILD={_rust_build_root()}")
 
     _remove_tree(buckyos_root, dry_run=dry_run)
-    _remove_tree(buckycli_root, dry_run=dry_run)
 
     if not skip_cargo_update:
         _run_checked(["cargo", "update"], cwd=SRC_DIR, dry_run=dry_run)
     buckyos_build_cmd = _buckyos_build_command(
-        app_keys=["buckycli", "buckyos"],
+        app_keys=["buckyos"],
         rust_target=rust_target,
         timings_dir=_timings_subdir(timings_dir, target, "buckyos"),
     )
     _run_checked(buckyos_build_cmd, cwd=SRC_DIR, dry_run=dry_run)
-    _run_checked(
-        ["buckyos-install", "--all", f"--target-rootfs={buckycli_root}", "--app=buckycli"],
-        cwd=SRC_DIR,
-        dry_run=dry_run,
-    )
+    if target.platform_key == "macos":
+        _run_checked(
+            [_python_executable(), str(SRC_DIR / "tools" / "macos_runtime_bundle.py"), "assemble"],
+            cwd=SRC_DIR,
+            dry_run=dry_run,
+        )
     _run_checked(
         ["buckyos-install", "--all", f"--target-rootfs={buckyos_root}", "--app=buckyos"],
         cwd=SRC_DIR,
@@ -1115,11 +1122,26 @@ def _prepare_common_build_root(
         timings_dir=timings_dir,
     )
     _ensure_executable(buckyos_root / "bin" / "stop_osx.sh", dry_run=dry_run)
+    # The edition is part of the package: etc/product.json from src/product/.
     _run_checked(
-        ["deno", "task", "make_config", "release", "--rootfs", str(buckyos_root)],
+        ["deno", "task", "make_config", "release", "--rootfs", str(buckyos_root), "--edition", edition],
         cwd=SRC_DIR,
         dry_run=dry_run,
     )
+    if edition == "lite":
+        # BuckyOS Desktop Lite runs no container: the paios_images module keeps
+        # only its README, never an image manifest or tarballs.
+        images_dir = buckyos_root / "bin" / "paios-images"
+        for staged in sorted(images_dir.iterdir()) if images_dir.is_dir() else []:
+            if staged.name == "README.md":
+                continue
+            print("[clean]", staged)
+            if dry_run:
+                continue
+            if staged.is_dir():
+                shutil.rmtree(staged)
+            else:
+                staged.unlink()
 
     _stage_desktop_app(
         target,
@@ -1127,6 +1149,78 @@ def _prepare_common_build_root(
         dry_run=dry_run,
         skip_desktop_app_build=skip_desktop_app_build,
     )
+
+
+def _paios_images_module() -> Any:
+    import importlib.util
+
+    script = REPO_ROOT / ".github" / "scripts" / "paios_images.py"
+    spec = importlib.util.spec_from_file_location("paios_images", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {script}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stage_local_paios_images(target: TargetScript, *, dry_run: bool) -> None:
+    """Pin this machine's paios/aios and paios/exttool latest-<arch> images into the
+    staged root (bin/paios-images/), like a release package, for offline test installs."""
+    import gzip
+    import hashlib
+
+    paios_images = _paios_images_module()
+    arch = "aarch64" if target.architecture in ("arm64", "aarch64") else "amd64"
+    out_dir = target.build_root / "buckyos" / "bin" / "paios-images"
+    if dry_run:
+        print(f"[paios-images] would pin local paios/aios and paios/exttool latest-{arch} into {out_dir}")
+        return
+    images: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(prefix="buckyos-paios-images-") as temporary:
+        for name in ("aios", "exttool"):
+            source = f"paios/{name}:latest-{arch}"
+            inspected = subprocess.run(["docker", "image", "inspect", source], capture_output=True, text=True)
+            if inspected.returncode != 0:
+                raise RuntimeError(f"{source} is not in the local Docker store: {inspected.stderr.strip()}")
+            data = json.loads(inspected.stdout)[0]
+            image_id = data["Id"]
+            short_id = image_id.split(":", 1)[-1][:12]
+            reference = f"paios/{name}:local-{short_id}-{arch}"
+            _run_checked(["docker", "tag", image_id, reference])
+            tar_path = out_dir / f"{name}-{arch}-{short_id}.tar.gz"
+            print(f"[paios-images] docker save {reference} -> {tar_path}")
+            with tar_path.open("wb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as packed:
+                saving = subprocess.Popen(["docker", "save", reference], stdout=subprocess.PIPE)
+                assert saving.stdout is not None
+                shutil.copyfileobj(saving.stdout, packed, 4 * 1024 * 1024)
+                if saving.wait() != 0:
+                    raise RuntimeError(f"docker save {reference} failed")
+            inspect_file = Path(temporary) / f"{name}.json"
+            inspect_file.write_text(json.dumps(data), encoding="utf-8")
+            digests = [item.split("@", 1)[1] for item in data.get("RepoDigests") or [] if "@" in item]
+            entry = paios_images.platform_entry(
+                name, arch, reference, inspect_file, digests[0] if digests else None, tar_path, "https://local.invalid"
+            )
+            entry["tar"].pop("path")
+            entry["tar"].pop("url")
+            labels = (data.get("Config") or {}).get("Labels") or {}
+            images[name] = {
+                "repo": f"paios/{name}",
+                "version": labels.get("org.opencontainers.image.version", "local"),
+                "revision": labels.get("org.opencontainers.image.revision") or "local-" + short_id,
+                "created": labels.get("org.opencontainers.image.created", ""),
+                "platforms": {arch: entry},
+            }
+    revision = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    manifest = {
+        "schema": paios_images.SCHEMA,
+        "buckyos_revision": revision or "local",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "images": images,
+    }
+    paios_images.validate(manifest)
+    (out_dir / "paios_images.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(f"[paios-images] pinned local images: " + ", ".join(f"{name}={images[name]['platforms'][arch]['image_id']}" for name in images))
 
 
 def prepare_root(argv: list[str]) -> int:
@@ -1148,6 +1242,12 @@ def prepare_root(argv: list[str]) -> int:
         default=None,
         help="Collect devkit cargo timing reports under this directory",
     )
+    parser.add_argument(
+        "--edition",
+        choices=("full", "lite"),
+        default="full",
+        help="Product edition of the package (lite: BuckyOS Desktop Lite, no container runtime)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them")
     args = parser.parse_args(argv)
 
@@ -1162,6 +1262,7 @@ def prepare_root(argv: list[str]) -> int:
         skip_desktop_app_build=bool(args.skip_desktop_app_build),
         rust_target=args.rust_target,
         timings_dir=args.timings_dir,
+        edition=args.edition,
     )
     return 0
 
@@ -1189,8 +1290,23 @@ def build_pkg(argv: list[str]) -> int:
         default=None,
         help="Collect devkit cargo timing reports under this directory",
     )
+    parser.add_argument(
+        "--paios-images",
+        choices=("none", "local"),
+        default="none",
+        help="none: package without bin/paios-images/paios_images.json (installed node_daemon uses local "
+        "latest-<arch> images); local: pin and bundle this machine's paios/aios and paios/exttool latest-<arch>",
+    )
+    parser.add_argument(
+        "--edition",
+        choices=("full", "lite"),
+        default="full",
+        help="Product edition of the package (lite: BuckyOS Desktop Lite, no container runtime)",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args, forwarded = parser.parse_known_args(argv)
+    if args.edition == "lite" and args.paios_images != "none":
+        parser.error("--edition lite packages no paios images")
 
     build_root_override = args.build_root or args.app_publish_dir
     target = detect_target(args.arch, build_root_override, args.format)
@@ -1205,9 +1321,12 @@ def build_pkg(argv: list[str]) -> int:
             skip_desktop_app_build=bool(args.skip_desktop_app_build),
             rust_target=args.rust_target,
             timings_dir=args.timings_dir,
+            edition=args.edition,
         )
     else:
         print("[prepare] skipped by --skip-prepare")
+    if args.paios_images == "local":
+        _stage_local_paios_images(target, dry_run=bool(args.dry_run))
 
     if args.version:
         version = args.version

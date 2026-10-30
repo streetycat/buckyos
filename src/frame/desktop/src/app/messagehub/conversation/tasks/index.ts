@@ -1,0 +1,114 @@
+import { useEffect, useState, useSyncExternalStore } from 'react'
+import { createTaskWatchSource, type TaskWatchSource } from '../../../../api/task_mgr'
+import { MockTaskSource } from '../../mock/tasks'
+import { isMessageHubMock } from '../../store'
+import { TaskWatch, type TaskChildren, type TaskEvents, type TaskSnapshot } from './taskWatch'
+
+let instance: TaskWatch | null = null
+let source: TaskWatchSource | null = null
+
+/** TaskMgr reads and `/obj/taskmgr/<id>/changed` hints of MessageHub: one kevent stream for every follower (task areas, notification cards). */
+export function getTaskWatchSource(): TaskWatchSource {
+  return source ??= isMessageHubMock() ? new MockTaskSource() : createTaskWatchSource()
+}
+
+/**
+ * One task cache for every MessageHub view. Reads use the logged-in user's
+ * own TaskMgr permissions whatever mailbox is shown: observing an Agent's
+ * mailbox does not borrow the Agent's (or its owner's) identity.
+ */
+export function getTaskWatch(): TaskWatch {
+  if (instance) return instance
+  const tasks = getTaskWatchSource()
+  const watch = new TaskWatch(tasks)
+  instance = watch
+  if (typeof window !== 'undefined') {
+    window.addEventListener('online', () => watch.resync())
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') watch.resync() })
+    if (import.meta.env.DEV) Object.assign(window, { __messageHubTaskWatch: watch, ...(tasks instanceof MockTaskSource ? { __messageHubMockTasks: tasks } : {}) })
+  }
+  return watch
+}
+
+/** Watches a task while the caller is mounted: the task and its first page of direct children. */
+export function useTaskSummary(taskId: string | undefined): { snapshot?: TaskSnapshot; children?: TaskChildren } {
+  const watch = getTaskWatch()
+  useEffect(() => taskId ? watch.watch(taskId) : undefined, [watch, taskId])
+  const snapshot = useSyncExternalStore(watch.subscribe, () => taskId ? watch.snapshot(taskId) : undefined)
+  const children = useSyncExternalStore(watch.subscribe, () => taskId ? watch.children(taskId) : undefined)
+  return { snapshot, children }
+}
+
+/** Follows the tree under `rootId` while mounted; `events` also keeps its event list current. */
+export function useTaskTree(rootId: string, events = false) {
+  const watch = getTaskWatch()
+  useEffect(() => {
+    const release = watch.watchTree(rootId)
+    if (events) void watch.loadEvents(rootId)
+    return release
+  }, [watch, rootId, events])
+}
+
+export function useTaskChildren(taskId: string): TaskChildren | undefined {
+  const watch = getTaskWatch()
+  return useSyncExternalStore(watch.subscribe, () => watch.children(taskId))
+}
+
+export function useTaskEvents(rootId: string): TaskEvents | undefined {
+  const watch = getTaskWatch()
+  return useSyncExternalStore(watch.subscribe, () => watch.events(rootId))
+}
+
+const expandedAnchors = new Set<string>()
+
+/** Whether a bubble's task tree is open; kept per anchor so a row scrolled out and back stays open. */
+export function useTaskExpanded(anchorId: string): [boolean, (value: boolean) => void] {
+  const [expanded, setExpanded] = useState(() => expandedAnchors.has(anchorId))
+  return [expanded, value => {
+    if (value) expandedAnchors.add(anchorId); else expandedAnchors.delete(anchorId)
+    setExpanded(value)
+  }]
+}
+
+const QA_EXPANDED_KEY = 'buckyos.messagehub.qaExpanded.v1'
+/** Hand-set Q/A lists remembered per viewer; the oldest are forgotten first. */
+const QA_EXPANDED_LIMIT = 200
+let qaChoices: Record<string, Record<string, boolean>> | null = null
+
+function readQaChoices(): Record<string, Record<string, boolean>> {
+  if (qaChoices) return qaChoices
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(QA_EXPANDED_KEY) ?? '{}')
+    qaChoices = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, Record<string, boolean>> : {}
+  } catch {
+    qaChoices = {}
+  }
+  return qaChoices
+}
+
+function storeQaChoice(viewerDid: string, anchorId: string, expanded: boolean) {
+  const all = readQaChoices()
+  const own = { ...(typeof all[viewerDid] === 'object' ? all[viewerDid] : {}) }
+  delete own[anchorId]
+  own[anchorId] = expanded
+  const keys = Object.keys(own)
+  for (const key of keys.slice(0, Math.max(0, keys.length - QA_EXPANDED_LIMIT))) delete own[key]
+  qaChoices = { ...all, [viewerDid]: own }
+  try { localStorage.setItem(QA_EXPANDED_KEY, JSON.stringify(qaChoices)) } catch { /* kept for this page only */ }
+}
+
+/**
+ * Whether the Q/A list under an Agent bubble is open: `fallback` (open while
+ * the Turn waits, closed once its reply arrived) until the viewer opens or
+ * closes it by hand, which is remembered per viewer in this browser.
+ */
+export function useQaExpanded(viewerDid: string, anchorId: string, fallback: boolean): [boolean, (value: boolean) => void] {
+  const [choice, setChoice] = useState<boolean | undefined>(() => {
+    const stored = readQaChoices()[viewerDid]?.[anchorId]
+    return typeof stored === 'boolean' ? stored : undefined
+  })
+  return [choice ?? fallback, value => {
+    storeQaChoice(viewerDid, anchorId, value)
+    setChoice(value)
+  }]
+}

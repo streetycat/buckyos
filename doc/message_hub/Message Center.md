@@ -1,5 +1,8 @@
 # MessageCenter 设计文档
 
+- 2026-09-07：按当前源码校正 Session UI 接入边界；新增约束为目标契约，未在本次修改中实现。
+- 2026-10-17：原生投递的自动路由与约定接收路径（§2.2）、无 Bearer 的签名入站与 Zone 托管签名（§4.5）、`buckyos.friend` 好友消息（§2.1.4）已实现；真实跨 Zone 只在两个 msg-center 实例的测试中验证。
+
 > **MessageCenter is not an IM server. It is a DID-native, store-and-forward personal messaging system—email upgraded for Personal Servers and Agents.**
 
 本文档与 [Message Tunnel Design.md](<./Message Tunnel Design.md>) 共同构成消息域的两份主设计文档，共享同一定位、同一五层模型和同一术语表。任何与本文冲突的旧描述（包括代码注释和历史文档）以本文为准。
@@ -66,17 +69,71 @@ Email 没有做好而 BuckyOS 升级的部分：DID 原生身份与签名、群�
 
 ### 2.1 MsgObject：不可变消息本体
 
-定义见 `ndn_lib::MsgObject`。`MsgObject` 只保存**不可变语义**，一经创建永不修改（内容寻址，改一个字节就是另一条消息）：
+定义见 `ndn_lib::MsgObject`，协议定义见 cyfs-ndn《CYFS 标准对象》§16（MsgObject v2，2026-09-30 breaking change，ndn-lib 已实现）。`MsgObject` 只保存**不可变语义**，一经创建永不修改（内容寻址，改一个字节就是另一条消息）：
 
 - `from` / `to`：消息参与方 DID。入站消息 `from` 保持来源 endpoint DID 原样（见 §3.3）。
+- `to_session`（v2）：目标实体下的具名会话，即 MailboxAddress 的 session 部分；只能用于单目标消息。
 - `content`：`MsgContent`，含 `title/format/content/machine/refs`。大对象放对象存储，用 `refs` 引用。
-- `proof`：来源签名/证明。
-- `thread`：`topic / reply_to / correlation_id` 语义线索。
-- `kind` / `created_at_ms` / `expires_at_ms` / `nonce` / `meta`。
+- `relates_to`（v2）：对另一条消息的编辑、撤回、回应或话题归属；`mentions`（v2）：结构化提及。
+- 签名：v2 删除 `proof` 字段。需要签名时，与其它标准对象一样以 JWT 形式传输（claims 为 MsgObject，ObjId 由 claims 计算、与签名无关）；收到 JWT 形式的一方应保留原文。MessageCenter 的实现见 §4.5。
+- 入口校验：`dispatch` / `post_send` / CYFS 接收都先调用 `MsgObject::validate()`（`to_session` 取值与单目标、`mentions` 非空、`relates_to`、`meta` 保留键含 `proof`），不合法即拒绝。已存储的旧记录仍可读出。
+- `thread`：`topic / reply_to / correlation_id` 语义线索，不参与路由。
+- `kind` / `created_at_ms` / `expires_at_ms` / `nonce` / `meta`。`created_at_ms` 是发送方声明的时间，只用于展示，不作为排序或游标的权威依据。
 
-**永远不属于 MsgObject 的**：已读状态、投递状态、重试信息、外部平台 message id、归档/删除标记、会话归类。这些全部落在 record 层。投递失败、重试、回执只更新 `DeliveryRecord`，`MsgObject` 与投递结果彻底解耦。
+#### 2.1.1 `agent_task`：Agent 回复指向它的 TaskMgr task（2026-10-04）
 
-> 注：`thread.tunnel_id` 是历史遗留字段，冻结设计中删除（transport 信息属于 DeliveryEnvelope 层，不属于消息语义）。`thread.topic` 是消息携带的**语义 hint**，与本地 `session_id` 的关系见 §5.4。
+Agent 的回复可以在 MsgObject 顶层（`meta` 平铺，**不**再包一层 `meta`）携带：
+
+```json
+{ "agent_task": { "task_id": "<TaskMgr task id>" } }
+```
+
+- 含义：产生这条回复的 Agent Turn 在 TaskMgr 里的 task。一个 Turn 一个 task，运行、等待、终结期间 `task_id` 不变。
+- 只有 MessageHub UI 解释这个字段。msg-center、tunnel、group host 把它当普通扩展字段透传，不解析、不校验；`MsgObject::validate()` 不认识它也不拒绝它。
+- 两种发送形态：
+  1. 慢 Turn：Agent 先发一条携带 `agent_task` 的占位消息（如“收到，开始处理…”），Turn 结束时只发**一条** `relates_to = { rel: "edit", target: <占位消息 ObjId> }` 的最终消息，其完整 `content`（text、format、refs、machine）整体替换占位内容。
+  2. 快 Turn：不发占位，只发一条携带 `agent_task` 的普通回复。
+- UI 只信**原锚点消息**（非 `edit` 的那条）上的 `agent_task`，忽略 edit 携带的；因此不需要服务端“禁止借 edit 更换 task”的校验。
+- 字段缺失、格式不对、task 不存在或当前登录者无权读取时，UI 不展示任务区，正文照常显示。UI 不从正文解析任何 ID。
+- 读取 task 用真实登录者自己的 TaskMgr 权限（task 由 Agent 自建并 grant 给 Agent 的 owner）；消息可读不代表 task 可读，观察 Agent 邮箱不借用 owner 或 Agent 的身份。
+- 进度不走消息：运行中的状态、子任务树、事件都从 TaskMgr 读（`get_task`、`get_subtasks`、`list_task_events`，事件路径 `/obj/taskmgr/<id>/changed`、`/obj/taskmgr/<root_id>/tree`），不为每次状态变化发 edit，也不产生新的 mailbox 记录或通知。
+- 未读：占位与 edit 各有一条 INBOX 记录；UI 在气泡可见时把二者一并标为已读（edit 没有自己的行）。会话摘要里的 `unread_count` 仍由 msg-center 按记录计数，未打开的会话在二者都未读时会计为 2（见 MessageHub `UI_DATAMODEL.md` §3.5.4）。
+
+#### 2.1.2 `agent_ask`：Turn 中途的提问（2026-10-11）
+
+Agent 在一个 Turn 内向用户提问（OpenDAN `agent-session ask-user`）时，问题是对占位的 `thread` 回复，顶层扩展字段：
+
+```json
+{ "agent_ask": { "anchor": "<占位 ObjId；不可编辑的会话为空>", "call_id": "<调用 id>", "turn": 3,
+                 "input": { "kind": "text | choice", "options": [{ "id": "a", "label": "…" }], "allow_text": false } } }
+```
+
+用户的回答同样是对占位（没有占位时对问题本身）的 `thread` 回复；从选项中选的回答另带 `content.machine = {intent: "agent_ask.answer", data: {call_id, option}}`。msg-center 与 tunnel 不解释这两个字段，原样存储与投递（读到的是正文；选项问题的正文附带选项列表）。只有 MessageHub（回答态、问答折叠，见 `UI_DATAMODEL.md` §3.5.5）和发出问题的 Agent 关心它们；Agent 把等待期间收到的下一条消息都当作答案，关系与 machine 只是线索。未读计数仍按记录：P、Q、A 与 edit 各一条（已知问题）。
+
+#### 2.1.3 `buckyos.notify`：系统通知（2026-10-11）
+
+App 给 Zone 用户发的通知（System Notify，对 App 的接口见 [System Notify.md](System%20Notify.md)）是 `kind = notify` 的 MsgObject，`content.machine = {intent: "buckyos.notify", data: NotifyMessageData}`（`version, notify_id, kind: notice|input, category: todo|agent|app, level, home, source, prompt, task_id?, url, expires_at_ms?`），正文是给不认识 intent 的客户端看的纯文本，最后一行是处理链接 `https://<zone host>/messagehub?notify=<id>`。
+
+- **主记录**：msg-center 以“系统通知发送者”（Zone DID）直接写进目标用户的 INBOX，不走联系人分级（否则会进 RequestBox），会话为用户自己的 `sysnotify:todo|agent|app`（首次用到时用 `msg.create_session` 那套登记，`origin = sysnotify`，peer 为系统通知发送者，标题“待办 / Agent / 应用通知”；不是对话，MessageHub 不给输入框）。幂等键 `notify:<id>:home`，`data.home = true`。
+- **另投**（只对 Agent 来源）：Agent 以自己的 DID `post_send` 到用户与它的已有私聊会话（原生或 Telegram，不进群），`data.home = false`；候选会话取自该 Agent 的 INBOX：用户在其中说过话的会话，回复坐标按用户最近一条消息（`to = 发送者 / ingress principal 对应的 endpoint`，`to_session` 同那条消息）。等级：`quiet` 不另投；`normal` 投 `source.conversation` 对应的会话；`timely` 再加最近活跃的会话；`urgent` 投全部。主记录 `quiet` 写入即已读、`urgent` 未读、`normal / timely` 有另投时已读否则未读：未读只落在用户最可能看的那一处。幂等键 `notify:<id>:<agent inbox session>`。
+- **观察记录**：每份另投成功后，msg-center 在 Agent 自己的 INBOX `<agent>/<会话>` 写一条 `kind = event`、`from = to = agent`、`intent = buckyos.notify.delivered` 的记录（`NotifyDeliveredData`：通知要点、`reply_route`、`delivered_msg_id`），同样不走联系人分级。OpenDAN Loader 把它转成该会话 UI Session 的 `_notify` 半订阅事件。
+- **状态的真相**：`notice` 看记录（主记录写入时未读、或原生副本，任一已读即 `read`；`notify.ack` 全部标已读；`notify.dismiss` 全部归档；过期 / 撤销也归档）；`input` 另挂 TaskMgr HumanSet 任务（`human.input/v1`，assignee 为目标用户，msg-center 为创建者并授权：用户 `ReadResult`，请求方 principal `ReadMeta/ReadInput/ReadResult/Control`），回答直接向 TaskMgr `commit_result`（`expected_revision`，先到先得），msg-center 只读任务。
+- `kind = notify` 计入会话活跃（§5.8 的 activity 口径、解除归档）。
+- 表 `notifies`（`notify_id, owner_did, requester, idempotency_key, state: delivering|delivered|closed, created_at_ms, row_json`）记录 msg-center 的决定与进度；`send` 每一步幂等、可从断点续做，30 s 一次的清扫补完中断的发送、处理过期（`notice` 归档，`input` 以 `expired` 撤销任务）、关闭任务已结束的行。
+
+#### 2.1.4 `buckyos.friend`：好友请求（2026-10-17）
+
+好友请求与回复是 `kind = Operation` 的 MsgObject，`content.machine = {intent: "buckyos.friend", data: {action: request|accept|reject|cancel|remove, request_id, message?, profile_hint?, expires_at_ms?}}`，只由 msg-center 代 owner 构造（`contact.send_friend_request` 等，见 [Contact Mgr.md](<./Contact Mgr.md>) §3.4 与 [My Network相关协议设计.md](<./My Network相关协议设计.md>) §5–§6），走普通原生投递。
+
+- dispatch 对每个收件人先做屏蔽检查，再识别这个 intent，最后才是 ContactMgr 准入：`accept` / `reject` / `cancel` / `remove` 只改联系人状态，不写邮箱；新的 `request` 建请求记录后按普通准入写一条记录（陌生人进 REQUEST_BOX）；屏蔽、过期、冷却中的请求丢弃（该收件人计入 dropped）。
+- 发送方的 `request` 留一条 SENT 记录；控制消息双方都不留记录。
+- `msg.post_send` 拒绝 `machine.intent = buckyos.friend` 的消息，返回 `friend-messages-use-contact-rpc`：好友状态由 msg-center 为 owner 维护，客户端不能自己发这类消息。入站时 data 不能解析为好友消息的这类消息直接丢弃，不当普通消息投递。
+
+**永远不属于 MsgObject 的**：已读状态、投递状态、重试信息、外部平台 message id、归档/删除标记、会话归类、接收方分配的序号。
+本地阅读状态属于 `MailboxRecord`；投递与重试属于 `DeliveryRecord`；投递回执由 `ReceiptObj`（`cyrece`）单独表达。
+会话级生命周期需另有 owner 范围元数据（§5.8）。这些变化均不修改原始 MsgObject。
+
+> 注：`thread.tunnel_id` 是历史遗留字段，冻结设计中删除（transport 信息属于 DeliveryEnvelope 层，不属于消息语义）。`thread.topic` 是消息携带的**语义 hint**，与本地 `session_id` 的关系见 §5.4；发往具名会话使用 `to_session`。
 
 ### 2.2 DeliveryEnvelope：一次确定投递的信封
 
@@ -95,7 +152,7 @@ pub struct DeliveryEnvelope {
 
 两条确定投递分支（也只有这两条）：
 
-- `target_did` 是 **shareable DID**（如 `did:bns:bob`、`did:bns:telegram.bob`）→ **MessageHub 原生投递**：解析 DID → 找到目标 Zone → POST MsgObject。Zone 解析发生在每次投递尝试时（如同 email 发送时才查 MX），但走的是确定性解析协议，不是策略选路。
+- `target_did` 是 **shareable DID**（如 `did:bns:bob`、`did:bns:telegram.bob`）→ **MessageHub 原生投递**（`message_hub.rs`）：本 Zone 目标直接本地 dispatch。他 Zone 目标先用显式配置：群消息用 `cyfs_dispatch.joined_groups`（没有绑定返回 `native-route-not-configured`），个人目标用 `cyfs_dispatch.outgoing[<did>]`（必须带 Bearer `authorization`）。个人目标没有配置时自动路由（`cyfs_dispatch.rs::auto_route`）：经名字服务（`network_directory.rs`）解析目标 DID 的 Zone（用户取 `binded_zone_list` 第一项，列表为空或缺省时取用户 DID 本身（自托管 Zone 的 owner DID 即 Zone DID）），投到约定接收点 `https://<zone>/kapi/msg-center/<did>/inbox`，upstream 为 `https://<zone>`（`cyfs_dispatch.zone_origins` 可按 Zone 覆盖），不带 Bearer，发送签名的 MsgObject（§4.5）。DID 没有 Zone 或名字服务确认不存在 → `native-route-unresolved`（不重试）；名字服务暂时无回答 → `native-route-unavailable`（可重试，60 秒后）；配置的路由与投递快照不一致 → `native-route-changed`。路由在执行投递时解析，名字服务答案缓存 10 分钟。接收与缓存结果见 §4.5。
 - `target_did` 是 **local shadow endpoint DID**（`did:msgtunnel:*`）→ **MessageTunnel 投递**：从 DID 内嵌的 `tunnel_instance_id` 在注册表查出 tunnel 实例，平台地址由 DID 内嵌的 account 信息与 tunnel 配置确定。
 
 任何解析失败（未注册的 tunnel 实例、无法解析的 DID、非法格式）都返回错误。**禁止 default tunnel、default chat、last-active fallback。**
@@ -107,11 +164,12 @@ pub struct DeliveryEnvelope {
 pub struct MailboxRecord {
     pub record_id: String,       // 可推导：hash(owner + box_kind + msg_id + variant)，天然幂等
     pub owner: DID,              // user / agent / group DID
+    pub mailbox: MailboxAddress, // $did/session_id；裸 $did 是默认 inbox
     pub box_kind: MailboxKind,   // INBOX / SENT / GROUP_INBOX / REQUEST_BOX
     pub msg_id: ObjId,           // 指向不可变 MsgObject（只存引用，不复制内容）
     pub state: RecipientState,   // 见 §2.5
-    pub session_id: String,      // 本地会话投影 key（见 §5.4）
-    pub sort_key: u64,           // 排序，通常 = msg.created_at_ms
+    pub session_id: Option<String>, // inbox 分区及本地会话投影 key；None 是默认 inbox
+    pub sort_key: u64,           // 排序；普通记录通常 = msg.created_at_ms，群记录见下
     pub tags: Vec<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -125,6 +183,8 @@ pub enum MailboxKind {
 }
 ```
 
+群记录的排序（目标设计，见 [Self-Host-Groupv2 §5.1](<./Self-Host-Groupv2.md>)）：GROUP_INBOX 记录以及由群消息生成的成员投影记录，`sort_key` 取 host 接受消息的时间（单调不减），并另外记录 host 分配的 `group_seq` / `session_seq`；不使用发送方的 `created_at_ms`。跨 Zone 同步按序号分页，晚到的消息不会落在已同步的游标之前。
+
 同一条 `MsgObject` 可以被多个 `MailboxRecord`（和多个 `DeliveryRecord`）引用，但消息内容全系统只存一份。
 
 命名冻结（旧名 → 新名）：
@@ -136,6 +196,32 @@ pub enum MailboxKind {
 | `TunnelOutboxRecord`（`TUNNEL_OUTBOX` 里的 `MsgRecord`） | `DeliveryRecord` | 投递队列条目 |
 | `RouteInfo` | `DeliveryEnvelope` / `DeliverySnapshot` | 确定投递的结果快照 |
 | `MsgRecord`（mailbox 语义部分） | `MailboxRecord` | owner 的本地消息引用 |
+
+### 2.3.1 Session inbox 地址（breaking change）
+
+`MailboxAddress` 的 wire 格式为 `$did/session_id`；省略 `/session_id` 时只表示默认 inbox（`session_id IS NULL`），不表示该 DID 的所有会话。记录的 `mailbox` 是由 `owner` 和现有 `session_id` 计算出的地址，不维护另一套会话分区。完整队列键为 `(mailbox, box_kind)`。
+
+`msg.get_next`、`msg.peek_box`、`msg.list_box_by_time` 的请求把 `owner` 替换为必填 `mailbox`。例如：
+
+```json
+{"mailbox":"did:bns:alice/approval-123","box_kind":"INBOX","lock_on_take":true,"with_object":true}
+```
+
+查询在 SQL 中精确限定 `owner + session_id + box_kind`。`get_next` 默认取 `UNREAD`，领取使用原子条件更新；`lock_on_take=false` 只要求 `read`，领取和状态修改要求 `write`。裸 DID 与任意具名会话互不读取。
+
+投递按 §5.4 的 session 推导：`to_session` 优先；群消息没有 `to_session` 时为群 DID；私聊再依次取 correlation / meta 中的 session hint，最后为 `dm:<peer DID>`。`thread.topic` 不参与推导。因此旧的“按 DID 扫描全部消息”调用必须改写；省略 `to_session` 的私聊不保证投到默认 inbox。向特定 UI session 发送消息时，把其 session ID 放入 `to_session`（Desktop、OpenDAN 回复、Telegram tunnel 入站均已改用）。群消息以 `to_session` 为准，host 不用 topic 推导 Session；带 `thread.topic` 却没有 `to_session` 的群消息被拒绝（`missing-to-session`，Self-Host-Groupv2 §2.5 过渡规则）。
+
+`msg.list_mailboxes(owner, box_kind)` 返回存在 `UNREAD` 记录的精确地址（包括默认 inbox），需要 owner 集合的读取权限，供 OpenDAN 等总收件路由器扫描。归档、删除 UI 投影不阻止待消费队列被发现。只获授权某个 session 的消费者直接调用 `get_next(mailbox, ...)`。
+
+`msg.update_record_session(record_id, session_id)` 同时移动记录所属的 inbox。`msg.move_record(record_id, mailbox)` 支持移入默认 inbox；只允许同一 owner 内移动。两者都检查源和目标 inbox 的写权限，采用条件更新防止授权后记录被并发搬走，且不会改变消息对象或 record ID。dispatch 重放保留已经移动的 session（包括 NULL）及阅读状态。
+
+权限资源为 `obj://msg-center/<kind>/<resource-encoded mailbox>`，`kind` 为 `inbox`、`sent`、`group_inbox` 或 `request_box`。例如给应用授予 `obj://msg-center/inbox/did:bns:alice/approval-123` 的 `read|write`，不会授权相邻会话或裸 DID。资源地址对点号、百分号和其它模式字符再次编码，避免 RBAC 的 `keyMatch3` 将它们解释为正则。用 Rust `MailboxAddress::resource` 或 WebSDK `mailboxResource` 生成策略键，例如 `did:web:agent.zone/approval.1` 对应 `obj://msg-center/inbox/did:web:agent%2Ezone/approval%2E1`。owner 集合资源也使用相同规则。资源检查通过 runtime 的 RBAC 执行，仍叠加 viewer/owner 身份约束；普通 App 没有默认全 inbox 权限。按 record ID 读取、改状态、改 session，以及按 msg ID 取正文，都检查实际持久记录所属的 inbox。用户驱动 Zone Agent 的具名 inbox 时，还需对该精确资源显式授予 `delegate`；普通观察权限仍然只读。`post_send` 的幂等作用域也按发送方 mailbox 划分，同一 key 在不同 session 内互不复用。
+
+`list_sessions`、`list_session` 和 owner UI 状态等聚合接口需要 `obj://msg-center/owners/<did>` 的权限；单 inbox 授权不能借它们读取其它会话。dispatch、delivery queue、全局 UI 状态和对象下载各有独立资源权限，不能仅凭 inbox 授权访问。网络 RPC 缺少 token 会被拒绝；无 token 的进程内调用仍视为服务内部调用。
+
+变更通知为对象事件：会话的 `/obj/msg-center/owners/<owner_did>/sessions/<session_id>/<box>` 与 owner 会话集合的 `/obj/msg-center/owners/<owner_did>/sessions/<box>` 各发一次（两个对象的 Profile 都声明了该事件；doc/key url.md §7：段名不合法时 `x`+hex，box 为 `inbox` / `sent` / `group_inbox` / `request_box`；session 过长时只发集合那一条），payload 相同、带精确 `mailbox`。订阅 `…/owners/<owner>/**` 的会收到两条，按唤醒处理即可。移动向源和目标各发送通知。投递结果（`report_delivery` 写入 SENT / 重试 / DEAD）不改 SENT 记录本身，但会对该消息的 SENT 记录再发一次通知（`operation: "delivery"`），让发送方界面及时刷新送达状态。订阅者需获得相应 kevent 路径权限，并以精确 inbox 轮询补偿丢失的通知。
+
+地址必须规范：DID 为裸 DID（保留 DID 自身的合法编码）；原始 session ID 为 1–200 个字符，禁止首尾空白、控制字符、`.` 和 `..`。session 中的斜杠、内部空格、Unicode、百分号等按 UTF-8 编码成单一路径段（大写百分号编码；字母、数字、`-._~:@` 保留）。解析后必须重新编码得到相同地址，禁止空尾斜杠、裸通配符或大小写不同的编码别名。SDK 的 `MailboxAddress::new` / `mailboxAddress` 负责编码；数据库仍保存原始 session ID。
 
 ### 2.4 DeliveryRecord：投递队列、重试和结果
 
@@ -174,11 +260,20 @@ DeliveryState（属 DeliveryRecord，executor 驱动）:
                ↘ FAILED → WAIT   （可重试，带退避）
                         ↘ DEAD   （不可重试或超次数，可诊断、可人工重投）
 
-SessionState（易失，不落 mailbox/delivery）:
-  typing / active / status_line 等 UI 会话状态，独立通道，随时可丢
+SessionRuntimeState（本文旧称 SessionState；易失，不落 mailbox/delivery）:
+  typing 等 UI 会话状态，独立通道，随时可丢
 ```
 
+这里的三类是既有消息处理状态机。新增的 Session 整体状态（`SessionSharedState`）和成员状态
+（`SessionMemberState`）是持久业务数据，不属于上述易失通道，也不替代 RecipientState / DeliveryState。
+字段、权限和 Action Log 契约见 §5.7。
+
 三个状态机互不迁移、互不共享取值。"收件人已读"不影响 DeliveryState；"投递失败"不产生 RecipientState；typing 永远不产生记录。
+
+`msg.update_record_state(record_id, READ)` 更新本地邮箱阅读状态，list_sessions 按记录的 UNREAD 计数。
+`msg.set_read_state(group_id, msg_id, reader_did, ...)` 写的是回执，不更新 mailbox；当前回执只保存在
+`MessageCenterState.receipts` 内存中，接口必填 group_id，尚无完整私聊回执、持久恢复及发布契约。
+UI 不能用它代替清除自己的未读，不能将投递 accepted / delivered 或 Agent 处理中当成 reader 已读。
 
 ---
 
@@ -230,6 +325,10 @@ def dispatch(msg_obj, ingress_meta, idempotency_key):
 | 低信任来源（ContactMgr 判为 Stranger 等） | 本地收件人 | `REQUEST_BOX` |
 
 群消息只写一条 `GROUP_INBOX` 权威记录；订阅该群的本地 reader（agent/user）的"未读视图"是 per-reader 的投影记录或 read receipt（见 Self-Host-Group 文档），**不是把 MsgObject 复制多份群消息**。
+
+当前实现为成员创建 INBOX 记录并附 `group:<did>` tag。`MailboxRecord.to` 在所有入站箱均为 owner，
+SENT 中仅取原始 msg.to 的第一项。UI 必须从原始 `MsgObject.to` 或权威会话登记识别群与多目标集合，
+不能用成员 INBOX 副本的 record.to 识别群，也不能因最后一条消息方向变化重新绑定会话。
 
 ### 3.3 入站身份：`from` 保持来源 endpoint DID
 
@@ -296,11 +395,16 @@ def post_send(msg_obj, idempotency_key=None):
 
 ### 4.3 多收件人语义
 
-**每个 `to` 生成独立的 `DeliveryRecord`，拥有独立的状态与结果。** 一个目标投递失败不污染其他目标：给 3 个人发消息，2 个 `SENT`、1 个 `FAILED` 是正常终态，UI 按目标分别展示。不存在"整条消息发送失败"这个聚合状态——只有创建期（阶段一）的整体失败和投递期的按目标结果。
+**每个 `to` 生成独立的 `DeliveryRecord`，拥有独立的状态与结果。** 一个目标投递失败不污染其他目标：
+给 3 个目标发消息，2 个 SENT、1 个 FAILED/DEAD 可同时存在。Session API 提供整体进度摘要，
+但 UI 必须保留逐目标结果，不能将 partial_failed 解释为所有目标失败或整条重发。
+创建期整体拒绝通过 `PostSendResult.ok=false/reason` 返回，RPC 成功不等于提交成功。
+`ok=true` 只确认发送历史和投递队列创建；后续是否送达以 delivery 为准。
+提交结果未知时重用原始对象与幂等键；人工重投需独立的目标范围、授权与去重契约，当前没有对应的 UI RPC。
 
 ### 4.4 投递执行与回报
 
-executor（MessageHub / tunnel）通过 `get_next(transport_did, DELIVERY_QUEUE, WAIT, lock_on_take=true)` 以 CAS 抢占方式取任务（`WAIT → SENDING`），执行后调用：
+executor（MessageHub / tunnel）通过 `get_next_delivery(transport_did, lock_on_take=true)` 以 CAS 抢占方式取任务（`WAIT → SENDING`），执行后调用：
 
 ```python
 def report_delivery(delivery_id, result):
@@ -320,17 +424,70 @@ def report_delivery(delivery_id, result):
 
 处于 `SENDING` 超过租约时间的记录由定时 sweep 收回（→ `WAIT`，`attempts+1`，记录 duplicate risk），覆盖 executor 崩溃场景。
 
+#### 私聊 edit 的接收侧校验
+
+群消息的关系校验在 group host。非群消息的 `relates_to.rel = edit` 在**接收侧** `dispatch` 写 inbox 前按收件人校验：
+收件人确实收到过原消息、原消息与 edit 的 `to_session` 相同（否则 `not-found`）；作者与原消息作者一致、`kind` 相同、
+原消息自身不是关系消息（否则 `edit-not-allowed`）；原作者此后没有在该会话里撤回（redact）它（否则 `not-found`）。
+不合法的 edit 对该收件人丢弃；没有任何收件人接受时 `dispatch` 返回错误。发送侧 `post_send` 不做此校验。
+
+### 4.5 跨 Zone 原生投递与 Gateway 尽力缓存（2026-10-17 实现边界）
+
+原生投递遵循 [CYFS dispatch 协议](<../../../cyfs-ndn/doc/CYFS Protocol/CYFS Protocol.md>)。Gateway 先执行 process-chain 安全过滤，再直接尝试 upstream；只有 upstream 失效才调用配置的 NamedInboxCacheServer。公网 VPS 上的 Gateway 可以因此在家庭 OOD 离线时暂存对象，并按配置后台转投。组件与实现入口见 [NamedInboxCacheServer 设计](../../../cyfs-gateway/doc/NamedInboxCacheServer设计.md)。
+
+| 原生 dispatch 结果 | 发送方含义与处理 |
+| --- | --- |
+| 无响应 | 对方是否已处理未知；保存原对象，退避后按同一目标与 ObjectId 重试 |
+| 明确拒绝 rejected | 按 reason/retryable 决定重试或失败；缓存满是可重试的暂时拒绝，不等同永久业务拒收 |
+| 已经缓存 cached | 仅表示响应时写入接收侧缓存成功，之后仍可能丢失；本地 DeliveryRecord 继续未完成，发送方保存对象并负责重试 |
+| 已经接收 accepted | 本次目标 upstream 已持久接收，或确认此前已经接收；只有此时原生投递才成功 |
+
+`cached` 不移交可靠投递责任。缓存不是 MsgBox，不进入 Session 历史；它只存小对象与必要转投上下文，不 Pull 附件，不依赖 BuckyOS 运行。upstream 正常时不以前置缓存读写为条件，缓存故障不得影响正常转发。缓存满则本次缓存写入失败，不谎报 cached。
+
+Gateway 排空按“取出但暂不删 → 投 upstream → accepted 后删除”执行；临时失败或无响应时尽力保留，永久拒绝可以清理。故障、过期清理或重建导致缓存丢失是允许的。发送方重试和 Gateway 排空可能重复或并发发生，接收适配必须按 `(target_zone, semantic_path, obj_id)` 幂等处理，并且只确认路径指定的本地接收点，不能因 MsgObject 带多个 to 就确认其他目标。
+
+**接收点**（`cyfs_dispatch.rs::serve`）：接受目标 `https://<本 Zone>/<path>`，`cyfs_dispatch.target_zone` 未配置时取运行时 Zone host。`path` 是 `accepted_paths` 中显式配置的路径（其收件人须是本地收件人 `is_local_recipient`），或约定路径 `/kapi/msg-center/<did>/inbox`。约定路径只服务 msg-center 显式登记的收件人（`is_registered_recipient`：Zone 同步登记的本 Zone 用户与 Agent、本 Zone 托管的群），不是 Zone host 下的任意 DID；未登记的 DID 返回 404 `no-handler`。两者都只确认路径指定的那个收件人。msg-center 的 HTTP 入口里，不属于 kRPC（POST）、群 HTTP 与对象访问的请求进入 CYFS 接收（PUT 投递、GET 状态查询）。
+
+**入站认证**：
+
+- 带 Bearer：必须是本 Zone 信任的 session token，`sub`（经 `principal_dids` 映射）为 principal。GET 状态查询只接受这种方式。
+- 不带 Bearer：只接受 `application/cyfs-named-object+jwt`，签名验出的 `from` 即 principal（未签名返回 401 `unauthenticated`）。每个发送方每分钟最多 30 条（进程内计数），超出返回 429 `rate-limited`（可重试）。配额在验签之前扣除，按 JWT 声称的 `from` 计，超额的发送方不会触发签名密钥的名字解析；已知风险：伪造者可以冒用某个 `from` 耗尽它在本 Zone 的配额。
+- 两种方式都要求 `from == principal` 且 `to` 含路径指定的收件人（否则 `sender-or-target-mismatch`），之后照常走 ContactMgr 准入：陌生人进 REQUEST_BOX，屏蔽丢弃并返回 403 `acl-denied`（不可重试）。所有签名消息都放行进准入，跨 Zone 私聊因此可用；垃圾消息是已知风险，目前只靠屏蔽、好友请求冷却与每分钟配额。
+
+CYFS 接收同时接受 `application/cyfs-named-object+json` 与 `application/cyfs-named-object+jwt`。JWT 形式的 MsgObject（`cyfs_dispatch.rs::verify_signed_message_with`）：
+
+- 签名者（`kid` 的 DID 部分）等于 `from`：公钥用 name-client `resolve_auth_key(from, #fragment)` 解析（`did:dev` 直接取 DID 内嵌公钥）。
+- 签名者不是 `from`：先按 **Zone 托管**规则——签名者所在 Zone（`network_directory.rs`）等于 `from` 的 canonical Zone 即接受；本 Zone 也可为本地账号或收件人代签，本地映射账号不会遮蔽其 canonical Zone。托管签名公钥显式从 Device 文档取，避免未指定类型时误解析为 Zone 文档；否则要求 `from` 的 DID Document `authentication` 列出该签名者或 `kid`（`from` 为 `did:dev` 时不适用）。都不满足返回 `signer-mismatch`。签名设备或作者的 Zone 暂时查不到（名字服务超时、不可用）时托管规则无法判定，不当作不满足：此时第二条规则也不成立就返回可重试的 `signing-key-unavailable`，只有两条规则都得到确定回答才返回 `signer-mismatch`（buckyos#684）。已知风险：Zone 可以替它的用户签名。用户自有密钥（`security/<user>/key`）未使用。
+- 签名无效返回 `invalid-signature`，未知密钥返回 `unknown-signing-key`，均为不可重试拒绝；解析服务不可用返回可重试的 `signing-key-unavailable`。签名无效时不降级为 JSON 形式接受。
+- 验证通过后，canonical JSON 照常写入 named store，JWT 原文写入 `msg_jwt_originals`（schema v11，按 msg_id，先到者保留）。原生 dispatch 转投该消息时发送 JWT 原文；读取 JWT 原文的 RPC 尚未提供。
+
+**发送签名**：`from` 是本地收件人（本 Zone 用户或 Agent）的消息原生投递到他 Zone 时，若还没有 JWT 原文，msg-center 用 OOD 设备私钥签名（`kid = <device_did>#main_key`），JWT 写入 `msg_jwt_originals` 后发送。启动时读不到设备私钥则不签名，此时只有带 Bearer 的显式配置路由可用。
+
+**验证边界**：`test_contact_network.rs::friend_request_and_chat_cross_two_zones` 用两个 msg-center HTTP 实例验证好友请求与接受往返、发送者在接收 Zone 有本地映射时普通私聊仍进 INBOX、重放不重复、未签名对象与他 Zone 设备代签被拒（目录用测试桩）。2026-10-22 在 `ssotest` 三 Zone VM 实测：Bob 查询自托管 Alice 和绑定 Charlie 均得到正确 Zone，Bob 经 SN 向 Alice 原生投递成功进入 INBOX；Alice 保留 DID Bob 的本地映射账号。复现：`BUCKYOS_TEST_DNS=<sn ip> node test/test_msg_center/test_native_routes_dv.mjs`，环境参数见同目录 README。真实网络上的好友请求往返、重放和拒绝场景仍只覆盖于前述 HTTP 集成测试。
+
+当前 `cyfs_dispatch.rs::delivery_report` 已把 accepted 映射为 ok=true，把 cached 映射为
+ok=false、error_code=`cyfs-cached`、retryable=true、retry_after_ms=30000，交由既有投递重试机制处理。
+因此 cached 仍待接收确认；UI 应保留该提示，不能提前标成 delivered/read，也不能将其显示为永久拒绝。
+发送方的重试次数 / 截止时间仍由自身策略决定，达到上限记录失败，不能标记成功。
+
+原生 executor 可以使用可选的 `GET https://<zone>/<semantic_path>?dispatch-status=<ObjectId>` 查询减少重复传输，但查询不是基础投递的前置条件。查询不支持、失败或 unknown 时继续同对象 PUT；缓存中没有对象不证明已接收。只有查询得到有依据的 accepted 才结束本地投递。
+
+SessionProjection 可以展示“对方网关已暂存，等待接收”，仍属于未完成状态；原生 accepted 不代表远端用户已读、Agent 已处理或附件已下载。外部 Telegram/Email 等 tunnel 的 transport accepted 语义仍按 Message Tunnel Design §6.3 描述。
+
 ---
 
 ## 5. Session Projection
 
 ### 5.1 Session 不是 MsgBox
 
-Session 是**投影**：为 UI/Agent 把分散在多个 mailbox 和 delivery queue 里的记录聚合成"一个会话"的只读视图。它不持有独立真相：
+Session 时间线是**投影**：为 UI/Agent 把分散在多个 mailbox 和 delivery queue 里的记录聚合成"一个会话"的只读视图。它不持有独立的消息真相：
 
 - 删除全部 session 索引，不丢任何消息，可从 MailboxRecord 全量重建。
-- 写操作（标已读、归档、删除）落到对应的 `MailboxRecord` 上，session 视图随之变化。
+- 单条消息阅读 / 记录状态更新落到对应的 `MailboxRecord` 上；会话级归档、恢复和删除另见 §5.8，不能与记录状态混用。
 - Session 里"这条消息发送中/失败"的角标来自 DeliveryRecord 聚合，UI 不直接读 DELIVERY_QUEUE。
+
+“只读投影”描述存储职责，不表示所有会话的 Composer 都只读；产品写入能力见 §5.6。
+尚无消息的已创建会话与稳定连接绑定需要独立的持久登记元数据（§5.5），不能仅靠消息索引重建。
 
 ### 5.2 定义
 
@@ -345,23 +502,28 @@ SessionProjection(owner, session_id)
 ### 5.3 API
 
 ```text
-list_sessions(owner, cursor, limit)
-  -> [ { session_id, peer/group 摘要, last_msg 摘要, unread_count, updated_at } ]
+msg.list_sessions(owner, cursor_updated_at_ms?, cursor_session_id?, limit?, with_object?)
+  -> { items: [ { session_id, last_record?: { record, msg? }, unread_count, updated_at_ms } ],
+       next_cursor_updated_at_ms?, next_cursor_session_id? }
 
-list_session(owner, session_id, cursor, limit, with_object)
-  -> [ { record_id, msg_id, direction, sort_key,
+msg.list_session(owner, session_id, cursor_sort_key?, cursor_record_id?, limit?, descending?, with_object?)
+  -> { items: [ { record_id, msg_id, direction, box_kind, sort_key, from, to,
          recipient_state?,                  # 入站记录
-         delivery: {                        # 出站记录：聚合视图
+         delivery?: {                       # 出站记录：聚合视图
             overall: sending | delivered | partial_failed | failed,
-            per_target: [ { target_did, state, attempts, last_error? } ]
+            per_target: [ { target_did, state, attempts, external_msg_id?, last_error? } ]
          },
          msg?                               # with_object=true 时附带 MsgObject
-       } ]
+       } ], next_cursor_sort_key?, next_cursor_record_id? }
 ```
 
-聚合规则：全部 target `SENT` → `delivered`；存在 `WAIT/SENDING` → `sending`；部分 `DEAD/FAILED` → `partial_failed`；全部 `DEAD` → `failed`。
+实际聚合规则按优先级为：存在 WAIT/SENDING → sending；否则全部 SENT → delivered；
+否则部分 SENT、部分 FAILED/DEAD → partial_failed；否则 failed。没有 delivery 时不返回该字段。
 
-**一个传统私聊 UI 只需要调用一次 `list_session()`** 就能渲染完整会话（双向消息 + 已读状态 + 投递角标），不需要分别读取 Inbox、Sent、Delivery Queue——后两者对 UI 根本不可见。
+一次 list_session 返回一页双向历史、本地阅读状态和投递视图，无需 UI 拼接 Inbox/Sent 或读取 Delivery Queue。
+对端回执独立查询；长历史需分页。当前 list_sessions 没有独立 peer/group 字段、生命周期或最后投递摘要，
+并按 MAX(mailbox.updated_at_ms) 排序；UI 需要的有效消息活动时间及同口径游标仍待补齐。
+读取或修改旧消息状态不应推进产品 lastActiveAt，前端只重排一页不能修复跨页排序。
 
 ### 5.4 `thread.topic` 与 `session_id`
 
@@ -372,7 +534,140 @@ list_session(owner, session_id, cursor, limit, with_object)
 | 由谁定 | 消息作者 | 收/发方本地的 MessageCenter |
 | 可变性 | 永不可变 | 可由可信后端/Agent 重新归类 |
 
-MessageCenter 可以建立 `thread.topic → session_id` 的映射（同 topic 默认聚为同一会话），但**不能修改 MsgObject**。同一条消息在不同 owner 的视图中可以有不同 `session_id`。
+MessageCenter 可以在确定的 owner、对端与连接范围内建立 `thread.topic → session_id` 的映射，
+但不能跨连接仅凭 topic 同名合并，也**不能修改 MsgObject**。同一条消息在不同 owner 的视图中可以有不同 `session_id`。
+
+`MsgObject.to_session`（v2）与 topic 不同，它是发送方指定的目标会话：托管会话的接收方（例如群 host）必须按它路由，会话不存在时拒绝；个人收件方可以把它映射为自己的本地 `session_id`。topic 始终只是 hint。
+
+当前 `derive_session_id`：`to_session` 原样作为本地 `session_id`（发送方 SENT 记录与接收方记录相同）；群消息没有 `to_session` 时为群 DID；私聊再取 correlation / meta 中的 session hint，最后为 `dm:<peer DID>`。`thread.topic` 不再参与。尚未实现的部分：群 host 校验 `to_session` 指向已存在的 Session（Session 记录未实现，见 Self-Host-Groupv2 §12.3），以及按 owner、对端、连接隔离的本地映射。
+
+### 5.5 会话登记与连接隔离（2026-09-06 目标契约，待实现）
+
+产品规则来自 [MessageHub PRD §6 / §9](../../product/message_hub/MessageHub_Web_UI_PRD.md)，
+UI 目标字段见 [UI DataModel §3.3](../../src/frame/desktop/src/app/messagehub/UI_DATAMODEL.md)。
+
+- 所有真实通信实体（包括 Agent、群与子群）均由 DID 标识，可进入 `MsgObject.from/to`。
+  父子关系、联系人别名归一只影响组织与展示，不自动合并其 Session 或改变消息端点。
+- 每条持久消息在每个 owner 的本地记录中必须有 Session 归属；不要求不同 owner 使用相同 Session ID。
+  完整引用键为 `(owner, session_id)`，每个 owner 与同一对端可有多个 Session。
+- 外部连接按 `(owner, tunnel_instance_id, peer/group endpoint DID)` 区分，建立连接即幂等登记至少一个默认 Session。
+  一个 tunnel 实例可连接多个实体；不能为整个实例只建一个共用会话。
+- tunnel 支持多个上下文时，再以稳定远端 thread / topic ID 建立 Session 映射；相同文本标题不是身份键。
+  不同连接的同名 topic 不合并，双向消息必须回到同一绑定。原生连接也有默认 Session，Agent 可另行手工创建。
+- 登记需保存 owner、对端 / 群、连接类型及确定目标、远端上下文关联、创建来源，
+  并在首条消息前可持久恢复；列表应合并登记与消息摘要，空会话的历史为空、未读为 0。
+  不允许通过伪造 MsgObject、`ui.title` 或可丢弃索引来代替登记。
+- 只有实体资料、尚未建立连接或创建会话时允许零 Session。连接断开 / 移除不删除已有消息与登记，
+  发送能力变为不可用；不得自动换 tunnel。
+- 本地 Session 与远端上下文的显式发送映射须在构造确定投递时完成。
+  `session_id` 不能直接冒充外部 thread ID，ContactMgr 归一结果和 ingress 元数据也不能成为隐式选路依据。
+
+登记是会话身份与连接关系的持久元数据，消息正文、收件状态与投递状态仍分别属于既有层。
+实现时须同步扩展 durable schema、Session API 与 UI 协议镜像；本节不宣称当前已存在登记 / 创建 RPC。
+当前 `MailboxRecord.session_id` 仍为可选，列表仅从消息索引读取，也需在实现阶段补齐上述约束。
+
+### 5.6 查看视角、创建与写入（2026-09-06 目标契约，待实现）
+
+- `viewer` 是实际登录 / 调用身份，`owner` 是被查看的会话所属实体。
+  默认查看自己的 Session；从 Agent 主页进入时，经授权以 Agent 为 owner 读取其通信对象与历史。
+  API 接受 owner 参数不等于调用者已经获得读取该 owner 的权限，服务端必须校验两者关系。
+  用户 DID 取自 `users/{user_id}/profile.did`；前端通过 `user.get` 获取，服务端在验证 token 后读取同一档案，缺失时拒绝访问，不能由用户名拼接 `did:bns`。Agent 观察权限依据本地 Agent 注册文档和未删除状态判断，不能将 Zone 域下的所有 `did:web` 当成 Agent。
+- Agent 观察首期只读：不发送、新建、修改已读或配置，不写 Agent 的草稿和 UI 状态。
+  未来代 Agent 通信必须校验独立的发送授权，`MsgObject.from` 为 Agent，审计保留实际 viewer。
+- 默认仅允许手工创建与 Agent 的 Session；其它会话由连接建立 / 远端上下文发现产生。
+  支持 `(owner, entity)` 级“允许手工创建”配置，显式设置覆盖类型默认；
+  在 tunnel 内创建还需多 Session 与远端创建能力，配置不能授予平台能力或发送权限。
+- MessageHub UI 中外部 tunnel Session 通常默认只读；已有出站能力和发送权限时，
+  用户确认“可能造成另一个软件中的会话历史记录错误或不一致”后，可对当前 Session 启用写入。
+  此确认是 UI 的产品门槛，不授予服务端权限，也不限制已授权的 Agent / tunnel 正常收发。
+  原生会话按授权正常发送，不套用外部 tunnel 风险确认。
+- 传输方式与操作能力分开：native 也需确认路由与发言权限；GroupMgr 的按 action 授权可用于
+  群历史、发言和管理能力。读取、发送、owner 本地生命周期、共享字段与成员字段编辑分别校验，
+  本地托管或存在 mailbox 记录不授予管理权。能力未知时不能按 native 默认开放写入。
+- Session UI 状态至少按 `(owner, session_id, key)` 存储与授权；浏览器缓存、草稿和选择态再按 viewer 隔离。
+  Agent 的未读数不并入用户 badge，观察不自动标记 Agent 已读。
+
+当前 `list_sessions/list_session` 已有 owner 参数，但对应 handler 未使用 `RPCContext`，
+`ui_session` 接口也只有 Session ID 作用域。实现前需补齐 / 验证授权与隔离，不能只改前端传参。
+
+### 5.7 Session 状态与 Action Log（2026-09-06 数据层目标契约，待实现）
+
+主定义见 [Session State and Action Log.md](<./Session State and Action Log.md>)，本轮不修改原型或协议实现。
+
+- 持久状态分为会话整体状态与每个成员自己的会话状态：整体字段按权限修改，成员默认可修改自己的昵称等字段。
+  角色 / 群成员资格继续由原有权威管理，不能通过普通状态 patch 改写。
+- 本地 `(owner, session_id)` 关联稳定权威会话引用；共享状态与成员状态分别带 revision，
+  更新需要 expected_revision 与幂等键。旧 `ui_session` KV 不能承担共享状态、成员权限或日志真相。
+- Session / 实体实际变化以 `kind=event`、`machine.intent=buckyos.action_log` 记录，
+  区分 target、actor 与受影响成员 subject；入群、主动退出、被移除、会话标题修改有明确动作。
+- 权威状态提交与待发布日志登记保持事务一致，跨 named store / mailbox / 服务的发布通过持久任务幂等恢复。
+  同一 GroupEvent 或平台事件映射一次；失败、无变化和重复请求不生成新的成功日志。
+- 外部平台仍是外部状态权威；平台修改确认前不能记录成功事实，回显需关联去重，旧事件不能回滚快照。
+- Action Log 是历史事实，不是状态修改命令。普通 `post_send` 或入站 event 不能直接更新共享状态或群 ACL。
+  日志可见范围受源状态权限约束；个人显示标题、草稿、typing 不产生共享 Action Log。
+
+当前 GroupMgr 已把 GroupEvent 写入 group_events；它们尚未发布到 Session 消息时间线。
+前端已有 mock Action renderer 和共享 / 成员编辑交互，不能将这些 UI 交互视为后端状态契约已实现。
+`ui_session_states` 的 typing KV 只有 MessageHub UI 一个消费方（Telegram tunnel 的 active / typing / status_line 同步已删除），
+缺少统一成员 DID、有效期与 owner 隔离；映射运行态时必须补齐可信来源和过期规则，不能据此推导实体在线状态。
+
+### 5.8 owner 本地会话生命周期（2026-09-07 已实现）
+
+实现：`owner_sessions(owner, session_id, lifecycle, registered, origin, peer_did, binding_json, title,
+archived_at_ms, delete_watermark_sort_key, delete_watermark_record_id, deleted_at_ms, ...)`；
+RPC `msg.create_session` / `msg.archive_session` / `msg.restore_session` / `msg.delete_session` / `msg.get_session_state`。
+`list_sessions` 支持 `lifecycle` 过滤与 `order_by: activity`（按 chat / group_msg / deliver 记录的 `sort_key` 排序并给同口径游标），
+摘要新增 `last_activity_ms` / `request_count` / `lifecycle` / `state`；`list_session` 与摘要都只统计删除水位之后的记录。
+新普通消息提交后自动解除归档。`ui_session.*` 带 `owner` 时读写 `owner_ui_session_states`；不带 `owner` 时，用户 / App / Agent 调用者取其自己的 mailbox owner（同样落在 `owner_ui_session_states`、按 owner 授权），只有 Zone 服务、设备与进程内调用使用全局 `ui_session_states`（资源 `obj://msg-center/ui-state`）。
+读取按 verify-hub 用户 token 校验：本人或 zone 托管的非用户身份（Agent）可读，写动作只允许本人；
+服务 / 设备 token 与无 token 的进程内调用保持原行为。
+
+附件经 `GET /kapi/msg-center/objects/{obj_id}[/content]?context_path=…` 访问，`context_path` 指明经由哪条消息读：
+
+- `<msg_id>`：调用者能读的私信或通知（邮箱记录）；`<session MailboxAddress>/<msg_id>`：托管群 Session 的消息；
+  `<session MailboxAddress>/_display`：该 Session 展示配置（EXT-04 `display.files`）里的文件。
+- 不带 `context_path` 时，msg-center 在调用者自己的邮箱（`msg_refs`，每个 owner 最新 1000 条）里按时间倒序找第一条引用
+  `obj_id` 且调用者能读的消息，作为上下文。Agent 的构造 App（App token，AppId = AgentId 且属于 token 的 owner）先找
+  Agent 自己的邮箱，再找 owner 的：Agent 工具因此只凭附件的 obj_id 就能读到收到的附件（NDM 不给普通用户的 Agent
+  通用对象读权限）。受限会话必须带上下文。
+- 调用者能读该消息（或该 Session），消息引用了 `obj_id`（或展示配置列出了它），且 `zone/msg-center/_/attachments`
+  中对应的 key（`<session>/<msg_id>/<n>`，展示文件为 `<group MailboxAddress>/_display/<obj_id>`）绑定的正是该对象，
+  才从 named store 读出；任一不满足、或找不到消息，都返回 404（受限会话的 404 带 `access_denied` /
+  `resource_grant_missing` 拒绝体）。
+- 托管群的消息对象本身也经此路由读：受限会话以 `<session MailboxAddress>/<msg_id>` 为上下文，其他调用者能读该消息即可，不带上下文。
+- 可选 `inner_path` 读目录附件内的文件。
+
+`msg.collect_attachment {obj_id, context_path}` 把调用者经上述同一规则能读的附件复制进自己的
+`user/msg-center/<user>/collected` 桶（`origin = {author: 发送者 DID, source: cyfs://<msg_id>}`），返回
+`{bucket_id, key}`，key 为 `<msg_id>/<n>/<label>`；重复收藏返回同一个 key。只有 Zone 用户可调用（外部用户、受限会话拒绝）。
+收藏的副本之后经 `/bucket/v1/<bucket_id>/<key>` 读，消息撤回不影响它。桶的声明、key 与解绑规则见
+`Message Center Durable Data Schema.md` §3。
+
+归档只改变会话在活动列表中的可见性，保留历史、逐记录阅读状态、未读计数和草稿；恢复沿用原会话与活动时间。
+有效普通新消息可以解除归档，运行态与 Action Log 不解除归档。归档属于独立的持久 Session 元数据。
+
+当前 RecipientState.ARCHIVED 会替换阅读状态，仍被 Session 查询纳入，且没有恢复到普通阅读状态的迁移。
+DELETED 仅被 Session 查询过滤。它们不能代替上述会话级操作。
+
+彻底删除的产品范围是当前 owner 的会话及本地历史引用、草稿和个人偏好；不删除其它 owner 的引用、联系人或连接。
+需保留最小连接来源与删除水位，阻止旧消息重放复活；水位后的有效新消息按连接规则形成新的可见历史。
+操作需有幂等结果、并发新消息边界、授权及重启恢复，不能用未完成的一串逐记录写入报告成功。
+共享 MsgObject 及附件仍可能被其它 mailbox/delivery 引用，对象物理回收另按引用规则处理，不承诺擦除所有副本。
+
+### 5.9 请求处理与 UI 同步边界
+
+- REQUEST_BOX 已存在，UI 需保留每条记录的 box_kind 并提供请求入口与准入操作。
+  同一 Session 可有请求与普通记录，不能从最后一条记录推导全部请求状态；筛选视图不重复增加未读。
+- 联系人临时授权 / 拉黑改变当前 owner 的准入规则，查看消息不改变该规则。
+  当前授权变化不迁移旧 REQUEST_BOX 记录；接受后的历史处理、处理状态及计数 / 分页需补显式契约。
+- mailbox changed 在提交后发布，delivery changed 按 transport/executor 组织；事件可丢失，只作刷新信号。
+  UI 需有权限的 owner/session 事件投影或受控轮询，通过 Session API 对账，不直接消费执行器队列。
+- 历史 reader 需支持记录更新、删除、重新归类和断线补拉。仅按时间游标追加新消息无法发现旧记录变化，
+  必须定向重读受影响记录 / 页面或提供变更游标；旧、新 Session 的摘要与未读均需刷新。
+- Telegram 附件已经通过 obj_id 与 cyfs:// hint 引用 FileObject。UI 应解析有权限的对象访问地址，
+  不依赖 HTTP URL 扩展名识别附件；无 hint、非图片及单附件失败均保留可读信息。
+
+具体 UI 投影与验收见 [UI DataModel §3.5、§4.5–§4.6、§6、§9.4](../../src/frame/desktop/src/app/messagehub/UI_DATAMODEL.md)。
 
 ---
 
@@ -384,7 +679,8 @@ MessageCenter 可以建立 `thread.topic → session_id` 的映射（同 topic �
 
 - `MsgObject` 存 named store（内容寻址，全系统一份）。**消息对象只存一份**，任意多个 `MailboxRecord` / `DeliveryRecord` 引用同一个 `msg_id`。
 - `MailboxRecord`、`DeliveryRecord` 与全部索引存本地 RDB（当前为 SQLite）。
-- SessionState（typing 等）存内存/易失存储，不进 RDB。
+- SessionRuntimeState（typing 等）按易失语义保存；当前实现借用 `ui_session_states` RDB KV 不改变其易失语义。
+  持久共享 / 成员状态与待发布 Action Log 另按 §5.7 的契约保存。
 
 ### 6.2 索引
 
@@ -494,16 +790,26 @@ beta2.2 尚处于 breaking-change 阶段，version 7 到 version 8 采用 no-com
 # 写入
 dispatch(msg_obj, ingress_meta, idempotency_key)   # 入站（tunnel/hub/系统）
 post_send(msg_obj, idempotency_key)                # 出站（user/agent/系统）
+get_edit_capability(msg_obj)                       # 按 post_send 的路由规划回答该信封的目标能否原地编辑；不发送、不落库
 report_delivery(delivery_id, result)               # executor 回报投递结果
 
 # Session（UI/Agent 的唯一读取面）
 list_sessions(owner, cursor, limit)
 list_session(owner, session_id, cursor, limit, with_object)
 update_record_state(owner, record_id, recipient_state)   # 已读/归档/删除
-set_session_state(owner, session_id, key, value)         # 易失 SessionState
+set_session_state(owner, session_id, key, value)         # 此处指易失 SessionRuntimeState，不是共享状态修改
 
 # 队列（仅 executor / agent pump 使用，UI 不可见）
-get_next(owner, box_or_queue, state_filter, lock_on_take)
+get_next(mailbox, box_kind, state_filter, lock_on_take)
+peek_box(mailbox, box_kind, state_filter, limit, with_object)
+list_box_by_time(mailbox, box_kind, state_filter, limit, cursor_sort_key, cursor_record_id, descending, with_object)
+list_mailboxes(owner, box_kind)  # owner 集合授权；仅返回有 UNREAD 的地址
+move_record(record_id, mailbox)
+get_next_delivery(transport_did, lock_on_take, with_object)
+
+# 系统通知（§2.1.3；App 契约见 System Notify.md）
+notify.send(req) / notify.get(notify_id) / notify.list(filter)
+notify.ack(notify_id, on_behalf?) / notify.dismiss(notify_id) / notify.cancel(notify_id, reason?)
 ```
 
 群聊 read receipt（`MsgReceiptObj`，per-reader）见 Self-Host-Group 文档；其存储同样遵守"独立对象 + 索引"模式。
@@ -522,6 +828,9 @@ P3 实现迁移已于 2026-07-14 完成：代码与本文档使用同一套命�
 | `RecipientState` / `DeliveryState` 两个状态机 | 两个独立枚举（`MsgState` 已删除；`READED` → `READ`） |
 | `transport_did` vs `tunnel_instance_id` | `DeliveryEnvelope.transport_did`；registry key 为 `tunnel_instance_id` |
 | `DeliveryExecutor` 接口 | `frame/msg_center/src/msg_tunnel.rs`；MessageHub 与 TgTunnel 共同实现 |
-| MessageHub（原生投递） | `frame/msg_center/src/message_hub.rs`（本 Zone 目标本地 dispatch；跨 Zone hop 待实现，失败明确 DEAD） |
+| MessageHub（原生投递） | `frame/msg_center/src/message_hub.rs`（本 Zone 目标本地 dispatch；他 Zone 目标按显式配置或自动路由投递，本地用户的消息用 Zone 托管签名，§2.2、§4.5） |
+| CYFS 接收、自动路由、JWT 校验 | `frame/msg_center/src/cyfs_dispatch.rs`（`serve`、`auto_route`、`verify_signed_message_with`） |
+| DID → Zone 目录、Zone 签名者 | `frame/msg_center/src/network_directory.rs`（`NetworkDirectory`、`ZoneSigner`） |
+| `buckyos.friend` 与联系人关系 RPC | `frame/msg_center/src/friend_service.rs`、`contact_rpc.rs`、`contact_lookup.rs`；类型在 `buckyos_api::msg_contact`（见 Contact Mgr.md） |
 | `list_session/list_sessions` | `msg.list_session` / `msg.list_sessions` RPC + Session 索引；Desktop 集成代码已保留，MessageHub 页面当前使用 Mock DataModel，待专门集成测试通过后启用 |
 | （已删除）`thread.tunnel_id` | 已从 `ndn_lib::TopicThread` 移除（cyfs-ndn beta2.2） |

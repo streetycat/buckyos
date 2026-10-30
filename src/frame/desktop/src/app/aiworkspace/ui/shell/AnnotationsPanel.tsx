@@ -1,0 +1,101 @@
+/* Annotations in scope (design §3.7, phase two §8.4): the ones anchored to what is shown or placed
+ * under a parent (a Surface's content folder, the selected data). New annotations are allowed with
+ * the `comment` capability in edit and view mode alike (D13). */
+
+import { useContext, useState } from 'react'
+import type { CapturedAnchor } from '../../anchors/registry'
+import { authorLabel, readGuestName } from '../../state/guest'
+import { useStore, useWorkspaceUi } from '../../state/hooks'
+import { useAiwsText } from '../../useAiwsText'
+import { annotationOp } from '../creators'
+import { anchorStatus, annotationLabel, revealAnnotation } from '../annotationInfo'
+import { ShellContext } from './shellContext'
+
+/** A note being written before it is placed (view mode, a phone): `save` places it with this text. */
+export interface NoteDraft { save: (body: string) => Promise<boolean>; cancel: () => void }
+
+export function AnnotationsPanel({ parentId, draft, onDraftDone, noteDraft }: { parentId: string | null; draft?: CapturedAnchor | null; onDraftDone?: () => void; noteDraft?: NoteDraft | null }) {
+  const store = useStore()
+  const { t } = useAiwsText()
+  const { annotations: all, annotate, activeAnnotation, setActiveAnnotation, draft: uiDraft, clearDraft, annotationFilter, showAnnotations } = useWorkspaceUi() as ReturnType<typeof useWorkspaceUi> & { draft?: CapturedAnchor | null; clearDraft?: () => void }
+  const [body, setBody] = useState('')
+  const [noteBody, setNoteBody] = useState('')
+  const guest = useContext(ShellContext)?.identity.guest ?? false
+  const pending = draft ?? uiDraft ?? null
+  const done = onDraftDone ?? clearDraft ?? (() => undefined)
+  const target = parentId ?? 'data'
+  // a note's replies (标准对象的交互改进 §7.3): the annotations targeting it, oldest first
+  const annotations = annotationFilter ? all.filter((mark) => mark.payload.target?.entity_id === annotationFilter).sort((a, b) => a.envelope.life_rev - b.envelope.life_rev) : all
+  const filterLabel = annotationFilter ? store.outline.get(annotationFilter) : undefined
+  return (
+    <div className="aiws-annotations" data-testid="aiws-annotations">
+      <div className="aiws-panel-title">{t('aiworkspace.shell.side.annotations')} <span className="aiws-muted">{annotations.length}</span></div>
+      {annotationFilter && (
+        <div className="aiws-inline-form" data-testid="aiws-annotations-filter">
+          <span className="aiws-muted">{t('aiworkspace.shell.annotations.filter', { name: filterLabel?.title ?? t('aiworkspace.shell.annotations.note') })}</span>
+          <button type="button" className="aiws-link" data-testid="aiws-annotations-filter-clear" onClick={() => showAnnotations(null)}>{t('aiworkspace.shell.annotations.showAll')}</button>
+        </div>
+      )}
+      {pending && (
+        <form className="aiws-annotation-draft" onSubmit={(event) => {
+          event.preventDefault()
+          if (body.trim() === '') return
+          void store.submit({ editId: `annotation:new`, label: t('aiworkspace.shell.annotations.editLabel', { target: pending.label }), mine: body, hasMine: true, operations: [annotationOp(store.core, store.outline.childrenOf(target), target, pending, body.trim(), guest ? readGuestName() : undefined)] })
+            .then((outcome) => { if (outcome.status === 'accepted' || outcome.status === 'saved_locally') { setBody(''); done() } })
+        }}>
+          <div data-testid="aiws-annotation-draft-target">{t('aiworkspace.shell.annotations.target', { target: pending.label })}</div>
+          {pending.context?.quote && pending.range && <div className="aiws-annotation-quote">{pending.context.quote.exact}</div>}
+          <textarea aria-label={t('aiworkspace.shell.annotations.body')} autoFocus rows={2} value={body} onChange={(event) => setBody(event.target.value)} maxLength={4000} />
+          <button type="submit" data-testid="aiws-annotation-save">{t('aiworkspace.shell.annotations.save')}</button>
+          <button type="button" onClick={() => { setBody(''); done() }}>{t('aiworkspace.common.cancel')}</button>
+        </form>
+      )}
+      {noteDraft && (
+        <form className="aiws-annotation-draft" data-testid="aiws-note-draft" onSubmit={(event) => {
+          event.preventDefault()
+          if (noteBody.trim() === '') return
+          void noteDraft.save(noteBody.trim()).then((saved) => { if (saved) setNoteBody('') })
+        }}>
+          <div>{guest && readGuestName() ? t('aiworkspace.shell.annotations.noteDraftSigned', { name: readGuestName() }) : t('aiworkspace.shell.annotations.noteDraft')}</div>
+          <textarea aria-label={t('aiworkspace.shell.annotations.noteBody')} autoFocus rows={3} value={noteBody} onChange={(event) => setNoteBody(event.target.value)} maxLength={4000} />
+          <button type="submit" data-testid="aiws-note-draft-save">{t('aiworkspace.shell.annotations.placeNote')}</button>
+          <button type="button" onClick={() => { setNoteBody(''); noteDraft.cancel() }}>{t('aiworkspace.common.cancel')}</button>
+        </form>
+      )}
+      {annotations.length === 0 && !pending && (
+        <div className="aiws-muted">{annotate ? t('aiworkspace.shell.annotations.emptyHint') : t('aiworkspace.shell.annotations.empty')}</div>
+      )}
+      {annotations.map((mark) => {
+        const capabilities = mark.envelope.capabilities
+        const quote = mark.payload.context?.quote?.exact
+        const free = !mark.payload.target
+        return (
+          <div
+            key={mark.entityId}
+            className={`aiws-annotation${mark.entityId === activeAnnotation ? ' is-active' : ''}`}
+            data-testid="aiws-annotation"
+            data-annotation-id={mark.entityId}
+            data-anchor-state={mark.anchor.state}
+            data-anchor-level={mark.anchor.level}
+            style={{ background: typeof mark.payload.style?.color === 'string' ? mark.payload.style.color : undefined }}
+            onClick={() => { setActiveAnnotation(mark.entityId); revealAnnotation(mark.entityId) }}
+          >
+            <div className="aiws-annotation-body">{mark.payload.body}</div>
+            {quote && mark.payload.range && mark.anchor.level !== 'range' && <div className="aiws-annotation-quote" title={t('aiworkspace.shell.annotations.quote')}>{quote}</div>}
+            <div className="aiws-annotation-meta">
+              <span>{free ? t('aiworkspace.shell.annotations.freeNote') : annotationLabel(mark)}</span>
+              {!free && <span data-testid="aiws-anchor-state">{anchorStatus(mark.anchor)}</span>}
+              {authorLabel(mark.payload) && <span data-testid="aiws-annotation-author">{authorLabel(mark.payload)}</span>}
+              {(capabilities.includes('comment') || capabilities.includes('manage')) && (
+                <button type="button" className="aiws-link" onClick={(event) => {
+                  event.stopPropagation()
+                  void store.submit({ editId: `entity:${mark.entityId}`, label: t('aiworkspace.shell.annotations.deleteLabel'), operations: [{ op: 'entity.delete', entity_id: mark.entityId, expect: { rev: mark.envelope.life_rev } }] })
+                }}>{t('aiworkspace.common.delete')}</button>
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}

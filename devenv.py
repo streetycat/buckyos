@@ -94,14 +94,6 @@ LINUX_DENO_CHOICES = {
     "zypper": [["deno"]],
 }
 
-LINUX_TMUX_CHOICES = {
-    "apt-get": [["tmux"]],
-    "dnf": [["tmux"]],
-    "yum": [["tmux"]],
-    "pacman": [["tmux"]],
-    "zypper": [["tmux"]],
-}
-
 LINUX_CROSS_PACKAGE_CHOICES = {
     "apt-get": [["musl-tools"], ["gcc-aarch64-linux-gnu"]],
     "dnf": [["musl-gcc"], ["gcc-aarch64-linux-gnu"]],
@@ -137,7 +129,7 @@ LINUX_BINDGEN_PACKAGE_CHOICES = {
     ],
 }
 
-BREW_FORMULAE = ["git", "wget", "pkgconf", "openssl@3", "python@3.12", "node", "pnpm", "rustup", "uv", "deno", "tmux"]
+BREW_FORMULAE = ["git", "wget", "pkgconf", "openssl@3", "python@3.12", "node", "pnpm", "rustup", "uv", "deno"]
 BREW_CASKS = ["docker"]
 
 WINGET_PACKAGE_CHOICES = {
@@ -149,6 +141,7 @@ WINGET_PACKAGE_CHOICES = {
     "uv": [["astral-sh.uv"]],
     "deno": [["DenoLand.Deno"]],
     "docker": [["Docker.DockerDesktop"]],
+    "wsl": [["Microsoft.WSL"]],
     "msvc": [["Microsoft.VisualStudio.2022.BuildTools"]],
     "llvm": [["LLVM.LLVM"]],
 }
@@ -594,17 +587,6 @@ class Bootstrapper:
         if rustup_path and not shutil.which(Path(rustup_path).name):
             self.notes.append(f"rustup was installed at {rustup_path}; reopen the terminal if it is not yet in PATH")
 
-    def ensure_tmux(self) -> None:
-        if shutil.which("tmux"):
-            return
-
-        if self.system == "Windows":
-            self.warnings.append("tmux is needed by OpenDAN Runtime; use WSL2 if you need tmux;Otherwise, you will not be able to debug and run Jarvis under Windows. You can only officially run Jarvis using Docker.")
-            return
-
-        if self.system == "Linux":
-            self.install_first_resolved_set("tmux", LINUX_TMUX_CHOICES[self.package_manager])
-
     def installed_node_version(self) -> str | None:
         node_path = shutil.which("node")
         if not node_path:
@@ -758,7 +740,6 @@ class Bootstrapper:
         self.ensure_linux_rustup()
         self.ensure_uv()
         self.ensure_deno()
-        self.ensure_tmux()
 
         if not self.args.skip_docker:
             self.install_first_resolved_set("Docker", LINUX_DOCKER_CHOICES[self.package_manager], optional=True)
@@ -811,7 +792,6 @@ class Bootstrapper:
         self.ensure_rust_toolchain()
         self.ensure_uv()
         self.ensure_deno()
-        self.ensure_tmux()
 
         if not self.args.skip_cross_tools:
             self.ensure_macos_musl_cross()
@@ -849,17 +829,21 @@ class Bootstrapper:
             if not self.package_installed(package_id, kind="winget"):
                 self.install_winget_package(package_id)
 
-        self.ensure_tmux()
-
         if not self.args.skip_docker:
-            package_ids = self.resolve_package_set(WINGET_PACKAGE_CHOICES["docker"], kind="winget")
-            if package_ids:
-                package_id = package_ids[0]
-                if not self.package_installed(package_id, kind="winget"):
-                    self.install_winget_package(package_id)
-                self.notes.append("Docker Desktop may require enabling virtualization or a system restart on first launch")
+            runtime = os.environ.get("BUCKYOS_CONTAINER_RUNTIME", "wslc")
+            if runtime not in ("docker", "wslc"):
+                raise BootstrapError(f"unknown BUCKYOS_CONTAINER_RUNTIME: {runtime}")
+            feature = "docker" if runtime == "docker" else "wsl"
+            package_ids = self.resolve_package_set(WINGET_PACKAGE_CHOICES[feature], kind="winget")
+            if not package_ids:
+                raise BootstrapError(f"winget could not find {feature}")
+            package_id = package_ids[0]
+            if not self.package_installed(package_id, kind="winget"):
+                self.install_winget_package(package_id)
+            if runtime == "wslc":
+                self.notes.append("Run wsl --install --no-distribution and wsl --update in an administrator terminal, then restart if requested. Verify wslc version and wslc run --rm hello-world; Docker Desktop is not required.")
             else:
-                self.warnings.append("winget could not find Docker Desktop, skipped")
+                self.notes.append("Docker Desktop may require enabling virtualization or a system restart on first launch")
 
         if not self.args.skip_msvc:
             package_ids = self.resolve_package_set(WINGET_PACKAGE_CHOICES["msvc"], kind="winget")
@@ -1103,10 +1087,8 @@ class Bootstrapper:
         print("- Python 3")
         print("- uv")
         print("- Deno")
-        if self.system != "Windows":
-            print("- tmux")
         if not self.args.skip_docker:
-            print("- Docker / Docker Desktop")
+            print("- WSL containers / Docker" if self.system == "Windows" else "- Docker / Docker Desktop")
         if self.system == "Linux" and not self.args.skip_cross_tools:
             print("- Linux cross-compilation helpers (best effort)")
         if self.system != "Windows" and not self.args.skip_buckyos_dir:
@@ -1136,7 +1118,7 @@ class Bootstrapper:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Bootstrap a BuckyOS development environment")
     parser.add_argument("--dry-run", action="store_true", help="Only print commands to be executed")
-    parser.add_argument("--skip-docker", action="store_true", help="Skip Docker / Docker Desktop")
+    parser.add_argument("--skip-docker", action="store_true", help="Skip container runtime installation (WSL containers on Windows, Docker elsewhere)")
     parser.add_argument("--skip-cross-tools", action="store_true", help="Skip Linux cross-compilation dependencies")
     parser.add_argument("--skip-buckyos-dir", action="store_true", help="Skip /opt/buckyos directory preparation")
     parser.add_argument("--skip-msvc", action="store_true", help="Skip Visual Studio Build Tools on Windows")

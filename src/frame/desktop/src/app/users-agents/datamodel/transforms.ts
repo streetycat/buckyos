@@ -1,27 +1,51 @@
 import type { AppSummary } from '../../../api/app_mgr.ts'
 import type {
-  AgentInfo,
+  AgentEntry,
+  AgentInstallState,
   UserContactSettings,
   UserDetail,
+  UserGroupListResponse,
   UserInfo,
   UserStateString,
   UserTunnelBinding,
   UserType,
 } from '../../../api/user_mgr.ts'
-import type { SelfHostGroupSummary } from '../../../api/self_host_groups.ts'
+import {
+  defaultCanChangePassword,
+  defaultCanEditContacts,
+  isPrivilegedUserType,
+  parseUserType,
+} from '../../../api/user_type.ts'
+import { agentDisplayName, JARVIS_GUIDE_ENTRY, usableImageUrl } from '../../agent-setup/model.ts'
 import type {
   AgentEntity,
-  EntityGroupEntity,
+  AgentLifecycle,
   LocalUserEntity,
   SelfEntity,
   SocialAccount,
   SocialAccountStatus,
+  UserGroupsInfo,
   ZoneUserSource,
   ZoneUserStatus,
   ZoneUserType,
 } from './types'
 
 const fallbackCreatedAt = '1970-01-01T00:00:00Z'
+
+export function appListTargetUserIds(
+  selfUserId: string | undefined,
+  callerUserType: string | undefined,
+  users: readonly Pick<UserInfo, 'user_id'>[],
+): string[] {
+  const targetUserIds = new Set<string>()
+  if (selfUserId) targetUserIds.add(selfUserId)
+  if (isPrivilegedUserType(callerUserType)) {
+    for (const user of users) {
+      if (user.user_id) targetUserIds.add(user.user_id)
+    }
+  }
+  return [...targetUserIds]
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -44,20 +68,10 @@ function firstString(...values: unknown[]): string | undefined {
 }
 
 function systemContactFromDetail(detail: UserDetail): UserContactSettings | undefined {
-  if (detail.contact) return detail.contact
   const localProfile = asRecord(detail.local_profile)
   const privateExtra = asRecord(localProfile.private_extra)
   const systemContact = asRecord(privateExtra.system_contact)
   return Object.keys(systemContact).length > 0 ? systemContact as UserContactSettings : undefined
-}
-
-function stringArray(value: unknown): string[] {
-  if (Array.isArray(value)) {
-    return value.map(stringValue).filter(Boolean) as string[]
-  }
-  const text = stringValue(value)
-  if (!text) return []
-  return text.split(',').map((item) => item.trim()).filter(Boolean)
 }
 
 function numberValue(value: unknown): number | undefined {
@@ -65,15 +79,6 @@ function numberValue(value: unknown): number | undefined {
   if (typeof value !== 'string' || !value.trim()) return undefined
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : undefined
-}
-
-function booleanValue(value: unknown): boolean | undefined {
-  if (typeof value === 'boolean') return value
-  if (typeof value !== 'string') return undefined
-  const normalized = value.trim().toLowerCase()
-  if (normalized === 'true') return true
-  if (normalized === 'false') return false
-  return undefined
 }
 
 function isoFromUnix(value: unknown): string | undefined {
@@ -84,6 +89,9 @@ function isoFromUnix(value: unknown): string | undefined {
   const millis = timestamp > 10_000_000_000 ? timestamp : timestamp * 1000
   return new Date(millis).toISOString()
 }
+
+/** Profile fields the signed-in user can edit from the info section (others are shown read-only). */
+export const SELF_EDITABLE_INFO_KEYS = ['displayName', 'title', 'bio', 'location', 'organization', 'website', 'email', 'phone'] as const
 
 function profileMap(profile: unknown, fallback: Record<string, string> = {}): Record<string, string> {
   const source = asRecord(profile)
@@ -133,37 +141,33 @@ export function toSocialAccounts(bindings: UserTunnelBinding[] | undefined): Soc
   }))
 }
 
-function socialAccountsFromUnknown(value: unknown): SocialAccount[] {
-  if (!Array.isArray(value)) return []
-  const bindings = value.flatMap((item): UserTunnelBinding[] => {
-    const record = asRecord(item)
-    const platform = stringValue(record.platform)
-    const accountId = stringValue(record.account_id ?? record.accountId)
-    if (!platform || !accountId) return []
-    return [{
-      platform,
-      account_id: accountId,
-      display_id: stringValue(record.display_id ?? record.displayId),
-      tunnel_instance_id: stringValue(record.tunnel_instance_id ?? record.tunnelId),
-      status: stringValue(record.status),
-      last_sync_at: typeof record.last_sync_at === 'number'
-        ? record.last_sync_at
-        : undefined,
-      meta: asRecord(record.meta) as Record<string, string>,
-    }]
-  })
-  return toSocialAccounts(bindings)
-}
-
 function userStateBase(state: UserStateString | undefined): string {
   return String(state ?? 'active').split(':', 1)[0]
 }
 
 function zoneUserType(type: UserType | string | undefined): ZoneUserType {
-  const normalized = String(type ?? 'user').toLowerCase()
-  if (normalized === 'admin' || normalized === 'root') return 'admin'
-  if (normalized === 'limited' || normalized === 'guest') return 'limited'
-  return 'user'
+  const parsed = parseUserType(type)
+  return parsed && parsed !== 'root' ? parsed : 'unknown'
+}
+
+function optionalBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+/** `user_group.list`; group display names fall back to their ids. */
+export function toUserGroupsInfo(response: UserGroupListResponse): UserGroupsInfo {
+  return {
+    groups: response.groups
+      .map((group) => ({
+        id: group.group_id,
+        name: group.name?.trim() || group.group_id,
+        ...(group.description?.trim() ? { description: group.description.trim() } : {}),
+        members: [...new Set(group.members ?? [])].sort(),
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    projectionRules: response.projections?.rules ?? [],
+    projectionsAreDefault: response.projections?.is_default ?? true,
+  }
 }
 
 function zoneUserSource(isLocal: boolean | undefined): ZoneUserSource {
@@ -205,8 +209,9 @@ export function toSelfEntity(
   return {
     ...fallback,
     id: detail.user_id,
+    role: parseUserType(detail.user_type) ?? 'unknown',
     displayName,
-    avatarUrl: firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
+    avatarUrl: usableImageUrl(firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl)),
     did: firstString(profile.did, asRecord(detail.local_profile).did, contact?.did, asRecord(detail.did_document).id, fallback.did),
     socialAccounts: toSocialAccounts(contact?.bindings),
     bio,
@@ -215,6 +220,7 @@ export function toSelfEntity(
     info: profileMap(profile, fallback.info),
     settings: {
       userType: String(detail.user_type),
+      ...(detail.groups?.length ? { groups: detail.groups.join(', ') } : {}),
       state: userStateBase(detail.state),
       resPool: detail.res_pool_id,
       passwordPolicy: detail.allow_password_change ? 'Change allowed' : 'Change restricted',
@@ -233,12 +239,17 @@ export function toLocalUserEntity(
   const status = zoneUserStatus(user.state)
   const role = zoneUserType(user.user_type)
   const availableApps = apps.map((app) => app.show_name || app.app_id)
+  const passwordChangeOverride = optionalBoolean(user.allow_password_change)
+  const contactEditOverride = optionalBoolean(user.allow_contact_edit)
+  const passwordChangeAllowed = user.can_change_password ?? passwordChangeOverride ?? defaultCanChangePassword(user.user_type)
+  const contactEditAllowed = user.can_edit_contacts ?? contactEditOverride ?? defaultCanEditContacts(user.user_type)
 
   return {
     id: user.user_id,
     kind: 'local-user',
     displayName: user.show_name || user.user_id,
-    did: `did:bns:${user.user_id}`,
+    did: user.did,
+    avatarUrl: usableImageUrl(user.avatar),
     socialAccounts: [],
     role,
     source,
@@ -248,13 +259,17 @@ export function toLocalUserEntity(
       : source === 'primary-did'
         ? 'passkey-ready'
         : 'password-set',
-    canChangePassword: (user.allow_password_change ?? role !== 'limited') && status === 'active',
+    canChangePassword: passwordChangeAllowed && status === 'active',
+    passwordChangeAllowed,
+    passwordChangeOverride,
+    contactEditAllowed,
+    contactEditOverride,
+    groups: [...new Set(user.groups ?? [])].sort(),
     storageUsed: 'Unknown',
     storageQuota: 'Unknown',
     lastActive: now,
     isOnline: status === 'active',
     availableApps,
-    defaultGroup: 'zone-members',
     profile: {
       displayName: user.show_name || user.user_id,
       userId: user.user_id,
@@ -282,7 +297,7 @@ export function toVisibleLocalUserEntities(
     const userId = user.user_id.trim()
     if (
       !userId ||
-      String(user.user_type).toLowerCase() === 'root' ||
+      parseUserType(user.user_type) === 'root' ||
       seenUserIds.has(userId)
     ) {
       continue
@@ -294,134 +309,70 @@ export function toVisibleLocalUserEntities(
   return visibleUsers
 }
 
-function agentStateToStatus(state: unknown): AgentEntity['status'] {
-  const normalized = String(state ?? '').toLowerCase()
-  if (normalized === 'running') return 'running'
-  if (normalized === 'stopped' || normalized === 'new' || normalized === 'deleted') return 'stopped'
-  return normalized ? 'error' : 'stopped'
-}
-
-function runtimeFromAgentInfo(
-  runtimeValue: unknown,
-  status: AgentEntity['status'],
-  fallback: AgentEntity['runtime'],
-): AgentEntity['runtime'] {
-  const runtime = asRecord(runtimeValue)
-  const available = runtime.available === true
-  const uiSessions = Number(runtime.ui_session_count ?? 0)
-  const workSessions = Number(runtime.work_session_count ?? runtime.total ?? 0)
-  const workspaces = Number(runtime.workspace_count ?? 0)
-
-  return {
-    uptime: available ? 'Online' : fallback.uptime,
-    memoryUsage: fallback.memoryUsage,
-    cpuUsage: fallback.cpuUsage,
-    lastActive: available ? new Date().toISOString() : fallback.lastActive,
-    runningTasks: available && status === 'running' ? workSessions : 0,
-    queuedTasks: 0,
-    healthStatus: available
-      ? status === 'running'
-        ? workSessions > 10
-          ? 'busy'
-          : 'healthy'
-        : 'degraded'
-      : 'offline',
-    uiSessions,
-    workSessions,
-    workspaces,
+/**
+ * An unfinished creation is `creating` / `failed`; a ready Agent takes the
+ * state of its constructed App. Anything not recognised is `unknown`, never
+ * an error.
+ */
+export function agentStateToStatus(
+  installState: AgentInstallState | string | null | undefined,
+  runtimeState: string | null | undefined,
+): AgentLifecycle {
+  switch (installState) {
+    case 'provisioning':
+    case 'bound':
+      return 'creating'
+    case 'failed':
+      return 'failed'
+    case 'ready':
+      break
+    default:
+      return 'unknown'
+  }
+  switch (String(runtimeState ?? '').toLowerCase()) {
+    case 'running':
+    case 'restarting':
+    case 'updating':
+      return 'running'
+    case 'new':
+    case 'stopped':
+    case 'stopping':
+    case 'deleted':
+      return 'stopped'
+    default:
+      return 'unknown'
   }
 }
 
-export function toAgentEntity(
-  agentInfo: AgentInfo | null,
-  fallback: AgentEntity,
-): AgentEntity {
-  const raw = asRecord(agentInfo)
-  const settings = asRecord(raw.settings)
-  const spec = asRecord(raw.spec)
-  const appDoc = asRecord(raw.app_doc ?? spec.app_doc)
-  const profile = asRecord(settings.profile ?? raw.profile)
-  const capabilities = [
-    ...stringArray(settings.capabilities),
-    ...stringArray(profile.capabilities),
-  ]
-  const dedupedCapabilities = Array.from(new Set(capabilities)).slice(0, 6)
-  const status = agentStateToStatus(settings.state ?? raw.state ?? spec.state)
-  const agentDid = firstString(raw.id, raw.did, raw.agent_did, settings.agent_did, fallback.did)
-  const agentId = firstString(
-    raw.agent_id,
-    raw.agentId,
-    raw.app_id,
-    raw.appId,
-    appDoc.name,
-    agentDid,
-    fallback.id,
-  ) ?? fallback.id
-  const displayName = firstString(
-    profile.display_name,
-    profile.displayName,
-    settings.display_name,
-    raw.display_name,
-    raw.name,
-    appDoc.show_name,
-    appDoc.showName,
-    agentId,
-    fallback.displayName,
-  ) ?? fallback.displayName
-
+export function toAgentEntity(entry: AgentEntry): AgentEntity {
+  const install = entry.install
+  const tunnels = entry.settings?.msg_tunnels ?? []
   return {
-    ...fallback,
-    id: agentId,
-    displayName,
-    avatarUrl: firstString(profile.avatar, profile.avatar_url, profile.avatarUrl, fallback.avatarUrl),
-    did: agentDid,
-    agentType: firstString(profile.agent_type, settings.agent_type, fallback.agentType) ?? fallback.agentType,
-    version: firstString(raw.version, settings.version, appDoc.version, fallback.version) ?? fallback.version,
-    status,
-    capabilities: dedupedCapabilities.length > 0 ? dedupedCapabilities : fallback.capabilities,
-    socialAccounts: socialAccountsFromUnknown(settings.bindings),
-    info: {
-      description: firstString(profile.description, raw.description, settings.description, fallback.info.description) ?? '',
-      model: firstString(profile.model, settings.model, fallback.info.model) ?? '',
-      appId: agentId,
-      appType: 'agent',
-    },
-    settings: {
-      owner: firstString(settings.owner, settings.owner_user_id, raw.owner_user_id, spec.user_id, fallback.settings.owner) ?? '',
-      permissions: firstString(settings.permissions, fallback.settings.permissions) ?? 'Not configured',
-      workspaceRoot: firstString(settings.workspace_root, settings.workspaceRoot, fallback.settings.workspaceRoot) ?? '',
-      serviceState: String(settings.state ?? raw.state ?? spec.state ?? 'unknown'),
-    },
-    didDocument: Object.keys(raw).length > 0 ? raw : fallback.didDocument,
-    runtime: runtimeFromAgentInfo(raw.runtime, status, fallback.runtime),
-  }
-}
-
-export function toEntityGroupEntity(group: SelfHostGroupSummary | unknown): EntityGroupEntity {
-  const raw = asRecord(group)
-  const groupDid = firstString(raw.group_did, raw.groupDid)
-  const groupId = firstString(raw.group_id, raw.groupId, groupDid, raw.id) ?? 'unknown-group'
-  const memberIds = stringArray(raw.member_entity_ids ?? raw.memberEntityIds)
-  const members = Array.isArray(raw.members) ? raw.members : []
-  const ownerName = firstString(raw.owner_name, raw.ownerName, raw.owner, raw.owner_did)
-  const createdAt =
-    firstString(raw.created_at, raw.createdAt) ??
-    isoFromUnix(raw.updated_at_ms ?? raw.updatedAtMs) ??
-    fallbackCreatedAt
-
-  return {
-    id: `eg-${groupId}`,
-    kind: 'entity-group',
-    displayName: firstString(raw.display_name, raw.displayName, raw.name, groupDid, groupId) ?? groupId,
-    avatarUrl: firstString(raw.avatar_url, raw.avatarUrl, raw.avatar),
-    did: groupDid,
-    socialAccounts: [],
-    description: firstString(raw.description),
-    memberCount: numberValue(raw.member_count ?? raw.memberCount) ?? (memberIds.length || members.length),
-    memberIds,
-    ownerName,
-    isHostedBySelf: booleanValue(raw.is_hosted_by_self ?? raw.isHostedBySelf) ?? false,
-    canMessage: booleanValue(raw.can_message ?? raw.canMessage) ?? false,
-    createdAt,
+    id: entry.agent_id,
+    kind: 'agent',
+    displayName: agentDisplayName(entry),
+    avatarUrl: usableImageUrl(entry.profile?.avatar),
+    did: entry.agent_did,
+    socialAccounts: tunnels.map((tunnel) => ({
+      id: `tunnel-${tunnel.platform}`,
+      platform: tunnel.platform,
+      accountId: tunnel.bot_account_id ?? '',
+      displayId: tunnel.bot_account_id ? `@${tunnel.bot_account_id}` : '',
+      status: install?.tunnel_state === 'failed' ? 'error' : install?.tunnel_state === 'bound' ? 'active' : 'pending',
+      isPublic: false,
+      canIdentify: false,
+    })),
+    createdAt: isoFromUnix(install?.created_at) ?? fallbackCreatedAt,
+    name: entry.name,
+    ownerUserId: entry.owner_user_id,
+    ownerDid: entry.owner_did || undefined,
+    bio: entry.profile?.bio?.trim() || undefined,
+    nickname: entry.profile?.display_name?.trim() || undefined,
+    status: agentStateToStatus(install?.state, entry.runtime?.state),
+    install,
+    settings: entry.settings,
+    template: entry.template ?? null,
+    runtime: entry.runtime ?? null,
+    createdFromGuide: entry.settings?.desktop_entry === JARVIS_GUIDE_ENTRY,
   }
 }

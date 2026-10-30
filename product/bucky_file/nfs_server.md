@@ -1,0 +1,601 @@
+# nfs_server 技术需求文档(v1,无 fs_meta 阶段)
+
+> 文档状态:Draft
+> 日期:2026-09-01
+> 代码位置:`buckyos/src/frame/nfs_server`(frame 服务,形态对齐 `smb_service`)
+> 上游协议:[NFSP v0](../../../cyfs-ndn/doc/NamedFileSystem_Protocol_v0.md)
+> 产品需求:[filebrowser_PRD.md](./filebrowser_PRD.md)
+> 记法:**【待决策】** = 需要 owner 拍板;**【上游】** = 需要 cyfs-ndn 侧配合修改。
+
+---
+
+## 1. 定位与总体策略
+
+### 1.1 一句话定位
+
+**nfs_server 是 NFSP v0 的一个"降级但诚实"的服务端实现**:在没有 fs_meta 的环境里,
+以服务器本地文件系统为实体树真相源、以 filedb 为虚拟 Node / Binding 真相源,
+对 WebUI(File Browser)提供统一的 Node / Entry / Container 协议服务;
+后续通过替换实体树实现平滑过渡到 cyfs-ndn 的 DFS(fs_meta)。
+
+```
+阶段一:WebUI → nfs_server(本地FS实体树 + filedb虚拟Binding/View/Collection + NamedStore)
+阶段二:WebUI → nfs_server(fs_meta实体树 + filedb虚拟Node + named_store) ← 客户端零改动
+```
+
+### 1.2 为什么这条路成立
+
+NFSP 的六条不变式(Ops_v3 I1–I6)里,I3/I4/I5/I6 依赖 fs_meta 作为强一致真相源。
+但在"网页访问服务器上的文件系统"这个产品形态下,**所有协议客户端的写入都必经
+nfs_server 进程**,唯一的旁路写入者只剩服务器本机进程——这与传统 NFS/Samba 服务器
+面对的局面完全相同,是有成熟解法的工程问题,而不是不可能的强一致模拟。
+
+### 1.3 平滑过渡的三条依赖
+
+协议里三样东西专门支撑这种分期,v1 必须正确使用:
+
+1. **`hello` feature 协商**(NFSP §4.4 / G7):v1 只广告实现了的 feature;
+   阶段二 feature 集合变大,老客户端无感。
+2. **结构化三态错误**(NFSP §8):客户端从第一天就必须处理 `NEED_PULL` / `REFERRAL` /
+   `STALE`,即使 v1 服务端永远不返回前两者。
+3. **opaque `revision` 是唯一正确性来源、watch 事件有损 + `resync`**(NFSP §5.6 / D11):
+   v1 的目录计数器、View/Collection generation 与 watch 都统一在这个语义框架内降级。
+
+### 1.4 目标与非目标
+
+**目标**
+
+- G1:支撑 filebrowser PRD 的 MVP 功能(浏览/上传/下载/搜索/分享/Topic 只读/Collection)。
+- G2:客户端(WebUI)只面向 NFSP 协议编程,阶段二零改动。
+- G3:服务端内部以 trait 隔离命名空间实现,阶段二只替换底层。
+- G4:所有降级语义显式、诚实——宁可返回错误/stale,绝不静默给出错误内容。
+- G5:Dir/View/Collection 统一返回 Container + Entry;协议从 v1 起允许 DFS Entry 引用
+  View/Collection,即使 `reference-binding` feature 分期开放。
+
+**非目标**
+
+- 不实现 fs_meta,不做 DirObject Base/Upper 内容 overlay;但必须实现"本地 FS native entries +
+  filedb virtual bindings"的最小 sidecar merge,否则未来无法在实体目录中引用 View/Collection。
+- 不做跨 Zone、不做设备视图 referral(可先硬编码只读)。
+- 不做 FUSE / 本地挂载。
+- 不追求 POSIX 兼容(继承 NFSP §1.2)。
+
+---
+
+## 2. 架构
+
+### 2.1 分层与 trait 边界
+
+```
+┌─────────────────────────────────────────────────┐
+│ NFSP handlers(resolve/stat/list/bind/commit/...)│ ← 一次写对,阶段二不动
+│ Node/Entry/Binding / want / cursor / cap         │
+├────────────── trait NamespacePlane ──────────────┤
+│ UnifiedNamespace                                 │
+│  ├─ NativeTree: v1 PassthroughFs → 阶段二 fs_meta│
+│  └─ VirtualPlane: filedb View/Collection/Binding │ ← 两阶段共用
+│     + Reconciler(v1 对账循环)                    │
+├─────────────────────────────────────────────────┤
+│  NamedStore(link 模式为主)                      │ ← 两阶段共用
+└─────────────────────────────────────────────────┘
+```
+
+**trait 边界放在统一 Node/Entry 原语层**,其中 NativeTree 对齐 fs_meta 的 dentry/inode 原语
+(Ops_v3 §0.4),VirtualPlane 提供同构的 Container 原语:
+resolve_locator / stat_node / list_entries / create_binding / unlink_entry /
+replace_target(CAS) / lease 表操作。
+这样 handler 层沉淀的全部工作——错误码、掩码、游标、watch 管道、上传编排、
+cap 校验——原样平移到阶段二。
+
+`list_entries` 必须对 Dir / View / Collection / Group 返回同一信封。NativeTree 与
+VirtualPlane 只在 NamespacePlane 内部按 Node kind 路由,WebUI 不得感知实现分层。
+
+**Reconciler 是 v1 唯一的一次性组件**(阶段二删除),必须隔离成独立模块,
+不允许其它模块依赖它的内部状态。
+
+### 2.2 部署形态
+
+- frame 服务,依赖 `buckyos-kit` / `buckyos-api`,由 node_daemon 拉起,对齐 `smb_service`。
+- 导出根目录(export roots)由服务配置声明:哪些本地目录以哪个逻辑路径暴露。
+  v1 至少支持多个 root 映射到当前 Zone 的 `cyfs:///` 命名空间一级子目录。
+- 鉴权:每个请求带 Verify Hub session token(NFSP §7.1 第一行),无凭证即匿名;授权按路径 ACL,
+  见 §11。分享(§12):`share.*` 的快照分享经 `share.<zone>/s/{token}` 放行;`grant` 签发的活子树
+  bearer cap 数据面仍不放行。`uid/gid` 不进协议。
+
+---
+
+## 3. 数据模型
+
+### 3.1 真相源划分(v1 的核心决定)
+
+| 数据 | 真相源 | 说明 |
+|---|---|---|
+| 实体 DFS 树(native Entry、名字、大小、mtime) | **本地文件系统** | nfs_server 无状态直通,不镜像 |
+| 虚拟 Node / Binding(View、Collection、Group、DFS reference Entry) | **filedb** | 与 native Entry 在服务端 list 时合并 |
+| 锚点及其派生物(meta/grant) | **filedb** | 见 §3.2 |
+| chunk 内容 | 本地文件(link 模式)/ NamedStore(Store 模式) | 见 §5 |
+| Dir revision / lease / seq 重放窗口 | **内存** | 重启即失效,靠协议的 resync/STALE 语义恢复 |
+| View/Collection revision | **filedb** | 持久 generation,对外编码为 opaque revision |
+
+可见命名空间不是把 View/Collection 伪装成本地目录,而是:
+
+```
+VisibleEntries(dir) = NativeFsEntries(dir) + VirtualBindings(dir)
+```
+
+native 父子边继续满足严格树;reference 边形成可成环导航图。递归操作默认不跟随 reference。
+
+### 3.2 filedb:最小持久集
+
+设计哲学:**filedb 只装本地文件系统表达不了的东西**。其中不可约的核心包括
+稳定 Node 身份、虚拟 Binding、View/Collection 结构。View/Collection 成员只保存 Ref;
+锚点不稳,Collection 必然烂掉(成员死链,违反 PRD 11.5"路径始终可信")。
+
+**持久表(丢失即数据丢失):**
+
+| 表 | 内容 |
+|---|---|
+| `entities` | 全局 `node_id`、gen、kind、owner、created_at;虚拟 Node 必有行,实体文件惰性建行 |
+| `anchors` | `node_id` ↔ 原生文件ID(ino/FileID) ↔ 最后已知路径 ↔ size/mtime ↔ qcid ↔ full_hash(可空) |
+| `namespace_bindings` | `entry_id`、parent Node、name、target Ref、binding_type、state;表示 DFS 目录中的 virtual reference |
+| `views` | View Node、title/origin/generation/stale/query 等 |
+| `view_base` | View 自动发现成员(target Ref + provenance),对应 NFSP §3.5 Base Layer |
+| `view_patch` | add/remove/pin,对应 Upper Layer;两表合并规则同 I2 |
+| `collections` | Collection Node、title/description/generation/owner |
+| `collection_nodes` | `entry_id`、parent Group、node_type(ref/group)、target Ref/name、manual_order |
+| `meta_records` | MetaRecord,anchor 列为 `live:<node_id>` 或 `obj:<obj_id>` |
+| `grants` | cap 签发记录(id、subtree、ops、expiry、revoked) |
+
+**缓存表(可全量重建,允许丢):** hash 缓存、搜索索引(名字索引起步)、缩略图映射。
+
+**惰性锚定原则:** 只有当实体文件/目录第一次进入 View/Collection、被写 meta、被分享、
+或作为 virtual binding 的 parent/target 时才分配稳定 node_id 建 anchor 行。纯浏览零 DB 写入。
+DB 规模 ∝ 参与高级功能的 Node 数,而非文件总数。
+
+Collection 和 namespace binding 的目标列只能保存 Ref,不得保存 path 作为身份。页面返回时服务端
+批量解析 target Ref 补 `canonical_path`;rename 后自然跟随。失联保存 Entry 并返回 stale,
+权限不足则保留最小占位但不得泄漏目标属性。
+
+**schema 约束:** entities.node_id 是 NFSP LiveRef 的稳定 id。实体 file/dir 的 anchors 必须可映射到
+fs_meta inode;阶段二迁移时保留 node_id(或建立一一映射而不改变对外 LiveRef)。
+View/Collection/Group 继续由 VirtualPlane 管理,namespace_bindings/meta/grants 原样跟随。
+这是"平滑过渡"的实际含义:已发出的 Ref、Collection 成员、Meta 锚点和分享链接跨切换存活。
+
+### 3.3 Ref 设计(NFSP 纪律:locator 只用于首次解析,后续 op 只认 Ref)
+
+两级 LiveRef:
+
+- **未锚定实体 Node**:LiveRef.node_id 是带签名的 opaque handle,内部编码
+  (export_root_id, 相对路径, 原生文件ID),gen 表达句柄代际。
+  解析时校验原生ID仍与路径匹配,失配返回 `STALE`,客户端重新 resolve。
+  这就是经典 NFS filehandle 方案。
+- **已锚定或虚拟 Node**:`LiveRef{node_id,gen}`,由 entities + anchors/View/Collection 表解析。
+  View/Collection/Group 从创建起就有稳定 LiveRef。
+
+**红线:WebUI 和服务端都不得在任何持久引用位置(收藏、View、Collection、Meta、分享)
+存路径作为身份,只能存 Ref。** path/`view://`/`collection://` 只是 locator 或展示 location。
+这是阶段二客户端零改动的前提。
+
+### 3.4 Container revision 语义(相对 I3 的显式偏离)
+
+- Dir 在内存中惰性维护计数器;协议写入同步递增;Reconciler 发现旁路变更后递增。
+- View/Collection/Group 使用 filedb generation。handler 对外统一编码为 opaque `revision`。
+- **偏离:Dir revision 不跨进程生命周期单调。** 客户端必须把所有 revision 当**相等性令牌**使用
+  (CAS 与缓存失效判断),不得跨 kind 或按数值比大小。此约定写入客户端开发文档。
+- 重启后所有 watch 连接收到 `resync`,客户端全量重拉——协议 D11 已定义此路径。
+
+### 3.5 Entry / Binding 与 sidecar merge
+
+- native Entry 来自本地 FS;entry_ref 可由 parent handle + name + 原生文件ID 派生。
+- View 成员是 `binding:derived`;Collection 文件成员是 `binding:reference`,自有 Group 是
+  `binding:member`;DFS 中引用 View/Collection/文件也是 `binding:reference`。
+- `entry_ref` 与 `target.ref` 必须分离。同一 target 可在 Collection 中出现多次;
+  unlink reference 只删 Entry,不删 target。
+- `list(DirRef)` 合并 native Entry 与 `namespace_bindings`;绑定创建时拒绝同名。服务器本机旁路
+  产生同名 native 项时,native 可见项保持不变,virtual binding 标 conflict 并通过 `conflicts[]`
+  + `container_changed/resync` 暴露,绝不静默覆盖或改绑。
+- reference 图允许成环。递归操作默认不跟随;显式跟随必须有 `max_hops` 并按 Ref 去重。
+- 权限 = 可见 Binding 与可访问 target 的交集。无 target 权限时只返回不可用占位,
+  不返回名称以外的目标信息、canonical_path、attrs 或成员数量。
+
+### 3.6 锚点维护(Reconciler 的核心职责)
+
+变更检测阶梯(与 NamedStore link 模式共用同一套判据,见 §5):
+
+```
+(size, mtime) 未变 → 视为未变(0 IO)
+(size, mtime) 变、qcid 未变 → 仅 touch(8KB IO)
+qcid 变 → 重算完整 hash,产生新 obj_id;旧 obj 上的 meta 走谱系迁移(commit 时刻
+         同时知道 node_id 与新旧 obj_id,可显式记录 lineage)
+```
+
+两个破坏源及对策:
+
+1. **rename/move**(原生ID不变、路径变):watcher 事件驱动更新 anchors.path。
+   平台机制:NTFS 用 USN Journal(可补读离线期间变更);Linux 用 inotify,
+   有条件时用 fanotify `FAN_REPORT_FID`(5.17+);macOS 用 FSEvents + 文件ID反查。
+2. **编辑器覆盖保存**(路径不变、原生ID变):启发式重绑——同目录同名出现新原生ID,
+   anchor 换绑到新ID(该场景的语义本意就是"同一文件被编辑")。
+
+两者都失败(离线期间既改名又编辑)→ anchor 标 **stale**,不猜。
+View/Collection/namespace binding 成员显示"失联"并提供重新定位或 unlink 入口。
+**诚实的 stale 优于静默的错链。**
+
+---
+
+## 4. 协议实现范围与降级契约
+
+### 4.1 v1 方法集(NFSP §12.2 MVP 子集的再裁剪)
+
+| 组 | 方法 | v1 状态 |
+|---|---|---|
+| 会话 | `hello` / `bye` | 完整 |
+| 解析 | `resolve` / `stat` / `list` / `batch` | 完整;`list` 接受 Dir/View/Collection/Group Ref,统一信封 |
+| 写入 | `mkdir` / `move` / `delete` / `open_write` / `commit_file` | 完整(revision CAS + 内存租约) |
+| 引用绑定 | `bind_ref` / `unlink` | 报文与 schema 从 v1 固定;首版可不广告 `reference-binding`,但 list 必须能返回 Binding Entry |
+| 上传 | `probe` + tus 续传 + `commit_file` | 完整(见 §5.3) |
+| 元数据 | `get_meta` / `set_meta`(user ns) | 完整 |
+| 视图 | `open_view` + 通用 `list(view_ref)` | 只读;`view_patch` 延后 |
+| 集合 | `create_collection` / `open_collection` / `collection_patch` + 通用 `list` | 完整;只管理引用/Group,不是上传目标 |
+| 搜索 | `search` | v1 只做 `name` mode,但**响应结构完整**(带 `match_source`/`sources[]`),后续加 mode 不改结构 |
+| 分享 | `grant` / `revoke` | 签发完整(活子树 bearer cap),数据面不放行 |
+| 分享(实现扩展) | `share.capabilities/plan/create/operation/get/list/update/stop/hide`、`share.app.handoff/report`、`share.public.list`、`share.stats` | 完整(§12,`hello` 广告 `share`) |
+| 派生 | `repr`(thumb256/thumb1024) | 完整(产物进 NamedStore) |
+| 通知 | `watch`(SSE) | 完整;统一 `container_changed(ref,revision)` + 有损 `resync` |
+
+**首版不实现且不在 hello 广告:** `get_tree`、`reference-binding` 写操作、`publish_dir` / Frozen、
+`referral`、`get_policy` 多维策略、跨 Zone、`search.semantic`。即使首版不允许用户创建 DFS Binding,
+Node/Entry/list 报文也不得退回 Folder-only 形态。
+
+### 4.2 降级契约(必须写进客户端开发文档)
+
+| 语义 | 忠实 / 降级 | 说明 |
+|---|---|---|
+| 信封 / seq exactly-once | 忠实 | 重放窗口在内存;重启后 `SEQ_OUT_OF_WINDOW`,客户端重新 resolve |
+| revision CAS(协议客户端之间) | 忠实 | Container 写入全部串行经过 nfs_server |
+| 租约 I4(协议客户端之间) | 忠实 | 多标签页/多设备单写保护是真的 |
+| 租约(对服务器本机进程) | **劝告性** | 旁路编辑在 `commit_file` 时显式冲突(size/mtime/qcid 复检),不静默覆盖 |
+| Dir revision 跨重启单调(I3) | **降级** | opaque 相等性令牌;重启 resync;View/Collection generation 持久化 |
+| `NEED_PULL`(I6) | 服务端不产生 | v1 全部内容在本地;客户端仍须实现三态处理 |
+| Frozen 承诺 | **不提供** | 不广告 `frozen-subtree`;绝不返回背后是可变本地文件的 Frozen |
+| meta 锚定 | 忠实(按协议) | 可变 Node 锚 `live:`;committed 内容锚 `obj:` |
+| reference 删除语义 | 忠实 | `unlink(entry_ref)` 只解除 Binding;`delete` 才销毁 native target |
+| reference 权限 | 忠实 | Binding 可见性与 target 权限取交集,不得借引用提权 |
+| Cache-Control immutable | 仅对 Store 模式对象 | link 模式内容不发 immutable 头 |
+
+### 4.3 错误模型
+
+完整实现 NFSP §8 错误码表。v1 额外强调:
+
+- `STALE`(LiveRef/EntryRef/动态 Group Ref 失效)→ 客户端从可信 locator 或父 Container 重新
+  resolve/list。NFSP §8 已纳入该错误。
+- `NAMESPACE_CONFLICT`(native 与 virtual binding 同名)→ list 返回 `conflicts[]`,客户端展示修复入口;
+  服务端不得猜测、覆盖或自动改绑。
+- link 模式 chunk 读取时 qcid 失配 → 数据面返回 5xx + 结构化 `VERIFY_FAILED`,
+  同时触发 Reconciler 对该锚点重新走检测阶梯;不返回撕裂内容。
+
+---
+
+## 5. NamedStore 集成(link 模式为主)
+
+### 5.1 存储策略
+
+依据 [link to local.md](../../../cyfs-ndn/doc/link%20to%20local.md) 与
+`named_store` 现有实现(`add_chunk_by_link_to_local_file` + `verify_local_link`):
+
+- **commit 默认零拷贝**:算完整 hash + qcid,以 link 模式登记 chunk;
+  每次打开 reader 前 `verify_local_link` 重校 qcid,失配响亮失败(检测而非防护,
+  失败模式正确)。
+- **Link → Store 单向提升**,触发时刻 = **对外承诺的生命周期超过本地文件时**:
+  - `grant` 分享一个文件/子树(首期以 `share.*` 的分享快照实现:Store 模式写入 named store 并 pin,
+    §12;`grant` 本身与 commit 路径的 link 模式仍未接 NamedStore);
+  - 生成 pinned URL;
+  - (未来)`publish_dir` / 广告 Frozen。
+  本地自用的 commit 保持 link;坏了会 `VerifyError`,由 Reconciler 重绑重算。
+- **小于 12KB 的文件必须走 Store 模式**(`calc_quick_hash` 对
+  `MIN_QCID_FILE_SIZE` 以下报错),commit 路径显式分支;小文件拷贝成本可忽略。
+- 缩略图(`repr` 产物)一律 Store 模式(它们本来就是新生成的字节)。
+
+### 5.2 已知边界(接受并记录)
+
+1. qcid 采样盲区:等长且不触及采样窗口的修改检不出。**不导出**数据库文件、
+   VM 镜像等原地写文件所在目录,或对此类目录禁用 link 模式(配置项)。
+2. verify 与流式读之间存在小窗口 TOCTOU:纯浏览器数据面兜不住撕裂读。
+   已知限制,走 mtree proof 的客户端(阶段二)可端到端兜底。
+
+### 5.3 上传路径
+
+按 NFSP §5.3:客户端算 hash → `probe`(批量查缺,命中即秒传)→ tus 续传 →
+`commit_file`(parent Container revision CAS 原子绑定)。上传中的文件不进命名空间(D4),
+占位条目由 WebUI 本地渲染。上传落盘后即为普通本地文件,立即可被 link 模式登记。
+
+**【待决策】** v1 是否复用 `/ndm/v1/uploads` 的 tus 实现,还是 nfs_server 内嵌
+一个最小 tus endpoint。倾向后者(减少 v1 对 ndm gateway 的部署依赖),
+但 URL 与报文格式保持与 NDM 协议一致,阶段二可切换。
+
+### 5.4 【上游】cyfs-ndn 侧需要的三个修改
+
+1. **qcid 算法不一致(疑似 bug)**:`calc_quick_hash`(hasher.rs:208)只采样
+   头4KB+中点4KB 两片;`calc_quick_hash_by_buffer` 要求头/中/尾三片;
+   `MIN_QCID_FILE_SIZE = 4096*3` 表明设计意图是三片。需统一为三片
+   (补尾片同时收窄最常见的尾部修改盲区:MP4 moov、ID3 tag 等)。
+2. **`verify_local_link` 增加 (size, mtime) 快速通道**:`ChunkLocalInfo` 存
+   size/mtime,未变则跳过 qcid 重算,省高频小对象每次 GET 的 8KB IO。
+3. `probe` 依赖的 `objects/lookup` 批量化(NFSP §12.1 P1 项)。
+
+---
+
+## 6. Watch 通知面
+
+- `GET /nfs/v1/watch` SSE,事件集按 NFSP §5.6:`container_changed` / `meta_changed` /
+  `lease_recall` / `policy_changed` / `resync`。
+- 事件来源:协议写入(同步发)+ Reconciler(去抖后发,建议 200–500ms 窗口)。
+- `container_changed` 携带 Node Ref、kind、opaque revision、reason;Dir/View/Collection/Group 同形。
+- `hint` 尽力而为;**正确性来源永远是 revision**(客户端收到事件后按 Ref 重拉 list)。
+- 大批量旁路变更(如服务器上跑构建)→ 直接发 `resync`,不逐条发事件。
+- 断线重连:v1 不做事件缓冲补发,重连一律先收 `resync`(D11 允许)。
+
+---
+
+## 7. 里程碑
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| M1 | 只读:hello/resolve/stat/通用 list/batch + 数据面 GET(Range)+ 无状态游标 | Dir 返回 Node/Entry 信封;WebUI 能浏览、下载,首屏 1 次 batch |
+| M2 | 写入:mkdir/move/delete/open_write/commit_file + Container revision/lease + watch | 多标签页写入互斥;统一 `container_changed` 变更互见 |
+| M3 | filedb:entities/anchors + 惰性锚定 + Reconciler(watcher+扫描+重绑启发式) | 旁路 rename/编辑后 LiveRef 与 meta 不丢;失联标 stale |
+| M4 | NamedStore:probe/秒传/link 模式 commit/repr 缩略图 | 重复上传秒传;缩略图可被浏览器缓存 |
+| M5 | View/Collection Node + 通用 list + collection_patch + meta/search(name)/grant | Topic 只读、Collection 引用管理/Shares、搜索分享闭环 |
+| M6 | namespace_bindings sidecar merge + bind_ref/unlink + conflict/cycle/权限约束 | 实体 Dir 可引用 View/Collection;解除引用不删除目标;无 N+1 |
+| M7 | 阶段二准备:NativeTree trait 冻结,fs_meta 实现开工;anchors → inode 迁移工具 | 迁移演练:LiveRef node_id 保留,客户端不改 |
+
+## 8. 阶段二切换脚本(现在就约束设计)
+
+1. 停写(维护窗口)→ Reconciler 最后一轮对账;
+2. 实体 file/dir anchors 灌入 fs_meta,保留对外 LiveRef node_id(可直接保留为 inode_id,
+   或持久化一一映射);未 hash 文件补算,字节按需 Link→Store;
+3. View/Collection/Group/entities/namespace_bindings/meta/grants 留在 VirtualPlane,无需迁移协议身份;
+4. NativeTree 从 PassthroughFs 切换为 fs_meta,`hello` feature 集合扩大;
+5. 内存态(未锚定 handle/Dir revision/lease/seq)全部作废:客户端经 `STALE`/`resync` 重新 resolve
+   ——这正是它们 v1 起就必须实现的路径,切换日无新代码。
+
+## 9. 待决策清单
+
+| # | 决策点 | 建议 |
+|---|---|---|
+| N1 | tus endpoint 内嵌 vs 依赖 ndm gateway | 内嵌最小实现,报文对齐 NDM 协议 |
+| N2 | export roots 配置格式与热更新 | 静态配置起步,热更新延后 |
+| N3 | 原地写文件目录(数据库等)的导出策略 | 提供目录级 `no_link` 配置,默认导出但禁 link |
+| N4 | native 与 virtual binding 被旁路写成同名时的修复 UI | 协议已定 `conflicts[]` + `NAMESPACE_CONFLICT`;自动重命名/覆盖都禁止,交互待产品定案 |
+| N5 | search 索引落 filedb 缓存表 vs 独立引擎 | v1 落 filedb(名字索引),语义检索阶段二再议 |
+| N6 | Windows 服务器支持是否进 v1 | 【待决策】影响 Reconciler 的 watcher 选型(USN vs inotify) |
+| N7 | `reference-binding` 写能力是否随首版开放 | 报文、schema、list 消费能力必须首版固定;若排期不足可不在 hello 广告,后续只开 feature |
+
+## 10. 本地文件复制扩展（FB-04-COPY）
+
+2026-09-07 实现。本节描述当前本地 FS 实现；named object 内容复制仍待真正 DFS 接入。
+共享协议以 `src/kernel/buckyos-api/src/nfs_copy.rs` 为准；执行器为
+`src/frame/nfs_server/src/copy.rs`，客户端为 `src/frame/desktop/src/api/nfs_copy.ts`。
+
+### 10.1 身份、认证及协议
+
+所有方法为 `POST /nfs/v1/<method>`，沿用 NFSP `{session,args}` 与 `{ok,result/error}`
+信封。`Authorization: Bearer <Verify Hub user session token>` 必填，服务端通过已有
+runtime 可信 token 验证入口校验签名、issuer、有效期、TokenUse、主体类型及目标。
+Task creator 为该用户及 token 中的规范 app target；查询/控制同时核对这两个字段。
+NFSP hello session 不参与创建者推断。Web SDK token 只发向当前页面同源的 NFSP 地址。
+提交时另按 §11 的路径 ACL 检查：用户须能读取每个源（含其下关闭继承的子树）并能写入目标目录；
+检查对签名 copy_ref 中的路径进行，已失效的源仍按逐项失败报告。文件读写本身仍受 OS 权限约束。
+
+普通浏览的 `ref` 保持原有长期锚点语义。Native `stat/resolve` 和 `list.target` 另返回
+`copy_ref: WireRef | null`，是带 HMAC 签名的原生文件身份，锚定实体也返回独立 copy_ref。
+其 `nh_*` payload 为 `{r,p,i,d,b,k}`：export、相对路径、inode、device、可用 birth time、
+kind。Copy 必须保存 copy_ref，Paste 不能重新仅按路径取得源，也不能使用会按编辑器
+覆盖规则重绑的 `n_*` 引用替代。不存在稳定原生身份的平台不开放复制。
+
+| 方法 | args | result / 行为 |
+|---|---|---|
+| `copy_capabilities` | `{}` | 验证用户及 TaskMgr schema 可用后返回 `{supported,schema_id}`；Unix 本地 FS 支持 |
+| `copy_submit` | `{idempotency_key,input}` | 立即返回 `{task_id}`；每次主动 Paste 新键，同次提交重试同键同 Input |
+| `copy_list` | `{cursor?}` | TaskMgr `ListTasksResp`，同 creator 的本 schema 任务；每页 50 项及 `next_cursor` |
+| `copy_get` | `{task_id,after?}` | `{task,summary,items,next,conflict}`；明细按递增 id 分页，每页至多 100 项 |
+| `copy_decide` | `{task_id,item_id,choice,apply?}` | choice 为 `keep-both/skip/cancel`；apply 仅作用于相同源/目标文件夹分类 |
+| `copy_cancel` | `{task_id,request_id}` | `{requested:true}`；真实 TaskMgr control 请求，执行器清理/对账后 ack |
+
+Input：
+
+```json
+{
+  "sources": [{"source_ref": {"type":"live","node_id":"nh_<signed identity>","gen":0}, "source_path":"/home/Documents/a.txt", "name":"a.txt"}],
+  "destination_ref": {"type":"live","node_id":"nh_<signed directory identity>","gen":0},
+  "conflict": "ask",
+  "retry_of": null
+}
+```
+
+每任务最多 256 个选中源，目录的递归子项不占该上限。源与目标 Ref 必须为签名本地身份。
+Input 在任务创建后不可变。服务先查询相同 creator/key 的已有 Task，核对完整 Input 后
+返回原 task_id；即使目标后来变化，合法重放也不会变成第二次复制。TaskMgr 负责并发
+创建去重、runner epoch/revision CAS 及一次性 Result，nfs-server 负责文件副作用。
+使用内置 `nfs.copy/v1` schema（version 1，system storage，App executor，非 user-creatable），
+由 nfs-server 代理用户创建并执行，无额外 Task Dispatch Center 协议。
+
+`summary` 包含 `success/failed/skipped/cancelled/pending/bytes`。每条 item 包含
+`id/source_index/source_path/target_path/kind/status/size/mtime/error/identity`。
+mtime 为可用 Unix 秒数，未知元数据为空；identity 为已创建副本的原生身份。
+冲突附 `target_kind/target_size/target_mtime`。目录与子项分别计数，部分失败目录不会
+报整目录成功。`next` 是最后 id，客户端按需加载；恰好整页时可能再读到空尾页。
+
+### 10.2 持久执行与故障窗口
+
+Task progress 为 `{journal:{version:1,task_id},summary}`。Task Input/Result/progress
+均不承载无界子项清单；`data_dir/copy.sqlite` 用 SQLite WAL + synchronous FULL 持久化
+copy_job 与分页 copy_item。每项记录源/目标父目录身份、所选名称、临时路径、读取基线、
+已写字节、副本身份及状态。数据库和 copy-locks 必须与任务运行数据一起保留；缺失旧
+任务日志时报告需人工核对，不把已有目录当成可合并目标。每任务用 OS 文件锁串行执行，
+防止同进程恢复扫描和多个进程同时执行；进程退出释放锁。恢复扫描间隔 2 秒。
+
+| 持久状态 | 执行/恢复规则 |
+|---|---|
+| pending / conflict | 校验源与目标父身份，选择名称；冲突进入同一 Task 的 Waiting |
+| creating | 创建目标目录或同目录 `.bucky-copy-<task>-<item>` 临时文件；身份未记下的中断明确失败待核对 |
+| creating + 已记录临时身份 | 复检源基线，核验并清理未提交临时文件，重新读取；不产生第二份已提交副本 |
+| prepared | 字节、普通权限/mtime、临时文件及父目录已同步；记录副本身份后执行原子不覆盖提交 |
+| prepared + 目标同身份 | 证明文件已提交，仅清理临时名并记 success，覆盖“落盘后进度未写入”的窗口 |
+| prepared + 目标异身份 | 保留当前目标，记录 STALE / manual reconciliation required，不再猜测生成副本 |
+| committed / directory_wait | 核验新目录身份后流式枚举真实源目录，子项与 expanded 标记事务落库，最后恢复目录元数据 |
+| success / failed / skipped / cancelled | 终态逐项结果保留；失败目录仍披露已成功子项 |
+
+普通文件读取使用 1 MiB buffer，不经浏览器下载再上传。Linux 读取使用
+O_NOFOLLOW/O_NONBLOCK，读取前核对 open/fstat 与 lstat，提交前复检 inode/device/birth、
+size、mtime 及 Unix 纳秒 ctime。目录复制没有树级快照；允许 Copy 后同一文件内容更新，
+读取执行时内容；检测到替换、移动或读取中变化时报失败。祖先路径禁止软链接。
+不承诺检测所有本机进程并发修改，目录元数据只表示各目录执行时捕获的状态。
+
+提交用 `hard_link(新建临时文件,目标)` 实现不覆盖的原子名称创建，再同步父目录并删除
+临时名；绝不把源文件硬链接到目标。源硬链接分别读写成独立普通文件。EEXIST 回到冲突
+处理，不覆盖目标。目录用原子 create_dir，不合并已有目录。保留两者保持扩展名，并按
+UTF-8 边界截断到 255 字节。目标目录是自身或源的后代时拒绝。
+
+取消通过 TaskMgr 请求/ack 完成，读取循环约每 100 ms 检查控制，约每 500 ms 更新
+大文件字节进度。停止新工作、对账 prepared 项、清理已识别的未提交临时文件；保留
+已提交子项。无法核验/清理的项明确记失败，Task 仍确认取消，UI 可查看原因。
+非终态重启继续原 Task。终态“重试失败项”创建新 Task、新键并填 `retry_of`；只重置
+失败/取消且可安全重试的项，成功项原样保留；部分目录只复用原日志记录且身份核验通过
+的副本目录。源/目标不可借重试改变，也不修改原 Task 的终态。
+
+### 10.3 元数据与范围
+
+- 普通文件独立内容；保留目录层级、空目录、普通权限位（0777）和文件/目录 mtime。
+  不复制属主、ACL、filedb 元数据、标签、分享授权、集合关系；创建身份/ACL 按目标 FS 规则。
+- 软链接复制链接文本（含失效、相对、绝对链接），不跟随、不套用普通文件内容独立性。
+  链接的相对解析由新位置决定；软链接权限/mtime 不做普通文件式设置。
+- 设备、FIFO、socket 显式 UNSUPPORTED；非 UTF-8 名称无法进入协议，目录项枚举失败会
+  披露部分目录结果，不将其读为普通字节流。
+- 实体目录中的 filedb binding 逐项 skipped，不递归跟随。集合成员可通过实体 copy_ref
+  复制本地目标；Collection/View/Group 及 named object 不支持内容复制。
+- 成功创建触发目录 revision/watch 及前端 reader 失效，可立即查看或定位副本。
+
+复现命令、实际验证数量、128 MiB 内容/身份及恢复证据见
+[FB-04-COPY 验收记录](./filebrowser_copy_TODO.md)。完整网关 SSO、非 Unix 平台、整仓部署、
+百万实体磁盘性能与断电硬件故障不由该独立服务 E2E 证明。
+
+## 11. 身份与路径权限（ACL）
+
+2026-10-15 实现。实现见 `src/frame/nfs_server/src/{auth,acl,access}.rs`，客户端见 websdk
+`nfsp.ts`（`getAcl`/`setAcl`/`listAcls`）与 Desktop File Browser “权限…”对话框、设置“文件权限”页。
+
+### 11.1 身份
+
+- 每个请求单独认证：`Authorization: Bearer <Verify Hub session token>`；`<img>`/下载等无法带头的
+  同源请求用 SSO cookie（`buckyos_session_token` 优先，其次 `<app_id>_token`）。网关对 `/nfs/v1/*`
+  不做鉴权，nfs-server 是唯一检查点。
+- 无凭证 = 匿名，只能到达授予 `public` 的路径。显式 Bearer 无效时报错（`PERMISSION_DENIED`，
+  `reason: "unauthenticated"`）；失效 cookie 降级为匿名，保证公开内容可读。
+- User 主体按 `system/zone_owner_user_id` 区分 Zone owner 与普通用户；System/Device 主体
+  （Zone 服务、节点上的 CLI）视同 owner；App/Agent 主体只能调用 `share.*`（以其用户身份读源文件，审计记
+  app），其余方法与数据面一律拒绝（`reason: "delegated_session"`）。
+- hello 会话绑定发起它的身份，hello 结果带 `identity {user_id, role: admin|user|anonymous}`；
+  之后身份不同的请求返回 `reason: "session_principal_changed"`，客户端重新 hello。watch、
+  上传分片同样核对身份。Desktop 的列表缓存在身份变化时整体清空。
+- 独立模式不给 `--auth-test-config` 时不鉴权（所有请求全权限，仅供本机开发/测试）；
+  给出 `{public_key, zone_owner}` 后按测试密钥验证 token，规则与服务模式相同。
+
+### 11.2 权限模型
+
+权限只由路径决定（NFSP §7.3：policy 保护的是命名空间入口），判定不触碰文件系统，
+因此对无权路径“不存在”与“无权”同样返回 `PERMISSION_DENIED`，无法借此探测名字。
+
+| 级别 | 含义 |
+|---|---|
+| `traverse` | 只是通往共享项的上级目录：可列出，但只显示通向可访问项的子项 |
+| `read` | 列目录、stat、读内容、get_meta、搜索命中 |
+| `write` | read + 在其中创建/上传/改名/移动/删除、set_meta |
+| `manage` | write + 查看与修改 ACL、grant/revoke |
+
+- 内置规则（不可被记录覆盖）：Zone owner 对一切 `manage`；用户对 `home/<user_id>/**` `manage`。
+  建账号时没有任何服务创建个人目录，nfs-server 在该用户 hello 时按需创建 `home/<user_id>`
+  （与 smb_service 一致；以 `.` 开头或含非法字符的 id 不创建）。
+- ACL 记录挂在路径上：`{inherit, entries[{principal, level}]}`，principal 为 `user:<id>`、
+  `zone_users`（任何已登录用户）或 `public`（任何人，只能 `read`）。授权沿目录向下继承，
+  多条取最高；`inherit=false` 的记录不再收集上级授权（内置规则仍生效），用于在共享目录中
+  保护子目录。
+- 结构操作：创建需目标目录 `write`；保存已有文件只需该文件 `write`（单文件授权可用）；改名/移动/
+  删除需父目录 `write` 且对象本身及其下所有关闭继承的记录处均 `write`；移动另需目的目录 `write`。
+  记录随协议内 move 迁移、随 delete 删除；旁路改名/删除会留下孤儿记录（设置页显示“路径已不存在”，
+  可移除），协议内在该路径新建目录/文件或移入时先清掉这些孤儿记录，新对象不会继承旧授权。
+- 符号链接：非 owner 主体的访问不经过路径中的符号链接目录（`reason: "symlink"`）；数据面读取
+  文件链接时按其真实路径授权，真实路径须在导出内。复制在每次运行（含重启恢复）时按任务创建者
+  重新检查权限。
+- 引用不提权：DFS binding、Collection 成员、View 成员的目标须对调用者可见，否则只返回
+  `target_state: "denied"` 占位（View 直接省略）；`bind_ref`/`add_ref` 要求能读目标。
+  Collection 归创建者所有（owner 外仅 Zone owner 可访问）。View 对已登录用户只读。
+- 侧信道：`probe` 与按 hash `commit_file` 只命中调用者可读的内容；watch 事件只投递给能读该
+  容器的订阅者，只有 `traverse` 的订阅者只收到不含名字提示的刷新。
+- 节点、列表项、搜索命中带 `access_level`；容器 `capabilities` 的可写位随之收紧。
+- 服务模式首次启动时写入两条默认记录（之后与普通记录无异，owner 可改）：
+  `srv/library` → `zone_users: write`，`srv/publish` → `public: read`（与 doc/path_usage.md 和
+  `public.<zone>` 一致）。
+
+### 11.3 方法（实现扩展，`hello` 广告 `acl`）
+
+| 方法 | args | 结果 |
+|---|---|---|
+| `get_acl` | `at` 或 `{ref}` | `{path, access_level, can_manage, revision}`；可管理者另得 `inherit, entries, inherited[{…, from}], builtin[{…, reason}], updated_by, updated_at` |
+| `set_acl`（写，需 seq） | `at`/`ref` + `{inherit, entries, expected_revision?}` | 需 `manage`；整体替换本节点记录，`inherit=true` 且无条目即删除；路径已不存在的孤儿记录也可如此清除 |
+| `list_acls` | `{}` | `{records[{path, inherit, entries, home_owner, updated_by, updated_at, revision, missing}], zone_owner, is_admin}`：调用者可管理的全部记录，Zone owner 得到所有用户的配置 |
+
+### 11.4 已知边界
+
+- 列表中的文件链接节点本身可见（名字与链接所在目录的权限一致），不暴露目标内容。
+- watch 连接建立后不随 token 过期而断开；`obj:sha256:` 锚点上的 meta 按内容共享（v1 用户 meta 只写
+  `live:` 锚点）。
+- App/Agent 主体的文件平面访问、`grant` 活子树 cap 的数据面放行、`library` 中“只能删除自己的文件”尚未实现。
+- ACL 路径按字节精确匹配。大小写不敏感或做 Unicode 归一化的文件系统（macOS APFS、Windows NTFS）上，
+  换大小写/归一化形式可以绕开 `inherit=false` 的保护记录；当前只在 Linux 上提供该保证。
+- 独立模式未给 `--auth-test-config` 时不鉴权，非 loopback 监听会在启动时告警；debug API 只允许 owner 级主体。
+- 接受任意 target 的用户 token（与复制扩展一致），即同一用户在任何应用中拿到的 token 都可访问
+  其文件；按应用收窄需要 App 级授权模型。
+
+## 12. 分享（ShareContentMgr，实现扩展）
+
+2026-10-19 实现，设计与实施记录见 `notepads/share-content-mgr-tech-design-todo.md`（§3 设计、§9 记录）。
+代码在 `src/frame/nfs_server/src/share/`，客户端见 websdk `nfsp.ts` 的 `share*` 方法、CLI `buckyos share`、
+Desktop `sysdlg/share` 与“我的内容”。
+
+- **快照**：源需 `read` 权限（同进程 `resolve_for`），文件/目录写成 FileObject / DirObject，字节以 32 MiB
+  分段读入、哈希并以 Store 模式写入本节点 named store（单 chunk ≤ 32 MiB，更大用 chunk list），pin owner
+  `share:<share_id>`。目录默认排除 `.git/`、`node_modules/`、`.env*`、`*.key`、`*.pem`、`.DS_Store`、符号链接与无读
+  权限项。≤ 64 MiB 请求内完成，更大的后台执行并（可用时）镜像为 `nfs.share_snapshot/v1` 任务。
+- **数据面**：`share.<zone>/s/{token}`（页面）、`/meta`、`/unlock`、`/d[/{inner}]`；每请求校验凭据、到期与状态，
+  不可用一律 404；只认 `obj:` 快照凭据。token 为 `HMAC(secret, cap_id)`，`grants` 只存其 sha256。密码 pbkdf2-sha256，
+  解锁 cookie 随 `password_rev` 失效，每 token 每分钟 10 次。HTML 等只下载不渲染，响应带 `CSP: sandbox`。
+  `share.<zone>` 上 `/nfs/v1/*` 返回 404（按 `X-Forwarded-Host`/`Host` 判断）。
+- **数据**：filedb 新表 `share_*`、`public_observations`；凭据仍在 `grants`。sweeper 每分钟处理到期与停止中的分享，
+  统计每 5 秒落库、按小时聚合、访问日志保留 90 天，Public 每 5 分钟扫描。
+- **`access_urls`**：`srv/publish` 下的文件增加 `public`；单节点查询时，调用者自己的有效链接增加 `signed`。
+- **独立模式**：`--named-store <dir>` 开启分享，`--share-base-url`（默认 `http://<listen>`）、`--public-base-url`；
+  未鉴权时所有调用者视为用户 `local`。
+
+- **停止重试**：停止时先置 `stopping`（访客立即 404），unpin 失败保持 `stopping`，sweeper 每分钟重试到释放为止；
+  pin owner 按分享区分，重试或重启不会释放其他分享对同一快照的保留（`tests/share.rs` 注入 named store 写锁验证）。
+- **应用附件**：交给 MessageHub、HomeStation 的附件由接收应用自己保留（D17）；停止分享只释放 `share:<share_id>`。
+
+## 13. NDM 网关（实现扩展）
+
+2026-10-20 由 control-panel 迁入（技术设计 D18/D19）。网关把 `/ndm/*` 原样转发到 nfs-server，代码在
+`src/frame/nfs_server/src/ndm/`；协议报文见 cyfs-ndn `doc/NDM Protocol/` 的 zone 与 proxy 协议，BuckyOS 部署差异写在
+zone 协议 §2.4。
+
+- **`/ndm/v1/uploads`**（tus 1.0.0，每 chunk 一个会话）由 nfs-server 自己实现：会话绑定已验证主体（用户 + 目标 App），
+  他人的 `HEAD`/`PATCH`/`DELETE` 一律 404；会话与暂存字节在 filedb `ndm_uploads` 与 `data_dir/ndm_uploads/`，重启后可续传；
+  支持 `DELETE` 终止；闲置超过 `ndm.session_ttl_secs`（默认 1 小时）的未完成会话由 sweeper 连同暂存文件清理；
+  完成的 chunk 写入 named store 并加 24 小时 Lease（`ndm-upload:<session_id>`），终止只释放该租约，不删 chunk。
+- **查重、`/ndm/v1/store/*` 与 `/ndm/proxy/v1/*`** 先在 nfs-server 授权，再交给 cyfs-ndn 的 `NamedDataMgrZoneGateway` /
+  `NamedDataMgrNodeGateway`（后者受限能力打开，由前置授权决定）。
+- **授权**：RBAC 资源 `obj://ndm/uploads`（write）、`obj://ndm/objects`（read）、`obj://ndm/retain`（write）、
+  `obj://ndm/manage`（write），用户主体与 App/服务主体都要放行；默认策略见 buckyos-api `rbac_config.rs`。
+  本主体上传、写入或登记过的对象记入 `ndm_holdings`，可读回；`put_object` 要求对象体哈希到 id、引用的 chunk/子对象
+  由本主体持有（manage 除外）；pin 类调用要求 manage，或 retain 且 owner 在 `<App 主体>/<用户>/` 前缀下。
+- **已知边界**：`chunk_hash` 秒传不证明持有内容；读写模式之外的 Agent 没有对象读取权；独立模式未鉴权时所有调用者
+  视为 `local` 且全部放行。

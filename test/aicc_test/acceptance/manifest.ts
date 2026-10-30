@@ -1,0 +1,614 @@
+import {
+  FAILURE_CLASSES,
+  RESULT_STATUSES,
+  type AcceptanceCase,
+  type CapabilityRule,
+  type MatrixCell,
+  type ProviderBaseline,
+  type ProviderInventory,
+} from "./types.ts";
+import { CANONICAL_API_TYPES, methodsForApiType } from "./canonical.ts";
+import { reconcileOfficialAndAiccInventories } from "./inventory_reconciliation.ts";
+
+const CASE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function requireString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function requireStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${field} must be a string array`);
+  }
+  return value as string[];
+}
+
+export function validateCaseManifest(value: unknown): AcceptanceCase[] {
+  if (!Array.isArray(value)) throw new Error("case manifest must be an array");
+  const seen = new Set<string>();
+  return value.map((raw, index) => {
+    if (!isObject(raw)) throw new Error(`case[${index}] must be an object`);
+    const caseId = requireString(raw.case_id, `case[${index}].case_id`);
+    if (!CASE_ID_PATTERN.test(caseId)) throw new Error(`invalid case_id ${caseId}`);
+    if (seen.has(caseId)) throw new Error(`duplicate case_id ${caseId}`);
+    seen.add(caseId);
+    if (!(["T1", "T1.5", "T2", "T3"] as unknown[]).includes(raw.layer)) {
+      throw new Error(`${caseId}.layer is invalid`);
+    }
+    if (!(["P0", "P1", "P2"] as unknown[]).includes(raw.priority)) {
+      throw new Error(`${caseId}.priority is invalid`);
+    }
+    requireStringArray(raw.tags, `${caseId}.tags`);
+    requireString(raw.input_entry, `${caseId}.input_entry`);
+    requireString(raw.user, `${caseId}.user`);
+    requireString(raw.session, `${caseId}.session`);
+    requireString(raw.method, `${caseId}.method`);
+    if (!(raw.execution_mode === "immediate" || raw.execution_mode === "stream")) {
+      throw new Error(`${caseId}.execution_mode is invalid`);
+    }
+    if (raw.api_type !== null) {
+      const apiType = requireString(raw.api_type, `${caseId}.api_type`);
+      if (!CANONICAL_API_TYPES.includes(apiType as never)) {
+        throw new Error(`${caseId}.api_type is not canonical`);
+      }
+      if (raw.method !== "route.resolve" &&
+        !methodsForApiType(apiType).includes(String(raw.method) as never)) {
+        throw new Error(`${caseId}.method is not valid for api_type ${apiType}`);
+      }
+    }
+    requireStringArray(raw.required_capabilities, `${caseId}.required_capabilities`);
+    requireStringArray(raw.disabled_capabilities, `${caseId}.disabled_capabilities`);
+    requireStringArray(raw.fixtures, `${caseId}.fixtures`);
+    const semanticRubric = requireStringArray(raw.semantic_rubric, `${caseId}.semantic_rubric`);
+    requireStringArray(raw.cleanup, `${caseId}.cleanup`);
+    if (!isObject(raw.expected_output)) {
+      throw new Error(`${caseId}.expected_output must be an object`);
+    }
+    requireStringArray(raw.expected_output.kinds, `${caseId}.expected_output.kinds`);
+    requireStringArray(
+      raw.expected_output.mime_types,
+      `${caseId}.expected_output.mime_types`,
+    );
+    if (!isObject(raw.expected_output.attachment_count)) {
+      throw new Error(`${caseId}.expected_output.attachment_count is required`);
+    }
+    const min = raw.expected_output.attachment_count.min;
+    const max = raw.expected_output.attachment_count.max;
+    if (!Number.isInteger(min) || !Number.isInteger(max) || Number(min) < 0 || Number(max) < Number(min)) {
+      throw new Error(`${caseId}.expected_output.attachment_count is invalid`);
+    }
+    if (!Number.isFinite(raw.timeout_ms) || Number(raw.timeout_ms) <= 0) {
+      throw new Error(`${caseId}.timeout_ms must be positive`);
+    }
+    if (!Number.isInteger(raw.max_attempts) || Number(raw.max_attempts) < 1) {
+      throw new Error(`${caseId}.max_attempts must be at least one`);
+    }
+    if (!Number.isFinite(raw.estimated_cost_usd) || Number(raw.estimated_cost_usd) < 0) {
+      throw new Error(`${caseId}.estimated_cost_usd must be non-negative`);
+    }
+    if (raw.layer === "T1.5") {
+      for (const field of [
+        "protocol_contract_id",
+        "protocol_evidence_revision",
+        "protocol_adapter_id",
+        "provider_api_version",
+        "expected_wire_fixture",
+        "response_fixture",
+      ]) {
+        requireString(raw[field], `${caseId}.${field}`);
+      }
+      if (semanticRubric.length !== 0) {
+        throw new Error(`${caseId}.semantic_rubric must be empty for T1.5`);
+      }
+      if ((raw.tags as string[]).includes("official_error")) {
+        requireString(raw.expected_aicc_error_code, `${caseId}.expected_aicc_error_code`);
+        requireString(raw.expected_provider_error_code, `${caseId}.expected_provider_error_code`);
+        if (typeof raw.expected_retriable !== "boolean") {
+          throw new Error(`${caseId}.expected_retriable must be boolean`);
+        }
+      }
+    }
+    return raw as AcceptanceCase;
+  });
+}
+
+export function validateProviderBaseline(value: unknown): ProviderBaseline {
+  if (!isObject(value)) throw new Error("provider baseline must be an object");
+  if (value.schema_version !== 3) throw new Error("unsupported baseline schema_version");
+  requireString(value.baseline_revision, "baseline_revision");
+  requireString(value.checked_at, "checked_at");
+  const canonical = requireStringArray(value.canonical_api_types, "canonical_api_types");
+  if (new Set(canonical).size !== canonical.length) {
+    throw new Error("canonical_api_types contains duplicates");
+  }
+  if (!Array.isArray(value.providers)) throw new Error("providers must be an array");
+  const drivers = new Set<string>();
+  for (const rawProvider of value.providers) {
+    if (!isObject(rawProvider)) throw new Error("provider entry must be an object");
+    const driver = requireString(rawProvider.provider_driver, "provider_driver");
+    if (drivers.has(driver)) throw new Error(`duplicate provider baseline ${driver}`);
+    drivers.add(driver);
+    requireString(rawProvider.provider_profile_id, `${driver}.provider_profile_id`);
+    const adapterIds = requireStringArray(rawProvider.protocol_adapter_ids, `${driver}.protocol_adapter_ids`);
+    const modelDriverIds = requireStringArray(rawProvider.model_driver_ids, `${driver}.model_driver_ids`);
+    if (adapterIds.length === 0 || new Set(adapterIds).size !== adapterIds.length) {
+      throw new Error(`${driver}.protocol_adapter_ids must be non-empty and unique`);
+    }
+    if (modelDriverIds.length === 0 || new Set(modelDriverIds).size !== modelDriverIds.length) {
+      throw new Error(`${driver}.model_driver_ids must be non-empty and unique`);
+    }
+    if (!isObject(rawProvider.official_catalog)) {
+      throw new Error(`${driver}.official_catalog must be an object`);
+    }
+    requireString(rawProvider.official_catalog.endpoint, `${driver}.official_catalog.endpoint`);
+    if (!["openai", "anthropic", "gemini", "fal", "sn", "typesafe", "frozen"].includes(String(rawProvider.official_catalog.format))) {
+      throw new Error(`${driver}.official_catalog.format is invalid`);
+    }
+    if (!["bearer", "x-api-key", "query-key", "fal-key", "none"].includes(String(rawProvider.official_catalog.authentication))) {
+      throw new Error(`${driver}.official_catalog.authentication is invalid`);
+    }
+    if (rawProvider.official_catalog.page_size !== undefined &&
+      (!Number.isInteger(rawProvider.official_catalog.page_size) || Number(rawProvider.official_catalog.page_size) < 1)) {
+      throw new Error(`${driver}.official_catalog.page_size must be a positive integer`);
+    }
+    if (rawProvider.official_catalog.anthropic_version_header !== undefined &&
+      (rawProvider.official_catalog.format !== "anthropic" ||
+        typeof rawProvider.official_catalog.anthropic_version_header !== "boolean")) {
+      throw new Error(`${driver}.official_catalog.anthropic_version_header is only valid as a boolean for anthropic catalogs`);
+    }
+    if (rawProvider.official_catalog.endpoint_ids !== undefined) {
+      const endpointIds = requireStringArray(
+        rawProvider.official_catalog.endpoint_ids,
+        `${driver}.official_catalog.endpoint_ids`,
+      );
+      if (rawProvider.official_catalog.format !== "fal") {
+        throw new Error(`${driver}.official_catalog.endpoint_ids is only valid for fal catalogs`);
+      }
+      if (endpointIds.length === 0 || endpointIds.length > 50 ||
+        new Set(endpointIds).size !== endpointIds.length) {
+        throw new Error(`${driver}.official_catalog.endpoint_ids must contain 1-50 unique ids`);
+      }
+    }
+    if (rawProvider.official_catalog.include_model_ids !== undefined) {
+      const ids = requireStringArray(
+        rawProvider.official_catalog.include_model_ids,
+        `${driver}.official_catalog.include_model_ids`,
+      );
+      if (ids.length === 0 || new Set(ids.map((id) => id.toLowerCase())).size !== ids.length) {
+        throw new Error(`${driver}.official_catalog.include_model_ids must be non-empty and unique`);
+      }
+      if (rawProvider.official_catalog.format === "frozen") {
+        throw new Error(`${driver}.official_catalog.include_model_ids is invalid for frozen catalogs`);
+      }
+    }
+    if (rawProvider.official_catalog.supplemental_model_ids !== undefined) {
+      const supplementalModelIds = requireStringArray(
+        rawProvider.official_catalog.supplemental_model_ids,
+        `${driver}.official_catalog.supplemental_model_ids`,
+      );
+      if (supplementalModelIds.length === 0 ||
+        new Set(supplementalModelIds).size !== supplementalModelIds.length) {
+        throw new Error(`${driver}.official_catalog.supplemental_model_ids must be non-empty and unique`);
+      }
+    }
+    if (rawProvider.official_catalog.task_type_api_types !== undefined) {
+      if (!isObject(rawProvider.official_catalog.task_type_api_types)) {
+        throw new Error(`${driver}.official_catalog.task_type_api_types must be an object`);
+      }
+      for (const [taskType, apiTypes] of Object.entries(rawProvider.official_catalog.task_type_api_types)) {
+        if (!taskType || !Array.isArray(apiTypes) || apiTypes.length === 0 ||
+          apiTypes.some((apiType) =>
+            typeof apiType !== "string" || !(CANONICAL_API_TYPES as readonly string[]).includes(apiType)
+          )) {
+          throw new Error(`${driver}.official_catalog.task_type_api_types.${taskType} is invalid`);
+        }
+      }
+    }
+    if (rawProvider.official_catalog.format === "frozen") {
+      const modelIds = requireStringArray(
+        rawProvider.official_catalog.model_ids,
+        `${driver}.official_catalog.model_ids`,
+      );
+      if (modelIds.length === 0 || new Set(modelIds).size !== modelIds.length) {
+        throw new Error(`${driver}.official_catalog.model_ids must be non-empty and unique`);
+      }
+      requireString(rawProvider.official_catalog.checked_at, `${driver}.official_catalog.checked_at`);
+      requireString(rawProvider.official_catalog.risk, `${driver}.official_catalog.risk`);
+      if (rawProvider.official_catalog.authentication !== "none") {
+        throw new Error(`${driver}.official_catalog frozen inventory must not require authentication`);
+      }
+    } else if (rawProvider.official_catalog.model_ids !== undefined ||
+      rawProvider.official_catalog.checked_at !== undefined ||
+      rawProvider.official_catalog.risk !== undefined) {
+      throw new Error(`${driver}.official_catalog frozen fields require format=frozen`);
+    }
+    requireStringArray(rawProvider.source_urls, `${driver}.source_urls`);
+    if (!isObject(rawProvider.protocol_evidence)) {
+      throw new Error(`${driver}.protocol_evidence must be an object`);
+    }
+    for (const field of [
+      "documentation_version",
+      "streaming_semantics",
+      "async_operation_semantics",
+      "usage_semantics",
+      "input_output_formats",
+      "item_request_batch_limits",
+      "image_audio_video_limits",
+      "context_output_limits",
+      "region_restrictions",
+      "account_tier_restrictions",
+      "preview_allowlist",
+    ] as const) {
+      requireString(rawProvider.protocol_evidence[field], `${driver}.protocol_evidence.${field}`);
+    }
+    if (rawProvider.coverage_rules !== undefined) {
+      if (!Array.isArray(rawProvider.coverage_rules)) {
+        throw new Error(`${driver}.coverage_rules must be an array`);
+      }
+      for (const rule of rawProvider.coverage_rules) {
+        if (!isObject(rule)) throw new Error(`${driver}.coverage_rule must be an object`);
+        requireString(rule.model_pattern, `${driver}.coverage_rule.model_pattern`);
+        if (!["exclude", "alias"].includes(String(rule.action))) {
+          throw new Error(`${driver}.coverage_rule.action is invalid`);
+        }
+        if (!["deprecated_or_retiring", "logical_alias", "not_physical_model", "unsupported_canonical_protocol"].includes(String(rule.reason))) {
+          throw new Error(`${driver}.coverage_rule.reason is invalid`);
+        }
+        if (rule.action === "alias") requireString(rule.physical_model_id, `${driver}.coverage_rule.physical_model_id`);
+        requireStringArray(rule.source_urls, `${driver}.coverage_rule.source_urls`);
+        requireString(rule.evidence_summary, `${driver}.coverage_rule.evidence_summary`);
+      }
+    }
+    const capabilitySource = rawProvider.capability_source_provider;
+    if (capabilitySource !== undefined && typeof capabilitySource !== "string") {
+      throw new Error(`${driver}.capability_source_provider must be a string`);
+    }
+    if (!Array.isArray(rawProvider.rules) ||
+      (rawProvider.rules.length === 0 && !capabilitySource)) {
+      throw new Error(`${driver}.rules must not be empty without a capability source provider`);
+    }
+    for (const rule of rawProvider.rules) {
+      if (!isObject(rule)) throw new Error(`${driver}.rule must be an object`);
+      requireString(rule.model_pattern, `${driver}.model_pattern`);
+      if (!["active", "preview", "deprecated", "removed"].includes(String(rule.status))) {
+        throw new Error(`${driver}.${String(rule.model_pattern)} has invalid normalized status ${String(rule.status)}`);
+      }
+      if (rule.source_status !== undefined && typeof rule.source_status !== "string") {
+        throw new Error(`${driver}.${String(rule.model_pattern)}.source_status must be a string`);
+      }
+      requireStringArray(rule.api_types, `${driver}.api_types`);
+      if (rule.disabled_api_types !== undefined) {
+        const disabled = requireStringArray(rule.disabled_api_types, `${driver}.disabled_api_types`);
+        if (disabled.some((api) => !(rule.api_types as string[]).includes(api))) {
+          throw new Error(`${driver}.disabled_api_types must be a subset of declared capabilities`);
+        }
+      }
+      requireStringArray(rule.methods, `${driver}.methods`);
+      requireStringArray(rule.input_kinds, `${driver}.input_kinds`);
+      requireStringArray(rule.output_kinds, `${driver}.output_kinds`);
+      if (rule.resource_representation !== undefined &&
+        !["url", "base64", "named_object"].includes(String(rule.resource_representation))) {
+        throw new Error(`${driver}.${String(rule.model_pattern)}.resource_representation is invalid`);
+      }
+      if ((rule.input_kinds as string[]).includes("document")) {
+        const formats = requireStringArray(rule.document_formats, `${driver}.document_formats`);
+        if (formats.length === 0 || new Set(formats).size !== formats.length) {
+          throw new Error(`${driver}.document_formats must be non-empty and unique for document input`);
+        }
+      }
+      if (rule.api_io !== undefined) {
+        if (!isObject(rule.api_io)) throw new Error(`${driver}.api_io must be an object`);
+        for (const [apiType, rawIo] of Object.entries(rule.api_io)) {
+          if (!isObject(rawIo)) throw new Error(`${driver}.api_io.${apiType} must be an object`);
+          for (const field of ["input_combinations", "output_combinations"] as const) {
+            const combinations = rawIo[field];
+            if (!Array.isArray(combinations) || combinations.length === 0 ||
+              combinations.some((combination) => !Array.isArray(combination) || combination.length === 0 ||
+                combination.some((kind) => typeof kind !== "string"))) {
+              throw new Error(`${driver}.api_io.${apiType}.${field} must contain non-empty string arrays`);
+            }
+          }
+        }
+      }
+      if (rule.request_defaults !== undefined) {
+        if (!isObject(rule.request_defaults)) {
+          throw new Error(`${driver}.request_defaults must be an object`);
+        }
+        for (const [apiType, defaults] of Object.entries(rule.request_defaults)) {
+          if (!(rule.api_types as string[]).includes(apiType) || !isObject(defaults)) {
+            throw new Error(`${driver}.request_defaults.${apiType} is invalid`);
+          }
+        }
+      }
+      requireStringArray(rule.source_urls, `${driver}.rule.source_urls`);
+      requireString(rule.evidence_summary, `${driver}.evidence_summary`);
+      for (const apiType of rule.api_types as string[]) {
+        if (!CANONICAL_API_TYPES.includes(apiType as never)) {
+          throw new Error(`${driver} uses unknown api_type ${apiType}`);
+        }
+      }
+      const expectedMethods = new Set(
+        (rule.api_types as string[]).flatMap((apiType) => methodsForApiType(apiType)),
+      );
+      const declaredMethods = new Set(rule.methods as string[]);
+      if (expectedMethods.size !== declaredMethods.size ||
+        [...expectedMethods].some((method) => !declaredMethods.has(method))) {
+        throw new Error(`${driver}.${String(rule.model_pattern)} has invalid method/api_type association`);
+      }
+    }
+  }
+  for (const rawProvider of value.providers) {
+    const provider = rawProvider as Record<string, unknown>;
+    if (typeof provider.capability_source_provider === "string" &&
+      !drivers.has(provider.capability_source_provider)) {
+      throw new Error(
+        `${String(provider.provider_driver)} references missing capability source ${provider.capability_source_provider}`,
+      );
+    }
+  }
+  return value as unknown as ProviderBaseline;
+}
+
+function globMatches(pattern: string, value: string): boolean {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`, "i").test(value);
+}
+
+function normalizedStatus(
+  rule: ProviderBaseline["providers"][number]["rules"][number],
+  modelId: string,
+): CapabilityRule["status"] {
+  if (/(?:^|[-_.])preview(?:$|[-_.])/i.test(modelId)) return "preview";
+  return rule.status;
+}
+
+function defaultInputCombinations(apiType: string, declared: string[]): string[][] {
+  const available = new Set(declared);
+  if (apiType === "llm") {
+    const singles = ["text", "code", "document", "image", "audio", "video"]
+      .filter((kind) => available.has(kind)).map((kind) => [kind]);
+    const paired = ["document", "image", "audio", "video"]
+      .filter((kind) => available.has("text") && available.has(kind))
+      .map((kind) => ["text", kind]);
+    return [...singles, ...paired].length > 0 ? [...singles, ...paired] : [["text"]];
+  }
+  const canonical: Record<string, string[][]> = {
+    "embedding.text": [["text"], ["code"], ["document_chunk"]],
+    "embedding.multimodal": [["text"], ["image"], ["text", "image"]],
+    rerank: [["query", "documents"]],
+    "image.txt2img": [["text"]],
+    "image.img2img": [["text", "image"]],
+    "image.inpaint": [["text", "image", "mask"]],
+    "image.upscale": [["image"]],
+    "image.bg_remove": [["image"]],
+    "vision.ocr": [["image"]],
+    "vision.caption": [["image"]],
+    "vision.detect": [["image"]],
+    "vision.segment": [["image"]],
+    "audio.tts": [["text"]],
+    "audio.asr": [["audio"]],
+    "audio.music": available.has("audio") ? [["text"], ["text", "audio"]] : [["text"]],
+    "audio.enhance": [["audio"]],
+    "video.generate": available.has("image") ? [["text"], ["text", "image"]] : [["text"]],
+    "video.edit": [["text", "video"]],
+    "video.extend": [["video"]],
+    "video.upscale": [["video"]],
+    "agent.computer_use": [["observation", "action", "environment_state", "session_state"]],
+  };
+  return canonical[apiType] ?? [declared.length > 0 ? declared : ["structured"]];
+}
+
+function defaultOutputCombinations(apiType: string, declared: string[]): string[][] {
+  if (apiType === "llm") {
+    const supported = ["text", "json", "tool_call"].filter((kind) => declared.includes(kind));
+    return (supported.length > 0 ? supported : ["text"]).map((kind) => [kind]);
+  }
+  const canonical: Record<string, string> = {
+    "embedding.text": "embedding",
+    "embedding.multimodal": "embedding",
+    rerank: "rerank",
+    "image.txt2img": "image",
+    "image.img2img": "image",
+    "image.inpaint": "image",
+    "image.upscale": "image",
+    "image.bg_remove": "image",
+    "vision.ocr": "text",
+    "vision.caption": "text",
+    "vision.detect": "structured",
+    "vision.segment": "structured",
+    "audio.tts": "audio",
+    "audio.asr": "text",
+    "audio.music": "audio",
+    "audio.enhance": "audio",
+    "video.generate": "video",
+    "video.edit": "video",
+    "video.extend": "video",
+    "video.upscale": "video",
+    "agent.computer_use": "structured",
+  };
+  return [[canonical[apiType] ?? declared[0] ?? "structured"]];
+}
+
+function generatedArtifactSourceApiType(apiType: string, declared: Set<string>): string | undefined {
+  if (apiType === "image.img2img" && declared.has("image.txt2img")) return "image.txt2img";
+  if (
+    ["video.edit", "video.extend", "video.upscale"].includes(apiType) &&
+    declared.has("video.generate")
+  ) return "video.generate";
+  if (apiType === "audio.enhance" && declared.has("audio.tts")) return "audio.tts";
+  return undefined;
+}
+
+export function analyzeProviderMatrix(args: {
+  baseline: ProviderBaseline;
+  officialInventories: ProviderInventory[];
+  aiccInventories: ProviderInventory[];
+  selectedDrivers?: string[];
+}): {
+  cells: MatrixCell[];
+  mismatches: string[];
+  coverage: import("./types.ts").ModelCoverageRecord[];
+} {
+  const selected = args.selectedDrivers?.length
+    ? new Set(args.selectedDrivers)
+    : null;
+  const profiles = new Map(
+    args.baseline.providers.map((profile) => [profile.provider_driver, profile]),
+  );
+  const cells: MatrixCell[] = [];
+  const errors: string[] = [];
+  const basePhysicalInventories = (inventories: ProviderInventory[]) => inventories.map((inventory) => ({
+    ...inventory,
+    models: inventory.models.filter((model) =>
+      !model.provider_actual_model_id && !model.provider_model_id.includes(":")
+    ),
+  }));
+  const reconciled = reconcileOfficialAndAiccInventories({
+    baseline: args.baseline,
+    officialInventories: basePhysicalInventories(args.officialInventories),
+    aiccInventories: basePhysicalInventories(args.aiccInventories),
+  });
+  errors.push(...reconciled.mismatches);
+  for (const inventory of reconciled.inventories) {
+    if (selected && !selected.has(inventory.provider_driver)) continue;
+    const profile = profiles.get(inventory.provider_driver);
+    if (!profile) {
+      errors.push(`missing provider baseline for ${inventory.provider_driver}`);
+      continue;
+    }
+    const capabilityProfile = profile.capability_source_provider
+      ? profiles.get(profile.capability_source_provider)
+      : profile;
+    if (!capabilityProfile) {
+      errors.push(
+        `missing capability source ${profile.capability_source_provider} for ${inventory.provider_driver}`,
+      );
+      continue;
+    }
+    for (const model of inventory.models) {
+      if (model.provider_actual_model_id || model.provider_model_id.includes(":")) continue;
+      const matchingRules = capabilityProfile.rules.filter((candidate) =>
+        globMatches(candidate.model_pattern, model.provider_model_id)
+      );
+      // A `*` rule declares "everything else is an LLM". It must not shadow what
+      // the official catalog reports: `task_type_api_types` is the capability
+      // authority, and only models the catalog leaves unspecified fall back to
+      // the catch-all.
+      const specificRule = matchingRules.find((candidate) =>
+        candidate.model_pattern !== "*"
+      );
+      const catchAllRule = matchingRules.find((candidate) =>
+        candidate.model_pattern === "*"
+      );
+      const catalogApiTypes = model.official_task_types?.flatMap((taskType) =>
+        profile.official_catalog.task_type_api_types?.[taskType] ?? []
+      );
+      const derivedApiTypes = catalogApiTypes ? [...new Set(catalogApiTypes)] : [];
+      const rule = specificRule ?? (derivedApiTypes.length > 0
+        ? {
+          model_pattern: model.provider_model_id,
+          status: "active" as const,
+          source_status: "official_catalog_task_type",
+          api_types: derivedApiTypes,
+          methods: derivedApiTypes.flatMap((apiType) => methodsForApiType(apiType)),
+          input_kinds: [],
+          output_kinds: [],
+          source_urls: profile.source_urls,
+          evidence_summary: `Official catalog task_type: ${model.official_task_types?.join(", ")}.`,
+        }
+        : catchAllRule);
+      if (!rule) {
+        errors.push(
+          `missing official capability rule for ${inventory.provider_driver}/${model.provider_model_id}`,
+        );
+        continue;
+      }
+      const declared = new Set(model.api_types);
+      const disabled = new Set(rule.disabled_api_types ?? []);
+      const official = new Set(rule.api_types.filter((api) => !disabled.has(api)));
+      for (const apiType of declared) {
+        if (!official.has(apiType)) {
+          errors.push(
+            `${disabled.has(apiType) ? "disabled_api_advertised" : "official_not_supported_but_aicc_advertised"} ${model.exact_model} ${apiType}`,
+          );
+        }
+      }
+      for (const apiType of official) {
+        if (!declared.has(apiType)) {
+          if (profile.capability_source_provider) continue;
+          errors.push(
+            `official_supported_but_aicc_missing ${model.exact_model} ${apiType}`,
+          );
+          continue;
+        }
+        const methods = rule.methods.length > 0
+          ? rule.methods.filter((method) => methodsForApiType(apiType).includes(method))
+          : [...methodsForApiType(apiType)];
+        const method = methods[0];
+        if (!method) {
+          errors.push(`missing canonical method for ${model.exact_model} ${apiType}`);
+          continue;
+        }
+        const ioProfile = rule.api_io?.[apiType];
+        const inputKinds = (ioProfile?.input_combinations ??
+          defaultInputCombinations(apiType, rule.input_kinds))[0];
+        const outputKinds = (ioProfile?.output_combinations ??
+          defaultOutputCombinations(apiType, rule.output_kinds))[0];
+        cells.push({
+          case_id: `t2.${inventory.provider_driver}.${inventory.provider_instance_name}.${model.provider_model_id}.${apiType}`
+            .toLowerCase().replace(/[^a-z0-9._-]+/g, "-"),
+          provider_driver: inventory.provider_driver,
+          provider_instance: inventory.provider_instance_name,
+          exact_model: model.exact_model,
+          provider_model_id: model.provider_model_id,
+          api_type: apiType,
+          method,
+          generated_artifact_source_api_type: generatedArtifactSourceApiType(apiType, declared),
+          baseline_status: normalizedStatus(rule, model.provider_model_id),
+          input_kinds: inputKinds,
+          output_kinds: outputKinds,
+          resource_representation: rule.resource_representation,
+          request_defaults: rule.request_defaults?.[apiType] === undefined
+            ? undefined
+            : structuredClone(rule.request_defaults[apiType]),
+          source_urls: rule.source_urls,
+          estimated_cost_usd: model.pricing?.currency?.toUpperCase() === "USD" &&
+              typeof model.pricing.estimated_cost === "number" &&
+              Number.isFinite(model.pricing.estimated_cost) &&
+              model.pricing.estimated_cost >= 0
+            ? model.pricing.estimated_cost
+            : undefined,
+        });
+      }
+    }
+  }
+  return { cells, mismatches: errors, coverage: reconciled.coverage };
+}
+
+export function buildProviderMatrix(args: {
+  baseline: ProviderBaseline;
+  officialInventories: ProviderInventory[];
+  aiccInventories: ProviderInventory[];
+  selectedDrivers?: string[];
+}): MatrixCell[] {
+  const result = analyzeProviderMatrix(args);
+  if (result.mismatches.length > 0) {
+    throw new Error(result.mismatches.join("; "));
+  }
+  return result.cells;
+}
+
+export function assertTaxonomyConstants(): void {
+  if (new Set(RESULT_STATUSES).size !== RESULT_STATUSES.length) {
+    throw new Error("duplicate result status");
+  }
+  if (new Set(FAILURE_CLASSES).size !== FAILURE_CLASSES.length) {
+    throw new Error("duplicate failure class");
+  }
+}

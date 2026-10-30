@@ -25,10 +25,10 @@ pub const SYSTEM_ROLE_ZONE_TRUSTED: &str = "zone-trusted";
 /// capability "may act as this user's task control surface"; see the `task`
 /// section of buckyos-api's `rbac_config`.
 fn task_collection_resource(owner_user_id: &str) -> String {
-    format!("obj://task/{}", owner_user_id)
+    format!("obj://taskmgr/users/{}", owner_user_id)
 }
 
-/// Per-request memo for the `obj://task/{user}` RBAC check.
+/// Per-request memo for the `obj://taskmgr/users/{user}` RBAC check.
 ///
 /// The check is what lets a system control surface (the Task Center, running
 /// as `control-panel`) look past a Task's creator `app_id` and show the user
@@ -48,7 +48,7 @@ impl TaskViewGate {
         }
         let allowed = rbac::enforce(
             &principal.user_id,
-            &principal.app_id,
+            &principal.authorization_id,
             &task_collection_resource(owner_user_id),
             "read",
             principal.sudo_mode(),
@@ -65,7 +65,11 @@ impl TaskViewGate {
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub user_id: String,
+    /// Kind-aware `AuthTarget::canonical_key()` used for creator and grant relations.
     pub app_id: String,
+    /// Bare app/service id used only for executor bindings.
+    pub executor_app_id: String,
+    pub authorization_id: String,
     pub roles: Vec<String>,
     pub sudo: bool,
     /// Shared with every clone so one request pays for one RBAC evaluation
@@ -74,18 +78,9 @@ pub struct Principal {
 }
 
 impl Principal {
-    pub fn actor_ref(&self) -> ActorRef {
-        ActorRef {
-            user_id: self.user_id.clone(),
-            app_id: self.app_id.clone(),
-            app_instance_id: None,
-        }
-    }
-
     fn sudo_mode(&self) -> Option<rbac::SudoMode> {
-        self.sudo.then(|| {
-            rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(&self.user_id))
-        })
+        self.sudo
+            .then(|| rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(&self.user_id)))
     }
 }
 
@@ -148,7 +143,7 @@ pub async fn compute_permission(
         task.creator.user_id == principal.user_id && task.creator.app_id == principal.app_id;
     let is_runner = matches!(
         &task.executor,
-        TaskExecutor::App { app_id, .. } if *app_id == principal.app_id
+        TaskExecutor::App { app_id, .. } if *app_id == principal.executor_app_id
     );
     let assignees = match task.assignees.clone() {
         Some(list) => list,
@@ -188,7 +183,7 @@ pub async fn compute_permission(
     // The owner's control surface. Every relation above matches on the exact
     // `{user_id, app_id}` principal, so a user cannot see the tasks their own
     // agents and apps created — which is precisely what the Task Center is
-    // for. An app the zone RBAC trusts to read `obj://task/{owner}` may look
+    // for. An app the zone RBAC trusts to read `obj://taskmgr/users/{owner}` may look
     // past the creator's `app_id`; apps without that grant keep the per-app
     // isolation of §8.5.
     if principal
@@ -211,7 +206,12 @@ pub async fn compute_permission(
     // inherited rows.
     if root_reachable && !permission.visible() {
         if store
-            .is_tree_participant(&task.root_id, &principal.user_id, &principal.app_id)
+            .is_tree_participant(
+                &task.root_id,
+                &principal.user_id,
+                &principal.app_id,
+                &principal.executor_app_id,
+            )
             .await?
         {
             permission.add(&[TaskAction::ReadMeta], TaskDataScope::MetaOnly);
@@ -223,7 +223,10 @@ pub async fn compute_permission(
     for grant in grants {
         let anchored_here = grant.task_id == task.task_id;
         let scope_covers = anchored_here
-            || matches!(grant.scope, TaskGrantScope::Subtree | TaskGrantScope::WholeTree);
+            || matches!(
+                grant.scope,
+                TaskGrantScope::Subtree | TaskGrantScope::WholeTree
+            );
         if !scope_covers {
             continue;
         }
@@ -346,6 +349,7 @@ pub fn summarize_task(task: &Task) -> TaskSummary {
             app_id: task.creator.app_id.clone(),
             app_instance_id: None,
         },
+        storage_domain: task.storage_domain,
         executor_kind: task.executor.kind(),
         phase: task.phase,
         wait_reason: task.wait_reason.clone(),

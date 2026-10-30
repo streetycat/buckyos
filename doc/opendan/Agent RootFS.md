@@ -253,7 +253,7 @@ report_delivery     = "final_only"      # "final_only" | "top_level" | "all"
 name = "explorer"
 objective = "..."
 system_prompt_template = "..."
-tool_whitelist = ["exec_bash", "..."]
+tool_whitelist = ["shell", "..."]
 approval_required = []
 tool_plan = "minimal_safe"
 mode = "behavior"
@@ -307,7 +307,7 @@ parser = "xml"                          # LLM 输出 parse 方式；renderer 等
 
 # ─── 能力声明（占位，§5.3 详述）────────────────────────────
 # behavior 在这次推理中能用到的能力，三类合在一起：
-#   - v2 内建 Action（exec_bash / write_file / ... / subscribe_event）
+#   - v2 内建 Action（shell / write_file / ... / subscribe_event）
 #   - skills bundle（<agent_root>/skills/ 下加载的成套能力）
 #   - 传统 function-call tool（ToolManager 注册的命名函数）
 # 详细 schema 待 §5.3 收敛；当前 5.2 草案先占位，不写细节字段。
@@ -358,7 +358,7 @@ mode = "cancel_pending_tools_then_continue"
   自带 prompt 片段、tool 注册、可能还有自己的 sub-behavior。behavior 要做的是"声明本次推理把哪些
   bundle 挂进来"。
 - **传统 function-call tool**（ToolManager 注册的命名函数，走 provider native tool_calls 通道）
-  是 v2 Action 的并存通道——`exec_bash` 之外的工具调用要么走 shim 进 bash，要么走这条 native tool
+  是 v2 Action 的并存通道——`shell` 之外的工具调用要么走 shim 进 bash，要么走这条 native tool
   通道。behavior 要声明白名单。
 
 三类都需要一个"上层引用 + 下层细节定义"的解耦：
@@ -450,7 +450,7 @@ PATH = SessionExecBin : AgentBin : RuntimeBin : SystemBin : <inherited>
 
 ### 6.2 Session `./tools/` 硬约束
 - 只放文本（脚本源码、`tool.toml`、prompts、schema），禁止二进制。
-- 单文件建议 ≤ 64 KB，整目录文件数建议 ≤ 几百（hot path，每次 `exec_bash` 起手要做 mtime 同步）。
+- 单文件建议 ≤ 64 KB，整目录文件数建议 ≤ 几百（hot path，每次 `shell` 起手要做 mtime 同步）。
 
 ### 6.3 Tool Plan
 位置：`<agent_root>/tool_plans/<plan>.toml`；schema 与渲染时机不变。
@@ -491,7 +491,7 @@ PATH = SessionExecBin : AgentBin : RuntimeBin : SystemBin : <inherited>
 |---|---|---|
 | `[on_context_limit_reached]` | `compress_then_continue` | 上下文满 ⇒ 压缩后继续 |
 | `[on_llm_message_compress]` | `context_window_ratio` | 一轮完成后按 context window 使用率自动压缩；不写则不启用自动压缩 |
-| `[on_provider_failed]` | `fallback_behavior`（带 `target = "<name>"`） | provider 失败 ⇒ 切到 target |
+| `[on_provider_failed]` | `fallback_behavior`（带 `target = "<name>"`） | 仅 provider 来源的终态错误（请求失败 / 超时 / 取消）⇒ 切到 target；输出协议、工具、运行时错误不触发 |
 | `[on_interrupt_graceful]` | `cancel_pending_tools_then_continue` | 收到 graceful 中断 ⇒ 注入 Cancelled 后继续 |
 | `[on_interrupt_discard]` | `end` | 收到 discard 中断 ⇒ 直接结束 process |
 
@@ -530,7 +530,7 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
 
 - **数据 / 运行时分离**：AgentRootFS 在宿主机普通文件系统；AgentRuntime 在 Linux 容器内。
 - **跨平台契约只落在 AgentRootFS**：目录结构、配置、session 数据平台无关；执行视图（PATH 里的 bin、
-  tmux pane、临时挂载）允许纯 Linux 形态。
+  临时挂载）允许纯 Linux 形态。
 - **`agent_root` 来源**：`opendan` 启动 BuckyOS AppService runtime 后，用 runtime 解析出的
   `app_id` / `owner_id` 调 `get_buckyos_app_data_dir(app_id, owner_id)` 取得当前 app 数据目录。
 - **Docker 中的 `agent_root`**：容器内为 `/home/<owner>/.local/share/<agent_id>`,host 侧对应
@@ -570,8 +570,7 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
 
 2. **`[capabilities]` 的最终 schema**：§5.3 留空。需要在同一个段下表达三类能力（v2 内建 Action /
    skill bundle / 传统 function-call tool），且每类都有"上层引用 + 下层细节定义"的解耦诉求。需要
-   等 [Agent Skill](./Agent%20Skill.md) 与 ToolManager 的配置形态一起定下来再收敛。在那之前 §5.2
-   草案里这段就只是占位。
+   以 [当前 cmd/goal skill 机制](../sdk/OpenDAN_Agent_Dev_Guide.md) 为现行依据；本段与 ToolManager 的组合配置只是后续设计，§5.2 草案的占位不定义当前 skill 安装格式。
 
 3. **session class 内多 behavior 时的事件路由**：dispatcher 把事件送进 session，session 把事件交给
    `current_behavior`，behavior 通过 prompt 表达自己的反应——不需要"event → behavior"的二级路由。
@@ -590,7 +589,7 @@ process-chain DSL 时就尾大不掉。要么不要，要么一次性全要。
    `.toml`，需要扩到 enum 或返回候选列表，并把"两种形态同名存在"的错误检查放在加载入口。
 
 7. **Channel 类型的对外接口**：`type = "msg_center" | "kevent" | "http" | ...` 的清单需要定一个准入
-   表，跟 [Agent Session 的事件订阅](./Agent%20Session的事件订阅.md) §2 三种模式对齐。
+   表，跟 [Agent Session 架构设计 §12.7](<OpenDAN Agent Session架构设计.md#127-事件订阅与三种等待模式>) 的三种模式对齐。
 
 8. **prompt 三段模板的默认值**：`[prompt].on_input_msg` / `on_input_event` 缺省走 runtime 内建的
    最小模板——这两个内建模板的具体形态需要跟 [Render_Prompt_Template_Variables](./Render_Prompt_Template_Variables.md)

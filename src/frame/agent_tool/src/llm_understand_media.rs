@@ -4,46 +4,58 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
-use buckyos_api::{get_buckyos_api_runtime, AiContent, AiMessage, AiRole, ResourceRef};
-use llm_context::deps::{LLMContextDeps, ToolManager};
-use llm_context::{
-    ContextOutput, LLMContextOutcome, LlmClient, ModelPolicy, OutputSpec, ToolMode, ToolPolicy,
+use buckyos_api::{
+    get_buckyos_api_runtime, AiContent, AiMessage, AiMethodStatus, AiRole, ApiType,
+    AudioSpeechRecognitionRequest, ResourceRef, RouteResolveRequest,
 };
-use ndn_lib::FileObject;
+use llm_context::deps::{LLMContextDeps, ToolManager};
+use llm_context::{ContextOutput, LlmClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
-use crate::run_local_llm::{ensure_buckyos_runtime, AiccLlmClient};
+mod image_fit;
+
+use image_fit::{fit_image_for_vision, ImageLimits, ImagePreprocess};
+
+use crate::xllm::{
+    ensure_buckyos_runtime, AiccLlmClient, LoopModel, RunOutcome, TaskInput, TaskOverrides,
+    XllmDeps, XllmRun, XllmTask,
+};
 use crate::{
     cli_error_result, llm_compress, render_cli_output, AgentTool, AgentToolError,
-    AgentToolPendingReason, AgentToolResult, AgentToolStatus, CallingConventions, LocalLLMContext,
-    OneShotRequest, SessionRuntimeContext, ToolSpec, AGENT_TOOL_PROTOCOL_VERSION, CLI_EXIT_ERROR,
-    CLI_EXIT_SUCCESS, CLI_EXIT_USAGE,
+    AgentToolResult, AgentToolStatus, CallingConventions,
+    SessionRuntimeContext, ToolSpec, AGENT_TOOL_PROTOCOL_VERSION, CLI_EXIT_ERROR, CLI_EXIT_SUCCESS,
+    CLI_EXIT_USAGE,
 };
 
 pub const TOOL_LLM_UNDERSTAND_MEDIA: &str = "llm_understand_media";
 
 const DEFAULT_MODEL_ALIAS: &str = "llm.vision";
+const DEFAULT_AUDIO_ANALYSIS_MODEL_ALIAS: &str = "llm.chat";
+const DEFAULT_AUDIO_ASR_MODEL_ALIAS: &str = "audio.asr";
 const DEFAULT_SUMMARY_MODEL_ALIAS: &str = "llm.summary";
 const DEFAULT_TARGET_TOKENS: u32 = 24_000;
 const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 2_048;
 const RAW_OUTPUT_LOG_PREVIEW_CHARS: usize = 2_000;
+const DEFAULT_VIDEO_FRAME_COUNT: usize = 8;
+const MAX_VIDEO_FRAME_COUNT: usize = 16;
 
 const SYSTEM_PROMPT: &str = r#"You are OpenDAN's controlled media-understanding side context.
 
-You must inspect the target media and answer the user's goal as a JSON object with exactly these fields:
+You must inspect the target media resource and answer the requested goal as a JSON object with exactly these fields:
 - observations: array of objects with id and description.
 - reasoning: string.
 - conclusion: string.
 - confidence: one of "Observed", "Inferred", "Uncertain".
 
 Rules:
-1. Produce observations first in causal order. Observations are objective facts visible in the media. Each observation must have a stable id such as "obs-1".
+1. Produce observations first in causal order. Observations are objective facts observable in the media resource. Each observation must have a stable id such as "obs-1".
 2. Reasoning must come after observations and must only cite facts that trace to observation ids. If a step needs information not in observations, mark it as speculation.
 3. Conclusions that cannot be derived only from observations must be marked in reasoning as speculation and reflected by confidence "Inferred" or "Uncertain".
-4. Do not invent visual details to support a likely answer.
-5. Return only JSON. Do not call tools."#;
+4. Do not invent media details to support a likely answer.
+5. For audio, distinguish clearly intelligible speech from a sound that merely resembles speech. An exact transcription is "Observed" only when the words are clearly audible and supported by an observation that explicitly states the speech is unambiguous. If the clip is short, noisy, ambiguous, or could instead be a non-speech sound, mark any proposed transcription "Uncertain" and present it only as a candidate, not as an observed fact.
+6. Return only JSON. Do not call tools."#;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ObservationItem {
@@ -86,19 +98,24 @@ impl AgentTool for LlmUnderstandMediaTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: TOOL_LLM_UNDERSTAND_MEDIA.to_string(),
-            description: "Understand an media resource through a controlled LLM side context. Accepts media and goal only; media should be a named_object ResourceRef.".to_string(),
+            description: "Understand a media resource through a controlled LLM side context. Archives must be extracted first; other formats are forwarded to the selected model and fail if it does not support them. media is either a stored object ({kind:\"named_object\", obj_id:\"cyfile:…\"}), a URL, or a local file ({kind:\"local_file\", path:\"/abs/path\"}); use the local-file form for artifacts an earlier shell produced.".to_string(),
             args_schema: json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["media", "goal"],
+                "required": ["media", "goal", "max_completion_tokens"],
                 "properties": {
                     "media": {
                         "type": "object",
-                        "description": "ResourceRef-shaped media argument. Prefer {kind:\"named_object\", obj_id:\"...\"}; url is accepted. mime_hint is optional."
+                        "description": "Media locator. {kind:\"named_object\", obj_id:\"cyfile:…\"} for a stored object, {kind:\"local_file\", path:\"/abs/path\"} for a file on this host (for example a frame written by a previous shell), or {url:\"https://…\"}. A bare path or url string is also accepted. mime_hint is optional."
                     },
                     "goal": {
                         "type": "string",
                         "description": "What to understand or answer from the media."
+                    },
+                    "max_completion_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Token budget for the media model to complete this task."
                     }
                 }
             }),
@@ -122,10 +139,11 @@ impl AgentTool for LlmUnderstandMediaTool {
 
     async fn call(
         &self,
-        _ctx: &SessionRuntimeContext,
+        ctx: &SessionRuntimeContext,
         args: Value,
     ) -> Result<AgentToolResult, AgentToolError> {
-        let opts = RunOpts::from_tool_args(args)?;
+        let mut opts = RunOpts::from_tool_args(args)?;
+        opts.session_id = Some(ctx.session_id.clone());
         let (result, _) = run(opts).await;
         Ok(result)
     }
@@ -170,6 +188,9 @@ fn emit_result(result: &AgentToolResult) {
 #[derive(Clone, Debug)]
 struct RunOpts {
     media_value: Value,
+    /// Session whose workspace relative local paths resolve against. Set by
+    /// `AgentTool::call`; the CLI leaves it unset.
+    session_id: Option<String>,
     goal: String,
     parent_history: Vec<AiMessage>,
     work_dir: Option<PathBuf>,
@@ -226,14 +247,26 @@ impl RunOpts {
             .and_then(Value::as_u64)
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(DEFAULT_TARGET_TOKENS);
-        let max_completion_tokens = map
-            .get("max_completion_tokens")
-            .and_then(Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS);
-
+        let max_completion_tokens = match map.get("max_completion_tokens") {
+            Some(value) => value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    AgentToolError::InvalidArgs(
+                        "max_completion_tokens must be an integer".to_string(),
+                    )
+                })?,
+            None => DEFAULT_MAX_COMPLETION_TOKENS,
+        };
+        if max_completion_tokens == 0 {
+            return Err(AgentToolError::InvalidArgs(
+                "max_completion_tokens must be greater than 0".to_string(),
+            ));
+        }
+        let max_completion_tokens = normalize_completion_tokens(max_completion_tokens);
         Ok(Self {
             media_value,
+            session_id: None,
             goal,
             parent_history,
             work_dir,
@@ -250,6 +283,8 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         Ok(media) => media,
         Err(err) => return (build_error_result(&opts, err), CLI_EXIT_USAGE),
     };
+    let input_source_kind = media.source.kind();
+    let media_id = media.source.display_id();
 
     if let Err(err) = ensure_buckyos_runtime().await {
         return (
@@ -258,18 +293,32 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
         );
     }
 
-    let resolved_media = match resolve_media(&media).await {
+    let resolved_media = match resolve_media(&media, opts.session_id.as_deref()).await {
         Ok(media) => media,
         Err(err) => return (build_error_result(&opts, err), CLI_EXIT_ERROR),
     };
-    let mime = resolved_media.mime;
-    if !is_image_mime(&mime) {
-        return (
-            build_error_result(
-                &opts,
-                format!("unsupported media mime `{mime}`; v0 only supports image/*"),
-            ),
-            CLI_EXIT_ERROR,
+    let mime = resolved_media.mime.clone();
+    let resolved_source_kind = resource_source_kind(&resolved_media.source);
+    let PreparedMedia {
+        content: media_content,
+        image_preprocess,
+    } = match prepare_media_content(resolved_media, opts.session_id.as_deref()).await {
+        Ok(prepared) => prepared,
+        Err(err) => return (build_error_result(&opts, err), CLI_EXIT_ERROR),
+    };
+    if let Some(preprocess) = &image_preprocess {
+        log::info!(
+            "llm_understand_media: image preprocess; media_id={} actions={:?} original={}x{} {} {}B sent={}x{} {} {}B",
+            media_id,
+            preprocess.actions,
+            preprocess.original.width,
+            preprocess.original.height,
+            preprocess.original.mime,
+            preprocess.original.bytes,
+            preprocess.sent.width,
+            preprocess.sent.height,
+            preprocess.sent.mime,
+            preprocess.sent.bytes
         );
     }
 
@@ -307,50 +356,57 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
 
     let parent_history_count = purified.len();
     let compressed_history_count = compressed.len();
-    let source_kind = resource_source_kind(&resolved_media.source);
-    let request = build_request(
-        &opts,
-        resolved_media.source,
-        model_alias.clone(),
-        compressed,
-    );
+    let input = build_input(&opts, media_content, compressed);
     let work_dir = opts
         .work_dir
         .clone()
         .unwrap_or_else(|| default_work_dir(&opts.goal));
-    let mut ctx = match LocalLLMContext::resume_or_new(work_dir.clone(), request, llm) {
-        Ok(ctx) => ctx,
+    let overrides = media_overrides(&opts, model_alias.clone(), work_dir.clone());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let xllm_deps = XllmDeps::default().with_llm(llm);
+    let prepared =
+        match XllmTask::prepare(&cwd, TaskInput::structured(input), overrides, &xllm_deps).await {
+            Ok(p) => p,
+            Err(err) => {
+                return (
+                    build_error_result(&opts, format!("prepare task failed: {err}")),
+                    CLI_EXIT_ERROR,
+                );
+            }
+        };
+    let mut run = match XllmRun::start(prepared, xllm_deps).await {
+        Ok(r) => r,
         Err(err) => {
             return (
-                build_error_result(&opts, format!("LocalLLMContext init failed: {err}")),
+                build_error_result(&opts, format!("start run failed: {err}")),
                 CLI_EXIT_ERROR,
             );
         }
     };
-    let run_id = ctx.run_id().to_string();
+    let run_id = run.run_id().to_string();
     eprintln!(
         "llm_understand_media: work_dir={} run_id={}",
         work_dir.display(),
         run_id
     );
     log::info!(
-        "llm_understand_media: started; work_dir={} run_id={} mime={} source_kind={} model={} parent_history_count={} compressed_history_count={} goal={}",
+        "llm_understand_media: started; work_dir={} run_id={} mime={} input_source_kind={} resolved_source_kind={} media_id={} model={} parent_history_count={} compressed_history_count={} goal={}",
         work_dir.display(),
         run_id,
         mime,
-        source_kind,
+        input_source_kind,
+        resolved_source_kind,
+        media_id,
         model_alias,
         parent_history_count,
         compressed_history_count,
         opts.goal
     );
 
-    let compressor =
-        crate::LlmSummarizeCompressor::new(deps, opts.summary_model.clone(), opts.target_tokens);
-    let outcome = match ctx.drive_to_terminal(&compressor).await {
+    let outcome = match run.execute().await {
         Ok(outcome) => outcome,
         Err(err) => {
-            let message = format!("drive_to_terminal failed: {err}");
+            let message = format!("execute failed: {err}");
             log::error!(
                 "llm_understand_media: {}; work_dir={} run_id={} goal={}",
                 message,
@@ -360,228 +416,245 @@ async fn run(opts: RunOpts) -> (AgentToolResult, i32) {
             );
             let mut result = build_error_result(&opts, message);
             add_run_context(&mut result, &work_dir, &run_id, Some(&mime));
+            attach_image_preprocess(&mut result, image_preprocess.as_ref());
             return (result, CLI_EXIT_ERROR);
         }
     };
 
-    build_outcome_result(outcome, &mime, &work_dir, &run_id, &opts.goal)
+    let (mut result, code) =
+        build_outcome_result(outcome, &mime, &work_dir, &run_id, &opts.goal, &media_id);
+    attach_image_preprocess(&mut result, image_preprocess.as_ref());
+    (result, code)
 }
 
-fn build_request(
+/// 图片原始/实际送出的尺寸写进 details；缩过图时在 output 末尾提醒主干 agent。
+fn attach_image_preprocess(result: &mut AgentToolResult, preprocess: Option<&ImagePreprocess>) {
+    let Some(preprocess) = preprocess else {
+        return;
+    };
+    if let Value::Object(map) = &mut result.details {
+        map.insert(
+            "media_preprocess".to_string(),
+            serde_json::to_value(preprocess).unwrap_or(Value::Null),
+        );
+    }
+    if let (Some(output), Some(note)) = (result.output.as_mut(), preprocess.caller_note()) {
+        output.push('\n');
+        output.push_str(&note);
+    }
+}
+
+/// 媒体侧 context 的执行配置：无工具、JSON 报告、关闭 web_search。
+fn media_overrides(opts: &RunOpts, model_alias: String, work_dir: PathBuf) -> TaskOverrides {
+    TaskOverrides {
+        model: Some(model_alias),
+        loop_model: Some(LoopModel::FunctionCall),
+        tools: Some(false),
+        max_tokens: Some(opts.max_completion_tokens),
+        runs_dir: Some(work_dir),
+        json: true,
+        json_schema: Some(report_schema()),
+        disable_capabilities: vec!["web_search".to_string()],
+        ..Default::default()
+    }
+}
+
+fn build_input(
     opts: &RunOpts,
-    media: ResourceRef,
-    model_alias: String,
+    media_content: Vec<AiContent>,
     parent_history: Vec<AiMessage>,
-) -> OneShotRequest {
+) -> Vec<AiMessage> {
     let mut input = Vec::with_capacity(parent_history.len() + 2);
     input.push(AiMessage::text(AiRole::System, SYSTEM_PROMPT));
     input.extend(parent_history);
-    input.push(AiMessage::new(
-        AiRole::User,
-        vec![
-            AiContent::image(media),
-            AiContent::text(format!("Goal: {}", opts.goal)),
-        ],
-    ));
-
-    let mut req = OneShotRequest::new(opts.goal.clone(), input);
-    req.model_policy = Some(ModelPolicy {
-        preferred: model_alias,
-        fallbacks: Vec::new(),
-        temperature: Some(0.0),
-        max_completion_tokens: Some(opts.max_completion_tokens),
-        provider_options: None,
-    });
-    req.tool_policy = Some(ToolPolicy {
-        mode: ToolMode::None,
-        action_mode: ToolMode::None,
-        max_rounds: 0,
-        max_calls_per_round: 0,
-        disable_capabilities: vec!["web_search".to_string()],
-        allow_deferred: false,
-        ..ToolPolicy::default()
-    });
-    req.output = Some(OutputSpec::Json {
-        schema: Some(report_schema()),
-        strict: false,
-    });
-    req.budget = Some(llm_context::request::BudgetSpec {
-        max_total_tokens: Some(
-            opts.target_tokens
-                .saturating_add(opts.max_completion_tokens),
-        ),
-        max_completion_tokens: Some(opts.max_completion_tokens),
-        ..Default::default()
-    });
-    req
+    let mut user_content = media_content;
+    user_content.push(AiContent::text(format!("Goal: {}", opts.goal)));
+    input.push(AiMessage::new(AiRole::User, user_content));
+    input
 }
 
 fn build_outcome_result(
-    outcome: LLMContextOutcome,
+    outcome: RunOutcome,
     mime: &str,
     work_dir: &PathBuf,
     run_id: &str,
     goal: &str,
+    media_id: &str,
 ) -> (AgentToolResult, i32) {
+    let record = outcome.record().clone();
+    let usage = record.usage.total();
+    let latency_ms = record.updated_at_ms.saturating_sub(record.created_at_ms);
     match outcome {
-        LLMContextOutcome::Done {
-            output,
-            trace,
-            usage,
-            ..
-        } => match parse_report_output(&output) {
-            Ok(report) => {
-                let rendered = render_report(&report);
-                let summary = truncate_for_summary(&report.conclusion, 200);
-                (
-                    AgentToolResult {
-                        agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                        tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                        cmd_name: None,
-                        status: AgentToolStatus::Success,
-                        task_id: None,
-                        pending_reason: None,
-                        check_after: None,
-                        estimated_wait: None,
-                        title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => done"),
-                        summary,
-                        details: serde_json::to_value(&report).unwrap_or_else(|_| json!({})),
-                        cmd_args: None,
-                        return_code: Some(0),
-                        partial_output: None,
-                        output: Some(rendered),
-                    },
-                    CLI_EXIT_SUCCESS,
-                )
+        RunOutcome::Completed(_) => {
+            let raw = record
+                .result
+                .as_ref()
+                .map(|r| r.raw.clone())
+                .unwrap_or_default();
+            let output = match serde_json::from_str::<Value>(raw.trim()) {
+                Ok(content) => ContextOutput::Json { content },
+                Err(_) => ContextOutput::Text { content: raw },
+            };
+            match parse_report_output(&output) {
+                Ok(report) => {
+                    log::info!(
+                        "llm_understand_media: completed; work_dir={} run_id={} mime={} media_id={} confidence={:?} conclusion={}",
+                        work_dir.display(),
+                        run_id,
+                        mime,
+                        media_id,
+                        report.confidence,
+                        truncate_for_summary(&report.conclusion, 200)
+                    );
+                    let rendered = render_report(&report);
+                    let summary = truncate_for_summary(&report.conclusion, 200);
+                    (
+                        AgentToolResult {
+                            agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                            tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
+                            cmd_name: None,
+                            status: AgentToolStatus::Success,
+                            task_id: None,
+                            pending_reason: None,
+                            check_after: None,
+                            estimated_wait: None,
+                            title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => done"),
+                            summary,
+                            details: serde_json::to_value(&report).unwrap_or_else(|_| json!({})),
+                            cmd_args: None,
+                            return_code: Some(0),
+                            partial_output: None,
+                            output: Some(rendered),
+                        },
+                        CLI_EXIT_SUCCESS,
+                    )
+                }
+                Err(err) => {
+                    let raw_output = output_to_text(&output);
+                    let raw_output_chars = raw_output.chars().count();
+                    let raw_output_preview =
+                        truncate_for_summary(&raw_output, RAW_OUTPUT_LOG_PREVIEW_CHARS);
+                    let output_kind = context_output_kind(&output);
+                    let final_outcome_path = run_final_outcome_path(work_dir, run_id);
+                    let raw_output_path = match write_parse_error_raw_output(
+                        work_dir,
+                        run_id,
+                        &raw_output,
+                    ) {
+                        Ok(path) => Some(path),
+                        Err(write_err) => {
+                            log::warn!(
+                                "llm_understand_media: write parse error raw output failed: {}; work_dir={} run_id={}",
+                                write_err,
+                                work_dir.display(),
+                                run_id
+                            );
+                            None
+                        }
+                    };
+                    log::error!(
+                        "llm_understand_media: parse understanding report failed: {}; work_dir={} run_id={} mime={} output_kind={} raw_output_chars={} raw_output_preview={:?} final_outcome_path={} raw_output_path={} goal={}",
+                        err,
+                        work_dir.display(),
+                        run_id,
+                        mime,
+                        output_kind,
+                        raw_output_chars,
+                        raw_output_preview,
+                        final_outcome_path.display(),
+                        raw_output_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<unwritten>".to_string()),
+                        goal
+                    );
+                    (
+                        AgentToolResult {
+                            agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                            tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
+                            cmd_name: None,
+                            status: AgentToolStatus::Error,
+                            task_id: None,
+                            pending_reason: None,
+                            check_after: None,
+                            estimated_wait: None,
+                            title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => parse_error"),
+                            summary: format!("parse understanding report failed: {err}"),
+                            details: json!({
+                                "error": err,
+                                "mime": mime,
+                                "work_dir": work_dir.display().to_string(),
+                                "run_id": run_id,
+                                "output_kind": output_kind,
+                                "raw_output": raw_output,
+                                "raw_output_chars": raw_output_chars,
+                                "raw_output_preview": raw_output_preview,
+                                "raw_output_path": raw_output_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
+                                "final_outcome_path": final_outcome_path.display().to_string(),
+                                "usage": usage,
+                                "latency_ms": latency_ms,
+                            }),
+                            cmd_args: None,
+                            return_code: None,
+                            partial_output: None,
+                            output: None,
+                        },
+                        CLI_EXIT_ERROR,
+                    )
+                }
             }
-            Err(err) => {
-                let raw_output = output_to_text(&output);
-                let raw_output_chars = raw_output.chars().count();
-                let raw_output_preview =
-                    truncate_for_summary(&raw_output, RAW_OUTPUT_LOG_PREVIEW_CHARS);
-                let output_kind = context_output_kind(&output);
-                let final_outcome_path = run_final_outcome_path(work_dir, run_id);
-                let raw_output_path = match write_parse_error_raw_output(
-                    work_dir,
-                    run_id,
-                    &raw_output,
-                ) {
-                    Ok(path) => Some(path),
-                    Err(write_err) => {
-                        log::warn!(
-                            "llm_understand_media: write parse error raw output failed: {}; work_dir={} run_id={}",
-                            write_err,
-                            work_dir.display(),
-                            run_id
-                        );
-                        None
-                    }
-                };
-                log::error!(
-                    "llm_understand_media: parse understanding report failed: {}; work_dir={} run_id={} mime={} output_kind={} raw_output_chars={} raw_output_preview={:?} final_outcome_path={} raw_output_path={} goal={}",
-                    err,
-                    work_dir.display(),
-                    run_id,
-                    mime,
-                    output_kind,
-                    raw_output_chars,
-                    raw_output_preview,
-                    final_outcome_path.display(),
-                    raw_output_path
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|| "<unwritten>".to_string()),
-                    goal
-                );
-                (
-                    AgentToolResult {
-                        agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                        tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                        cmd_name: None,
-                        status: AgentToolStatus::Error,
-                        task_id: None,
-                        pending_reason: None,
-                        check_after: None,
-                        estimated_wait: None,
-                        title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => parse_error"),
-                        summary: format!("parse understanding report failed: {err}"),
-                        details: json!({
-                            "error": err,
-                            "mime": mime,
-                            "work_dir": work_dir.display().to_string(),
-                            "run_id": run_id,
-                            "output_kind": output_kind,
-                            "raw_output": raw_output,
-                            "raw_output_chars": raw_output_chars,
-                            "raw_output_preview": raw_output_preview,
-                            "raw_output_path": raw_output_path
-                                .as_ref()
-                                .map(|path| path.display().to_string()),
-                            "final_outcome_path": final_outcome_path.display().to_string(),
-                            "usage": usage,
-                            "latency_ms": trace.latency_ms,
-                        }),
-                        cmd_args: None,
-                        return_code: None,
-                        partial_output: None,
-                        output: None,
-                    },
-                    CLI_EXIT_ERROR,
-                )
-            }
-        },
-        LLMContextOutcome::PendingTool { pending, .. } => (
-            AgentToolResult {
-                agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                cmd_name: None,
-                status: AgentToolStatus::Pending,
-                task_id: None,
-                pending_reason: Some(AgentToolPendingReason::LongRunning),
-                check_after: None,
-                estimated_wait: None,
-                title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => pending_tool"),
-                summary: format!("pending {} tool call(s)", pending.len()),
-                details: json!({ "pending": pending }),
-                cmd_args: None,
-                return_code: None,
-                partial_output: None,
-                output: None,
-            },
-            CLI_EXIT_SUCCESS,
-        ),
-        LLMContextOutcome::BudgetExhausted {
-            which,
-            partial,
-            usage,
-        } => (
-            AgentToolResult {
-                agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                cmd_name: None,
-                status: AgentToolStatus::Error,
-                task_id: None,
-                pending_reason: None,
-                check_after: None,
-                estimated_wait: None,
-                title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => budget_exhausted"),
-                summary: format!("budget exhausted ({which:?})"),
-                details: json!({
-                    "outcome": "budget_exhausted",
-                    "which": which,
-                    "usage": usage,
-                }),
-                cmd_args: None,
-                return_code: None,
-                partial_output: partial.as_ref().map(output_to_text),
-                output: None,
-            },
-            CLI_EXIT_ERROR,
-        ),
-        LLMContextOutcome::Error { error, usage } => {
+        }
+        RunOutcome::Paused(_) | RunOutcome::Interrupted(_) => {
+            let reason = record
+                .last_error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .or_else(|| record.interrupt_reason.clone())
+                .unwrap_or_else(|| record.status.label().to_string());
+            (
+                AgentToolResult {
+                    agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
+                    tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
+                    cmd_name: None,
+                    status: AgentToolStatus::Error,
+                    task_id: None,
+                    pending_reason: None,
+                    check_after: None,
+                    estimated_wait: None,
+                    title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => {}", record.status.as_str()),
+                    summary: format!(
+                        "sub run {run_id} {}: {reason}. It did not finish; take it over with `{}` or start again.",
+                        record.status.label(),
+                        record.resume_command()
+                    ),
+                    details: json!({
+                        "outcome": record.status.as_str(),
+                        "reason": reason,
+                        "usage": usage,
+                        "work_dir": work_dir.display().to_string(),
+                        "run_id": run_id,
+                        "resume": record.resume_command(),
+                    }),
+                    cmd_args: None,
+                    return_code: None,
+                    partial_output: None,
+                    output: None,
+                },
+                CLI_EXIT_SUCCESS,
+            )
+        }
+        RunOutcome::LimitReached(_) | RunOutcome::Failed(_) => {
+            let reason = record
+                .limit_reason
+                .clone()
+                .or_else(|| record.last_error.as_ref().map(|e| e.message.clone()))
+                .unwrap_or_else(|| record.status.label().to_string());
             log::error!(
-                "llm_understand_media: llm outcome error: {}; work_dir={} run_id={} goal={}",
-                error,
+                "llm_understand_media: llm outcome {}: {}; work_dir={} run_id={} goal={}",
+                record.status.as_str(),
+                reason,
                 work_dir.display(),
                 run_id,
                 goal
@@ -596,12 +669,12 @@ fn build_outcome_result(
                     pending_reason: None,
                     check_after: None,
                     estimated_wait: None,
-                    title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => error"),
-                    summary: format!("llm error: {error}"),
+                    title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => {}", record.status.as_str()),
+                    summary: format!("{}: {reason}", record.status.label()),
                     details: json!({
-                        "error": format!("{error}"),
-                        "error_detail": serde_json::to_value(&error)
-                            .unwrap_or_else(|_| json!({ "message": format!("{error}") })),
+                        "outcome": record.status.as_str(),
+                        "error": reason,
+                        "error_detail": record.last_error,
                         "mime": mime,
                         "work_dir": work_dir.display().to_string(),
                         "run_id": run_id,
@@ -615,53 +688,48 @@ fn build_outcome_result(
                 CLI_EXIT_ERROR,
             )
         }
-        LLMContextOutcome::ContextLimitReached { which, .. } => (
-            AgentToolResult {
-                agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                cmd_name: None,
-                status: AgentToolStatus::Error,
-                task_id: None,
-                pending_reason: None,
-                check_after: None,
-                estimated_wait: None,
-                title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => context_limit_reached"),
-                summary: format!("context limit surfaced unexpectedly: {which:?}"),
-                details: json!({ "which": format!("{which:?}") }),
-                cmd_args: None,
-                return_code: None,
-                partial_output: None,
-                output: None,
-            },
-            CLI_EXIT_ERROR,
-        ),
-        LLMContextOutcome::Interrupted { reason, usage, .. } => (
-            AgentToolResult {
-                agent_tool_protocol: AGENT_TOOL_PROTOCOL_VERSION.to_string(),
-                tool: Some(TOOL_LLM_UNDERSTAND_MEDIA.to_string()),
-                cmd_name: None,
-                status: AgentToolStatus::Pending,
-                task_id: None,
-                pending_reason: Some(AgentToolPendingReason::LongRunning),
-                check_after: None,
-                estimated_wait: None,
-                title: format!("{TOOL_LLM_UNDERSTAND_MEDIA} => interrupted"),
-                summary: format!("inference interrupted: {reason}"),
-                details: json!({ "reason": reason, "usage": usage }),
-                cmd_args: None,
-                return_code: None,
-                partial_output: None,
-                output: None,
-            },
-            CLI_EXIT_SUCCESS,
-        ),
     }
 }
 
 #[derive(Clone, Debug)]
 struct MediaArg {
-    source: ResourceRef,
+    source: MediaSource,
     mime_hint: Option<String>,
+}
+
+/// Where `llm_understand_media` reads the media from.
+///
+/// `ResourceRef` — the wire type — has no local-file variant, but an agent that
+/// has just produced a frame or a clip with `shell` naturally holds a
+/// filesystem path. Accepting that path here keeps a multi-step media task
+/// inside one turn; the alternative is that the model wraps the path in a
+/// `named_object` (the only shape it is offered), the path fails to decode as
+/// an object id, and the turn is spent on a cryptic error.
+#[derive(Clone, Debug)]
+enum MediaSource {
+    Resource(ResourceRef),
+    LocalFile(PathBuf),
+}
+
+impl MediaSource {
+    /// Stable label for logs and the tool result.
+    fn kind(&self) -> &'static str {
+        match self {
+            MediaSource::Resource(source) => resource_source_kind(source),
+            MediaSource::LocalFile(_) => "local_file",
+        }
+    }
+
+    /// Identifier safe to echo back to the model.
+    fn display_id(&self) -> String {
+        match self {
+            MediaSource::Resource(source) => masked_resource_id(source),
+            MediaSource::LocalFile(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "<local file>".to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -670,20 +738,339 @@ struct ResolvedMedia {
     mime: String,
 }
 
+/// Parse the `media` argument.
+///
+/// Accepted shapes, in order of preference:
+/// * `{"kind":"named_object","obj_id":"cyfile:…"}` — a stored object;
+/// * `{"url":"https://…"}` / a bare `http(s):` / `data:` string;
+/// * a bare path or `{"kind":"local_file","path":"…"}` — a file on this host,
+///   which covers artifacts an earlier `shell` produced;
+/// * `{"kind":"named_object","obj_id":"<path>"}` — a model that reached for
+///   the only shape it knows; coerced to a local file when the path exists,
+///   rejected with an actionable message when it does not.
 fn parse_media_arg(value: &Value) -> Result<MediaArg, String> {
-    let source = serde_json::from_value::<ResourceRef>(value.clone())
-        .map_err(|err| format!("invalid media ResourceRef: {err}"))?;
     let mime_hint = value
         .get("mime_hint")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("mime")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    let source = match value {
+        // Bare string: URL, typed object id, or local path.
+        Value::String(raw) => parse_media_locator(raw)?,
+        Value::Object(map) => {
+            let kind = map
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|kind| kind.trim().to_ascii_lowercase());
+
+            if let Some(url) = map
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                // Documented shorthand — `{"url": "…"}`, with or without the
+                // `kind` tag the wire type insists on.
+                parse_media_locator(url)?
+            } else if let Some(path) = local_path_from_object(map, kind.as_deref())? {
+                MediaSource::LocalFile(path)
+            } else {
+                MediaSource::Resource(parse_resource_ref(value)?)
+            }
+        }
+        other => {
+            return Err(format!(
+                "media must be an object or a string, got {}",
+                json_type_name(other)
+            ))
+        }
+    };
+
     Ok(MediaArg { source, mime_hint })
 }
 
-async fn resolve_media(media: &MediaArg) -> Result<ResolvedMedia, String> {
-    match &media.source {
+/// Decode a media object as a `ResourceRef`.
+///
+/// `mime_hint` / `mime` are documented as media-level fields, but the wire type
+/// rejects unknown fields, so the documented shape fails for variants that do
+/// not declare one. Retry with the hints removed — the value is already kept in
+/// `MediaArg::mime_hint` — and only then report the failure.
+fn parse_resource_ref(value: &Value) -> Result<ResourceRef, String> {
+    let err = match serde_json::from_value::<ResourceRef>(value.clone()) {
+        Ok(source) => return Ok(source),
+        Err(err) => err,
+    };
+
+    if let Some(map) = value.as_object() {
+        let mut stripped = map.clone();
+        stripped.remove("mime_hint");
+        stripped.remove("mime");
+        if stripped.len() != map.len() {
+            if let Ok(source) = serde_json::from_value::<ResourceRef>(Value::Object(stripped)) {
+                return Ok(source);
+            }
+        }
+    }
+
+    Err(format!(
+        "invalid media argument: {err}. Pass one of \
+         {{\"kind\":\"named_object\",\"obj_id\":\"cyfile:…\"}}, \
+         {{\"kind\":\"local_file\",\"path\":\"/abs/path\"}}, a file path, or a url."
+    ))
+}
+
+/// Resolve a bare locator string to a media source.
+fn parse_media_locator(raw: &str) -> Result<MediaSource, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("media string is empty".to_string());
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Ok(MediaSource::Resource(ResourceRef::Url {
+            url: trimmed.to_string(),
+            mime_hint: None,
+        }));
+    }
+    if let Some(rest) = trimmed.strip_prefix("data:") {
+        return parse_data_url(rest).map(MediaSource::Resource);
+    }
+    if looks_like_object_id(trimmed) {
+        // Let the wire type do the decoding so the error message stays
+        // authoritative about what a valid object id is.
+        return serde_json::from_value::<ResourceRef>(serde_json::json!({
+            "kind": "named_object",
+            "obj_id": trimmed,
+        }))
+        .map(MediaSource::Resource)
+        .map_err(|err| format!("invalid object id `{trimmed}`: {err}"));
+    }
+    let path = PathBuf::from(trimmed);
+    if path.exists() {
+        return Ok(MediaSource::LocalFile(path));
+    }
+    Err(format!(
+        "media `{trimmed}` is neither a URL, a typed object id (`cyfile:…` / `chunk:…`), \
+         nor an existing local file"
+    ))
+}
+
+/// Detect `{"kind":"local_file","path":…}` and friends, plus the very common
+/// mistake of passing a filesystem path as `obj_id`.
+fn local_path_from_object(
+    map: &serde_json::Map<String, Value>,
+    kind: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    let explicit_path = map
+        .get("path")
+        .or_else(|| map.get("file"))
+        .or_else(|| map.get("local_path"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(path) = explicit_path {
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    if matches!(kind, Some("local_file") | Some("file") | Some("path")) {
+        return Err(format!(
+            "media kind `{}` requires a `path`",
+            kind.unwrap_or("local_file")
+        ));
+    }
+
+    if matches!(kind, Some("named_object") | None) {
+        if let Some(obj_id) = map.get("obj_id").and_then(Value::as_str) {
+            let obj_id = obj_id.trim();
+            // A path handed over as an object id: the tool can serve it, so
+            // serve it rather than failing on base32 decoding.
+            if !looks_like_object_id(obj_id) && looks_like_path(obj_id) {
+                // A path handed over as an object id. It cannot decode as an
+                // id, but it is exactly the shape a model produces after
+                // `shell` wrote an artifact — treat it as a local file and
+                // let resolution report a precise error if it is missing.
+                log::warn!(
+                    "llm_understand_media: media.obj_id `{obj_id}` is not a typed object id; \
+                     treating it as a local file path"
+                );
+                return Ok(Some(PathBuf::from(obj_id)));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn looks_like_object_id(value: &str) -> bool {
+    // Object ids in this system are typed (`cyfile:<…>`, a chunk id such as
+    // `mix256:<…>` / `sha256:<…>`): whatever ndn-lib parses as an `ObjId`,
+    // with no path separator or whitespace.
+    if value.contains(['/', '\\']) || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    matches!(
+        value.split_once(':').map(|(kind, _)| kind),
+        Some("cyfile") | Some("chunk") | Some("objid") | Some("obj")
+    ) || ndn_lib::ObjId::new(value).is_ok()
+}
+
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/') || value.contains('\\') || value.contains('.') || value.starts_with('~')
+}
+
+fn parse_data_url(rest: &str) -> Result<ResourceRef, String> {
+    let (meta, data) = rest
+        .split_once(',')
+        .ok_or_else(|| "malformed data: URL".to_string())?;
+    if !meta.ends_with(";base64") {
+        return Err("only base64 `data:` URLs are supported for media".to_string());
+    }
+    let mime = normalize_mime(meta.trim_end_matches(";base64"))
+        .ok_or_else(|| "data: URL has no mime type".to_string())?;
+    if data.trim().is_empty() {
+        return Err("data: URL carries no payload".to_string());
+    }
+    Ok(ResourceRef::Base64 {
+        mime,
+        data_base64: data.trim().to_string(),
+    })
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Find the file a caller meant by a local path.
+///
+/// `shell` runs inside the session workspace — `<agent_root>/sessions/<id>`,
+/// which is also where session media inputs live — while the agent process
+/// itself starts in the install root. A model that has just written
+/// `frame008.png` therefore names it relative to a directory that is *not* the
+/// process CWD. Try the process-relative path first, then the session
+/// workspace, and on failure report every path that was tried.
+fn resolve_local_file_path(raw: &Path, session_id: Option<&str>) -> Result<PathBuf, String> {
+    let candidates = local_path_candidates(raw, session_id);
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.is_file() {
+            if index > 0 {
+                log::info!(
+                    "llm_understand_media: resolved local media `{}` to `{}`",
+                    raw.display(),
+                    candidate.display()
+                );
+            }
+            return Ok(candidate.clone());
+        }
+    }
+    Err(format!(
+        "local media `{}` does not exist (tried: {}); pass an absolute path",
+        raw.display(),
+        candidates
+            .iter()
+            .map(|candidate| candidate.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn local_path_candidates(raw: &Path, session_id: Option<&str>) -> Vec<PathBuf> {
+    let mut agent_roots = Vec::new();
+    if let Some(agent_root) = env_path(crate::runtime_context::OPENDAN_AGENT_ROOT_ENV) {
+        agent_roots.push(agent_root);
+    }
+    // The agent process does not always carry `OPENDAN_AGENT_ROOT`; recover the
+    // agent root from the deployment layout instead.
+    if let Some(data_dir) = env_path("BUCKYOS_DATA_DIR") {
+        agent_roots.push(data_dir);
+    }
+    local_path_candidates_under(raw, session_id, &agent_roots)
+}
+
+/// Pure half of [`local_path_candidates`]: each entry of `agent_roots`
+/// contributes `<root>/sessions/<session_id>/<raw>`.
+fn local_path_candidates_under(
+    raw: &Path,
+    session_id: Option<&str>,
+    agent_roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut candidates = vec![raw.to_path_buf()];
+    if raw.is_absolute() {
+        return candidates;
+    }
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return candidates;
+    };
+    for root in agent_roots {
+        candidates.push(root.join("sessions").join(session_id).join(raw));
+    }
+    candidates
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+async fn resolve_media(
+    media: &MediaArg,
+    session_id: Option<&str>,
+) -> Result<ResolvedMedia, String> {
+    let source: &ResourceRef = match &media.source {
+        MediaSource::Resource(source) => source,
+        MediaSource::LocalFile(raw) => {
+            let path = resolve_local_file_path(raw, session_id)?;
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|err| format!("read local media `{}` failed: {err}", path.display()))?;
+            if bytes.is_empty() {
+                return Err(format!("local media `{}` is empty", path.display()));
+            }
+            let mime = media
+                .mime_hint
+                .as_deref()
+                .and_then(normalize_mime)
+                .or_else(|| mime_from_path_extension(&path))
+                .or_else(|| sniff_archive_mime(&bytes).map(str::to_string))
+                .or_else(|| sniff_image_mime(&bytes).map(str::to_string))
+                .or_else(|| sniff_video_mime(&bytes).map(str::to_string))
+                .or_else(|| sniff_document_mime(&bytes).map(str::to_string))
+                .ok_or_else(|| {
+                    format!(
+                        "cannot determine MIME for local media `{}`; pass mime_hint",
+                        path.display()
+                    )
+                })?;
+            return Ok(ResolvedMedia {
+                source: ResourceRef::Base64 {
+                    mime: mime.clone(),
+                    data_base64: general_purpose::STANDARD.encode(bytes),
+                },
+                mime,
+            });
+        }
+    };
+
+    match source {
         ResourceRef::Base64 { mime, data_base64 } => {
             let mime =
                 normalize_mime(mime).ok_or_else(|| "base64 media has empty mime".to_string())?;
@@ -691,62 +1078,46 @@ async fn resolve_media(media: &MediaArg) -> Result<ResolvedMedia, String> {
                 return Err("base64 media has empty data_base64".to_string());
             }
             Ok(ResolvedMedia {
-                source: media.source.clone(),
+                source: source.clone(),
                 mime,
             })
         }
         ResourceRef::Url { url, mime_hint } => {
             if let Some(mime) = mime_hint.as_deref().and_then(normalize_mime) {
                 return Ok(ResolvedMedia {
-                    source: media.source.clone(),
+                    source: source.clone(),
                     mime,
                 });
             }
             if let Some(mime) = media.mime_hint.as_deref().and_then(normalize_mime) {
                 return Ok(ResolvedMedia {
-                    source: media.source.clone(),
+                    source: source.clone(),
                     mime,
                 });
             }
             Ok(ResolvedMedia {
-                source: media.source.clone(),
+                source: source.clone(),
                 mime: resolve_url_mime(url).await?,
             })
         }
         ResourceRef::NamedObject { obj_id } => {
-            let runtime = get_buckyos_api_runtime()
-                .map_err(|err| format!("get buckyos runtime failed: {err}"))?;
-            let named_store = runtime
-                .get_named_store()
+            let content = crate::read_tool::read_named_object(obj_id)
                 .await
-                .map_err(|err| format!("get named_store failed: {err}"))?;
-
-            let object_mime = match named_store.get_object(obj_id).await {
-                Ok(object_json) => file_object_mime_from_json(&object_json),
-                Err(err) => {
-                    log::warn!(
-                        "llm_understand_media: load named_object metadata failed: {}; obj_id={}",
-                        err,
-                        obj_id
-                    );
-                    None
-                }
-            };
-            let (mut reader, _total_size) = named_store
-                .open_reader(obj_id, None)
-                .await
-                .map_err(|err| format!("open named_object {obj_id} reader failed: {err}"))?;
-            let mut bytes = Vec::new();
-            reader
-                .read_to_end(&mut bytes)
-                .await
-                .map_err(|err| format!("read named_object {obj_id} bytes failed: {err}"))?;
+                .map_err(|err| format!("read named_object failed: {err}"))?;
+            let bytes = content.bytes;
             if bytes.is_empty() {
                 return Err(format!("named_object {obj_id} has empty content"));
             }
 
+            let object_mime = content.mime.as_deref().and_then(normalize_mime);
             let mime = object_mime
+                .clone()
+                .filter(|mime| mime != "application/octet-stream")
+                .or_else(|| sniff_archive_mime(&bytes).map(str::to_string))
                 .or_else(|| sniff_image_mime(&bytes).map(str::to_string))
+                .or_else(|| sniff_video_mime(&bytes).map(str::to_string))
+                .or_else(|| sniff_document_mime(&bytes).map(str::to_string))
+                .or(object_mime)
                 .or_else(|| media.mime_hint.as_deref().and_then(normalize_mime))
                 .ok_or_else(|| format!("cannot determine MIME for named_object {obj_id}"))?;
             let data_base64 = general_purpose::STANDARD.encode(bytes);
@@ -761,21 +1132,36 @@ async fn resolve_media(media: &MediaArg) -> Result<ResolvedMedia, String> {
     }
 }
 
-fn file_object_mime_from_json(object_json: &str) -> Option<String> {
-    let file_obj: FileObject = serde_json::from_str(object_json).ok()?;
-    file_obj
-        .meta
-        .get("mime_type")
-        .or_else(|| file_obj.meta.get("mime"))
-        .and_then(Value::as_str)
-        .and_then(normalize_mime)
-}
-
 fn resource_source_kind(source: &ResourceRef) -> &'static str {
     match source {
         ResourceRef::Base64 { .. } => "base64",
         ResourceRef::Url { .. } => "url",
         ResourceRef::NamedObject { .. } => "named_object",
+    }
+}
+
+fn masked_resource_id(source: &ResourceRef) -> String {
+    let ResourceRef::NamedObject { obj_id } = source else {
+        return "<none>".to_string();
+    };
+    let value = obj_id.to_string();
+    let (kind, payload) = value
+        .split_once(':')
+        .map(|(kind, payload)| (Some(kind), payload))
+        .unwrap_or((None, value.as_str()));
+    let chars = payload.chars().collect::<Vec<_>>();
+    let masked_payload = if chars.len() <= 16 {
+        payload.to_string()
+    } else {
+        format!(
+            "{}…{}",
+            chars[..8].iter().collect::<String>(),
+            chars[chars.len() - 8..].iter().collect::<String>()
+        )
+    };
+    match kind {
+        Some(kind) => format!("{kind}:{masked_payload}"),
+        None => masked_payload,
     }
 }
 
@@ -801,6 +1187,45 @@ fn normalize_mime(value: &str) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+/// MIME guess from a file extension, checked before content sniffing so local
+/// artifacts that sniffing does not recognize (audio, for instance) still route
+/// to the right model.
+fn mime_from_path_extension(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "json" => "application/json",
+        "txt" | "md" | "log" | "csv" | "tsv" => "text/plain",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        "zst" => "application/zstd",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
 fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
         return Some("image/png");
@@ -817,19 +1242,372 @@ fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
+fn sniff_video_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.get(4..8) == Some(b"ftyp") {
+        return Some("video/mp4");
+    }
+    if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        return Some("video/webm");
+    }
+    None
+}
+
+fn sniff_document_mime(bytes: &[u8]) -> Option<&'static str> {
+    bytes.starts_with(b"%PDF-").then_some("application/pdf")
+}
+
+fn sniff_archive_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        return Some("application/zip");
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return Some("application/gzip");
+    }
+    if bytes.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
+        return Some("application/x-7z-compressed");
+    }
+    if bytes.starts_with(b"Rar!\x1a\x07") {
+        return Some("application/vnd.rar");
+    }
+    if bytes.starts_with(b"BZh") {
+        return Some("application/x-bzip2");
+    }
+    if bytes.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
+        return Some("application/x-xz");
+    }
+    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return Some("application/zstd");
+    }
+    (bytes.get(257..262) == Some(b"ustar")).then_some("application/x-tar")
+}
+
 fn is_image_mime(mime: &str) -> bool {
     mime.starts_with("image/")
 }
 
+fn is_video_mime(mime: &str) -> bool {
+    mime.starts_with("video/")
+}
+
+fn is_audio_mime(mime: &str) -> bool {
+    mime.starts_with("audio/")
+}
+
+fn is_archive_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "application/zip"
+            | "application/x-7z-compressed"
+            | "application/x-rar-compressed"
+            | "application/vnd.rar"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-tar"
+            | "application/x-compressed-tar"
+            | "application/zstd"
+            | "application/x-bzip2"
+            | "application/x-xz"
+    )
+}
+
+fn configured_model(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn route_model(mime: &str) -> Option<String> {
-    if is_image_mime(mime) {
-        std::env::var("LLM_UNDERSTAND_MEDIA_IMAGE_MODEL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| Some(DEFAULT_MODEL_ALIAS.to_string()))
+    let specific = if is_video_mime(mime) {
+        configured_model("LLM_UNDERSTAND_MEDIA_VIDEO_MODEL")
+    } else if is_image_mime(mime) {
+        configured_model("LLM_UNDERSTAND_MEDIA_IMAGE_MODEL")
+    } else if is_audio_mime(mime) {
+        configured_model("LLM_UNDERSTAND_MEDIA_AUDIO_MODEL")
+    } else if is_archive_mime(mime) {
+        return None;
     } else {
         None
+    };
+    specific
+        .or_else(|| configured_model("LLM_UNDERSTAND_MEDIA_MODEL"))
+        .or_else(|| Some(default_model_alias(mime).to_string()))
+}
+
+fn default_model_alias(mime: &str) -> &'static str {
+    if is_audio_mime(mime) {
+        DEFAULT_AUDIO_ANALYSIS_MODEL_ALIAS
+    } else {
+        DEFAULT_MODEL_ALIAS
     }
+}
+
+#[derive(Debug)]
+struct PreparedMedia {
+    content: Vec<AiContent>,
+    image_preprocess: Option<ImagePreprocess>,
+}
+
+impl From<Vec<AiContent>> for PreparedMedia {
+    fn from(content: Vec<AiContent>) -> Self {
+        Self {
+            content,
+            image_preprocess: None,
+        }
+    }
+}
+
+async fn prepare_media_content(
+    media: ResolvedMedia,
+    session_id: Option<&str>,
+) -> Result<PreparedMedia, String> {
+    if is_image_mime(&media.mime) {
+        return prepare_image_content(media).await;
+    }
+    if is_audio_mime(&media.mime) {
+        let transcript = transcribe_audio(media.source, session_id).await?;
+        return Ok(audio_transcript_content(&transcript).into());
+    }
+    if is_archive_mime(&media.mime) {
+        return Err(format!(
+            "archive media mime `{}` must be extracted first",
+            media.mime
+        ));
+    }
+    if !is_video_mime(&media.mime) {
+        return Ok(vec![AiContent::Document {
+            source: media.source,
+            title: Some("media input".to_string()),
+        }]
+        .into());
+    }
+
+    let frames = extract_video_frames(&media).await?;
+    let mut content = Vec::with_capacity(frames.len() * 2 + 1);
+    content.push(AiContent::text(format!(
+        "The following {} images are representative video frames in chronological order.",
+        frames.len()
+    )));
+    for (timestamp, frame) in frames {
+        content.push(AiContent::text(format!("Frame at {timestamp:.3} seconds:")));
+        content.push(AiContent::image(frame));
+    }
+    Ok(content.into())
+}
+
+/// 过大、格式不被 vision 模型接受或带 EXIF 旋转的图片先在本地处理（见 image_fit）；
+/// URL 图片也先下载，否则看不到尺寸。
+async fn prepare_image_content(media: ResolvedMedia) -> Result<PreparedMedia, String> {
+    let bytes = media_bytes(&media.source, "image").await?;
+    let fitted = fit_image_for_vision(bytes, &media.mime, ImageLimits::from_env()).await?;
+    let mut content = Vec::with_capacity(2);
+    if let Some(note) = fitted.preprocess.model_note() {
+        content.push(AiContent::text(note));
+    }
+    content.push(AiContent::image(ResourceRef::Base64 {
+        mime: fitted.mime,
+        data_base64: general_purpose::STANDARD.encode(fitted.bytes),
+    }));
+    Ok(PreparedMedia {
+        content,
+        image_preprocess: Some(fitted.preprocess),
+    })
+}
+
+async fn media_bytes(source: &ResourceRef, kind: &str) -> Result<Vec<u8>, String> {
+    let bytes = match source {
+        ResourceRef::Base64 { data_base64, .. } => general_purpose::STANDARD
+            .decode(data_base64)
+            .map_err(|err| format!("decode {kind} base64 failed: {err}"))?,
+        ResourceRef::Url { url, .. } => reqwest::Client::new()
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("download {kind} failed: {err}"))?
+            .error_for_status()
+            .map_err(|err| format!("download {kind} failed: {err}"))?
+            .bytes()
+            .await
+            .map_err(|err| format!("read downloaded {kind} failed: {err}"))?
+            .to_vec(),
+        ResourceRef::NamedObject { .. } => {
+            return Err(format!("named_object {kind} was not resolved to bytes"))
+        }
+    };
+    if bytes.is_empty() {
+        return Err(format!("{kind} has empty content"));
+    }
+    Ok(bytes)
+}
+
+fn media_temp_dir(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+async fn transcribe_audio(source: ResourceRef, session_id: Option<&str>) -> Result<String, String> {
+    let runtime = get_buckyos_api_runtime()
+        .map_err(|err| format!("get buckyos runtime for audio transcription failed: {err}"))?;
+    let client = runtime
+        .get_aicc_client()
+        .await
+        .map_err(|err| format!("get aicc client for audio transcription failed: {err}"))?;
+
+    let mut route_request = RouteResolveRequest::new(
+        ApiType::AudioSpeechRecognition,
+        DEFAULT_AUDIO_ASR_MODEL_ALIAS,
+    );
+    route_request.session_id = session_id.map(str::to_string);
+    let route = client
+        .route_resolve(route_request)
+        .await
+        .map_err(|err| format!("resolve audio.asr model failed: {err}"))?;
+
+    let mut request = AudioSpeechRecognitionRequest::new(route.selected_exact_model, source);
+    request.session_id = session_id.map(str::to_string);
+    let response = client
+        .audio_speech_recognition(request)
+        .await
+        .map_err(|err| format!("aicc audio.asr failed: {err}"))?;
+
+    match response.status {
+        AiMethodStatus::Succeeded => {
+            let text = response
+                .text
+                .filter(|text| !text.trim().is_empty())
+                .or_else(|| {
+                    let text = response
+                        .segments
+                        .iter()
+                        .map(|segment| segment.text.trim())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then_some(text)
+                })
+                .ok_or_else(|| "audio.asr succeeded but returned an empty transcript".to_string())?;
+            Ok(text)
+        }
+        AiMethodStatus::Failed => Err(format!(
+            "audio.asr failed: task_id={}, event_ref={}, error={}",
+            response.task_id,
+            response.event_ref.as_deref().unwrap_or(""),
+            response
+                .error
+                .as_ref()
+                .and_then(|error| serde_json::to_string(error).ok())
+                .unwrap_or_else(|| "<none>".to_string())
+        )),
+        AiMethodStatus::Running => Err(format!(
+            "audio.asr returned async task `{}`; llm_understand_media requires an immediate transcription",
+            response.task_id
+        )),
+    }
+}
+
+fn audio_transcript_content(transcript: &str) -> Vec<AiContent> {
+    vec![AiContent::text(format!(
+        "Audio preprocessing result from automatic speech recognition. This evidence covers intelligible speech only; it does not identify music, ambient sounds, emotion, or the scene unless those are stated in the transcript.\n\nTranscript:\n{}",
+        transcript.trim()
+    ))]
+}
+
+async fn extract_video_frames(media: &ResolvedMedia) -> Result<Vec<(f64, ResourceRef)>, String> {
+    let bytes = media_bytes(&media.source, "video").await?;
+    let temp_dir = media_temp_dir("llm-understand-video");
+    tokio::fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|err| format!("create video frame temp dir failed: {err}"))?;
+    let input_path = temp_dir.join(if media.mime == "video/webm" {
+        "input.webm"
+    } else {
+        "input.mp4"
+    });
+    let result = async {
+        tokio::fs::write(&input_path, bytes)
+            .await
+            .map_err(|err| format!("write temporary video failed: {err}"))?;
+        let probe = buckyos_api::hide_child_console_async(&mut Command::new("ffprobe"))
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(&input_path)
+            .output()
+            .await
+            .map_err(|err| format!("start ffprobe failed: {err}"))?;
+        if !probe.status.success() {
+            return Err(format!(
+                "ffprobe failed: {}",
+                String::from_utf8_lossy(&probe.stderr).trim()
+            ));
+        }
+        let duration = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse::<f64>()
+            .map_err(|err| format!("parse video duration failed: {err}"))?;
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(format!("invalid video duration `{duration}`"));
+        }
+        let configured_count = std::env::var("LLM_UNDERSTAND_MEDIA_VIDEO_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_VIDEO_FRAME_COUNT)
+            .clamp(1, MAX_VIDEO_FRAME_COUNT);
+        let frame_count = configured_count
+            .min((duration * 2.0).ceil() as usize)
+            .max(1);
+        let max_edge = image_fit::video_frame_max_long_edge();
+        let scale_filter = format!(
+            "scale='min(iw,{max_edge})':'min(ih,{max_edge})':force_original_aspect_ratio=decrease"
+        );
+        let mut frames = Vec::with_capacity(frame_count);
+        for index in 0..frame_count {
+            let timestamp = duration * (index as f64 + 0.5) / frame_count as f64;
+            let frame_path = temp_dir.join(format!("frame-{index:02}.jpg"));
+            let output = buckyos_api::hide_child_console_async(&mut Command::new("ffmpeg"))
+                .args(["-v", "error", "-y", "-ss", &format!("{timestamp:.6}")])
+                .arg("-i")
+                .arg(&input_path)
+                .args(["-frames:v", "1", "-vf", &scale_filter, "-q:v", "2"])
+                .arg(&frame_path)
+                .output()
+                .await
+                .map_err(|err| format!("start ffmpeg failed: {err}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "extract video frame at {timestamp:.3}s failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let frame_bytes = tokio::fs::read(&frame_path)
+                .await
+                .map_err(|err| format!("read extracted video frame failed: {err}"))?;
+            frames.push((
+                timestamp,
+                ResourceRef::Base64 {
+                    mime: "image/jpeg".to_string(),
+                    data_base64: general_purpose::STANDARD.encode(frame_bytes),
+                },
+            ));
+        }
+        Ok(frames)
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    result
 }
 
 fn purify_history(history: &[AiMessage]) -> Vec<AiMessage> {
@@ -933,7 +1711,9 @@ fn scrub_value(value: &Value) -> Value {
 fn parse_report_output(output: &ContextOutput) -> Result<UnderstandingReport, String> {
     let value = match output {
         ContextOutput::Json { content } => content.clone(),
-        ContextOutput::Text { content } => parse_jsonish(content)?,
+        ContextOutput::Text { content } | ContextOutput::Invalid { content, .. } => {
+            parse_jsonish(content)?
+        }
     };
     let mut report: UnderstandingReport =
         serde_json::from_value(value).map_err(|err| err.to_string())?;
@@ -999,7 +1779,9 @@ fn render_report(report: &UnderstandingReport) -> String {
 
 fn output_to_text(output: &ContextOutput) -> String {
     match output {
-        ContextOutput::Text { content } => content.clone(),
+        ContextOutput::Text { content } | ContextOutput::Invalid { content, .. } => {
+            content.clone()
+        }
         ContextOutput::Json { content } => {
             serde_json::to_string_pretty(content).unwrap_or_else(|_| content.to_string())
         }
@@ -1010,15 +1792,12 @@ fn context_output_kind(output: &ContextOutput) -> &'static str {
     match output {
         ContextOutput::Text { .. } => "text",
         ContextOutput::Json { .. } => "json",
+        ContextOutput::Invalid { .. } => "invalid",
     }
 }
 
 fn run_final_outcome_path(work_dir: &Path, run_id: &str) -> PathBuf {
-    work_dir
-        .join("runs")
-        .join(run_id)
-        .join("outcomes")
-        .join("final.json")
+    work_dir.join(run_id).join("run.json")
 }
 
 fn write_parse_error_raw_output(
@@ -1026,7 +1805,7 @@ fn write_parse_error_raw_output(
     run_id: &str,
     raw_output: &str,
 ) -> std::io::Result<PathBuf> {
-    let outcomes_dir = work_dir.join("runs").join(run_id).join("outcomes");
+    let outcomes_dir = work_dir.join(run_id);
     std::fs::create_dir_all(&outcomes_dir)?;
     let path = outcomes_dir.join("parse_error_raw_output.txt");
     std::fs::write(&path, raw_output)?;
@@ -1133,27 +1912,39 @@ struct NoopToolManager;
 
 #[async_trait]
 impl ToolManager for NoopToolManager {
-    async fn call_tool(&self, call: buckyos_api::AiToolCall) -> llm_context::Observation {
-        llm_context::Observation::Error {
+    async fn call_tool(
+        &self,
+        call: buckyos_api::AiToolCall,
+        _ctx: llm_context::ToolCallCtx,
+    ) -> Result<llm_context::Observation, llm_context::ToolDispatchError> {
+        Ok(llm_context::Observation::Error {
             call_id: call.call_id,
             message: "tools are disabled in llm_understand_media".to_string(),
             tool_result: None,
-        }
+        })
     }
 }
 
-const USAGE: &str = r#"Usage: agent_tool llm_understand_media --media <json> --goal <text> [options]
+const USAGE: &str = r#"Usage: llm_understand_media <file | object id | url> [--goal <text>] [options]
+       agent_tool llm_understand_media --media <json | locator> [--goal <text>] [options]
 
-Required:
-  --media <json>          ResourceRef JSON, e.g. {"kind":"named_object","obj_id":"...","mime_hint":"image/png"}
-  --goal <text>           Understanding goal.
+Media (one of):
+  <locator>               A local file (relative to the current directory or absolute), an object id
+                          (cyfile:…, a chunk id such as mix256:…; e.g. an attachment of a message) or an http(s) URL.
+  --media <json>          The same as a JSON ResourceRef, e.g. {"kind":"named_object","obj_id":"cyfile:…","mime_hint":"image/png"},
+                          {"kind":"local_file","path":"/abs/frame.png"}, or {"url":"https://…"}.
 
 Options:
+  --goal <text>           What to find out (default: describe the content in detail).
   --history-file <path>   JSON Vec<AiMessage> parent history snapshot.
   --work-dir <path>       LocalLLMContext working directory.
   --model <alias>         AICC logical model alias; default image route is llm.vision.
+  --max-completion-tokens <n>  Positive output budget; default 2048, rounded up to 2048/4096/8192 tiers.
   -h, --help              Show this help.
 "#;
+
+/// The goal of a CLI call without `--goal`.
+const DEFAULT_CLI_GOAL: &str = "Describe this content in detail: what it shows or says, any text in it (verbatim), its structure, and anything notable, so that someone who cannot see it can work with it.";
 
 #[derive(Debug)]
 struct CliOpts {
@@ -1162,6 +1953,7 @@ struct CliOpts {
     history_file: Option<PathBuf>,
     work_dir: Option<PathBuf>,
     model: Option<String>,
+    max_completion_tokens: Option<u32>,
 }
 
 impl CliOpts {
@@ -1179,13 +1971,17 @@ impl CliOpts {
         };
         Ok(RunOpts {
             media_value: self.media,
+            session_id: None,
             goal: self.goal,
             parent_history,
             work_dir: self.work_dir,
             model: self.model,
             summary_model: DEFAULT_SUMMARY_MODEL_ALIAS.to_string(),
             target_tokens: DEFAULT_TARGET_TOKENS,
-            max_completion_tokens: DEFAULT_MAX_COMPLETION_TOKENS,
+            max_completion_tokens: normalize_completion_tokens(
+                self.max_completion_tokens
+                    .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS),
+            ),
         })
     }
 
@@ -1195,16 +1991,26 @@ impl CliOpts {
         let mut history_file: Option<PathBuf> = None;
         let mut work_dir: Option<PathBuf> = None;
         let mut model: Option<String> = None;
+        let mut max_completion_tokens = None;
 
         let mut idx = 0;
+        fn set_media(value: Value, media: &mut Option<Value>) -> Result<(), ParseError> {
+            if media.replace(value).is_some() {
+                return Err(ParseError::Bad("give one media only".to_string()));
+            }
+            Ok(())
+        }
         while idx < args.len() {
             match args[idx].as_str() {
                 "-h" | "--help" => return Err(ParseError::Help),
                 "--media" => {
                     let raw = next_value(args, &mut idx, "--media")?;
-                    media = Some(serde_json::from_str(&raw).map_err(|err| {
-                        ParseError::Bad(format!("--media must be JSON ResourceRef: {err}"))
-                    })?);
+                    // A JSON ResourceRef, or a bare locator.
+                    let value = match serde_json::from_str::<Value>(&raw) {
+                        Ok(v @ Value::Object(_)) => v,
+                        _ => Value::String(raw),
+                    };
+                    set_media(value, &mut media)?;
                 }
                 "--goal" => goal = Some(next_value(args, &mut idx, "--goal")?),
                 "--history-file" => {
@@ -1215,20 +2021,33 @@ impl CliOpts {
                     work_dir = Some(PathBuf::from(next_value(args, &mut idx, "--work-dir")?));
                 }
                 "--model" => model = Some(next_value(args, &mut idx, "--model")?),
-                other => return Err(ParseError::Bad(format!("unknown flag `{other}`"))),
+                "--max-completion-tokens" => {
+                    max_completion_tokens = Some(parse_positive_u32(
+                        &next_value(args, &mut idx, "--max-completion-tokens")?,
+                        "--max-completion-tokens",
+                    )?);
+                }
+                other if other.starts_with("--") => {
+                    return Err(ParseError::Bad(format!("unknown flag `{other}`")))
+                }
+                // The locator itself (`llm_understand_media photo.png`).
+                locator => set_media(Value::String(locator.to_string()), &mut media)?,
             }
             idx += 1;
         }
 
         Ok(Self {
-            media: media.ok_or_else(|| ParseError::Bad("missing --media".to_string()))?,
+            media: media.ok_or_else(|| {
+                ParseError::Bad("missing media: a file, an object id (cyfile:…) or a url".to_string())
+            })?,
             goal: goal
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| ParseError::Bad("missing non-empty --goal".to_string()))?,
+                .unwrap_or_else(|| DEFAULT_CLI_GOAL.to_string()),
             history_file,
             work_dir,
             model,
+            max_completion_tokens,
         })
     }
 }
@@ -1245,10 +2064,64 @@ fn next_value(args: &[String], idx: &mut usize, flag: &str) -> Result<String, Pa
         .ok_or_else(|| ParseError::Bad(format!("{flag} requires a value")))
 }
 
+fn parse_positive_u32(raw: &str, flag: &str) -> Result<u32, ParseError> {
+    let value = raw
+        .parse::<u32>()
+        .map_err(|_| ParseError::Bad(format!("{flag} must be an integer")))?;
+    if value == 0 {
+        return Err(ParseError::Bad(format!("{flag} must be greater than 0")));
+    }
+    Ok(value)
+}
+
+fn normalize_completion_tokens(value: u32) -> u32 {
+    match value {
+        1..=2_048 => 2_048,
+        2_049..=4_096 => 4_096,
+        4_097..=8_192 => 8_192,
+        _ => value,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buckyos_api::{AiResponse, AiToolResultContent, AiUsage};
+    use buckyos_api::{AiToolResultContent, AiUsage};
+
+    fn cli(args: &[&str]) -> Result<CliOpts, ParseError> {
+        CliOpts::parse(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn chunk_ids_are_object_ids() {
+        let chunk = "mix256:8d11eaa912debbdd30ccbbebbdae7ac4950b321afaaf740dd98ad76af3d7cfdc19c9";
+        assert!(looks_like_object_id(chunk));
+        assert!(matches!(
+            parse_media_locator(chunk),
+            Ok(MediaSource::Resource(ResourceRef::NamedObject { .. }))
+        ));
+        assert!(!looks_like_object_id("notes/a.png"));
+        assert!(!looks_like_object_id("a.png"));
+    }
+
+    #[test]
+    fn the_cli_takes_a_bare_locator_and_a_default_goal() {
+        let o = cli(&["photo.png"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("photo.png".into()));
+        assert_eq!(o.goal, DEFAULT_CLI_GOAL);
+        let o = cli(&["cyfile:abc", "--goal", "what error is shown?"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("cyfile:abc".into()));
+        assert_eq!(o.goal, "what error is shown?");
+        // `--media` takes JSON or a locator.
+        let o = cli(&["--media", r#"{"kind":"local_file","path":"/a.png"}"#]).ok().unwrap();
+        assert_eq!(o.media["path"], "/a.png");
+        let o = cli(&["--media", "https://example.com/a.png"]).ok().unwrap();
+        assert_eq!(o.media, Value::String("https://example.com/a.png".into()));
+        assert!(matches!(cli(&[]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["a.png", "b.png"]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["a.png", "--nope"]), Err(ParseError::Bad(_))));
+        assert!(matches!(cli(&["--help"]), Err(ParseError::Help)));
+    }
 
     #[test]
     fn purify_history_omits_media_payloads() {
@@ -1310,9 +2183,20 @@ mod tests {
     }
 
     #[test]
+    fn masked_resource_id_preserves_type_and_masks_payload() {
+        let source: ResourceRef = serde_json::from_value(json!({
+            "kind": "named_object",
+            "obj_id": "cyfile:d05ec9f1d9ff3713fda374c2ad1e1a9ff1b168c941772df29769935fbbb49fdd"
+        }))
+        .unwrap();
+        assert_eq!(masked_resource_id(&source), "cyfile:d05ec9f1…bbb49fdd");
+    }
+
+    #[test]
     fn build_request_disables_web_search_for_media_side_context() {
         let opts = RunOpts {
             media_value: json!({}),
+            session_id: None,
             goal: "describe image".to_string(),
             parent_history: Vec::new(),
             work_dir: None,
@@ -1322,22 +2206,233 @@ mod tests {
             max_completion_tokens: DEFAULT_MAX_COMPLETION_TOKENS,
         };
 
-        let request = build_request(
+        let input = build_input(
             &opts,
-            ResourceRef::Base64 {
+            vec![AiContent::image(ResourceRef::Base64 {
                 mime: "image/png".to_string(),
                 data_base64: "AAAA".to_string(),
-            },
-            DEFAULT_MODEL_ALIAS.to_string(),
+            })],
             Vec::new(),
         );
-
-        let tool_policy = request.tool_policy.expect("tool policy");
-        assert_eq!(tool_policy.mode, ToolMode::None);
-        assert_eq!(tool_policy.action_mode, ToolMode::None);
-        assert!(tool_policy
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0].role, AiRole::System);
+        let overrides = media_overrides(
+            &opts,
+            DEFAULT_MODEL_ALIAS.to_string(),
+            PathBuf::from("/tmp/x"),
+        );
+        assert_eq!(overrides.max_tokens, Some(2_048));
+        assert_eq!(overrides.tools, Some(false));
+        assert!(overrides.json);
+        assert!(overrides
             .disable_capabilities
             .contains(&"web_search".to_string()));
+    }
+
+    #[test]
+    fn caller_can_raise_media_output_budget() {
+        let opts = RunOpts::from_tool_args(json!({
+            "media": { "kind": "url", "url": "https://example.test/video.mp4" },
+            "goal": "produce a detailed timeline",
+            "max_completion_tokens": 16384
+        }))
+        .expect("caller-selected media budget should be accepted");
+        let overrides = media_overrides(
+            &opts,
+            DEFAULT_MODEL_ALIAS.to_string(),
+            PathBuf::from("/tmp/x"),
+        );
+        assert_eq!(overrides.max_tokens, Some(16_384));
+    }
+
+    #[test]
+    fn omitted_media_output_budget_uses_default() {
+        let opts = RunOpts::from_tool_args(json!({
+            "media": { "kind": "url", "url": "https://example.test/image.png" },
+            "goal": "describe the image"
+        }))
+        .expect("omitted media budget should use the default");
+        assert_eq!(opts.max_completion_tokens, DEFAULT_MAX_COMPLETION_TOKENS);
+    }
+
+    #[test]
+    fn media_tool_schema_requires_caller_budget() {
+        let spec = LlmUnderstandMediaTool::new().spec();
+        let required = spec.args_schema["required"]
+            .as_array()
+            .expect("required array");
+        assert!(required.contains(&json!("media")));
+        assert!(required.contains(&json!("goal")));
+        assert!(required.contains(&json!("max_completion_tokens")));
+        assert_eq!(spec.args_schema["additionalProperties"], json!(false));
+    }
+
+    #[test]
+    fn media_output_budget_rounds_up_to_staged_floor() {
+        assert_eq!(normalize_completion_tokens(1), 2_048);
+        assert_eq!(normalize_completion_tokens(2_047), 2_048);
+        assert_eq!(normalize_completion_tokens(2_048), 2_048);
+        assert_eq!(normalize_completion_tokens(2_049), 4_096);
+        assert_eq!(normalize_completion_tokens(4_096), 4_096);
+        assert_eq!(normalize_completion_tokens(4_097), 8_192);
+        assert_eq!(normalize_completion_tokens(8_192), 8_192);
+        assert_eq!(normalize_completion_tokens(8_193), 8_193);
+        assert_eq!(normalize_completion_tokens(16_384), 16_384);
+    }
+
+    #[test]
+    fn non_archive_media_mime_routes_to_model_and_sniffs_common_containers() {
+        assert!(route_model("video/mp4").is_some());
+        assert!(route_model("audio/mpeg").is_some());
+        assert!(route_model("application/pdf").is_some());
+        assert!(route_model("text/plain").is_some());
+        assert!(route_model("application/octet-stream").is_some());
+        assert!(route_model("application/zip").is_none());
+        assert_eq!(sniff_video_mime(b"\0\0\0\x18ftypisom"), Some("video/mp4"));
+        assert_eq!(
+            sniff_video_mime(&[0x1a, 0x45, 0xdf, 0xa3, 0x01]),
+            Some("video/webm")
+        );
+        assert_eq!(sniff_document_mime(b"%PDF-1.7"), Some("application/pdf"));
+        assert_eq!(
+            sniff_archive_mime(b"PK\x03\x04archive"),
+            Some("application/zip")
+        );
+        assert_eq!(default_model_alias("audio/mpeg"), "llm.chat");
+        assert_eq!(default_model_alias("image/png"), "llm.vision");
+    }
+
+    #[tokio::test]
+    async fn document_resources_are_forwarded_inline() {
+        for mime in ["application/pdf", "text/plain", "application/octet-stream"] {
+            let content = prepare_media_content(
+                ResolvedMedia {
+                    source: ResourceRef::Base64 {
+                        mime: mime.to_string(),
+                        data_base64: "AAAA".to_string(),
+                    },
+                    mime: mime.to_string(),
+                },
+                None,
+            )
+            .await
+            .expect("non-archive media should be forwarded")
+            .content;
+            assert!(matches!(
+                &content[0],
+                AiContent::Document {
+                    source: ResourceRef::Base64 { mime: actual, .. },
+                    ..
+                } if actual == mime
+            ));
+        }
+
+        let err = prepare_media_content(
+            ResolvedMedia {
+                source: ResourceRef::Base64 {
+                    mime: "application/zip".to_string(),
+                    data_base64: "AAAA".to_string(),
+                },
+                mime: "application/zip".to_string(),
+            },
+            None,
+        )
+        .await
+        .expect_err("archives must be extracted before understanding");
+        assert!(err.contains("must be extracted first"));
+    }
+
+    #[tokio::test]
+    async fn oversized_images_are_downscaled_with_a_note_for_the_model() {
+        fn png_base64(width: u32, height: u32) -> String {
+            let mut bytes = Vec::new();
+            image::RgbImage::new(width, height)
+                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            general_purpose::STANDARD.encode(bytes)
+        }
+        let prepare = |data_base64: String| {
+            prepare_media_content(
+                ResolvedMedia {
+                    source: ResourceRef::Base64 {
+                        mime: "image/png".to_string(),
+                        data_base64,
+                    },
+                    mime: "image/png".to_string(),
+                },
+                None,
+            )
+        };
+
+        let small = png_base64(32, 32);
+        let prepared = prepare(small.clone()).await.expect("small image");
+        assert_eq!(prepared.content.len(), 1);
+        assert!(matches!(
+            &prepared.content[0],
+            AiContent::Image { source: ResourceRef::Base64 { data_base64, .. } } if *data_base64 == small
+        ));
+        assert!(prepared.image_preprocess.expect("probe info").actions.is_empty());
+
+        let prepared = prepare(png_base64(4096, 1024)).await.expect("large image");
+        assert!(matches!(
+            &prepared.content[0],
+            AiContent::Text { text } if text.contains("downscaled from 4096x1024 to 2048x512")
+        ));
+        assert!(matches!(&prepared.content[1], AiContent::Image { .. }));
+
+        let mut result = build_error_result(
+            &RunOpts::from_tool_args(json!({
+                "media": { "kind": "url", "url": "https://example.test/image.png" },
+                "goal": "describe the image"
+            }))
+            .unwrap(),
+            "boom",
+        );
+        result.output = Some("Conclusion:\nok".to_string());
+        attach_image_preprocess(&mut result, prepared.image_preprocess.as_ref());
+        assert_eq!(result.details["media_preprocess"]["sent"]["width"], 2048);
+        assert_eq!(result.details["media_preprocess"]["original"]["width"], 4096);
+        assert!(result.output.unwrap().ends_with("analyze the crop."));
+    }
+
+    #[test]
+    fn audio_transcript_is_forwarded_as_text_with_scope_limit() {
+        let content = audio_transcript_content(" hello world ");
+        assert_eq!(content.len(), 1);
+        let AiContent::Text { text } = &content[0] else {
+            panic!("audio transcript must become text content");
+        };
+        assert!(text.contains("speech only"));
+        assert!(text.ends_with("Transcript:\nhello world"));
+    }
+
+    #[test]
+    fn build_request_preserves_timestamped_video_frames() {
+        let opts = RunOpts {
+            media_value: json!({}),
+            session_id: None,
+            goal: "find the action time".to_string(),
+            parent_history: Vec::new(),
+            work_dir: None,
+            model: None,
+            summary_model: DEFAULT_SUMMARY_MODEL_ALIAS.to_string(),
+            target_tokens: DEFAULT_TARGET_TOKENS,
+            max_completion_tokens: DEFAULT_MAX_COMPLETION_TOKENS,
+        };
+        let media_content = vec![
+            AiContent::text("Frame at 1.250 seconds:"),
+            AiContent::image(ResourceRef::Base64 {
+                mime: "image/jpeg".to_string(),
+                data_base64: "AAAA".to_string(),
+            }),
+        ];
+        let input = build_input(&opts, media_content, Vec::new());
+        let user = input.last().expect("user message");
+        assert!(matches!(
+            &user.content[0],
+            AiContent::Text { text } if text.contains("1.250 seconds")
+        ));
+        assert!(matches!(&user.content[1], AiContent::Image { .. }));
     }
 
     #[test]
@@ -1351,28 +2446,35 @@ mod tests {
         ));
         let run_id = "20260524-234831-test";
         let raw = "{\n  \"observations\": [";
-        let outcome = LLMContextOutcome::Done {
-            reason: None,
-            output: ContextOutput::Text {
-                content: raw.to_string(),
-            },
-            usage: AiUsage {
-                input_tokens: Some(1),
-                output_tokens: Some(2),
-                total_tokens: Some(3),
-            },
-            response: AiResponse::text(raw),
-            trace: llm_context::ContextRunTrace {
-                trace_id: run_id.to_string(),
-                latency_ms: 12,
-                tool_trace: Vec::new(),
-                llm_task_ids: Vec::new(),
-            },
-            behavior_result: None,
-        };
+        let mut record = crate::xllm::RunRecord::synthetic(
+            run_id,
+            &work_dir,
+            crate::xllm::RunStatus::Completed,
+        );
+        record.result = Some(crate::xllm::RunResultRecord {
+            raw: raw.to_string(),
+            extracted: None,
+            extract_error: None,
+            json_valid: None,
+            json_error: None,
+            response_model: None,
+        });
+        record.usage.main = Some(AiUsage {
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            total_tokens: Some(3),
+            ..Default::default()
+        });
+        let outcome = RunOutcome::Completed(record);
 
-        let (result, exit_code) =
-            build_outcome_result(outcome, "image/png", &work_dir, run_id, "describe image");
+        let (result, exit_code) = build_outcome_result(
+            outcome,
+            "image/png",
+            &work_dir,
+            run_id,
+            "describe image",
+            "cyfile:12345678…90abcdef",
+        );
 
         assert_eq!(exit_code, CLI_EXIT_ERROR);
         assert_eq!(result.status, AgentToolStatus::Error);
@@ -1383,8 +2485,120 @@ mod tests {
         assert!(result.details["final_outcome_path"]
             .as_str()
             .unwrap()
-            .ends_with("outcomes/final.json"));
+            .ends_with("run.json"));
 
         let _ = std::fs::remove_dir_all(work_dir);
+    }
+
+    #[test]
+    fn parse_media_arg_keeps_typed_object_ids() {
+        let arg = parse_media_arg(&json!({
+            "kind": "named_object",
+            "obj_id": "cyfile:f155c4725272667e44761ec037d8247aae48848c5a33d86e88303d5841228b9f",
+            "mime_hint": "video/mp4",
+        }))
+        .expect("typed object id must stay a named_object");
+        assert_eq!(arg.mime_hint.as_deref(), Some("video/mp4"));
+        assert!(matches!(
+            arg.source,
+            MediaSource::Resource(ResourceRef::NamedObject { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_media_arg_accepts_url_and_data_url() {
+        let url = parse_media_arg(&json!({ "url": "https://example.test/a.mp4" })).unwrap();
+        assert!(matches!(
+            url.source,
+            MediaSource::Resource(ResourceRef::Url { .. })
+        ));
+
+        let data = parse_media_arg(&json!("data:image/png;base64,AAAA")).unwrap();
+        match data.source {
+            MediaSource::Resource(ResourceRef::Base64 { mime, data_base64 }) => {
+                assert_eq!(mime, "image/png");
+                assert_eq!(data_base64, "AAAA");
+            }
+            other => panic!("expected base64 media, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_media_arg_accepts_local_files_including_paths_mistaken_for_ids() {
+        let dir = std::env::temp_dir().join(format!("lum-media-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("frame008.png");
+        std::fs::write(&file, b"png-bytes").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+
+        let explicit =
+            parse_media_arg(&json!({ "kind": "local_file", "path": file_str.clone() })).unwrap();
+        assert!(matches!(explicit.source, MediaSource::LocalFile(_)));
+
+        let bare = parse_media_arg(&json!(file_str.clone())).unwrap();
+        assert!(matches!(bare.source, MediaSource::LocalFile(_)));
+
+        // The mistake that motivated this: a filesystem path passed as an
+        // object id must become a local file, not a base32 decode failure.
+        let coerced =
+            parse_media_arg(&json!({ "kind": "named_object", "obj_id": file_str })).unwrap();
+        match coerced.source {
+            MediaSource::LocalFile(path) => {
+                assert_eq!(path.file_name().unwrap(), "frame008.png")
+            }
+            other => panic!("expected a local file, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_local_file_reports_every_candidate_path() {
+        let missing = "definitely-missing-frame-9f3a.png";
+        let err = resolve_local_file_path(Path::new(missing), Some("ui-test")).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("absolute path"), "{err}");
+    }
+
+    #[test]
+    fn media_finds_sessions_directly_in_the_agents_data_directory() {
+        if let Some(root) = env_path("BUCKYOS_MEDIA_ROOT_TEST") {
+            let candidates = local_path_candidates(Path::new("frame.png"), Some("ui-test"));
+            assert!(candidates.contains(&root.join("sessions/ui-test/frame.png")));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "llm_understand_media::tests::media_finds_sessions_directly_in_the_agents_data_directory"])
+            .env_remove(crate::runtime_context::OPENDAN_AGENT_ROOT_ENV)
+            .env("BUCKYOS_DATA_DIR", root.path())
+            .env("BUCKYOS_MEDIA_ROOT_TEST", root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn relative_paths_also_consider_the_session_workspace() {
+        let agent_root = PathBuf::from("/opt/agent");
+        let candidates =
+            local_path_candidates_under(Path::new("frame008.png"), Some("ui-abc"), &[agent_root]);
+        assert_eq!(candidates[0], PathBuf::from("frame008.png"));
+        assert_eq!(
+            candidates[1],
+            PathBuf::from("/opt/agent/sessions/ui-abc/frame008.png")
+        );
+
+        // Absolute paths are taken verbatim, and an unknown session adds
+        // nothing.
+        assert_eq!(
+            local_path_candidates_under(Path::new("/tmp/x.png"), Some("ui-abc"), &[]),
+            vec![PathBuf::from("/tmp/x.png")]
+        );
+        assert_eq!(
+            local_path_candidates_under(Path::new("a.png"), None, &[PathBuf::from("/opt/agent")]),
+            vec![PathBuf::from("a.png")]
+        );
     }
 }

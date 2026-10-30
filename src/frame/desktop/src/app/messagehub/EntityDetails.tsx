@@ -1,50 +1,38 @@
+import { useState } from 'react'
+import { useForm } from 'react-hook-form'
+import { z } from 'zod'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useMessageHubStore } from './store'
+import { hubButtonClass, hubInputClass } from './SessionDialogs'
+import { RelationSection } from './RelationPanel'
+import { GroupPanel } from './GroupPanel'
 import {
   X,
-  Bot,
   Users,
-  User,
   Bell,
   BellOff,
   Pin,
   PinOff,
-  Tag,
   Link2,
   Edit3,
-  Trash2,
+  UsersRound,
 } from 'lucide-react'
 import { useI18n } from '../../i18n/provider'
-import type { EntityDetail } from './types'
+import type { EntityDetail, MessageHubContext } from './types'
+import { HubAvatar } from './HubAvatar'
 
 interface EntityDetailsProps {
   entity: EntityDetail
+  context?: MessageHubContext
   onClose: () => void
+  /** Opens the new-group dialog with these members preselected. */
+  onCreateGroup?: (members: string[]) => void
 }
 
 function DetailAvatar({ entity }: { entity: EntityDetail }) {
-  const colors: Record<string, string> = {
-    person: 'var(--cp-accent)',
-    agent: 'var(--cp-success)',
-    group: 'var(--cp-warning)',
-    service: 'var(--cp-danger)',
-  }
-  const icons: Record<string, React.ReactNode> = {
-    person: <User size={32} />,
-    agent: <Bot size={32} />,
-    group: <Users size={32} />,
-    service: <Tag size={32} />,
-  }
-
   return (
-    <div
-      className="flex items-center justify-center rounded-full mx-auto"
-      style={{
-        width: 80,
-        height: 80,
-        background: `color-mix(in srgb, ${colors[entity.type]} 18%, transparent)`,
-        color: colors[entity.type],
-      }}
-    >
-      {icons[entity.type]}
+    <div className="mx-auto flex w-fit">
+      <HubAvatar type={entity.type} name={entity.name} avatar={entity.avatar} size={80} systemNotify={entity.systemNotify} />
     </div>
   )
 }
@@ -75,8 +63,11 @@ function InfoRow({
   )
 }
 
-export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
+export function EntityDetails({ entity, context, onClose, onCreateGroup }: EntityDetailsProps) {
   const { t } = useI18n()
+  const store = useMessageHubStore()
+  const groupInfo = context && entity.type === 'group' ? store.group(context, entity.id) : null
+  const canStartGroup = Boolean(onCreateGroup && context?.mode === 'self' && context.ownerDid === context.viewerDid && (entity.type === 'person' || entity.type === 'agent') && entity.id.startsWith('did:') && !entity.id.startsWith('did:msgtunnel:') && entity.accessLevel !== 'block' && store.connections(context, entity.id).some(choice => choice.binding.kind === 'native'))
 
   const typeLabels: Record<string, string> = {
     person: t('messagehub.entityType.person', 'Person'),
@@ -92,18 +83,21 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
     >
       {/* Header */}
       <div
-        className="flex items-center justify-between px-4 py-3 flex-shrink-0"
+        className="flex flex-shrink-0 items-center justify-between py-1 pl-4 pr-1"
         style={{ borderBottom: '1px solid var(--cp-border)' }}
       >
         <h2
           className="text-sm font-semibold"
           style={{ color: 'var(--cp-text)' }}
         >
-          {t('messagehub.details', 'Details')}
+          {t('messagehub.entityDetails')}
         </h2>
         <button
+          type="button"
+          aria-label={t('messagehub.close')}
+          title={t('messagehub.close')}
           onClick={onClose}
-          className="p-1 rounded-lg"
+          className="flex min-h-11 min-w-11 items-center justify-center rounded-lg"
           style={{ color: 'var(--cp-muted)' }}
         >
           <X size={18} />
@@ -121,6 +115,9 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
           >
             {entity.name}
           </h3>
+          <p className="mx-auto mt-1 max-w-full select-text break-all text-xs" style={{ color: 'var(--cp-muted)' }} data-testid="entity-address">
+            {entity.id}
+          </p>
           <p className="text-xs mt-1" style={{ color: 'var(--cp-muted)' }}>
             {typeLabels[entity.type]}
             {entity.isOnline && (
@@ -168,7 +165,7 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
               <p className="text-xs" style={{ color: 'var(--cp-muted)' }}>
                 {t('messagehub.note', 'Note')}
               </p>
-              <button style={{ color: 'var(--cp-muted)' }}>
+              <button disabled={context?.mode === 'observe'} style={{ color: 'var(--cp-muted)' }}>
                 <Edit3 size={12} />
               </button>
             </div>
@@ -178,6 +175,8 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
           </div>
         )}
 
+        {context && entity.type === 'group' && <GroupPanel key={`group:${entity.id}`} entity={entity} context={context} />}
+
         {/* Info section */}
         <div
           className="rounded-xl px-3 mb-4"
@@ -186,7 +185,7 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
               'color-mix(in srgb, var(--cp-text) 4%, transparent)',
           }}
         >
-          {entity.memberCount !== undefined && (
+          {entity.memberCount !== undefined && !groupInfo && (
             <InfoRow
               label={t('messagehub.members', 'Members')}
               value={`${entity.memberCount}`}
@@ -243,6 +242,19 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
           </div>
         )}
 
+        {canStartGroup && (
+          <button
+            type="button"
+            onClick={() => onCreateGroup?.([entity.id])}
+            className="mb-4 flex min-h-11 w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm font-medium"
+            style={{ background: 'color-mix(in srgb, var(--cp-accent) 10%, transparent)', color: 'var(--cp-accent)' }}
+            data-testid="entity-create-group"
+          >
+            <UsersRound size={16} aria-hidden />
+            {t('messagehub.group.createWith', undefined, { name: entity.name })}
+          </button>
+        )}
+
         {/* Actions */}
         <div
           className="rounded-xl overflow-hidden mb-4"
@@ -252,6 +264,7 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
           }}
         >
           <button
+            disabled={context?.mode === 'observe'}
             className="flex items-center gap-3 w-full px-3 py-2.5 text-sm text-left transition-colors"
             style={{ color: 'var(--cp-text)' }}
           >
@@ -268,6 +281,7 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
             )}
           </button>
           <button
+            disabled={context?.mode === 'observe'}
             className="flex items-center gap-3 w-full px-3 py-2.5 text-sm text-left transition-colors"
             style={{ color: 'var(--cp-text)' }}
           >
@@ -285,19 +299,24 @@ export function EntityDetails({ entity, onClose }: EntityDetailsProps) {
           </button>
         </div>
 
-        {/* Danger zone */}
-        <button
-          className="flex items-center gap-3 w-full px-3 py-2.5 rounded-xl text-sm text-left"
-          style={{
-            color: 'var(--cp-danger)',
-            background:
-              'color-mix(in srgb, var(--cp-danger) 6%, transparent)',
-          }}
-        >
-          <Trash2 size={16} />
-          {t('messagehub.deleteChat', 'Delete Chat')}
-        </button>
+        {/* The system notify sender is neither a contact to admit nor a peer to start sessions with. */}
+        {context && !entity.systemNotify && <RelationSection key={`relation:${entity.id}`} entity={entity} context={context} />}
+        {context && !entity.systemNotify && <CreationPolicyEditor key={entity.id} entity={entity} context={context} />}
       </div>
     </div>
   )
+}
+
+const policySchema = z.object({ policy: z.enum(['default', 'allow', 'deny']) })
+function CreationPolicyEditor({ entity, context }: { entity: EntityDetail; context: MessageHubContext }) {
+  const { t } = useI18n(), store = useMessageHubStore()
+  const form = useForm<z.infer<typeof policySchema>>({ resolver: zodResolver(policySchema), defaultValues: { policy: store.policy(context, entity.id) } })
+  const [status, setStatus] = useState('')
+  return <form className="space-y-3" onSubmit={form.handleSubmit(async ({ policy }) => { setStatus(''); try { await store.setPolicy(context, entity.id, policy); setStatus('saved') } catch { setStatus('operationFailed') } })}>
+    <label className="block text-sm">{t('messagehub.creationPolicy')}<select className={hubInputClass} disabled={context.mode === 'observe' || form.formState.isSubmitting} {...form.register('policy')}>{(['default', 'allow', 'deny'] as const).map(policy => <option key={policy} value={policy}>{t(`messagehub.policy.${policy}`)}</option>)}</select></label>
+    <p className="text-xs text-[color:var(--cp-muted)]">{t(entity.type === 'agent' ? 'messagehub.agentCreationDefault' : 'messagehub.otherCreationDefault')}</p>
+    {entity.sessionCreation?.unavailableReason && <p className="text-xs">{t(`messagehub.reason.${entity.sessionCreation.unavailableReason}`)}</p>}
+    <button className={hubButtonClass} type="submit" disabled={context.mode === 'observe' || form.formState.isSubmitting}>{t(form.formState.isSubmitting ? 'messagehub.saving' : 'messagehub.save')}</button>
+    {status && <p role={status === 'saved' ? 'status' : 'alert'}>{t(`messagehub.${status}`)}</p>}
+  </form>
 }

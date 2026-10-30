@@ -1,0 +1,72 @@
+import { defaultModelFilters, filterModelCatalog, modelCard, type ModelCatalog } from '../../src/app/ai-center/datamodel/model-catalog.ts'
+
+function assert(value: unknown, message: string): asserts value {
+  if (!value) throw new Error(message)
+}
+
+const catalog: ModelCatalog = {
+  revision: 1,
+  vendors: [{
+    id: 'future-vendor', revision: 1,
+    models: [
+      { id: 'cloud', metadata: { api_types: ['image.txt2img'] }, providers: [{ id: 'remote', local: false, exact_models: ['aliased@remote'] }] },
+      { id: 'local', metadata: { local_deployable: true }, providers: [{ id: 'engine', local: true, exact_models: ['aliased@engine', 'aliased:high@engine'] }] },
+      { id: 'unconnected', metadata: { local_deployable: true }, providers: [] },
+    ],
+    specs: [{ id: 'empty-spec', path: 'llm.empty-spec', direct_only: true, members: [] }],
+  }],
+}
+
+Deno.test('status derives from provider presence separately from local deployment metadata', () => {
+  const models = catalog.vendors[0].models.map((model) => modelCard(model, 'future-vendor'))
+  assert(models[0].available && !models[0].local && !models[0].deployable, 'remote presence must not imply local support')
+  assert(models[1].available && models[1].local && models[1].deployable, 'local inventory lights both indicators')
+  assert(!models[2].available && !models[2].local && models[2].deployable, 'deployable is independent of availability')
+})
+
+Deno.test('filters intersect, search is case insensitive and empty specs survive without status filters', () => {
+  const query = (filters: Partial<typeof defaultModelFilters>) => filterModelCatalog(catalog, { ...defaultModelFilters, ...filters })
+  assert(query({ query: '  FUTURE-VENDOR  ' })[0].models.length === 3, 'unknown vendors stay searchable')
+  assert(query({ query: 'image' })[0].models[0].id === 'cloud', 'capability search')
+  assert(query({ available: true })[0].models.length === 2, 'available inventory')
+  assert(query({ deployable: true })[0].models.length === 2, 'deployment metadata')
+  assert(query({ available: true, deployable: true, local: true })[0].models[0].id === 'local', 'combined filters')
+  assert(query({ query: 'empty-spec' })[0].specs.length === 1, 'empty specification search')
+  assert(query({ available: true })[0].specs.length === 0, 'status filters hide empty specifications')
+  assert(query({ query: 'missing' }).length === 0, 'unmatched search')
+})
+
+Deno.test('decision catalog is discoverable with zero inventory and filters by API independently of LLM', () => {
+  const decisionCatalog: ModelCatalog = { revision: 2, vendors: [{ id: 'typesafe', revision: 1, specs: [], models: [{ id: 'jev-1.13.0', metadata: { api_types: ['decision'], capabilities: { 'decision.probabilities': true } }, providers: [] }] }] }
+  const filters = { ...defaultModelFilters, query: 'decision' }
+  const empty = filterModelCatalog(decisionCatalog, filters)
+  assert(empty.length === 1 && empty[0].models[0].metadata.api_types?.[0] === 'decision', 'decision remains visible and keeps its type')
+  assert(filterModelCatalog(decisionCatalog, { ...filters, available: true }).length === 0, 'catalog metadata does not create inventory')
+  decisionCatalog.vendors[0].models[0].providers.push({ id: 'typesafe-main', local: false, exact_models: ['jev-1.13.0@typesafe-main'] })
+  assert(filterModelCatalog(decisionCatalog, { ...filters, available: true })[0].models[0].available, 'real inventory activates decision')
+  assert(filterModelCatalog(decisionCatalog, { ...filters, query: 'llm' }).length === 0, 'decision does not match the LLM filter')
+})
+
+Deno.test('additional specifications remain searchable and retain their model members', () => {
+  const multiSpecCatalog: ModelCatalog = {
+    revision: 6,
+    vendors: [{
+      id: 'openai', revision: 6,
+      models: [{
+        id: 'gpt-6-sol', providers: [],
+        metadata: { api_types: ['llm'], llm: {
+          spec: 'gpt-pro', effort: 'high', default_effort: 'medium',
+          supported_efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], stability: 'stable',
+          additional_specs: [{ spec: 'gpt-codex', effort: 'xhigh', weight: 60 }],
+        } },
+      }],
+      specs: [{ id: 'gpt-codex', path: 'llm.gpt-codex', direct_only: false,
+        members: [{ model_id: 'gpt-6-sol', target: 'llm.gpt-6-sol:xhigh', weight: 60, active: false }],
+      }],
+    }],
+  }
+  const filtered = filterModelCatalog(multiSpecCatalog, { ...defaultModelFilters, query: 'GPT-CODEX' })
+  assert(filtered[0].models.length === 1 && filtered[0].models[0].id === 'gpt-6-sol', 'additional spec matches model')
+  assert(filtered[0].specs[0].members.length === 1, 'matching model stays in the spec')
+  assert(filtered[0].specs[0].members[0].target === 'llm.gpt-6-sol:xhigh', 'spec preserves its effort')
+})

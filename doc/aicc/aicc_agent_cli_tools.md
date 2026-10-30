@@ -1,7 +1,7 @@
 # AICC Agent CLI Tools
 
-版本：`v0.1-draft`
-更新基线：`2026-05-12`
+版本：`v0.2`
+更新基线：`2026-09-04`
 
 本文定义一组面向 Agent 的 AI 能力 CLI。CLI 是 AICC kRPC API 的薄封装，用于让 Agent 在 shell / workflow / task runner 中直接调用典型 AI 能力，例如：
 
@@ -9,7 +9,7 @@
 gen_image "A precise product photo of a matte black desk lamp." result.png
 ```
 
-本文不包含原始 LLM 推理类命令。`llm.chat`、`llm.completion` 仍由 Agent Runtime / SDK 直接使用，不包装成通用 shell 工具。
+本文不包含原始 LLM 推理类命令。Agent Runtime / SDK 使用 `chat.completions.create` 或对应 Helper，不包装成通用 shell 工具。
 
 相关协议：
 
@@ -26,7 +26,7 @@ Agent CLI 的目标是把常用 AI 能力变成可组合、可脚本化、可观
 1. 文生图、图生图、局部重绘、超分、抠图。
 2. OCR、图片描述、检测、分割。
 3. TTS、ASR、音乐生成、音频增强。
-4. 文生视频、图生视频、视频编辑、续写、超分。
+4. 视频生成（文本、首尾帧、参考素材）、视频编辑、续写、超分。
 5. provider / quota 等服务辅助查询命令。
 
 CLI 只列出最终结果对用户或交付物有直接意义的能力。`embedding.text`、`rerank` 这类中间计算能力应保留在 SDK / Agent Runtime 内部使用，不作为独立面向 Agent 的短命令暴露。
@@ -38,7 +38,7 @@ CLI 不重新定义 AI 协议。每个命令只负责：
 3. 调用 `/kapi/aicc` 对应 method。
 4. 把 artifacts / 文本结果落到本地文件 / stdout。
 
-> 调用路径：CLI 默认走 helper 层（如文生图走 `helper.text_to_image`），由 helper 内部 `route.resolve` + typed inference（`images.generate`）完成；传入的是逻辑模型名。需要强制指定精确模型或调试两阶段时，可显式 `route.resolve` 再 `images.generate(exact_model=...)`。CLI 不再直接构造 legacy all-in-one `AiMethodRequest`（该形态仅兼容保留）。
+> 调用路径：CLI 默认走 helper 层（如文生图走 `helper.text_to_image`），由 helper 内部 `route.resolve` + typed inference（`images.generate`）完成；传入的是逻辑模型名。需要强制指定精确模型或调试两阶段时，可显式 `route.resolve` 再 `images.generate(exact_model=...)`。CLI 不构造已删除的 all-in-one `AiMethodRequest`。
 
 ---
 
@@ -70,7 +70,7 @@ gen_video "prompt" result.mp4
 --no-fallback
 --idempotency-key <key>
 --trace-id <trace_id>
---json                       输出完整 AiMethodResponse JSON 到 stdout
+--json                       输出完整 typed response JSON 到 stdout
 --timeout <seconds>          当前 CLI 进程最长等待时间
 ```
 
@@ -107,6 +107,8 @@ gen_video "prompt" result.mp4
 
 实现允许在小文件或调试模式下使用 `ResourceRef::Base64`，但 CLI 对外不暴露协议差异。
 
+`obj://bucket/<bucket_id>/<key>`（例如上一条命令返回的 `detail.files[].url`）先经 `bucket.get` 解析为它绑定的 ObjId，再以 `ResourceRef::NamedObject` 传给 AICC。
+
 URL 输入通过 `--url` 或参数值的 URL scheme 识别，转换为：
 
 ```json
@@ -121,12 +123,18 @@ URL 输入通过 `--url` 或参数值的 URL scheme 识别，转换为：
 
 默认行为：
 
-1. 单文件输出命令把第一个匹配 artifact 下载到指定路径。
-2. 多文件输出命令要求输出目录。
+1. 媒体命令的每个结果都交到运行它的 Agent 的 `artifacts` 桶（`user/<agent app>/<owner>/artifacts`，`documents` 档）：AICC 已绑定进它的 `outputs` 桶（`user/aicc/<owner>/outputs`，7 天，见 [aicc_api设计.md](aicc_api设计.md) §3.1）的结果用 `bucket.copy` 复制过来（按 `extra.materialized_artifacts[].bucket_ref`），不再传字节；URL / base64 / raw PCM 结果读出后上传一次（≤32 MiB `PUT /bucket/v1`，更大走 NDM 上传 + `bind`）。key 为 `<16 位内容摘要>/<文件名>`。结果 `detail.files[] = {url, obj_id, path, bytes, mime, source_kind}`，`url` 是 `obj://bucket/...`，Agent 直接把它列进报告的 artifacts。
+2. 输出路径是可选的位置参数：给了才另写一份本地文件（本地工具需要路径时的降级），没有扩展名时按结果类型补上；多结果命令按 `<name>-<n>.<ext>` 写。之后要本地文件用 `materialize_resource obj://bucket/... <path>`。
 3. 结构化结果写 JSON 文件；如果未指定输出文件，则写 stdout。
-4. `--json` 时不做精简输出，直接输出完整 `AiMethodResponse`。
+4. `--json` 时不做精简输出，直接输出完整 canonical typed response。
 
-输出文件不存在时创建，存在时覆盖。CLI 不做交互确认，因为这些工具面向 Agent 自动化。
+本地输出文件不存在时创建，存在时覆盖。CLI 不做交互确认，因为这些工具面向 Agent 自动化。
+
+Provider 返回的 `ResourceRef::Url` 可能要求 Provider credential，CLI 不直接匿名下载这类
+URL。CLI 先将 URL 交给 `POST /kapi/aicc/artifact/open`；AICC 只对已登记且属于当前 tenant
+的 URL 返回流，由原 ProviderInstance 的 Adapter 完成读取。仅当 AICC 明确返回 `404`
+（URL 未登记）时，CLI 才把它视为普通公开 URL 直接下载；鉴权失败和 Provider 下载失败不得
+绕过 AICC 重试。该读取接口只需要 URL 和可选 `artifact_id`，不需要 `task_id`。
 
 异步任务返回 `running` 后，CLI 每 5 秒向 stderr 写一行结构化进度心跳：前缀为
 `__BUCKYOS_AGENT_PROGRESS__`，后面紧跟 JSON，包含协议版本、AICC method、stage、task_id
@@ -154,7 +162,7 @@ URL 输入通过 `--url` 或参数值的 URL scheme 识别，转换为：
 
 ### 3.1 `gen_image`
 
-文生图。映射到 `image.txt2img`。
+文生图。调用 `helper.text_to_image`，默认逻辑模型为 `image.txt2img`。
 
 ```bash
 gen_image "A precise product photo of a matte black desk lamp." result.png
@@ -163,7 +171,7 @@ gen_image "A precise product photo of a matte black desk lamp." result.png
 参数：
 
 ```text
-gen_image <prompt> <output_image>
+gen_image <prompt> [output_image]
   --negative <text>
   --n <count>
   --aspect <1:1|16:9|9:16|4:3|3:4>
@@ -176,10 +184,9 @@ gen_image <prompt> <output_image>
 AICC mapping：
 
 ```text
-method: image.txt2img
-capability: image
-model.alias default: image.txt2img
-payload.input_json:
+method: helper.text_to_image
+logical_model default: image.txt2img
+params:
   prompt
   negative_prompt
   n
@@ -210,7 +217,7 @@ edit_image source.png "Change the background to a sunny beach." result.png
 参数：
 
 ```text
-edit_image <input_image> <prompt> <output_image>
+edit_image <input_image> <prompt> [output_image]
   --strength <0.0-1.0>
   --format <png|jpg|webp>
 ```
@@ -226,7 +233,7 @@ inpaint_image image.png mask.png "Add a vase of flowers on the table." result.pn
 参数：
 
 ```text
-inpaint_image <input_image> <mask_image> <prompt> <output_image>
+inpaint_image <input_image> <mask_image> <prompt> [output_image]
   --mask-semantics <white_area_is_edit_area|black_area_is_edit_area|alpha_zero_is_edit_area>
   --format <png|jpg|webp>
 ```
@@ -242,7 +249,7 @@ upscale_image source.png result.png --scale 4
 参数：
 
 ```text
-upscale_image <input_image> <output_image>
+upscale_image <input_image> [output_image]
   --scale <2|4>
   --target-width <px>
   --target-height <px>
@@ -261,7 +268,7 @@ remove_bg product.jpg product_rgba.png
 参数：
 
 ```text
-remove_bg <input_image> <output_image>
+remove_bg <input_image> [output_image]
   --mode <rgba_image|mask>
 ```
 
@@ -323,7 +330,7 @@ detect_image <image> <output_json>
   --classes <class1,class2,...>
   --threshold <float>
   --bbox-format <xywh>
-  --bbox-unit <px|ratio>
+  --bbox-unit <px|relative>
 ```
 
 ### 4.4 `segment_image`
@@ -360,18 +367,17 @@ text_to_speech "你好，欢迎使用 AICC。" result.mp3
 参数：
 
 ```text
-text_to_speech <text> <output_audio>
-  --voice-id <id>
+text_to_speech <text> [output_audio]
   --lang <language_tag>
   --gender <male|female|neutral>
-  --style <style>
-  --speaker-similarity-required
+  --style <AICC voice style>
+  --instructions <text>
   --speed <float>
   --format <mp3|wav|ogg>
   --sample-rate <hz>
 ```
 
-如果传入 `--voice-id --speaker-similarity-required`，CLI 应默认设置 strict route，避免跨 Provider fallback 导致声音不一致。
+CLI 只构造 Provider/Model 无关的 `VoiceSpec`，不接受 Provider 原生 voice ID，也不在 voice 数据中混入路由匹配策略。
 
 ### 5.2 `speech_to_text`
 
@@ -394,6 +400,8 @@ speech_to_text <input_audio> [output_text]
 
 `--format txt` 写 transcript。`json`、`vtt`、`srt` 对应 AICC `output_formats`。
 
+该命令适用于转写明确的语音；音效、音乐或噪声的描述应使用媒体理解。Provider 将低可信候选保留为诊断信息，CLI 的 transcript 正文保持为空。
+
 ### 5.3 `gen_music`
 
 音乐生成。映射到 `audio.music`。
@@ -405,7 +413,7 @@ gen_music "A 30-second cheerful acoustic folk song with guitar." result.mp3
 参数：
 
 ```text
-gen_music <prompt> <output_audio>
+gen_music <prompt> [output_audio]
   --duration <seconds>
   --instrumental
   --lyrics <text_or_file>
@@ -426,7 +434,7 @@ enhance_audio noisy.wav clean.wav --task denoise
 参数：
 
 ```text
-enhance_audio <input_audio> <output_audio>
+enhance_audio <input_audio> [output_audio]
   --task <denoise|dereverb|separate_voice|normalize>
   --strength <0.0-1.0>
   --return-stems
@@ -441,72 +449,74 @@ enhance_audio <input_audio> <output_audio>
 
 ### 6.1 `gen_video`
 
-文生视频。映射到 `video.txt2video`。
+视频生成。映射到 `video.generate`；`--model` 为逻辑模型（默认 `video.generate`）时走 `helper.video_generate`。协议见 [video_generation.md](video_generation.md)。
 
 ```bash
 gen_video "A cinematic tracking shot through a lantern-lit market at dusk." result.mp4
+gen_video "Slow push-in; the lamp turns on at the end." result.mp4 --first-frame start.png --last-frame end.png
+gen_video "@{hero} runs through the rain toward @{door}." result.mp4 --ref-image hero=hero.png --ref-image door=door.png --duration 6 --aspect 16:9
 ```
 
 参数：
 
 ```text
-gen_video <prompt> <output_video>
+gen_video <prompt> [output_video]
+  --first-frame <image>            # keyframe start（id "first"）
+  --last-frame <image>             # keyframe end（id "last"）
+  --ref-image <id>=<image>         # reference_image，可重复
+  --ref-video <id>=<video>         # reference_video，可重复
+  --ref-audio <id>=<audio>         # reference_audio，可重复
+  --with-audio <id>                # 该 reference_video 的 include_audio=true
+  --clip <id>=<start>-<end>        # reference_video / reference_audio 的 time_range（秒）
   --duration <seconds>
-  --aspect <16:9|9:16|1:1>
-  --resolution <720p|1080p|4k>
-  --audio
+  --aspect <W:H>
+  --short-edge <px> | --size <WxH>
+  --fps <n>
+  --audio <auto|generate|none>
+  --format <mp4|webm|mov>
+  --negative <text>
   --seed <int>
-  --fps <int>
-  --format <mp4|webm>
 ```
 
-### 6.2 `img2video`
+文本、首尾帧和参考图/视频/音频都是同一请求的 `conditions[]`；素材可以是本地路径、http(s) URL 或 `named_object:<obj_id>`。提示词用 `@{id}` 引用素材（`@@` 表示字面量 `@`），条件足以说明时 prompt 可以为 `""`。输出参数组成 `output`。逻辑模型由 AICC 实测素材后选模。所选模型不支持的条件或输出规格返回 `unsupported_operation`，不丢弃、不取近似值；AICC 尚不裁剪素材，`--clip` 只接受覆盖整段素材的区间。
 
-图生视频。映射到 `video.img2video`。
+### 6.2 `edit_video`
+
+视频编辑。映射到 `video.edit`，只有具备真实源视频编辑合同的模型可用。要以参考片段生成新视频，使用 `gen_video --ref-video`。
 
 ```bash
-img2video start.png "Animate the scene with slow camera movement." result.mp4
+edit_video source.mp4 "Shift the color palette to teal and warm backlight." result.mp4
 ```
 
 参数：
 
 ```text
-img2video <input_image> <prompt> <output_video>
+edit_video <input_video> <prompt> [output_video]
   --duration <seconds>
-  --aspect <16:9|9:16|1:1>
-  --resolution <720p|1080p|4k>
+  --aspect <W:H>
+  --short-edge <px> | --size <WxH>
+  --fps <n>
+  --audio <auto|generate|none>
+  --format <mp4|webm|mov>
 ```
 
-### 6.3 `video2video`
+### 6.3 视频结果
 
-视频风格 / 内容编辑。映射到 `video.video2video`。
-
-```bash
-video2video source.mp4 "Shift the color palette to teal and warm backlight." result.mp4
-```
-
-参数：
-
-```text
-video2video <input_video> <prompt> <output_video>
-  --preserve-motion
-  --start <seconds>
-  --end <seconds>
-```
+视频类命令从 typed response 的 `videos[]` 取产物，结果多于一个视频时报错，不截断。`detail.video` 带 Provider 声明值（`provider_metadata`）、AICC 实测值（`measured_metadata`）和与请求不一致的 `deviations`。
 
 ### 6.4 `extend_video`
 
 视频续写。映射到 `video.extend`。
 
 ```bash
-extend_video previous.mp4 "Continue the shot over the rooftops." result.mp4
+extend_video previous.mp4 "Continue the shot over the rooftops." result.mp4 --continuation-handle <provider_handle>
 ```
 
 参数：
 
 ```text
-extend_video <input_video> <prompt> <output_video>
-  --continuation-handle <provider_handle>
+extend_video <input_video> <prompt> [output_video]
+  --continuation-handle <provider_handle>  # required; from a compatible previous generation
   --duration <seconds>
   --resolution <720p|1080p|4k>
 ```
@@ -522,7 +532,7 @@ upscale_video source.mp4 result.mp4 --target-resolution 4k
 参数：
 
 ```text
-upscale_video <input_video> <output_video>
+upscale_video <input_video> [output_video]
   --target-resolution <1080p|4k>
   --denoise
   --sharpen <0.0-1.0>
@@ -539,7 +549,7 @@ Provider 查询。
 
 ```bash
 ai_provider list
-ai_provider health
+ai_provider health <exact_model>
 ```
 
 映射到：
@@ -547,27 +557,47 @@ ai_provider health
 | command | AICC method |
 |---|---|
 | `ai_provider list` | `provider.list` |
-| `ai_provider health` | `provider.health` |
+| `ai_provider health <exact_model>` | `provider.health` |
 
 ### 7.2 `ai_quota`
 
-Quota 查询。
+Token 额度查询：列出约束调用者的额度规则（管理员对调用者及其 App / Agent 的规则、共享 App 规则、本人 App 自限），每条带当前周期窗口或总量账户的已结算、预占、可用与 `reset_at_ms`（总量账户为 `null`）。协议见 [aicc_token_quota.md](aicc_token_quota.md)。
 
 ```bash
 ai_quota
-ai_quota --capability image
-ai_quota --method image.txt2img
+ai_quota --app aiworkspace
 ```
 
-映射到 `quota.query`。
+映射到 `quota.query`（`{ app_id? }`）。各 AIGC 命令遇到额度或资源策略拒绝时，结果的 `detail.error_code` 为 `quota_exhausted` / `quota_budget_exceeded` / `quota_unavailable` / `resource_not_permitted` / `attribution_unavailable`，`detail.details` 为 AICC 的拒绝详情。
+
+### 7.3 `materialize_resource`
+
+将非本地资源保存为当前 workspace 中的本地文件，供 ffmpeg 等本地命令继续处理（工具需要路径时的显式降级；交付和传给下一条命令用 `obj://bucket/...` 或对象 id）。
+
+```bash
+materialize_resource 'obj://bucket/user/<agent>/<owner>/artifacts/<key>' inputs/clip.mp4
+materialize_resource 'named_object:cyfile:...' inputs/audio.mp3
+materialize_resource 'https://example.com/input.wav' inputs/audio.wav --mime audio/wav
+```
+
+参数：
+
+```text
+materialize_resource <resource> <output_path>
+  --mime <mime_type>
+```
+
+支持 `obj://bucket/<bucket_id>/<key>`（经 `/bucket/v1` 数据面读取）、`named_object:<typed_object_id>`、直接的 `cyfile:` / `chunk:` typed ID、HTTP(S) URL
+和 data URL。命令保留完整 typed object ID，目标文件已存在时拒绝覆盖。它不创建 AICC
+推理任务，只复用 SDK 的 ResourceRef 读取能力。
 
 ---
 
 ## 8. 命令到 AICC Method 映射
 
-| CLI | AICC method | capability | 默认 model.alias |
+| CLI | AICC method | capability | 默认 logical_model |
 |---|---|---|---|
-| `gen_image` | `image.txt2img` | `image` | `image.txt2img` |
+| `gen_image` | `helper.text_to_image` | `image` | `image.txt2img` |
 | `edit_image` | `image.img2img` | `image` | `image.img2img` |
 | `inpaint_image` | `image.inpaint` | `image` | `image.inpaint` |
 | `upscale_image` | `image.upscale` | `image` | `image.upscale` |
@@ -580,9 +610,8 @@ ai_quota --method image.txt2img
 | `speech_to_text` | `audio.asr` | `audio` | `audio.asr` |
 | `gen_music` | `audio.music` | `audio` | `audio.music` |
 | `enhance_audio` | `audio.enhance` | `audio` | `audio.enhance` |
-| `gen_video` | `video.txt2video` | `video` | `video.txt2video` |
-| `img2video` | `video.img2video` | `video` | `video.img2video` |
-| `video2video` | `video.video2video` | `video` | `video.video2video` |
+| `gen_video` | `helper.video_generate`（精确模型时 `video.generate`） | `video` | `video.generate` |
+| `edit_video` | `video.edit` | `video` | `video.edit` |
 | `extend_video` | `video.extend` | `video` | `video.extend` |
 | `upscale_video` | `video.upscale` | `video` | `video.upscale` |
 
@@ -594,40 +623,29 @@ ai_quota --method image.txt2img
 
 ```json
 {
-  "method": "image.txt2img",
+  "method": "helper.text_to_image",
   "params": {
-    "capability": "image",
-    "model": {
-      "alias": "image.txt2img"
-    },
-    "requirements": {
-      "must_features": [],
-      "resp_format": "text"
-    },
-    "payload": {
-      "input_json": {
-        "prompt": "prompt",
-        "n": 1,
-        "aspect_ratio": "1:1",
-        "quality": "high",
-        "output": {
-          "media_type": "image/png"
-        }
-      },
-      "resources": [],
-      "options": {}
+    "logical_model": "image.txt2img",
+    "requirements": {},
+    "disable": {},
+    "trace_id": "<trace_id>",
+    "prompt": "prompt",
+    "n": 1,
+    "aspect_ratio": "1:1",
+    "quality": "high",
+    "output": {
+      "media_type": "image/png"
     },
     "policy": {
       "profile": "balanced",
       "allow_fallback": true,
       "runtime_failover": true
     }
-  },
-  "sys": [1001, "<session_token>", "<trace_id>"]
+  }
 }
 ```
 
-同步成功后，CLI 从 `result.artifacts[0].resource` 取生成图片并写入 `result.png`。
+同步成功后，CLI 从 typed response 的 `images[0]` 取生成图片并写入 `result.png`。异步成功时从 TaskMgr 2.0 `result.result.output.artifacts` 读取产物。
 
 ---
 
@@ -655,11 +673,12 @@ CLI 默认连接本机 NodeGateway：
 http://127.0.0.1:3180/kapi/aicc
 ```
 
-可通过环境变量覆盖：
+OpenDAN 使用 AppClient session token 并通过宿主机 NodeGateway 访问服务；本地模式使用 SDK 的标准登录流程。相关环境变量：
 
 ```text
-AICC_ENDPOINT
-BUCKYOS_SESSION_TOKEN
+BUCKYOS_APPCLIENT_SESSION_TOKEN
+BUCKYOS_HOST_GATEWAY
+BUCKYOS_NODE_GATEWAY_PORT
 AICC_DEFAULT_PROFILE
 AICC_DEFAULT_TIMEOUT  # milliseconds; default 900000
 ```
@@ -671,7 +690,7 @@ AICC_DEFAULT_TIMEOUT  # milliseconds; default 900000
 ```json
 {
   "ok": true,
-  "method": "image.txt2img",
+  "method": "helper.text_to_image",
   "task_id": "aicc-001",
   "status": "succeeded",
   "outputs": [
@@ -689,7 +708,7 @@ AICC_DEFAULT_TIMEOUT  # milliseconds; default 900000
 ```json
 {
   "ok": false,
-  "method": "image.txt2img",
+  "method": "helper.text_to_image",
   "error": {
     "code": "route_failed",
     "message": "no provider available"
@@ -718,7 +737,7 @@ AICC_DEFAULT_TIMEOUT  # milliseconds; default 900000
 ## 11. 非目标
 
 1. 不设计新的 REST AI API。
-2. 不在 CLI 中实现 Provider 专有参数透传，除非放入 `--provider-extra <json>`。
+2. 不在 CLI 中实现 Provider 专有参数透传。
 3. 不实现 `chat`、`completion`、`ask`、`reason` 等原始 LLM 推理命令。
 4. 不在 CLI 内做复杂模型选择逻辑；路由决策属于 AICC。
 5. 不为每个 Provider 设计独立命令。

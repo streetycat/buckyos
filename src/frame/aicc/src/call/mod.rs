@@ -1,0 +1,3012 @@
+use crate::canonical::{
+    resolve_canonical_field, resolve_missing_canonical_field, CanonicalFieldMapping,
+    CanonicalMatchQuality,
+};
+use crate::catalog::{CatalogSnapshot, Pricing, ResolvedProviderRule};
+use crate::error::{CallLoweringError, CatalogResolveError, ModelRegistryError};
+use crate::matching::MatchContext;
+use crate::model::ExactModelName;
+use crate::protocol::{
+    CodecContext, CodecInput, CodecLimits, CodecRegistry, CredentialAudit, ExecutionMode,
+    ResolvedCredential,
+};
+use crate::resource::ResourceAccessContext;
+use crate::routing::{RouteDecision, SelectedRoute};
+use crate::video::{VideoGenerationContract, VideoMaterialFacts, VIDEO_PLAN_PARAMETER};
+use buckyos_api::{
+    AiccCall, AiccErrorCode, AiccExecutionMode, ApiType, CanonicalFieldRequirement, Money,
+    ResourceRef,
+};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PricingSource {
+    Discovery,
+    ProviderRules,
+    RouteEstimate,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ResolvedPricing {
+    pub source: PricingSource,
+    pub pricing: Option<Pricing>,
+    pub matched_amount: Option<f64>,
+    pub estimated_cost: Option<Money>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderCallTarget {
+    pub provider_rules_id: Option<String>,
+    pub use_server_defaults: bool,
+    pub base_url: String,
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub credential: ResolvedCredential,
+    pub credential_reference: String,
+    pub credential_header_name: Option<String>,
+    pub limits: CodecLimits,
+    pub pricing: Option<ResolvedPricing>,
+    pub match_dimensions: MatchContext,
+    /// The selected inventory model's video contract (`video.generate` only).
+    pub video_contract: Option<VideoGenerationContract>,
+    /// Facts measured for the request's conditions before the final route.
+    pub video_facts: VideoMaterialFacts,
+}
+
+impl fmt::Debug for ProviderCallTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderCallTarget")
+            .field("provider_rules_id", &self.provider_rules_id)
+            .field("base_url", &self.base_url)
+            .field("operation_base_urls", &self.operation_base_urls)
+            .field("credential", &self.credential.audit())
+            .field("limits", &self.limits)
+            .field("pricing", &self.pricing)
+            .field(
+                "match_dimension_names",
+                &self.match_dimensions.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResourceRequirement {
+    pub request_pointer: String,
+    pub resource: ResourceRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct LoweringRevisions {
+    pub catalog_target_seq: u64,
+    pub model_driver_revision_seq: u64,
+    pub provider_rules_revision_seq: Option<u64>,
+    pub inventory_revision: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedProviderCall {
+    pub exact_model: String,
+    pub provider_model_id: String,
+    pub provider_instance_name: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub model_driver_id: String,
+    pub origin_model_id: String,
+    pub variant: Option<String>,
+    pub method: String,
+    pub api_type: ApiType,
+    pub operation: String,
+    pub execution_mode: ExecutionMode,
+    pub input: CodecInput,
+    pub context: CodecContext,
+    pub credential: CredentialAudit,
+    pub credential_reference: String,
+    pub credential_header_name: Option<String>,
+    pub resource_requirements: Vec<ResourceRequirement>,
+    pub resource_access_context: Option<ResourceAccessContext>,
+    pub resource_leases: Vec<crate::resource::ResourceLease>,
+    pub pricing: ResolvedPricing,
+    pub reported_cost_currency: Option<String>,
+    /// Model metadata output cap: the quota budget when the call sets none.
+    pub model_max_output_tokens: Option<u64>,
+    pub revisions: LoweringRevisions,
+}
+
+impl fmt::Debug for ResolvedProviderCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedProviderCall")
+            .field("exact_model", &self.exact_model)
+            .field("provider_model_id", &self.provider_model_id)
+            .field("provider_instance_name", &self.provider_instance_name)
+            .field("provider_profile_id", &self.provider_profile_id)
+            .field("protocol_adapter_id", &self.protocol_adapter_id)
+            .field("model_driver_id", &self.model_driver_id)
+            .field("origin_model_id", &self.origin_model_id)
+            .field("variant", &self.variant)
+            .field("method", &self.method)
+            .field("api_type", &self.api_type)
+            .field("operation", &self.operation)
+            .field("execution_mode", &self.execution_mode)
+            .field("input", &self.input)
+            .field("context", &self.context)
+            .field("credential", &self.credential)
+            .field(
+                "resource_requirement_pointers",
+                &self
+                    .resource_requirements
+                    .iter()
+                    .map(|requirement| requirement.request_pointer.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("pricing", &self.pricing)
+            .field("revisions", &self.revisions)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Serialize)]
+pub(crate) struct DeterministicCallView<'a> {
+    exact_model: &'a str,
+    provider_model_id: &'a str,
+    provider_instance_name: &'a str,
+    provider_profile_id: &'a str,
+    protocol_adapter_id: &'a str,
+    model_driver_id: &'a str,
+    origin_model_id: &'a str,
+    variant: Option<&'a str>,
+    method: &'a str,
+    api_type: &'static str,
+    operation: &'a str,
+    execution_mode: &'static str,
+    resolved_parameters: &'a BTreeMap<String, Value>,
+    credential_kind: &'static str,
+    credential_ref: &'a str,
+    resource_pointers: Vec<&'a str>,
+    pricing: &'a ResolvedPricing,
+    revisions: &'a LoweringRevisions,
+}
+
+impl ResolvedProviderCall {
+    #[cfg(test)]
+    pub(crate) fn deterministic_view(&self) -> DeterministicCallView<'_> {
+        DeterministicCallView {
+            exact_model: &self.exact_model,
+            provider_model_id: &self.provider_model_id,
+            provider_instance_name: &self.provider_instance_name,
+            provider_profile_id: &self.provider_profile_id,
+            protocol_adapter_id: &self.protocol_adapter_id,
+            model_driver_id: &self.model_driver_id,
+            origin_model_id: &self.origin_model_id,
+            variant: self.variant.as_deref(),
+            method: &self.method,
+            api_type: api_type_name(self.api_type),
+            operation: &self.operation,
+            execution_mode: execution_mode_name(self.execution_mode),
+            resolved_parameters: &self.input.resolved_parameters,
+            credential_kind: self.credential.kind.as_str(),
+            credential_ref: self.credential.anonymous_ref.as_str(),
+            resource_pointers: self
+                .resource_requirements
+                .iter()
+                .map(|requirement| requirement.request_pointer.as_str())
+                .collect(),
+            pricing: &self.pricing,
+            revisions: &self.revisions,
+        }
+    }
+}
+
+impl CallLoweringError {
+    pub(crate) fn code(&self) -> AiccErrorCode {
+        match self {
+            Self::UnsupportedExecutionMode { .. } => AiccErrorCode::UnsupportedExecutionMode,
+            Self::Video(error) => error.code,
+            _ => AiccErrorCode::InvalidRequest,
+        }
+    }
+}
+
+impl fmt::Display for CallLoweringError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedCanonicalCall(v) => write!(f, "{v} is not a typed inference call"),
+            Self::InvalidCanonicalRequest(v) => write!(f, "invalid canonical request: {v}"),
+            Self::InvalidExactModel(v) => v.fmt(f),
+            Self::RouteMismatch(v) => write!(f, "route decision mismatch: {v}"),
+            Self::Catalog(v) => v.fmt(f),
+            Self::MissingProviderVariant {
+                provider_rules_id,
+                variant,
+            } => write!(
+                f,
+                "provider rules `{provider_rules_id}` do not lower variant `{variant}`"
+            ),
+            Self::AmbiguousProviderVariant {
+                provider_rules_id,
+                variant,
+            } => write!(
+                f,
+                "provider rules `{provider_rules_id}` lower variant `{variant}` more than once"
+            ),
+            Self::UnknownAdapter(v) => write!(f, "unknown adapter `{v}`"),
+            Self::MissingDefaultOperation {
+                adapter_id,
+                api_type,
+            } => write!(
+                f,
+                "adapter `{adapter_id}` has no default operation for `{api_type}`"
+            ),
+            Self::AmbiguousDefaultOperation {
+                adapter_id,
+                api_type,
+            } => write!(
+                f,
+                "adapter `{adapter_id}` has multiple default operations for `{api_type}`"
+            ),
+            Self::RouteOperationMismatch { routed, lowered } => write!(
+                f,
+                "routed operation `{routed}` differs from lowered operation `{lowered}`"
+            ),
+            Self::UnsupportedOperation(v) => f.write_str(v),
+            Self::UnsupportedExecutionMode {
+                adapter_id,
+                operation,
+                api_type,
+                execution_mode,
+            } => write!(
+                f,
+                "adapter `{adapter_id}` operation `{operation}` does not support `{execution_mode}` execution for `{api_type}`"
+            ),
+            Self::InvalidRule(v) => write!(f, "invalid request rule: {v}"),
+            Self::Video(v) => f.write_str(&v.message),
+        }
+    }
+}
+
+impl Error for CallLoweringError {}
+impl From<CatalogResolveError> for CallLoweringError {
+    fn from(value: CatalogResolveError) -> Self {
+        Self::Catalog(value)
+    }
+}
+impl From<ModelRegistryError> for CallLoweringError {
+    fn from(value: ModelRegistryError) -> Self {
+        Self::InvalidExactModel(value)
+    }
+}
+
+pub(crate) struct CallResolver<'a> {
+    catalog: &'a CatalogSnapshot,
+    codecs: &'a CodecRegistry,
+}
+
+impl<'a> CallResolver<'a> {
+    pub(crate) fn new(catalog: &'a CatalogSnapshot, codecs: &'a CodecRegistry) -> Self {
+        Self { catalog, codecs }
+    }
+
+    pub(crate) fn lower(
+        &self,
+        decision: &RouteDecision,
+        canonical_request: &AiccCall,
+        target: ProviderCallTarget,
+    ) -> Result<ResolvedProviderCall, CallLoweringError> {
+        let api_type = call_api_type(canonical_request)?;
+        let requested_execution_mode = call_execution_mode(canonical_request)?;
+        let video_contract = target.video_contract.clone();
+        let video_facts = target.video_facts.clone();
+        let method = canonical_request.method().to_owned();
+        let exact_model = call_exact_model(canonical_request)?;
+        validate_route(&decision.selected, exact_model, api_type)?;
+        let parsed_exact = ExactModelName::parse(exact_model)?;
+        let api_name = api_type_name(api_type);
+        let mut identity_context = target.match_dimensions.clone();
+        identity_context.extend([
+            (
+                "provider_model_id".into(),
+                Value::String(decision.selected.provider_model_id.clone()),
+            ),
+            (
+                "origin_model_id".into(),
+                Value::String(decision.selected.origin_model_id.clone()),
+            ),
+            (
+                "model_driver_id".into(),
+                Value::String(decision.selected.model_driver_id.clone()),
+            ),
+            ("api_type".into(), Value::String(api_name.into())),
+        ]);
+        if let Some(variant) = parsed_exact.variant() {
+            identity_context.insert("variant".into(), Value::String(variant.into()));
+        }
+        let provider_rule = target
+            .provider_rules_id
+            .as_deref()
+            .map(|rules_id| {
+                self.catalog.resolve_provider_rule(
+                    rules_id,
+                    &decision.selected.provider_model_id,
+                    &identity_context,
+                )
+            })
+            .transpose()?
+            .flatten();
+        let operation = self.resolve_operation(
+            &decision.selected,
+            provider_rule.as_ref(),
+            api_type,
+            &method,
+        )?;
+        let mut canonical_json = serialize_call(canonical_request)?;
+        let option_keys = canonical_option_keys(canonical_request)?;
+        let mut normalized = Value::Object(Map::new());
+        if let Some(rule) = &provider_rule {
+            merge_overwrite(
+                &mut normalized,
+                &Value::Object(rule.action.provider_options.clone().into_iter().collect()),
+            );
+        }
+        let variant_options = self.resolve_variant(
+            target.provider_rules_id.as_deref(),
+            &decision.selected,
+            parsed_exact.variant(),
+            &identity_context,
+        )?;
+        merge_overwrite(
+            &mut normalized,
+            &Value::Object(variant_options.clone().into_iter().collect()),
+        );
+        let model = self.catalog.resolve_model(
+            &decision.selected.model_driver_id,
+            &decision.selected.origin_model_id,
+        )?;
+        let model_max_output_tokens = model
+            .semantics
+            .capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.get("max_output_tokens"))
+            .and_then(Value::as_u64);
+        let mut canonical_fields = model.semantics.canonical_fields.unwrap_or_default();
+        if let Some(rule) = &provider_rule {
+            canonical_fields.extend(rule.action.canonical_fields.clone());
+            let canonical_context = request_match_context(api_name, &operation, &normalized);
+            for request_rule in rule.matching_request_rules(&canonical_context) {
+                canonical_fields.extend(request_rule.canonical_fields.clone());
+            }
+        }
+        let mut canonical_provider_options =
+            apply_canonical_mappings(&mut canonical_json, &mut normalized, &canonical_fields)?;
+        merge_user_options(&mut normalized, &canonical_json, option_keys);
+        if let Some(rule) = &provider_rule {
+            let defaults_context = request_match_context(api_name, &operation, &normalized);
+            for request_rule in rule.matching_request_rules(&defaults_context) {
+                fill_defaults(
+                    &mut normalized,
+                    &Value::Object(request_rule.defaults.clone().into_iter().collect()),
+                );
+            }
+            let rewrite_context = request_match_context(api_name, &operation, &normalized);
+            for request_rule in rule.matching_request_rules(&rewrite_context) {
+                merge_overwrite(
+                    &mut normalized,
+                    &Value::Object(request_rule.set.clone().into_iter().collect()),
+                );
+                for pointer in &request_rule.remove {
+                    remove_pointer(&mut normalized, pointer)?;
+                }
+            }
+        }
+        if parsed_exact
+            .variant()
+            .is_some_and(|variant| variant.starts_with("reasoning-"))
+        {
+            for key in [
+                "reasoning",
+                "reasoning_effort",
+                "thinking",
+                "thinking_budget",
+                "enable_thinking",
+                "preserve_thinking",
+            ] {
+                if let Some(value) = variant_options.get(key) {
+                    normalized
+                        .as_object_mut()
+                        .expect("normalized object")
+                        .insert(key.into(), value.clone());
+                } else {
+                    normalized
+                        .as_object_mut()
+                        .expect("normalized object")
+                        .remove(key);
+                }
+            }
+        }
+        if parsed_exact
+            .variant()
+            .is_some_and(|variant| variant.starts_with("reasoning-"))
+        {
+            if let Some(config) = normalized
+                .get_mut("generation_config")
+                .and_then(Value::as_object_mut)
+            {
+                for key in ["thinking_level", "thinking_budget", "thinking_config"] {
+                    config.remove(key);
+                }
+            }
+            if let Some(config) = variant_options.get("generation_config") {
+                merge_overwrite(
+                    &mut normalized,
+                    &serde_json::json!({"generation_config": config}),
+                );
+            }
+        }
+        if target.use_server_defaults && api_type == ApiType::Llm {
+            for key in [
+                "reasoning",
+                "reasoning_effort",
+                "thinking",
+                "thinking_budget",
+                "enable_thinking",
+                "preserve_thinking",
+            ] {
+                normalized
+                    .as_object_mut()
+                    .expect("normalized object")
+                    .remove(key);
+                canonical_provider_options.remove(key);
+            }
+            if let Some(config) = normalized
+                .get_mut("generation_config")
+                .and_then(Value::as_object_mut)
+            {
+                for key in ["thinking_level", "thinking_budget", "thinking_config"] {
+                    config.remove(key);
+                }
+            }
+        }
+        let descriptor = self
+            .codecs
+            .operation_descriptor(&decision.selected.protocol_adapter_id, &operation, api_type)
+            .map_err(|error| CallLoweringError::UnsupportedOperation(error.to_string()))?;
+        let binding = descriptor
+            .binding(api_type)
+            .map_err(|error| CallLoweringError::UnsupportedOperation(error.to_string()))?;
+        if let Some(default) = binding.default_max_output_tokens {
+            fill_default_max_output_tokens(
+                &mut normalized,
+                option_keys,
+                default,
+                model_max_output_tokens,
+            );
+        }
+        apply_execution_mode(&mut normalized, requested_execution_mode)?;
+        let rewritten_json = rewrite_canonical_options(&canonical_json, &normalized, option_keys)?;
+        let rewritten_request =
+            AiccCall::from_method_and_params(&method, rewritten_json.clone())
+                .map_err(|error| CallLoweringError::InvalidCanonicalRequest(error.to_string()))?;
+        let mut resolved_parameters =
+            provider_parameters(&normalized, option_keys, &canonical_provider_options);
+        resolved_parameters.insert(
+            "provider_model_id".into(),
+            Value::String(decision.selected.provider_model_id.clone()),
+        );
+        // Any binding that declares `web_search` can act on it. Gemini grounds
+        // image generation through the same `google_search` tool, so gating the
+        // injection on `llm` silently dropped the caller's request.
+        if binding
+            .supported_features
+            .contains(buckyos_api::features::WEB_SEARCH)
+        {
+            let enabled = decision
+                .selected
+                .enabled_capabilities
+                .iter()
+                .any(|feature| feature == buckyos_api::features::WEB_SEARCH)
+                && !decision
+                    .selected
+                    .disabled_capabilities
+                    .iter()
+                    .any(|feature| feature == buckyos_api::features::WEB_SEARCH);
+            resolved_parameters.insert(buckyos_api::features::WEB_SEARCH.into(), json!(enabled));
+        }
+        let mut video_dimensions = BTreeMap::new();
+        if let AiccCall::VideoGenerate(request) = &rewritten_request {
+            let contract = video_contract.as_ref().ok_or_else(|| {
+                CallLoweringError::UnsupportedOperation(
+                    "the selected model declares no video generation contract".into(),
+                )
+            })?;
+            let plan = crate::video::plan_video(contract, request, &video_facts)
+                .map_err(CallLoweringError::Video)?;
+            video_dimensions = plan.pricing_dimensions();
+            resolved_parameters.insert(
+                VIDEO_PLAN_PARAMETER.into(),
+                serde_json::to_value(&plan)
+                    .map_err(|error| CallLoweringError::InvalidRule(error.to_string()))?,
+            );
+        }
+        let input = CodecInput {
+            canonical_request: rewritten_request,
+            resolved_parameters,
+        };
+        let Some(execution_mode) =
+            internal_execution_mode(requested_execution_mode, &binding.execution_modes)
+        else {
+            return Err(CallLoweringError::UnsupportedExecutionMode {
+                adapter_id: decision.selected.protocol_adapter_id.clone(),
+                operation,
+                api_type: api_name.into(),
+                execution_mode: execution_mode_name(requested_execution_mode).into(),
+            });
+        };
+        input
+            .validate_for(binding)
+            .map_err(|error| CallLoweringError::InvalidCanonicalRequest(error.to_string()))?;
+        let resources = if api_type == ApiType::Decision {
+            Vec::new()
+        } else {
+            collect_resource_requirements(&rewritten_json)
+        };
+        let model_revision = self
+            .catalog
+            .model_driver(&decision.selected.model_driver_id)
+            .ok_or_else(|| {
+                CallLoweringError::RouteMismatch(format!(
+                    "model driver `{}` is absent from the catalog snapshot",
+                    decision.selected.model_driver_id
+                ))
+            })?
+            .revision_seq;
+        let provider_revision = target
+            .provider_rules_id
+            .as_deref()
+            .map(|rules_id| {
+                self.catalog
+                    .provider_rules(rules_id)
+                    .map(|rules| rules.revision_seq)
+                    .ok_or_else(|| {
+                        CallLoweringError::RouteMismatch(format!(
+                            "provider rules `{rules_id}` are absent from the catalog snapshot"
+                        ))
+                    })
+            })
+            .transpose()?;
+        let mut pricing_context = request_match_context(api_name, &operation, &normalized);
+        pricing_context.extend(video_dimensions);
+        let mut target_pricing = target.pricing;
+        if let Some(target) = target_pricing.as_mut() {
+            if target.matched_amount.is_none() {
+                target.matched_amount = target
+                    .pricing
+                    .as_ref()
+                    .and_then(|pricing| matched_rule_amount(pricing, &pricing_context));
+            }
+        }
+        let mut pricing = resolve_pricing(
+            target_pricing,
+            provider_rule
+                .as_ref()
+                .and_then(|rule| rule.action.pricing.clone()),
+            provider_rule
+                .as_ref()
+                .and_then(|rule| rule.price_for(&pricing_context)),
+            decision.selected.estimated_cost.clone(),
+        );
+        let credential = target.credential.audit().clone();
+        let credential_reference = target.credential_reference;
+        let credential_header_name = target.credential_header_name;
+        let base_url = target
+            .operation_base_urls
+            .get(&operation)
+            .cloned()
+            .unwrap_or(target.base_url);
+        if decision.selected.provider_profile_id == "doubao"
+            && reqwest::Url::parse(&base_url)
+                .ok()
+                .is_some_and(|url| url.path().split('/').any(|part| part == "plan"))
+        {
+            pricing.pricing = None;
+            pricing.matched_amount = None;
+            pricing.estimated_cost = None;
+        }
+        let context = CodecContext {
+            base_url,
+            state_coordinate: buckyos_api::ProviderStateCoordinate {
+                provider_profile_id: decision.selected.provider_profile_id.clone(),
+                adapter_type: decision.selected.protocol_adapter_id.clone(),
+                origin_provider: decision.selected.model_driver_id.clone(),
+                origin_model: decision.selected.origin_model_id.clone(),
+            },
+            credential: Some(target.credential),
+            resources: BTreeMap::new(),
+            limits: target.limits,
+        };
+        context
+            .validate()
+            .map_err(|error| CallLoweringError::InvalidCanonicalRequest(error.to_string()))?;
+        Ok(ResolvedProviderCall {
+            exact_model: exact_model.into(),
+            provider_model_id: decision.selected.provider_model_id.clone(),
+            provider_instance_name: decision.selected.provider_instance_name.clone(),
+            provider_profile_id: decision.selected.provider_profile_id.clone(),
+            protocol_adapter_id: decision.selected.protocol_adapter_id.clone(),
+            model_driver_id: decision.selected.model_driver_id.clone(),
+            origin_model_id: decision.selected.origin_model_id.clone(),
+            variant: parsed_exact.variant().map(str::to_owned),
+            method,
+            api_type,
+            operation,
+            execution_mode,
+            input,
+            context,
+            credential,
+            credential_reference,
+            credential_header_name,
+            resource_requirements: resources,
+            resource_access_context: None,
+            resource_leases: Vec::new(),
+            pricing,
+            model_max_output_tokens,
+            reported_cost_currency: target
+                .provider_rules_id
+                .as_deref()
+                .and_then(|id| self.catalog.provider_rules(id))
+                .and_then(|rules| rules.reported_cost.as_ref())
+                .map(|policy| policy.currency.clone()),
+            revisions: LoweringRevisions {
+                catalog_target_seq: self.catalog.target_revision_seq(),
+                model_driver_revision_seq: model_revision,
+                provider_rules_revision_seq: provider_revision,
+                inventory_revision: decision.selected.inventory_revision.clone(),
+            },
+        })
+    }
+
+    fn resolve_operation(
+        &self,
+        selected: &SelectedRoute,
+        rule: Option<&ResolvedProviderRule>,
+        api_type: ApiType,
+        method: &str,
+    ) -> Result<String, CallLoweringError> {
+        let empty = BTreeMap::new();
+        let mappings = rule.map_or(&empty, |rule| &rule.action.operations);
+        let operation = if mappings.is_empty() {
+            self.codecs
+                .operation_descriptor(&selected.protocol_adapter_id, &selected.operation, api_type)
+                .map_err(|error| CallLoweringError::UnsupportedOperation(error.to_string()))?;
+            selected.operation.clone()
+        } else {
+            select_operation(
+                self.codecs,
+                &selected.protocol_adapter_id,
+                mappings,
+                api_type,
+                method,
+            )?
+        };
+        if selected.operation != operation {
+            return Err(CallLoweringError::RouteOperationMismatch {
+                routed: selected.operation.clone(),
+                lowered: operation,
+            });
+        }
+        Ok(selected.operation.clone())
+    }
+
+    fn resolve_variant(
+        &self,
+        rules_id: Option<&str>,
+        selected: &SelectedRoute,
+        variant: Option<&str>,
+        context: &MatchContext,
+    ) -> Result<BTreeMap<String, Value>, CallLoweringError> {
+        let Some(variant) = variant else {
+            return Ok(BTreeMap::new());
+        };
+        let rules_id = rules_id
+            .or_else(|| {
+                if selected.provider_profile_id == "custom" || !variant.starts_with("reasoning-") {
+                    return None;
+                }
+                self.catalog
+                    .llm_model(&selected.model_driver_id, &selected.origin_model_id)?;
+                let adapter = self.codecs.adapter(&selected.protocol_adapter_id)?;
+                self.catalog.protocol_default_rules_id(
+                    &adapter.protocol_family_id,
+                    &adapter.protocol_adapter_id,
+                )
+            })
+            .unwrap_or_default();
+        let matches = if self.catalog.provider_rules(rules_id).is_some() {
+            self.catalog
+                .executable_variants(
+                    rules_id,
+                    &selected.model_driver_id,
+                    &selected.origin_model_id,
+                    context,
+                )?
+                .into_iter()
+                .filter(|candidate| {
+                    candidate.model_driver == selected.model_driver_id
+                        && candidate.variant == variant
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        match matches.as_slice() {
+            [] => Err(CallLoweringError::MissingProviderVariant {
+                provider_rules_id: rules_id.into(),
+                variant: variant.into(),
+            }),
+            [matched] => Ok(matched.provider_options.clone()),
+            _ => Err(CallLoweringError::AmbiguousProviderVariant {
+                provider_rules_id: rules_id.into(),
+                variant: variant.into(),
+            }),
+        }
+    }
+}
+
+fn select_operation(
+    codecs: &CodecRegistry,
+    adapter_id: &str,
+    mappings: &BTreeMap<String, String>,
+    api_type: ApiType,
+    method: &str,
+) -> Result<String, CallLoweringError> {
+    let api_name = api_type_name(api_type);
+    let configured = mappings
+        .get(method)
+        .or_else(|| mappings.get(api_name))
+        .cloned();
+    let operation = match configured {
+        Some(operation) => operation,
+        None => {
+            let adapter = codecs
+                .adapter(adapter_id)
+                .ok_or_else(|| CallLoweringError::UnknownAdapter(adapter_id.into()))?;
+            let matching = adapter
+                .operations
+                .values()
+                .filter(|operation| {
+                    operation
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.api_type == api_type)
+                })
+                .map(|operation| {
+                    let priority = operation
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.api_type == api_type)
+                        .map(|binding| binding.default_priority)
+                        .max()
+                        .unwrap_or_default();
+                    (operation.operation_id.clone(), priority)
+                })
+                .collect::<Vec<_>>();
+            let highest_priority = matching.iter().map(|(_, priority)| *priority).max();
+            let matching = matching
+                .into_iter()
+                .filter(|(_, priority)| Some(*priority) == highest_priority)
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [] => {
+                    return Err(CallLoweringError::MissingDefaultOperation {
+                        adapter_id: adapter_id.into(),
+                        api_type: api_name.into(),
+                    });
+                }
+                [(operation, _)] => operation.clone(),
+                _ => {
+                    return Err(CallLoweringError::AmbiguousDefaultOperation {
+                        adapter_id: adapter_id.into(),
+                        api_type: api_name.into(),
+                    });
+                }
+            }
+        }
+    };
+    codecs
+        .operation_descriptor(adapter_id, &operation, api_type)
+        .map_err(|error| CallLoweringError::UnsupportedOperation(error.to_string()))?;
+    Ok(operation)
+}
+
+fn validate_route(
+    selected: &SelectedRoute,
+    exact_model: &str,
+    _api_type: ApiType,
+) -> Result<(), CallLoweringError> {
+    if selected.exact_model != exact_model {
+        return Err(CallLoweringError::RouteMismatch(
+            "canonical exact_model differs from the selected route".into(),
+        ));
+    }
+    let parsed = ExactModelName::parse(exact_model)?;
+    if parsed.provider_model_id() != selected.provider_model_id
+        || parsed.provider_instance_name() != selected.provider_instance_name
+    {
+        return Err(CallLoweringError::RouteMismatch(
+            "exact model identity differs from the selected route".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn call_api_type(call: &AiccCall) -> Result<ApiType, CallLoweringError> {
+    if is_routing_only(call) {
+        return Err(CallLoweringError::UnsupportedCanonicalCall(
+            call.method().into(),
+        ));
+    }
+    call.api_type()
+        .ok_or_else(|| CallLoweringError::UnsupportedCanonicalCall(call.method().into()))
+}
+
+fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Immediate => "immediate",
+        ExecutionMode::Stream => "stream",
+        ExecutionMode::NativeTask => "native_task",
+    }
+}
+
+fn call_execution_mode(call: &AiccCall) -> Result<ExecutionMode, CallLoweringError> {
+    Ok(match call.execution_mode() {
+        AiccExecutionMode::Immediate => ExecutionMode::Immediate,
+        AiccExecutionMode::Stream => ExecutionMode::Stream,
+    })
+}
+
+fn internal_execution_mode(
+    requested: ExecutionMode,
+    supported: &BTreeSet<ExecutionMode>,
+) -> Option<ExecutionMode> {
+    if supported.contains(&requested) {
+        Some(requested)
+    } else if requested == ExecutionMode::Immediate
+        && supported.contains(&ExecutionMode::NativeTask)
+    {
+        Some(ExecutionMode::NativeTask)
+    } else {
+        None
+    }
+}
+
+fn is_routing_only(call: &AiccCall) -> bool {
+    matches!(
+        call,
+        AiccCall::RouteResolve(_)
+            | AiccCall::HelperLlmChat(_)
+            | AiccCall::HelperTextToImage(_)
+            | AiccCall::HelperVideoGenerate(_)
+    )
+}
+
+fn serialize_call(call: &AiccCall) -> Result<Value, CallLoweringError> {
+    if is_routing_only(call) {
+        return Err(CallLoweringError::UnsupportedCanonicalCall(
+            call.method().into(),
+        ));
+    }
+    call.to_params()
+        .map_err(|error| CallLoweringError::InvalidCanonicalRequest(error.to_string()))
+}
+
+fn call_exact_model(call: &AiccCall) -> Result<&str, CallLoweringError> {
+    call.exact_model()
+        .ok_or_else(|| CallLoweringError::UnsupportedCanonicalCall(call.method().into()))
+}
+
+fn canonical_option_keys(call: &AiccCall) -> Result<&'static [&'static str], CallLoweringError> {
+    Ok(match call {
+        AiccCall::ChatCompletionsCreate(_) => &[
+            "response_format",
+            "temperature",
+            "top_p",
+            "max_output_tokens",
+            "seed",
+            "stop",
+            "output",
+        ],
+        AiccCall::ImagesGenerate(_) => &[
+            "negative_prompt",
+            "n",
+            "aspect_ratio",
+            "size",
+            "quality",
+            "style",
+            "seed",
+            "output",
+        ],
+        AiccCall::EmbeddingText(_) => &[
+            "chunking",
+            "embedding_space_id",
+            "dimensions",
+            "normalize",
+            "prefer_artifact",
+        ],
+        AiccCall::EmbeddingMultimodal(_) => &["dimensions", "normalize"],
+        AiccCall::DecisionEvaluate(_) => &[],
+        AiccCall::Rerank(_) => &["n", "return_documents"],
+        AiccCall::ImageToImage(_) => &["strength", "output"],
+        AiccCall::ImageInpaint(_) => &["mask_semantics", "output"],
+        AiccCall::ImageUpscale(_) => &[
+            "scale",
+            "target_width",
+            "target_height",
+            "preserve_faces",
+            "output",
+        ],
+        AiccCall::ImageBackgroundRemove(_) => &["mode", "output"],
+        AiccCall::VisionOcr(_) => &[
+            "level",
+            "language_hints",
+            "return_layout",
+            "return_artifacts",
+        ],
+        AiccCall::VisionCaption(_) => &["style", "language", "n"],
+        AiccCall::VisionDetect(_) => &["classes", "score_threshold", "bbox_spec"],
+        AiccCall::VisionSegment(_) => &["mask_format", "return_bitmap_mask"],
+        AiccCall::AudioTextToSpeech(_) => &["voice", "speed", "output"],
+        AiccCall::AudioSpeechRecognition(_) => {
+            &["language", "timestamps", "diarization", "output_formats"]
+        }
+        AiccCall::AudioMusic(_) => &[
+            "duration_seconds",
+            "instrumental",
+            "lyrics",
+            "seed",
+            "output",
+        ],
+        AiccCall::AudioEnhance(_) => &["strength", "return_stems"],
+        // The video plan maps these requests field by field, so provider
+        // rules never see (or rewrite) their content.
+        AiccCall::VideoGenerate(_) | AiccCall::VideoEdit(_) => &[],
+        AiccCall::VideoExtend(_) => &["continuation_handle", "duration_seconds", "resolution"],
+        AiccCall::VideoUpscale(_) => &["denoise", "sharpen", "output"],
+        AiccCall::ComputerUse(_) => &[],
+        AiccCall::RouteResolve(_)
+        | AiccCall::HelperLlmChat(_)
+        | AiccCall::HelperTextToImage(_)
+        | AiccCall::HelperVideoGenerate(_) => {
+            return Err(CallLoweringError::UnsupportedCanonicalCall(
+                call.method().into(),
+            ));
+        }
+    })
+}
+
+fn api_type_name(api_type: ApiType) -> &'static str {
+    match api_type {
+        ApiType::Llm => "llm",
+        ApiType::EmbeddingText => "embedding.text",
+        ApiType::EmbeddingMultimodal => "embedding.multimodal",
+        ApiType::Rerank => "rerank",
+        ApiType::Decision => "decision",
+        ApiType::ImageTextToImage => "image.txt2img",
+        ApiType::ImageImageToImage => "image.img2img",
+        ApiType::ImageInpaint => "image.inpaint",
+        ApiType::ImageUpscale => "image.upscale",
+        ApiType::ImageBackgroundRemove => "image.bg_remove",
+        ApiType::VisionOcr => "vision.ocr",
+        ApiType::VisionCaption => "vision.caption",
+        ApiType::VisionDetect => "vision.detect",
+        ApiType::VisionSegment => "vision.segment",
+        ApiType::AudioTextToSpeech => "audio.tts",
+        ApiType::AudioSpeechRecognition => "audio.asr",
+        ApiType::AudioMusic => "audio.music",
+        ApiType::AudioEnhance => "audio.enhance",
+        ApiType::VideoGenerate => "video.generate",
+        ApiType::VideoEdit => "video.edit",
+        ApiType::VideoExtend => "video.extend",
+        ApiType::VideoUpscale => "video.upscale",
+        ApiType::AgentComputerUse => "agent.computer_use",
+    }
+}
+
+fn merge_user_options(target: &mut Value, canonical: &Value, keys: &[&str]) {
+    let (Some(target), Some(canonical)) = (target.as_object_mut(), canonical.as_object()) else {
+        return;
+    };
+    for key in keys {
+        if let Some(value) = canonical.get(*key) {
+            match target.get_mut(*key) {
+                Some(existing) if existing.is_object() && value.is_object() => {
+                    merge_overwrite(existing, value);
+                }
+                _ => {
+                    target.insert((*key).into(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+fn apply_canonical_mappings(
+    canonical: &mut Value,
+    normalized: &mut Value,
+    mappings: &BTreeMap<String, CanonicalFieldMapping>,
+) -> Result<BTreeMap<String, Value>, CallLoweringError> {
+    let mut provider_options = BTreeMap::new();
+    for (pointer, mapping) in mappings {
+        let (resolved, strict) = match canonical.pointer(pointer).cloned() {
+            Some(value) => {
+                let requirement = inferred_canonical_requirement(value);
+                let strict = requirement.strict;
+                (resolve_canonical_field(Some(mapping), &requirement), strict)
+            }
+            None => (resolve_missing_canonical_field(mapping), false),
+        };
+        if resolved.quality == CanonicalMatchQuality::Unsupported
+            || (strict && resolved.quality < CanonicalMatchQuality::Fuzzy)
+        {
+            return Err(CallLoweringError::InvalidCanonicalRequest(format!(
+                "canonical field `{pointer}` cannot be mapped for the selected model"
+            )));
+        }
+        if resolved.omit {
+            if canonical.pointer(pointer).is_some() {
+                remove_pointer(canonical, pointer)?;
+            }
+            continue;
+        }
+        let Some(resolution) = resolved.resolution else {
+            continue;
+        };
+        set_pointer(canonical, pointer, resolution.resolved)?;
+        provider_options.extend(resolution.provider_options.clone());
+        merge_overwrite(
+            normalized,
+            &Value::Object(resolution.provider_options.into_iter().collect()),
+        );
+    }
+    Ok(provider_options)
+}
+
+fn set_pointer(
+    document: &mut Value,
+    pointer: &str,
+    replacement: Value,
+) -> Result<(), CallLoweringError> {
+    if document.pointer(pointer).is_some() {
+        return replace_pointer(document, pointer, replacement);
+    }
+    let Some((parent_pointer, token)) = pointer.rsplit_once('/') else {
+        return Err(CallLoweringError::InvalidRule(format!(
+            "canonical field pointer `{pointer}` is invalid"
+        )));
+    };
+    let token = token.replace("~1", "/").replace("~0", "~");
+    let parent = document.pointer_mut(parent_pointer).ok_or_else(|| {
+        CallLoweringError::InvalidRule(format!(
+            "canonical field pointer `{pointer}` has a missing parent"
+        ))
+    })?;
+    let parent = parent.as_object_mut().ok_or_else(|| {
+        CallLoweringError::InvalidRule(format!(
+            "canonical field pointer `{pointer}` does not target an object member"
+        ))
+    })?;
+    parent.insert(token, replacement);
+    Ok(())
+}
+
+fn inferred_canonical_requirement(value: Value) -> CanonicalFieldRequirement {
+    CanonicalFieldRequirement::new(value)
+}
+
+fn replace_pointer(
+    document: &mut Value,
+    pointer: &str,
+    replacement: Value,
+) -> Result<(), CallLoweringError> {
+    if pointer.is_empty() {
+        *document = replacement;
+        return Ok(());
+    }
+    let target = document.pointer_mut(pointer).ok_or_else(|| {
+        CallLoweringError::InvalidRule(format!("canonical field pointer `{pointer}` is invalid"))
+    })?;
+    *target = replacement;
+    Ok(())
+}
+
+fn merge_overwrite(target: &mut Value, overlay: &Value) {
+    match (target, overlay) {
+        (Value::Object(target), Value::Object(overlay)) => {
+            for (key, value) in overlay {
+                match target.get_mut(key) {
+                    Some(existing) if existing.is_object() && value.is_object() => {
+                        merge_overwrite(existing, value);
+                    }
+                    _ => {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (target, overlay) => *target = overlay.clone(),
+    }
+}
+
+fn fill_defaults(target: &mut Value, defaults: &Value) {
+    if let (Value::Object(target), Value::Object(defaults)) = (target, defaults) {
+        for (key, value) in defaults {
+            match target.get_mut(key) {
+                Some(existing) if existing.is_object() && value.is_object() => {
+                    fill_defaults(existing, value);
+                }
+                Some(_) => {}
+                None => {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Gives protocols that require an output cap a value when neither the caller
+/// nor the provider rules chose one, never above what the model can emit.
+fn fill_default_max_output_tokens(
+    normalized: &mut Value,
+    option_keys: &[&str],
+    default: u64,
+    model_limit: Option<u64>,
+) {
+    if !option_keys.contains(&"max_output_tokens") {
+        return;
+    }
+    let Some(parameters) = normalized.as_object_mut() else {
+        return;
+    };
+    let value = model_limit
+        .filter(|limit| *limit > 0)
+        .map_or(default, |limit| default.min(limit));
+    parameters
+        .entry("max_output_tokens")
+        .or_insert_with(|| Value::from(value));
+}
+
+fn apply_execution_mode(
+    normalized: &mut Value,
+    execution_mode: ExecutionMode,
+) -> Result<(), CallLoweringError> {
+    let parameters = normalized.as_object_mut().ok_or_else(|| {
+        CallLoweringError::InvalidRule("normalized options must be an object".into())
+    })?;
+    parameters.remove("stream");
+    if execution_mode == ExecutionMode::Stream {
+        parameters.insert("stream".into(), Value::Bool(true));
+    }
+    Ok(())
+}
+
+fn remove_pointer(value: &mut Value, pointer: &str) -> Result<(), CallLoweringError> {
+    if pointer.is_empty() || !pointer.starts_with('/') {
+        return Err(CallLoweringError::InvalidRule(format!(
+            "invalid normalized JSON Pointer `{pointer}`"
+        )));
+    }
+    let mut parts = pointer[1..]
+        .split('/')
+        .map(unescape_pointer)
+        .collect::<Result<Vec<_>, _>>()?;
+    let last = parts
+        .pop()
+        .ok_or_else(|| CallLoweringError::InvalidRule("empty remove pointer".into()))?;
+    let mut parent = value;
+    for part in parts {
+        parent = match parent {
+            Value::Object(object) => match object.get_mut(&part) {
+                Some(value) => value,
+                None => return Ok(()),
+            },
+            Value::Array(array) => {
+                match part
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| array.get_mut(index))
+                {
+                    Some(value) => value,
+                    None => return Ok(()),
+                }
+            }
+            _ => return Ok(()),
+        };
+    }
+    match parent {
+        Value::Object(object) => {
+            object.remove(&last);
+        }
+        Value::Array(array) => {
+            if let Ok(index) = last.parse::<usize>() {
+                if index < array.len() {
+                    array.remove(index);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn unescape_pointer(value: &str) -> Result<String, CallLoweringError> {
+    let mut output = String::new();
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '~' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('0') => output.push('~'),
+            Some('1') => output.push('/'),
+            _ => {
+                return Err(CallLoweringError::InvalidRule(
+                    "invalid JSON Pointer escape".into(),
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn request_match_context(api_type: &str, operation: &str, normalized: &Value) -> MatchContext {
+    let mut context = MatchContext::from([
+        ("api_type".into(), Value::String(api_type.into())),
+        ("operation".into(), Value::String(operation.into())),
+    ]);
+    flatten_match_dimensions(normalized, "", &mut context);
+    context
+}
+
+fn flatten_match_dimensions(value: &Value, pointer: &str, context: &mut MatchContext) {
+    if !pointer.is_empty() {
+        context.insert(pointer.into(), value.clone());
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                flatten_match_dimensions(
+                    value,
+                    &format!("{pointer}/{}", escape_pointer(key)),
+                    context,
+                );
+            }
+        }
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                flatten_match_dimensions(value, &format!("{pointer}/{index}"), context);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn escape_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn rewrite_canonical_options(
+    canonical: &Value,
+    normalized: &Value,
+    keys: &[&str],
+) -> Result<Value, CallLoweringError> {
+    let mut rewritten = canonical.clone();
+    let object = rewritten.as_object_mut().ok_or_else(|| {
+        CallLoweringError::InvalidCanonicalRequest("request must serialize as an object".into())
+    })?;
+    let normalized = normalized.as_object().ok_or_else(|| {
+        CallLoweringError::InvalidRule("normalized options must be an object".into())
+    })?;
+    for key in keys {
+        object.remove(*key);
+        if let Some(value) = normalized.get(*key) {
+            object.insert((*key).into(), value.clone());
+        }
+    }
+    Ok(rewritten)
+}
+
+fn provider_parameters(
+    normalized: &Value,
+    canonical_keys: &[&str],
+    canonical_provider_options: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let mut parameters = normalized
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| !canonical_keys.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    parameters.extend(canonical_provider_options.clone());
+    parameters
+}
+
+pub(crate) fn collect_resource_requirements(value: &Value) -> Vec<ResourceRequirement> {
+    fn visit(value: &Value, pointer: &str, output: &mut Vec<ResourceRequirement>) {
+        if value.get("kind").and_then(Value::as_str).is_some() {
+            if let Ok(resource) = serde_json::from_value::<ResourceRef>(value.clone()) {
+                output.push(ResourceRequirement {
+                    request_pointer: pointer.into(),
+                    resource,
+                });
+                return;
+            }
+        }
+        match value {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    visit(value, &format!("{pointer}/{}", escape_pointer(key)), output);
+                }
+            }
+            Value::Array(array) => {
+                for (index, value) in array.iter().enumerate() {
+                    visit(value, &format!("{pointer}/{index}"), output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut output = Vec::new();
+    visit(value, "", &mut output);
+    output
+}
+
+/// The first price rule of an inventory (discovery) price that matches the
+/// request; provider-rule prices are matched by the catalog itself.
+fn matched_rule_amount(pricing: &Pricing, context: &MatchContext) -> Option<f64> {
+    pricing.rules.iter().find_map(|rule| {
+        crate::matching::CompiledMatchRule::compile(
+            rule.when.clone(),
+            &crate::matching::PRICING_RULE_MATCH_SCHEMA,
+        )
+        .ok()?
+        .matches(context)
+        .then_some(rule.amount)
+    })
+}
+
+fn resolve_pricing(
+    target: Option<ResolvedPricing>,
+    provider_pricing: Option<Pricing>,
+    matched_amount: Option<f64>,
+    estimated_cost: Option<Money>,
+) -> ResolvedPricing {
+    if let Some(mut target) = target {
+        // A caller-supplied target (usually the provider inventory snapshot) still wins,
+        // but a conditional rule may refine it. The bare `return target` here used to
+        // discard `matched_amount` outright, which made `pricing.rules` dead code.
+        if target.matched_amount.is_none() {
+            target.matched_amount = matched_amount;
+        }
+        return target;
+    }
+    if let Some(pricing) = provider_pricing {
+        return ResolvedPricing {
+            source: PricingSource::ProviderRules,
+            pricing: Some(pricing),
+            matched_amount,
+            estimated_cost,
+        };
+    }
+    ResolvedPricing {
+        source: PricingSource::RouteEstimate,
+        pricing: None,
+        matched_amount: None,
+        estimated_cost,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{CanonicalFallback, CanonicalFieldConverter};
+    use crate::catalog::{
+        CatalogBuildOptions, CatalogDocuments, CatalogKind, CurrentCatalogFile, ModelDriverCatalog,
+        ProviderRulesCatalog, ResolvedProviderConfiguration,
+    };
+    use crate::protocol::{openai_responses_adapter, CodecRegistry};
+    use crate::provider::claude_messages_adapter;
+    use crate::routing::{RouteModelKind, RoutingTrace, ScoreBreakdown, UserFacingRouteSummary};
+    use buckyos_api::{
+        AiMessage, AiRole, EmbeddingTextRequest, LlmChatInvokeRequest, VideoGenerateRequest,
+        VideoOutputSpec,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn catalog() -> CatalogSnapshot {
+        catalog_with_provider_variant(true)
+    }
+
+    fn catalog_with_provider_variant(include_provider_variant: bool) -> CatalogSnapshot {
+        let model: ModelDriverCatalog = serde_json::from_value(json!({
+            "format": "buckyos.aicc.model-driver-catalog",
+            "schema_version": 2,
+            "schema_revision": 0,
+            "model_driver_id": "openai",
+            "revision_seq": 7,
+            "specs": [{"id":"gpt-test","direct_only":true}],
+            "models": [{
+                "id": "gpt-5.2", "api_types": ["llm", "embedding.text"],
+                "llm": {"spec":"gpt-test","effort":"high","default_effort":"high","supported_efforts":["high"],"stability":"stable","weight":1.0},
+                "canonical_fields": {"/temperature": {"converter": "openai_tts_voice_v1", "fallback": {"action": "reject"}}}
+            }]
+        })).unwrap();
+        let mut rules_json = json!({
+            "format": "buckyos.aicc.provider-rules-catalog",
+            "schema_version": 1,
+            "schema_revision": 0,
+            "revision_seq": 9,
+            "provider_profile_id": "openai",
+            "models": [{
+                "id": "gpt-5.2",
+                "operations": {
+                    "llm": "responses.create",
+                    "chat.completions.create": "responses.create",
+                    "embedding.text": "embeddings.create"
+                },
+                "provider_options": {
+                    "reasoning": {"effort": "minimal"},
+                    "service_tier": "auto",
+                    "stream": false
+                },
+                "canonical_fields": {
+                    "/temperature": {
+                        "converter": "passthrough",
+                        "fallback": {"action": "omit"}
+                    }
+                },
+                "request_rules": [
+                    {"defaults": {"temperature": 0.2, "top_p": 0.8, "max_output_tokens": 100}},
+                    {
+                        "when": {"/reasoning/effort": {"not": "none"}},
+                        "set": {"service_tier": "priority"},
+                        "remove": ["/temperature", "/top_p"]
+                    }
+                ]
+            }],
+            "model_pricing": [{
+                "id": "gpt-5.2",
+                "pricing": {"currency": "USD", "unit": "request", "amount": 0.01}
+            }],
+            "patterns": [],
+            "variants": [{
+                "model_driver": "openai",
+                "variant": "reasoning-high",
+                "match": {"provider_model_id": "gpt-*", "variant": "reasoning-high"},
+                "provider_options": {"reasoning": {"effort": "high"}}
+            }]
+        });
+        if !include_provider_variant {
+            rules_json["variants"] = json!([]);
+        }
+        let rules: ProviderRulesCatalog = serde_json::from_value(rules_json).unwrap();
+        CatalogSnapshot::build(
+            11,
+            CatalogDocuments {
+                model_drivers: vec![model],
+                provider_rules: vec![rules],
+                known_providers: Vec::new(),
+            },
+            &CatalogBuildOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn codecs() -> CodecRegistry {
+        let mut registry = CodecRegistry::default();
+        let (descriptor, codecs) = openai_responses_adapter();
+        registry.register_codecs(descriptor, codecs).unwrap();
+        registry
+    }
+
+    fn all_codecs() -> CodecRegistry {
+        use crate::protocol::{
+            doubao_media_adapter, doubao_speech_adapter, fal_queue_adapter,
+            gemini_interactions_adapter, glm_chat_adapter, glm_media_adapter, kimi_chat_adapter,
+            minimax_media_adapter, minimax_messages_adapter, openai_chat_completions_adapter,
+            openai_responses_compatible_adapters, openrouter_responses_adapter, qwen_media_adapter,
+        };
+        use crate::provider::register_sn_openai_adapter;
+
+        let mut registry = CodecRegistry::default();
+        let (responses, registration) = openai_responses_adapter();
+        registry.register_codecs(responses, registration).unwrap();
+        for (descriptor, registration) in [doubao_media_adapter(), qwen_media_adapter()] {
+            registry.register_codecs(descriptor, registration).unwrap();
+        }
+        let (speech, registration) = doubao_speech_adapter();
+        registry.register_codecs(speech, registration).unwrap();
+        for (descriptor, registration) in openai_responses_compatible_adapters().unwrap() {
+            registry.register_derived(descriptor, registration).unwrap();
+        }
+        register_sn_openai_adapter(&mut registry).unwrap();
+
+        let (claude, registration) = claude_messages_adapter();
+        registry.register_codecs(claude, registration).unwrap();
+        let (media, registration) = minimax_media_adapter();
+        registry.register_codecs(media, registration).unwrap();
+        let (minimax, registration) = minimax_messages_adapter();
+        registry.register_derived(minimax, registration).unwrap();
+
+        let (gemini, registration) = gemini_interactions_adapter();
+        registry.register_codecs(gemini, registration).unwrap();
+        let (chat, registration) = openai_chat_completions_adapter();
+        registry.register_codecs(chat, registration).unwrap();
+        let (media, registration) = glm_media_adapter();
+        registry.register_codecs(media, registration).unwrap();
+        for (descriptor, registration) in [
+            openrouter_responses_adapter(),
+            kimi_chat_adapter(),
+            glm_chat_adapter(),
+        ] {
+            registry.register_derived(descriptor, registration).unwrap();
+        }
+        let (typesafe, registration) = crate::protocol::typesafe::typesafe_adapter();
+        registry.register_codecs(typesafe, registration).unwrap();
+        let (fal, registration) = fal_queue_adapter();
+        registry.register_codecs(fal, registration).unwrap();
+        registry
+    }
+
+    fn metadata_snapshot() -> CatalogSnapshot {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("driver_metadata");
+        let mut files = Vec::new();
+        for (directory, kind) in [
+            ("models", CatalogKind::ModelDriver),
+            ("providers", CatalogKind::ProviderRules),
+            ("known-providers", CatalogKind::KnownProvider),
+        ] {
+            let mut paths = std::fs::read_dir(root.join(directory))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "json")
+                })
+                .collect::<Vec<_>>();
+            paths.sort();
+            files.extend(paths.into_iter().map(|path| CurrentCatalogFile {
+                kind,
+                contents: std::fs::read(path).unwrap(),
+            }));
+        }
+        CatalogSnapshot::from_current_files(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            files,
+            &CatalogBuildOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn built_in_rules() -> Vec<(ResolvedProviderConfiguration, ProviderRulesCatalog)> {
+        let catalog = metadata_snapshot();
+        catalog
+            .known_providers()
+            .map(|known_provider| {
+                let configuration = catalog
+                    .resolve_provider_configuration(&known_provider.provider_profile_id)
+                    .unwrap();
+                let rules = catalog
+                    .provider_rules(&configuration.provider_rules_id)
+                    .unwrap()
+                    .clone();
+                (configuration, rules)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vendor_models_that_reject_sampling_parameters_declare_remove_rules() {
+        // Claude 5.5 rejects `temperature`, `top_p` and `top_k` with a 400
+        // ("`temperature` is deprecated for this model"). Only the provider rules can express
+        // that: the values have to be removed from the normalized options so the lowering step
+        // drops them from the canonical request. Every channel that exposes the model has to
+        // declare it, so both the direct and the aggregate profile are asserted here.
+        let catalog = metadata_snapshot();
+        let context = MatchContext::from([
+            ("api_type".into(), Value::String("llm".into())),
+            ("operation".into(), Value::String("messages.create".into())),
+        ]);
+        for (profile, model) in [
+            ("claude", "claude-sonnet-5-5"),
+            ("claude", "claude-haiku-5-5"),
+            ("claude", "claude-opus-5-5"),
+            ("openrouter", "anthropic/claude-sonnet-5.5"),
+            ("openrouter", "anthropic/claude-haiku-5.5"),
+            ("openrouter", "anthropic/claude-opus-5.5"),
+        ] {
+            let rule = catalog
+                .resolve_provider_rule(profile, model, &context)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{profile}/{model} must resolve a provider rule"));
+            let removed = rule
+                .matching_request_rules(&context)
+                .iter()
+                .flat_map(|rule| rule.remove.iter().map(String::as_str))
+                .collect::<Vec<_>>();
+            for pointer in ["/temperature", "/top_p", "/top_k"] {
+                assert!(
+                    removed.contains(&pointer),
+                    "{profile}/{model} must remove {pointer}, got {removed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_without_the_constraint_keep_their_sampling_parameters() {
+        let catalog = metadata_snapshot();
+        let context = MatchContext::from([
+            ("api_type".into(), Value::String("llm".into())),
+            ("operation".into(), Value::String("messages.create".into())),
+        ]);
+        for (profile, model) in [
+            ("claude", "claude-opus-4-6"),
+            ("openrouter", "anthropic/claude-opus-4.6"),
+        ] {
+            let rule = catalog
+                .resolve_provider_rule(profile, model, &context)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{profile}/{model} must resolve a provider rule"));
+            let removed = rule
+                .matching_request_rules(&context)
+                .iter()
+                .flat_map(|rule| rule.remove.iter())
+                .collect::<Vec<_>>();
+            assert!(
+                !removed
+                    .iter()
+                    .any(|pointer| pointer.starts_with("/temperature")
+                        || pointer.starts_with("/top_p")
+                        || pointer.starts_with("/top_k")),
+                "{profile}/{model} must keep sampling parameters, got {removed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_normalized_keys_are_dropped_from_the_canonical_request() {
+        // A remove rule edits the normalized options only. The lowering step has to carry that
+        // deletion over to the canonical request, otherwise the typed request keeps the value
+        // and the codec sends a parameter the provider refuses.
+        let canonical = json!({"temperature": 0.4, "top_p": 0.9, "max_output_tokens": 64});
+        let normalized = json!({"max_output_tokens": 64});
+        let rewritten =
+            rewrite_canonical_options(&canonical, &normalized, &["temperature", "top_p"]).unwrap();
+        assert!(rewritten.get("temperature").is_none());
+        assert!(rewritten.get("top_p").is_none());
+        assert_eq!(rewritten["max_output_tokens"], json!(64));
+    }
+
+    fn api_type_from_mapping_key(key: &str) -> ApiType {
+        match key {
+            "chat.completions.create" => ApiType::Llm,
+            "images.generate" => ApiType::ImageTextToImage,
+            key => serde_json::from_value(Value::String(key.into())).unwrap(),
+        }
+    }
+
+    fn decision(exact_model: &str) -> RouteDecision {
+        let selected = SelectedRoute {
+            exact_model: exact_model.into(),
+            model_uid: "openai:gpt-5.2:openai-responses:reasoning-high".into(),
+            provider_instance_name: "openai-primary".into(),
+            provider_profile_id: "openai".into(),
+            protocol_adapter_id: "openai-responses".into(),
+            model_driver_id: "openai".into(),
+            origin_model_id: "gpt-5.2".into(),
+            provider_model_id: "gpt-5.2".into(),
+            operation: "responses.create".into(),
+            inventory_revision: "inventory-3".into(),
+            enabled_capabilities: vec!["reasoning".into()],
+            disabled_capabilities: Vec::new(),
+            estimated_cost: Some(Money::new(0.01, "USD")),
+            final_score: 1.0,
+        };
+        RouteDecision {
+            selected,
+            fallback_candidates: Vec::new(),
+            trace: RoutingTrace {
+                trace_id: "trace-1".into(),
+                request_id: "request-1".into(),
+                api_type: "llm".into(),
+                requested_model: exact_model.into(),
+                requested_model_type: RouteModelKind::Exact,
+                resolved_logical_path: None,
+                selected_exact_model: exact_model.into(),
+                selected_provider_instance_name: "openai-primary".into(),
+                candidate_count_before_filter: 1,
+                candidate_count_after_filter: 1,
+                filtered_candidates: Vec::new(),
+                ranked_candidates: Vec::new(),
+                fallback_applied: false,
+                fallback_chain: Vec::new(),
+                scheduler_profile: "balanced".into(),
+                score_breakdown: ScoreBreakdown {
+                    cost: 0.0,
+                    quality: 0.0,
+                    preference: 0.0,
+                    cache: 0.0,
+                    local: 0.0,
+                    final_score: 1.0,
+                },
+                estimated_cost: Some(Money::new(0.01, "USD")),
+                runtime_failover_count: 0,
+                warnings: Vec::new(),
+                logical_item_sources: Vec::new(),
+                logical_admission: Vec::new(),
+                logical_expansion: Vec::new(),
+                disabled_capabilities: Vec::new(),
+                user_summary: UserFacingRouteSummary {
+                    display_name: "gpt-5.2".into(),
+                    model_family: "openai".into(),
+                    provider_origin: "openai".into(),
+                    reason_short: "selected".into(),
+                    was_fallback: false,
+                    was_failover: false,
+                },
+            },
+        }
+    }
+
+    fn video_decision() -> RouteDecision {
+        let mut route = decision("sora-2-pro@openai-main");
+        route.selected.exact_model = "sora-2-pro@openai-main".into();
+        route.selected.model_uid = "openai:sora-2-pro:openai-responses".into();
+        route.selected.provider_instance_name = "openai-main".into();
+        route.selected.provider_model_id = "sora-2-pro".into();
+        route.selected.origin_model_id = "sora-2-pro".into();
+        route.selected.operation = "videos.create".into();
+        route.selected.enabled_capabilities = Vec::new();
+        route.trace.api_type = "video.generate".into();
+        route.trace.requested_model = "sora-2-pro@openai-main".into();
+        route.trace.selected_exact_model = "sora-2-pro@openai-main".into();
+        route.trace.selected_provider_instance_name = "openai-main".into();
+        route.trace.user_summary.display_name = "sora-2-pro@openai-main".into();
+        route
+    }
+
+    fn target(secret: &str) -> ProviderCallTarget {
+        ProviderCallTarget {
+            provider_rules_id: Some("openai".into()),
+            use_server_defaults: false,
+            base_url: "https://api.openai.test/v1".into(),
+            operation_base_urls: BTreeMap::new(),
+            credential: ResolvedCredential::bearer("secret://openai/main", secret).unwrap(),
+            credential_reference: "secret://openai/main".into(),
+            credential_header_name: None,
+            limits: CodecLimits {
+                request_timeout: Duration::from_secs(30),
+                max_request_bytes: 1024 * 1024,
+                max_response_bytes: 1024 * 1024,
+            },
+            pricing: None,
+            match_dimensions: MatchContext::new(),
+            video_contract: None,
+            video_facts: VideoMaterialFacts::new(),
+        }
+    }
+
+    fn call() -> AiccCall {
+        let mut request = LlmChatInvokeRequest::new(
+            "gpt-5.2:reasoning-high@openai-primary",
+            vec![AiMessage::text(AiRole::User, "hello")],
+        );
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.9);
+        request.max_output_tokens = Some(200);
+        AiccCall::ChatCompletionsCreate(request)
+    }
+
+    #[test]
+    fn issue666_server_default_base_call_does_not_inject_reasoning() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let mut call = call();
+        let AiccCall::ChatCompletionsCreate(request) = &mut call else {
+            unreachable!()
+        };
+        request.exact_model = "gpt-5.2@openai-primary".into();
+        let mut route = decision("gpt-5.2@openai-primary");
+        route.selected.model_uid = "openai:gpt-5.2:openai-responses".into();
+        let mut destination = target("test-secret");
+        destination.use_server_defaults = true;
+        let lowered = CallResolver::new(&catalog, &codecs)
+            .lower(&route, &call, destination)
+            .unwrap();
+        assert!(lowered.variant.is_none());
+        assert!(!lowered.input.resolved_parameters.contains_key("reasoning"));
+        assert!(!lowered.input.resolved_parameters.contains_key("thinking"));
+        assert!(!lowered
+            .input
+            .resolved_parameters
+            .contains_key("reasoning_effort"));
+        let wire = codecs
+            .encode(
+                "openai-responses",
+                &lowered.operation,
+                lowered.api_type,
+                &lowered.input,
+                &lowered.context,
+            )
+            .unwrap();
+        let crate::protocol::HttpBody::Json(body) = wire.body else {
+            panic!("expected JSON")
+        };
+        for key in ["reasoning", "thinking", "reasoning_effort"] {
+            assert!(body.get(key).is_none(), "{body}");
+        }
+    }
+
+    #[test]
+    fn golden_variant_lowering_obeys_operation_and_parameter_precedence() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let call = call();
+        let lowered = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("credential-secret"),
+            )
+            .unwrap();
+
+        assert_eq!(lowered.operation, "responses.create");
+        assert_eq!(lowered.execution_mode, ExecutionMode::Immediate);
+        assert_eq!(lowered.variant.as_deref(), Some("reasoning-high"));
+        assert_eq!(lowered.credential_reference, "secret://openai/main");
+        assert_eq!(lowered.credential_header_name, None);
+        assert_eq!(
+            lowered.input.resolved_parameters,
+            BTreeMap::from([
+                ("provider_model_id".into(), json!("gpt-5.2")),
+                ("reasoning".into(), json!({"effort": "high"})),
+                ("service_tier".into(), json!("priority")),
+                ("web_search".into(), json!(false)),
+            ])
+        );
+        let AiccCall::ChatCompletionsCreate(rewritten) = &lowered.input.canonical_request else {
+            panic!("expected chat request")
+        };
+        assert_eq!(rewritten.temperature, None);
+        assert_eq!(rewritten.top_p, None);
+        assert_eq!(rewritten.max_output_tokens, Some(200));
+        assert_eq!(lowered.pricing.source, PricingSource::ProviderRules);
+        assert_eq!(lowered.pricing.matched_amount, Some(0.01));
+        assert_eq!(lowered.revisions.catalog_target_seq, 11);
+        assert_eq!(
+            lowered.context.limits.request_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            lowered.context.state_coordinate,
+            buckyos_api::ProviderStateCoordinate {
+                provider_profile_id: "openai".to_string(),
+                adapter_type: "openai-responses".to_string(),
+                origin_provider: "openai".to_string(),
+                origin_model: "gpt-5.2".to_string(),
+            }
+        );
+        let golden = serde_json::to_value(lowered.deterministic_view()).unwrap();
+        assert_eq!(golden["operation"], "responses.create");
+        assert_eq!(golden["execution_mode"], "immediate");
+        assert_eq!(golden["credential_kind"], "bearer");
+        assert!(!golden.to_string().contains("credential-secret"));
+    }
+
+    #[test]
+    fn custom_provider_reasoning_variants_lower_to_protocol_options() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        for (model_id, origin, effort) in [
+            ("gpt-6.1-sol", "gpt-6.1-sol", "medium"),
+            ("ep-custom", "gpt-6-sol", "medium"),
+            ("gpt-6-luna", "gpt-6-luna", "none"),
+        ] {
+            let exact = format!("{model_id}:reasoning-{effort}@custom-provider");
+            let mut route = decision(&exact);
+            route.selected.provider_instance_name = "custom-provider".into();
+            route.selected.provider_profile_id = "custom".into();
+            route.selected.provider_model_id = model_id.into();
+            route.selected.origin_model_id = origin.into();
+            let mut target = target("test-secret");
+            assert!(matches!(
+                resolver.resolve_variant(None, &route.selected, Some(&format!("reasoning-{effort}")), &MatchContext::new()),
+                Err(CallLoweringError::MissingProviderVariant { .. })
+            ));
+            target.provider_rules_id = Some("openai".into());
+            let mut request =
+                LlmChatInvokeRequest::new(exact, vec![AiMessage::text(AiRole::User, "hello")]);
+            request.temperature = Some(0.7);
+            let lowered = resolver
+                .lower(&route, &AiccCall::ChatCompletionsCreate(request), target)
+                .unwrap();
+            assert_eq!(lowered.provider_model_id, model_id);
+            assert_eq!(
+                lowered.input.resolved_parameters["reasoning"],
+                json!({"effort": effort})
+            );
+            assert!(lowered.revisions.provider_rules_revision_seq.is_some());
+            let AiccCall::ChatCompletionsCreate(request) = &lowered.input.canonical_request else {
+                panic!("expected chat request");
+            };
+            assert_eq!(request.temperature, if effort == "none" { Some(0.7) } else { None });
+            let encoded = codecs
+                .encode(
+                    "openai-responses",
+                    "responses.create",
+                    ApiType::Llm,
+                    &lowered.input,
+                    &lowered.context,
+                )
+                .unwrap();
+            let crate::protocol::HttpBody::Json(body) = encoded.body else {
+                panic!("expected JSON body");
+            };
+            assert_eq!(body["model"], model_id);
+            assert_eq!(body["reasoning"]["effort"], effort);
+        }
+    }
+
+    #[test]
+    fn provider_canonical_mapping_overrides_model_default_during_lowering() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let mut call = call();
+        let AiccCall::ChatCompletionsCreate(request) = &mut call else {
+            unreachable!()
+        };
+        request.temperature = Some(0.5);
+        let lowered = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("credential-secret"),
+            )
+            .unwrap();
+        assert_eq!(
+            lowered.input.resolved_parameters.get("provider_model_id"),
+            Some(&json!("gpt-5.2"))
+        );
+    }
+
+    #[test]
+    fn default_output_cap_is_clamped_to_model_and_never_overrides() {
+        let keys = &["max_output_tokens"];
+        let mut normalized = json!({});
+        fill_default_max_output_tokens(&mut normalized, keys, 32_000, Some(8_192));
+        assert_eq!(normalized["max_output_tokens"], 8_192);
+
+        let mut normalized = json!({});
+        fill_default_max_output_tokens(&mut normalized, keys, 32_000, None);
+        assert_eq!(normalized["max_output_tokens"], 32_000);
+
+        let mut normalized = json!({"max_output_tokens": 100});
+        fill_default_max_output_tokens(&mut normalized, keys, 32_000, Some(8_192));
+        assert_eq!(normalized["max_output_tokens"], 100);
+
+        let mut normalized = json!({});
+        fill_default_max_output_tokens(&mut normalized, &["temperature"], 32_000, None);
+        assert_eq!(normalized, json!({}));
+    }
+
+    #[test]
+    fn video_lowering_plans_exact_sora_size_and_rejects_unsupported_fps() {
+        let catalog = metadata_snapshot();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let mut request = VideoGenerateRequest::new(
+            "sora-2-pro@openai-main",
+            Some("stick figure exercise".to_string()),
+        );
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(8.0),
+            aspect_ratio: Some("16:9".to_string()),
+            ..Default::default()
+        });
+        let mut video_target = target("credential-secret");
+        video_target.video_contract = Some(crate::video::test_support::model_contract(
+            "openai",
+            "sora-2-pro",
+        ));
+        let lowered = resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target.clone(),
+            )
+            .unwrap();
+        assert_eq!(lowered.operation, "videos.create");
+        assert_eq!(lowered.execution_mode, ExecutionMode::NativeTask);
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.duration_seconds, Some(8.0));
+        assert_eq!(
+            plan.size,
+            Some(buckyos_api::VideoExactSize {
+                width: 1280,
+                height: 720
+            })
+        );
+        assert!(lowered.input.resolved_parameters.get("seconds").is_none());
+
+        // The old converter rounded 1s up to 4s and dropped fps; both are now refused.
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(1.0),
+            ..Default::default()
+        });
+        let error = resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&error, CallLoweringError::Video(error) if error.code == AiccErrorCode::UnsupportedOperation)
+        );
+        request.output = Some(VideoOutputSpec {
+            fps: Some(24.0),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request.clone()),
+                video_target,
+            )
+            .is_err());
+        assert!(resolver
+            .lower(
+                &video_decision(),
+                &AiccCall::VideoGenerate(request),
+                target("credential-secret"),
+            )
+            .is_err());
+    }
+
+    fn openrouter_video_call(model: &str, origin: &str) -> (RouteDecision, ProviderCallTarget) {
+        let exact = format!("{model}@openrouter-main");
+        let mut route = decision(&exact);
+        route.selected.model_uid = format!("minimax:{origin}:openrouter-responses");
+        route.selected.provider_instance_name = "openrouter-main".into();
+        route.selected.provider_profile_id = "openrouter".into();
+        route.selected.protocol_adapter_id = "openrouter-responses".into();
+        route.selected.model_driver_id = "minimax".into();
+        route.selected.origin_model_id = origin.into();
+        route.selected.provider_model_id = model.into();
+        route.selected.operation = "videos.create".into();
+        route.selected.enabled_capabilities = Vec::new();
+        route.trace.api_type = "video.generate".into();
+        route.trace.selected_provider_instance_name = "openrouter-main".into();
+        let mut target = target("sk-or");
+        target.provider_rules_id = Some("openrouter".into());
+        target.base_url = "https://openrouter.ai/api/v1".into();
+        target.video_contract = Some(crate::video::test_support::openrouter_contract(model));
+        (route, target)
+    }
+
+    /// OpenRouter's `pricing_skus` as discovery turns them into a price.
+    fn openrouter_video_pricing(
+        base: f64,
+        resolutions: &[(&str, f64)],
+        reference_image: Option<f64>,
+    ) -> ResolvedPricing {
+        let rule = |resolution: &str, amount: f64| {
+            serde_json::from_value::<crate::catalog::PricingRule>(json!({
+                "when": {"/video/resolution": resolution},
+                "amount": amount,
+                "unit": "video_second"
+            }))
+            .unwrap()
+        };
+        let mut pricing = serde_json::from_value::<Pricing>(json!({
+            "currency": "USD",
+            "unit": "video_second",
+            "amount": base
+        }))
+        .unwrap();
+        pricing.rules = resolutions
+            .iter()
+            .map(|(resolution, amount)| rule(resolution, *amount))
+            .collect();
+        pricing.addons = reference_image
+            .map(|amount| crate::catalog::PricingAddon {
+                unit: crate::catalog::PricingUnit::ReferenceImage,
+                amount,
+            })
+            .into_iter()
+            .collect();
+        ResolvedPricing {
+            source: PricingSource::Discovery,
+            pricing: Some(pricing),
+            matched_amount: None,
+            estimated_cost: None,
+        }
+    }
+
+    #[test]
+    fn openrouter_h3_lowering_plans_the_channel_contract_and_prices_by_resolution() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+
+        // H3-Max at 480p: the per-resolution SKU wins over the base price.
+        let (route, mut target) = openrouter_video_call("minimax/hailuo-3-max", "MiniMax-H3-Max");
+        target.pricing = Some(openrouter_video_pricing(
+            0.08,
+            &[("480p", 0.05), ("768p", 0.08)],
+            None,
+        ));
+        let mut request = VideoGenerateRequest::new(
+            "minimax/hailuo-3-max@openrouter-main",
+            Some("a paper boat drifting down a gutter".to_string()),
+        );
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(5.0),
+            size: Some(buckyos_api::VideoSize::short_edge(480)),
+            ..Default::default()
+        });
+        let lowered = resolver
+            .lower(
+                &route,
+                &AiccCall::VideoGenerate(request.clone()),
+                target.clone(),
+            )
+            .unwrap();
+        assert_eq!(lowered.operation, "videos.create");
+        assert_eq!(lowered.execution_mode, ExecutionMode::NativeTask);
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.resolution.as_deref(), Some("480p"));
+        assert_eq!(plan.duration_seconds, Some(5.0));
+        assert_eq!(lowered.pricing.matched_amount, Some(0.05));
+        let pinned = crate::execution::PinnedPricingSnapshot::from_pricing(
+            lowered.pricing.pricing.as_ref().unwrap(),
+            lowered.pricing.matched_amount,
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .unwrap();
+        let usage = buckyos_api::AiUsage {
+            video_seconds: Some(5.0),
+            reference_images: Some(0),
+            ..Default::default()
+        };
+        assert!((pinned.completion_cost(&usage).unwrap().amount - 0.25).abs() < 1e-9);
+
+        // H3-Max cannot generate sound and has no 1080p tier.
+        request.output = Some(VideoOutputSpec {
+            audio: Some(buckyos_api::VideoAudioMode::Generate),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(
+                &route,
+                &AiccCall::VideoGenerate(request.clone()),
+                target.clone()
+            )
+            .is_err());
+        request.output = Some(VideoOutputSpec {
+            size: Some(buckyos_api::VideoSize::short_edge(1080)),
+            ..Default::default()
+        });
+        assert!(resolver
+            .lower(&route, &AiccCall::VideoGenerate(request), target)
+            .is_err());
+
+        // H3 at 2K with one reference image: 0.13/s for 6s plus 0.04 per image.
+        let (route, mut target) = openrouter_video_call("minimax/hailuo-3", "MiniMax-H3");
+        target.pricing = Some(openrouter_video_pricing(0.13, &[], Some(0.04)));
+        let mut request = VideoGenerateRequest::new(
+            "minimax/hailuo-3@openrouter-main",
+            Some("the cat from @{cat} jumps onto the sofa".to_string()),
+        );
+        request.conditions = vec![buckyos_api::VideoCondition::ReferenceImage {
+            id: "cat".into(),
+            resource: ResourceRef::url("https://example.test/cat.png".to_string(), None),
+        }];
+        request.output = Some(VideoOutputSpec {
+            duration_seconds: Some(6.0),
+            ..Default::default()
+        });
+        let mut target_with_facts = target.clone();
+        target_with_facts.video_facts = VideoMaterialFacts::from([(
+            "cat".to_string(),
+            crate::video::test_support::image_facts(1024, 1024),
+        )]);
+        let lowered = resolver
+            .lower(&route, &AiccCall::VideoGenerate(request), target_with_facts)
+            .unwrap();
+        let plan =
+            crate::video::VideoPlan::from_parameters(&lowered.input.resolved_parameters).unwrap();
+        assert_eq!(plan.resolution.as_deref(), Some("2K"));
+        assert_eq!(
+            plan.submitted_prompt.as_deref(),
+            Some("the cat from reference image 1 jumps onto the sofa")
+        );
+        assert_eq!(lowered.pricing.matched_amount, None);
+        let pinned = crate::execution::PinnedPricingSnapshot::from_pricing(
+            lowered.pricing.pricing.as_ref().unwrap(),
+            lowered.pricing.matched_amount,
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .unwrap();
+        let usage = buckyos_api::AiUsage {
+            video_seconds: Some(6.0),
+            reference_images: Some(1),
+            ..Default::default()
+        };
+        assert!((pinned.completion_cost(&usage).unwrap().amount - 0.82).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canonical_provider_options_survive_canonical_key_filtering() {
+        let mut canonical = json!({
+            "text": "hello",
+            "voice": {"language": "zh-CN"}
+        });
+        let mut normalized = json!({});
+        let mappings = BTreeMap::from([(
+            "/voice".to_owned(),
+            CanonicalFieldMapping {
+                converter: CanonicalFieldConverter::GlmTtsVoiceV1,
+                fallback: CanonicalFallback::Default { value: json!({}) },
+            },
+        )]);
+        let provider_options =
+            apply_canonical_mappings(&mut canonical, &mut normalized, &mappings).unwrap();
+        merge_user_options(&mut normalized, &canonical, &["voice", "speed", "output"]);
+
+        let parameters = provider_parameters(
+            &normalized,
+            &["voice", "speed", "output"],
+            &provider_options,
+        );
+
+        assert_eq!(parameters.get("voice"), Some(&json!("tongtong")));
+    }
+
+    #[test]
+    fn minimax_voice_hint_it_cannot_honor_falls_back_to_default_voice() {
+        let mut canonical = json!({"text": "hello", "voice": {"gender": "female"}});
+        let mut normalized = json!({});
+        let mappings = BTreeMap::from([(
+            "/voice".to_owned(),
+            CanonicalFieldMapping {
+                converter: CanonicalFieldConverter::MinimaxTtsVoiceV1,
+                fallback: CanonicalFallback::Default { value: json!({}) },
+            },
+        )]);
+        let provider_options =
+            apply_canonical_mappings(&mut canonical, &mut normalized, &mappings).unwrap();
+        assert_eq!(
+            provider_options.get("voice_setting"),
+            Some(&json!({"voice_id": "male-qn-qingse"}))
+        );
+    }
+
+    #[test]
+    fn stream_mode_is_lowered_to_internal_wire_parameter() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let mut call = call();
+        let AiccCall::ChatCompletionsCreate(request) = &mut call else {
+            unreachable!()
+        };
+        request.execution_mode = AiccExecutionMode::Stream;
+
+        let lowered = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("secret"),
+            )
+            .unwrap();
+
+        assert_eq!(lowered.execution_mode, ExecutionMode::Stream);
+        assert_eq!(
+            lowered.input.resolved_parameters.get("stream"),
+            Some(&Value::Bool(true))
+        );
+        let canonical = serialize_call(&lowered.input.canonical_request).unwrap();
+        assert_eq!(canonical["execution_mode"], "stream");
+        assert!(canonical.get("stream").is_none());
+        assert_eq!(
+            serde_json::to_value(lowered.deterministic_view()).unwrap()["execution_mode"],
+            "stream"
+        );
+    }
+
+    #[test]
+    fn provider_wire_stream_parameter_is_not_a_canonical_input() {
+        let mut canonical = serialize_call(&call()).unwrap();
+        canonical["stream"] = Value::Bool(true);
+        let error =
+            AiccCall::from_method_and_params("chat.completions.create", canonical).unwrap_err();
+        assert!(error.to_string().contains("unknown field `stream`"));
+    }
+
+    #[test]
+    fn unsupported_execution_mode_fails_during_lowering() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let mut request =
+            EmbeddingTextRequest::new("gpt-5.2:reasoning-high@openai-primary", Vec::new());
+        request.execution_mode = AiccExecutionMode::Stream;
+        let call = AiccCall::EmbeddingText(request);
+        let mut route = decision(call_exact_model(&call).unwrap());
+        route.selected.operation = "embeddings.create".into();
+
+        let error = resolver.lower(&route, &call, target("secret")).unwrap_err();
+        assert_eq!(error.code(), AiccErrorCode::UnsupportedExecutionMode);
+        assert!(matches!(
+            error,
+            CallLoweringError::UnsupportedExecutionMode {
+                ref adapter_id,
+                ref operation,
+                ref api_type,
+                ref execution_mode,
+            } if adapter_id == "openai-responses"
+                && operation == "embeddings.create"
+                && api_type == "embedding.text"
+                && execution_mode == "stream"
+        ));
+    }
+
+    #[test]
+    fn public_immediate_mode_uses_an_internal_native_task_for_native_only_operations() {
+        assert_eq!(
+            internal_execution_mode(
+                ExecutionMode::Immediate,
+                &BTreeSet::from([ExecutionMode::NativeTask]),
+            ),
+            Some(ExecutionMode::NativeTask)
+        );
+        assert_eq!(
+            internal_execution_mode(
+                ExecutionMode::Stream,
+                &BTreeSet::from([ExecutionMode::NativeTask]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn identical_inputs_produce_identical_safe_golden_output() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let call = call();
+        let route = decision(call_exact_model(&call).unwrap());
+        let first = resolver
+            .lower(&route, &call, target("same-secret"))
+            .unwrap();
+        let second = resolver
+            .lower(&route, &call, target("same-secret"))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(first.deterministic_view()).unwrap(),
+            serde_json::to_value(second.deterministic_view()).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_provider_variant_fails_before_protocol_execution() {
+        let catalog = catalog();
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let call = AiccCall::ChatCompletionsCreate(LlmChatInvokeRequest::new(
+            "gpt-5.2:unknown@openai-primary",
+            Vec::new(),
+        ));
+        let error = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("secret"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallLoweringError::MissingProviderVariant { .. }
+        ));
+    }
+
+    #[test]
+    fn missing_provider_variant_cannot_fall_back_to_model_parameters() {
+        let catalog = catalog_with_provider_variant(false);
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let call = call();
+        let error = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("secret"),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CallLoweringError::MissingProviderVariant { .. }
+        ));
+    }
+
+    #[test]
+    fn provider_variant_is_used_without_a_model_metadata_variant() {
+        let catalog = catalog_with_provider_variant(true);
+        let codecs = codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        let call = call();
+        let lowered = resolver
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("secret"),
+            )
+            .unwrap();
+        assert_eq!(lowered.variant.as_deref(), Some("reasoning-high"));
+        assert_eq!(
+            lowered.input.resolved_parameters.get("reasoning"),
+            Some(&json!({"effort": "high"}))
+        );
+    }
+
+    #[test]
+    fn resource_discovery_is_pointer_stable_and_debug_is_redacted() {
+        let value = json!({
+            "images": [
+                {"kind": "url", "url": "https://example.test/input.png"},
+                {"kind": "base64", "mime": "image/png", "data_base64": "sensitive-bytes"}
+            ]
+        });
+        let requirements = collect_resource_requirements(&value);
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|requirement| requirement.request_pointer.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/images/0", "/images/1"]
+        );
+        let rendered = format!("{:?}", target("credential-secret"));
+        assert!(!rendered.contains("credential-secret"));
+    }
+
+    #[test]
+    fn operation_precedence_is_method_then_api_type_then_preferred_adapter_default() {
+        let codecs = codecs();
+        let mappings = BTreeMap::from([
+            ("images.generate".into(), "images.generate".into()),
+            ("image.txt2img".into(), "responses.create".into()),
+        ]);
+        assert_eq!(
+            select_operation(
+                &codecs,
+                "openai-responses",
+                &mappings,
+                ApiType::ImageTextToImage,
+                "images.generate",
+            )
+            .unwrap(),
+            "images.generate"
+        );
+        let api_only = BTreeMap::from([("image.txt2img".into(), "responses.create".into())]);
+        assert_eq!(
+            select_operation(
+                &codecs,
+                "openai-responses",
+                &api_only,
+                ApiType::ImageTextToImage,
+                "images.generate",
+            )
+            .unwrap(),
+            "responses.create"
+        );
+        for (api_type, method, expected) in [
+            (
+                ApiType::ImageTextToImage,
+                "images.generate",
+                "images.generate",
+            ),
+            (ApiType::ImageImageToImage, "images.edit", "images.edit"),
+        ] {
+            assert_eq!(
+                select_operation(
+                    &codecs,
+                    "openai-responses",
+                    &BTreeMap::new(),
+                    api_type,
+                    method
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            select_operation(
+                &codecs,
+                "openai-responses",
+                &BTreeMap::new(),
+                ApiType::Llm,
+                "chat.completions.create",
+            )
+            .unwrap(),
+            "responses.create"
+        );
+    }
+
+    #[test]
+    fn custom_provider_lowering_has_a_default_for_every_selectable_binding() {
+        let catalog = metadata_snapshot();
+        let registry = crate::provider::builtin_provider_registry(&catalog).unwrap();
+        let codecs = registry.codecs();
+        for adapter_id in registry.custom_provider_adapter_ids() {
+            let adapter = codecs.adapter(adapter_id).unwrap();
+            for binding in adapter
+                .operations
+                .values()
+                .flat_map(|operation| &operation.bindings)
+            {
+                select_operation(
+                    &codecs,
+                    adapter_id,
+                    &BTreeMap::new(),
+                    binding.api_type,
+                    binding.api_type.typed_method(),
+                )
+                .unwrap_or_else(|error| panic!("{adapter_id}/{:?}: {error}", binding.api_type));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_multi_operation_lowering_preserves_defaults_and_overrides() {
+        let codecs = all_codecs();
+        for (adapter, api_type, expected, alternate) in [
+            (
+                "gemini-interactions",
+                ApiType::Llm,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionOcr,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionCaption,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionDetect,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VisionSegment,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::AudioSpeechRecognition,
+                "interactions.background",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VideoGenerate,
+                "models.predictLongRunning",
+                "interactions.create",
+            ),
+            (
+                "gemini-interactions",
+                ApiType::VideoExtend,
+                "models.predictLongRunning",
+                "interactions.create",
+            ),
+            (
+                "openai-responses",
+                ApiType::ImageTextToImage,
+                "images.generate",
+                "responses.create",
+            ),
+            (
+                "openai-responses",
+                ApiType::ImageImageToImage,
+                "images.edit",
+                "responses.create",
+            ),
+        ] {
+            let method = api_type.typed_method();
+            assert_eq!(
+                select_operation(&codecs, adapter, &BTreeMap::new(), api_type, method).unwrap(),
+                expected
+            );
+            let mappings = BTreeMap::from([(api_type_name(api_type).into(), alternate.into())]);
+            assert_eq!(
+                select_operation(&codecs, adapter, &mappings, api_type, method).unwrap(),
+                alternate
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_lowering_preserves_function_tools_and_route_disables() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        for (profile, adapter, model, operation, tool_type) in [
+            (
+                "openai",
+                "openai-responses",
+                "gpt-5.4",
+                "responses.create",
+                "web_search",
+            ),
+            (
+                "sn",
+                "sn-openai",
+                "gpt-5.4",
+                "responses.create",
+                "web_search",
+            ),
+            (
+                "openrouter",
+                "openrouter-responses",
+                "openai/gpt-5.4",
+                "responses.create",
+                "openrouter:web_search",
+            ),
+            (
+                "gemini",
+                "gemini-interactions",
+                "gemini-3.6-flash",
+                "interactions.create",
+                "google_search",
+            ),
+            (
+                "claude",
+                "claude-messages",
+                "claude-sonnet-5",
+                "messages.create",
+                "web_search_20250305",
+            ),
+        ] {
+            for (supported, disabled) in [(true, false), (true, true), (false, false)] {
+                for stream in [false, true] {
+                    let exact = format!("{model}@primary");
+                    let mut route = decision(&exact);
+                    route.trace.requested_model = "llm.chat".into();
+                    route.trace.requested_model_type = RouteModelKind::Logical;
+                    route.trace.resolved_logical_path = Some("llm.chat".into());
+                    route.selected.provider_instance_name = "primary".into();
+                    route.selected.provider_profile_id = profile.into();
+                    route.selected.protocol_adapter_id = adapter.into();
+                    route.selected.model_driver_id = match profile {
+                        "gemini" => "gemini",
+                        "claude" => "claude",
+                        _ => "openai",
+                    }
+                    .into();
+                    route.selected.origin_model_id = model.trim_start_matches("openai/").into();
+                    route.selected.provider_model_id = model.into();
+                    route.selected.operation = operation.into();
+                    route.selected.enabled_capabilities = if supported {
+                        vec!["web_search".into()]
+                    } else {
+                        vec![]
+                    };
+                    route.selected.disabled_capabilities = if disabled {
+                        vec!["web_search".into()]
+                    } else {
+                        vec![]
+                    };
+                    let mut request = LlmChatInvokeRequest::new(
+                        exact,
+                        vec![AiMessage::text(AiRole::User, "San Jose今天的天气如何？")],
+                    );
+                    request.max_output_tokens = Some(128);
+                    request.web_search = supported && !disabled;
+                    request.execution_mode = if stream {
+                        AiccExecutionMode::Stream
+                    } else {
+                        AiccExecutionMode::Immediate
+                    };
+                    request.tools.push(buckyos_api::AiToolSpec {
+                        tool_type: "function".into(),
+                        name: "shell".into(),
+                        description: "Execute a command".into(),
+                        args_json_schema: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+                        output_schema: None,
+                    });
+                    let mut target = target("test-secret");
+                    target.provider_rules_id = Some(profile.into());
+                    if profile == "gemini" {
+                        target.credential =
+                            crate::protocol::gemini_api_key("secret://gemini", "test-secret")
+                                .unwrap();
+                    } else if profile == "claude" {
+                        target.credential = crate::protocol::ResolvedCredential::named_header(
+                            "secret://claude",
+                            "x-api-key",
+                            "test-secret",
+                        )
+                        .unwrap();
+                    }
+                    let lowered = resolver
+                        .lower(&route, &AiccCall::ChatCompletionsCreate(request), target)
+                        .unwrap();
+                    let wire = codecs
+                        .encode(
+                            adapter,
+                            operation,
+                            ApiType::Llm,
+                            &lowered.input,
+                            &lowered.context,
+                        )
+                        .unwrap();
+                    let crate::protocol::HttpBody::Json(body) = wire.body else {
+                        panic!("expected JSON")
+                    };
+                    let tools = body["tools"].as_array().unwrap();
+                    if profile != "claude" {
+                        assert_eq!(tools[0]["type"], "function", "{adapter}");
+                    }
+                    assert_eq!(tools[0]["name"], "shell", "{adapter}");
+                    assert_eq!(
+                        tools.len(),
+                        if supported && !disabled { 2 } else { 1 },
+                        "{adapter}"
+                    );
+                    if supported && !disabled {
+                        assert_eq!(tools[1]["type"], tool_type, "{adapter}");
+                    }
+                    assert!(body.get("web_search").is_none());
+                    assert_eq!(
+                        body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                        stream
+                    );
+                }
+            }
+        }
+    }
+
+    /// Gemini grounds image generation through the same `google_search` tool it
+    /// uses for chat, but lowering only injected the resolved parameter for
+    /// `llm`, so `enabled_capabilities = ["web_search"]` never reached the codec.
+    #[test]
+    fn image_generation_lowering_honours_the_web_search_capability() {
+        let catalog = metadata_snapshot();
+        let codecs = all_codecs();
+        let resolver = CallResolver::new(&catalog, &codecs);
+        for (enabled, expected_tools) in [(true, 1), (false, 0)] {
+            let exact = "gemini-3.1-flash-image@primary".to_string();
+            let mut route = decision(&exact);
+            route.trace.requested_model = "images.generate".into();
+            route.trace.requested_model_type = RouteModelKind::Logical;
+            route.trace.resolved_logical_path = None;
+            route.selected.provider_instance_name = "primary".into();
+            route.selected.provider_profile_id = "gemini".into();
+            route.selected.protocol_adapter_id = "gemini-interactions".into();
+            route.selected.model_driver_id = "gemini".into();
+            route.selected.origin_model_id = "gemini-3.1-flash-image".into();
+            route.selected.provider_model_id = "gemini-3.1-flash-image".into();
+            route.selected.operation = "interactions.create".into();
+            route.selected.enabled_capabilities = if enabled {
+                vec!["web_search".into()]
+            } else {
+                Vec::new()
+            };
+            route.selected.disabled_capabilities = Vec::new();
+            let request = buckyos_api::TextToImageInvokeRequest::new(exact, "上海外滩今天的日出");
+            let mut target = target("test-secret");
+            target.provider_rules_id = Some("gemini".into());
+            target.credential =
+                crate::protocol::gemini_api_key("secret://gemini", "test-secret").unwrap();
+            let lowered = resolver
+                .lower(&route, &AiccCall::ImagesGenerate(request), target)
+                .unwrap();
+            let wire = codecs
+                .encode(
+                    "gemini-interactions",
+                    "interactions.create",
+                    ApiType::ImageTextToImage,
+                    &lowered.input,
+                    &lowered.context,
+                )
+                .unwrap();
+            let crate::protocol::HttpBody::Json(body) = wire.body else {
+                panic!("expected JSON")
+            };
+            let google = body
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter(|tool| {
+                            tool.get("type").and_then(Value::as_str) == Some("google_search")
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
+            assert_eq!(google, expected_tools, "web_search={enabled}");
+        }
+    }
+
+    #[test]
+    fn every_builtin_provider_operation_has_a_golden_lowering_binding() {
+        let codecs = all_codecs();
+        let providers = built_in_rules();
+        let actual_profiles = providers
+            .iter()
+            .map(|(profile, _)| profile.provider_profile_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual_profiles,
+            std::collections::BTreeSet::from([
+                "claude",
+                "deepseek",
+                "doubao",
+                "doubao-agent-plan",
+                "doubao-speech",
+                "fal",
+                "gemini",
+                "glm",
+                "kimi",
+                "minimax",
+                "openai",
+                "openrouter",
+                "qwen",
+                "sn",
+                "typesafe",
+            ])
+        );
+
+        let mut golden = Vec::new();
+        for (profile, rules) in providers {
+            let mappings = rules
+                .models
+                .iter()
+                .map(|rule| &rule.operations)
+                .chain(rules.patterns.iter().map(|rule| &rule.operations));
+            for mappings in mappings {
+                for (key, expected_operation) in mappings {
+                    let api_type = api_type_from_mapping_key(key);
+                    let actual = select_operation(
+                        &codecs,
+                        &profile.protocol_adapter_id,
+                        mappings,
+                        api_type,
+                        api_type.typed_method(),
+                    )
+                    .unwrap();
+                    assert_eq!(&actual, expected_operation);
+                    golden.push(format!(
+                        "{}|{}|{}|{}",
+                        profile.provider_profile_id,
+                        profile.protocol_adapter_id,
+                        api_type_name(api_type),
+                        actual
+                    ));
+                }
+            }
+        }
+        golden.sort();
+        golden.dedup();
+        let document = include_str!("../../../../../doc/aicc/provider_operation_bindings.md");
+        let documented = document
+            .split("<!-- BEGIN GENERATED BINDINGS -->")
+            .nth(1)
+            .and_then(|section| section.split("<!-- END GENERATED BINDINGS -->").next())
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(golden, documented);
+        assert_eq!(golden.len(), 131);
+        assert!(golden.contains(&"typesafe|typesafe-systemone|decision|systemone.evaluate".into()));
+        assert!(golden.contains(&"openai|openai-responses|llm|responses.create".into()));
+        assert!(
+            golden.contains(&"openai|openai-responses|agent.computer_use|responses.create".into())
+        );
+        assert!(golden.contains(&"claude|claude-messages|llm|messages.create".into()));
+        assert!(golden.contains(&"glm|glm-chat|vision.ocr|chat.completions.create".into()));
+        assert!(golden.contains(&"kimi|kimi-chat|vision.caption|chat.completions.create".into()));
+        assert!(golden.contains(&"deepseek|deepseek-responses|vision.ocr|responses.create".into()));
+        assert!(golden.contains(&"doubao|doubao-responses|vision.caption|responses.create".into()));
+        assert!(
+            golden.contains(&"doubao-speech|doubao-responses|audio.tts|tts.unidirectional".into())
+        );
+        assert!(
+            golden.contains(&"doubao-speech|doubao-responses|audio.asr|asr.recognize.flash".into())
+        );
+        assert!(golden
+            .contains(&"doubao-speech|doubao-responses|audio.asr|asr.recognize.submit".into()));
+        assert!(golden.contains(
+            &"doubao-agent-plan|doubao-responses|image.txt2img|ark.images.generate".into()
+        ));
+        assert!(golden
+            .contains(&"gemini|gemini-interactions|video.extend|models.predictLongRunning".into()));
+        assert!(golden.contains(&"fal|fal-queue|image.upscale|queue.submit".into()));
+        assert!(golden.contains(&"openrouter|openrouter-responses|rerank|rerank.create".into()));
+        assert!(golden
+            .contains(&"openrouter|openrouter-responses|embedding.text|embeddings.create".into()));
+        assert!(golden
+            .contains(&"minimax|minimax-messages|video.generate|video_generation.create".into()));
+        assert!(golden.contains(&"qwen|qwen-responses|llm|responses.create".into()));
+        assert!(golden.contains(&"qwen|qwen-responses|llm|chat.completions.create".into()));
+        assert!(golden.contains(&"sn|sn-openai|llm|responses.create".into()));
+        assert!(golden.contains(&"sn|sn-openai|embedding.text|embeddings.create".into()));
+        assert!(golden.contains(&"sn|sn-openai|image.txt2img|images.generate".into()));
+    }
+    #[test]
+    fn request_rewrites_cannot_override_a_selected_effort() {
+        let original = catalog();
+        let mut rules = original.provider_rules("openai").unwrap().clone();
+        rules.models[0].request_rules[1]
+            .set
+            .insert("reasoning".into(), json!({"effort":"medium"}));
+        rules.models[0].request_rules[1]
+            .set
+            .insert("enable_thinking".into(), json!(false));
+        let catalog = CatalogSnapshot::build(
+            12,
+            CatalogDocuments {
+                model_drivers: original.model_drivers().cloned().collect(),
+                provider_rules: vec![rules],
+                known_providers: vec![],
+            },
+            &Default::default(),
+        )
+        .unwrap();
+        let codecs = codecs();
+        let call = call();
+        let lowered = CallResolver::new(&catalog, &codecs)
+            .lower(
+                &decision(call_exact_model(&call).unwrap()),
+                &call,
+                target("secret"),
+            )
+            .unwrap();
+        assert_eq!(
+            lowered.input.resolved_parameters["reasoning"],
+            json!({"effort":"high"})
+        );
+        assert!(!lowered
+            .input
+            .resolved_parameters
+            .contains_key("enable_thinking"));
+    }
+}

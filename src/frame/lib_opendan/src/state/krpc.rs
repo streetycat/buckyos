@@ -1,0 +1,972 @@
+//! Agent State over kRPC: the wire form of [`AgentStateClient`] for callers
+//! that do not see the AgentRoot (tools in a container, WebUI, other apps).
+//!
+//! Both ends live here and are transport-free: [`serve_call`] dispatches one
+//! call onto any `AgentStateClient` (the service wraps it with its
+//! authentication), [`KrpcAgentStateClient`] turns the trait into calls over
+//! a [`StateTransport`]. The truth stays the AgentRoot files of the serving
+//! side; nothing is stored here.
+//!
+//! Only non-driver operations travel: reads and signed writes (`register`,
+//! `post_input`, `notebook_append`, `decide`). What a driver writes under
+//! its lease (`report_state`, `perception.append`, cursors, artifact
+//! versions) and the Agent-level locks depend on flock and stay with the
+//! processes that see the AgentRoot.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::{json, Value};
+
+use crate::error::{OpenDanError, Result};
+use crate::lock::{Acquire, Lease};
+use crate::protocol::*;
+
+use super::*;
+
+/// One call to the serving side.
+#[async_trait]
+pub trait StateTransport: Send + Sync {
+    async fn call(&self, method: &str, params: Value) -> Result<Value>;
+}
+
+/// The error of a served call as it travels (`OpenDanError::to_json`).
+pub fn error_to_wire(e: &OpenDanError) -> String {
+    let mut v = e.to_json();
+    match e {
+        OpenDanError::InputFull { session_id, pending } => {
+            v["session_id"] = json!(session_id);
+            v["pending"] = json!(pending);
+        }
+        OpenDanError::QueueMissing { session_id } => v["session_id"] = json!(session_id),
+        OpenDanError::Busy { resource, holder } => {
+            v["resource"] = json!(resource);
+            v["holder"] = json!(holder);
+        }
+        _ => {}
+    }
+    v.to_string()
+}
+
+/// The error a caller sees for a wire error (kinds a caller acts on keep
+/// their variant).
+pub fn error_from_wire(text: &str) -> OpenDanError {
+    let Some(v) = text
+        .find('{')
+        .and_then(|i| serde_json::from_str::<Value>(&text[i..]).ok())
+    else {
+        return OpenDanError::Channel(text.to_string());
+    };
+    let message = v["message"].as_str().unwrap_or(text).to_string();
+    let detail = |prefix: &str| {
+        message
+            .strip_prefix(prefix)
+            .unwrap_or(&message)
+            .to_string()
+    };
+    match v["kind"].as_str().unwrap_or_default() {
+        "invalid_argument" => OpenDanError::InvalidArgument(detail("invalid argument: ")),
+        "not_found" => OpenDanError::NotFound(detail("not found: ")),
+        "busy" => OpenDanError::Busy {
+            resource: v["resource"].as_str().unwrap_or_default().to_string(),
+            holder: v.get("holder").cloned().filter(|h| !h.is_null()),
+        },
+        "input_full" => OpenDanError::InputFull {
+            session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
+            pending: v["pending"].as_u64().unwrap_or(MAX_PENDING_INPUTS as u64) as usize,
+        },
+        "queue_missing" => OpenDanError::QueueMissing {
+            session_id: v["session_id"].as_str().unwrap_or_default().to_string(),
+        },
+        "session_finished" => OpenDanError::SessionFinished(
+            detail("session ").trim_end_matches(" is finished").to_string(),
+        ),
+        "session_id_conflict" => OpenDanError::SessionIdConflict(detail("session id conflict: ")),
+        "artifact" => OpenDanError::Artifact(detail("artifact error: ")),
+        "goal_conflict" => OpenDanError::GoalConflict(detail("goal conflict: ")),
+        "goal_budget_exhausted" => {
+            OpenDanError::GoalBudgetExhausted(detail("goal budget exhausted: "))
+        }
+        "forbidden" => OpenDanError::Forbidden(detail("forbidden: ")),
+        "notify_conflict" => OpenDanError::NotifyConflict(detail("notify conflict: ")),
+        "channel" => OpenDanError::Channel(detail("input channel error: ")),
+        _ => OpenDanError::Other(message),
+    }
+}
+
+fn arg<T: DeserializeOwned>(params: &Value, name: &str) -> Result<T> {
+    serde_json::from_value(params.get(name).cloned().unwrap_or(Value::Null))
+        .map_err(|e| OpenDanError::InvalidArgument(format!("param `{name}`: {e}")))
+}
+
+fn out<T: Serialize>(v: T) -> Result<Value> {
+    serde_json::to_value(v).map_err(|e| OpenDanError::Other(format!("encode result: {e}")))
+}
+
+/// Whether `method` changes state (a service authorizes it as a write).
+pub fn is_write(method: &str) -> bool {
+    matches!(
+        method,
+        "sessions.reserve_id"
+            | "sessions.register"
+            | "sessions.post_input"
+            | "sessions.verify"
+            | "cognition.notebook_append"
+            | "artifacts.decide"
+            | "workspaces.create"
+            | "workspaces.import"
+            | "workspaces.discover"
+            | "workspaces.check"
+            | "workspaces.update"
+            | "workspaces.archive"
+            | "workspaces.unregister"
+            | "workspaces.set_runtime_available"
+            | "runtimes.register"
+            | "runtimes.update"
+            | "runtimes.check"
+            | "runtimes.unregister"
+            | "goals.create"
+            | "goals.revise"
+            | "goals.set_status"
+            | "goals.reopen"
+            | "goals.restart"
+            | "notify.send"
+            | "notify.cancel"
+            | "notify.answer"
+            | "skills.install"
+            | "skills.remove"
+    )
+}
+
+/// Goal writes of a driver or the host: never served (they need the
+/// AgentRoot and, for the Goal State, the session lease).
+pub const GOAL_DRIVER_ONLY: &[&str] = &[
+    "goals.write_state",
+    "goals.append_activations",
+    "goals.prepare_epoch",
+    "goals.end_epoch",
+    "goals.write_schedule",
+];
+
+fn goal_caller(who: &str, params: &Value) -> Result<GoalCaller> {
+    Ok(GoalCaller {
+        principal: who.to_string(),
+        session: arg::<Option<String>>(params, "session")?,
+    })
+}
+
+/// Dispatch one Agent State call of `who` onto `agent`. `None`: not an
+/// Agent State method.
+pub async fn serve_call(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    method: &str,
+    params: &Value,
+) -> Option<Result<Value>> {
+    Some(match method {
+        "agent.info" => out(json!({
+            "agent_did": agent.agent_did(),
+            "agent_id": agent.agent_id(),
+        })),
+        "sessions.reserve_id" => match (
+            arg::<SessionKind>(params, "kind"),
+            arg::<String>(params, "key"),
+            arg::<Option<PathBuf>>(params, "parent_dir"),
+        ) {
+            (Ok(kind), Ok(key), Ok(parent)) => agent
+                .sessions()
+                .reserve_id(kind, &key, parent.as_deref())
+                .await
+                .and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "sessions.register" => match arg::<RegistryEntry>(params, "entry") {
+            Ok(entry) if entry.created_by.principal != who => Err(OpenDanError::InvalidArgument(
+                format!("entry.created_by is {}, the caller is {who}", entry.created_by.principal),
+            )),
+            Ok(entry) => agent.sessions().register(entry, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "sessions.lookup" => match arg::<String>(params, "sid") {
+            Ok(sid) => agent.sessions().lookup(&sid).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "sessions.query" => match arg::<Option<RegistryQuery>>(params, "query") {
+            Ok(q) => agent.sessions().query(&q.unwrap_or_default()).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "sessions.children_of" => match arg::<Vec<String>>(params, "parents") {
+            Ok(p) => agent.sessions().children_of(&p).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "sessions.verify" => agent.sessions().verify().await.and_then(out),
+        "sessions.post_input" => {
+            match (arg::<String>(params, "sid"), arg::<PostedInput>(params, "input")) {
+                (Ok(sid), Ok(mut input)) => {
+                    // The record is signed by the caller the service saw.
+                    input.from = who.to_string();
+                    match input.validate() {
+                        Ok(()) => agent.sessions().post_input(&sid, &input).await.and_then(out),
+                        Err(e) => Err(e),
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        "activity.active" => {
+            let limit = arg::<Option<usize>>(params, "limit").ok().flatten().unwrap_or(20);
+            match arg::<Option<String>>(params, "me") {
+                Ok(me) => {
+                    let me = match me {
+                        Some(sid) => match agent.sessions().lookup(&sid).await {
+                            Ok(e) => e,
+                            Err(e) => return Some(Err(e)),
+                        },
+                        None => None,
+                    };
+                    agent.activity().active(me.as_ref(), limit).await.and_then(out)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "perception.last_seq" => match arg::<String>(params, "sid") {
+            Ok(sid) => agent.perception().last_seq(&sid).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "cognition.recall_hints" => match arg::<RecallQuery>(params, "query") {
+            Ok(q) => agent.cognition().recall_hints(&q).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "cognition.notebook_append" => match arg::<NotebookNote>(params, "note") {
+            Ok(n) => agent.cognition().notebook_append(&n, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "artifacts.head" => match arg::<String>(params, "aid") {
+            Ok(aid) => agent.artifacts().head(&aid).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "artifacts.version" => match (arg::<String>(params, "aid"), arg::<String>(params, "ver")) {
+            (Ok(aid), Ok(ver)) => agent.artifacts().version(&aid, &ver).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "artifacts.versions" => match arg::<String>(params, "aid") {
+            Ok(aid) => agent.artifacts().versions(&aid).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "artifacts.list" => agent.artifacts().list().await.and_then(out),
+        "artifacts.decide" => {
+            match (
+                arg::<String>(params, "aid"),
+                arg::<String>(params, "ver"),
+                arg::<String>(params, "decision"),
+            ) {
+                (Ok(aid), Ok(ver), Ok(decision)) => {
+                    decide_as(agent, who, &aid, &ver, &decision).await.and_then(out)
+                }
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+            }
+        }
+        "workspaces.create" => match arg::<WorkspaceCreate>(params, "request") {
+            Ok(request) => agent.workspaces().create(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.import" => match arg::<WorkspaceImport>(params, "request") {
+            Ok(request) => agent.workspaces().import(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.discover" => match arg::<WorkspaceDiscover>(params, "request") {
+            Ok(request) => agent.workspaces().discover(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.lookup" => match arg::<String>(params, "workspace_id") {
+            Ok(id) => agent.workspaces().lookup(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.query" | "workspaces.list" => match arg::<Option<WorkspaceQuery>>(params, "query") {
+            Ok(query) => agent.workspaces().query(&query.unwrap_or_default()).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.check" => match arg::<String>(params, "workspace_id") {
+            Ok(id) => agent.workspaces().check(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "workspaces.update" => match (arg::<String>(params, "workspace_id"), arg::<WorkspaceUpdate>(params, "request")) {
+            (Ok(id), Ok(request)) => agent.workspaces().update(&id, &request, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.archive" => match (arg::<String>(params, "workspace_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.workspaces().archive(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.unregister" => match (arg::<String>(params, "workspace_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.workspaces().unregister(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.runtime_impact" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.workspaces().runtime_impact(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.list" => agent.runtimes().list().await.and_then(out),
+        "runtimes.lookup" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.runtimes().lookup(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.register" => match arg::<RuntimeRegister>(params, "request") {
+            Ok(request) => agent.runtimes().register(&request, who).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.update" => match (arg::<String>(params, "runtime_id"), arg::<RuntimeUpdate>(params, "request")) {
+            (Ok(id), Ok(request)) => agent.runtimes().update(&id, &request, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "runtimes.check" => match arg::<String>(params, "runtime_id") {
+            Ok(id) => agent.runtimes().check(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "runtimes.unregister" => match (arg::<String>(params, "runtime_id"), arg::<u64>(params, "expected_revision")) {
+            (Ok(id), Ok(revision)) => agent.runtimes().unregister(&id, revision, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "workspaces.set_runtime_available" => match (arg::<String>(params, "runtime_id"), arg::<bool>(params, "available")) {
+            (Ok(id), Ok(available)) => agent.workspaces().set_runtime_available(&id, available, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "behaviors.identity" => agent.behaviors().identity().await.and_then(out),
+        "behaviors.get" => match arg::<String>(params, "name") {
+            Ok(n) => agent.behaviors().get(&n).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "behaviors.list" => agent.behaviors().list().await.and_then(out),
+        "behaviors.revision" => agent.behaviors().revision().await.and_then(out),
+        "behaviors.cmd_skill" => match arg::<String>(params, "name") {
+            Ok(n) => agent.behaviors().cmd_skill(&n).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "skills.list" => match arg::<Option<SkillKind>>(params, "kind") {
+            Ok(kind) => agent.behaviors().skills(kind).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "skills.install" => match (
+            arg::<crate::skills::SkillPackage>(params, "package"),
+            arg::<Option<bool>>(params, "replace"),
+        ) {
+            (Ok(pkg), Ok(replace)) => agent
+                .behaviors()
+                .install_skills(&pkg, replace.unwrap_or(false), who)
+                .await
+                .and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "skills.remove" => match (arg::<SkillKind>(params, "kind"), arg::<String>(params, "name")) {
+            (Ok(kind), Ok(name)) => agent.behaviors().remove_skill(kind, &name, who).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.list" => agent.goals().list().await.and_then(out),
+        "goals.get" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().get(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "goals.revision" => match (arg::<String>(params, "goal_id"), arg::<u64>(params, "revision")) {
+            (Ok(id), Ok(rev)) => agent.goals().revision(&id, rev).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.changes" => match (arg::<String>(params, "goal_id"), arg::<Option<usize>>(params, "limit")) {
+            (Ok(id), Ok(limit)) => agent.goals().changes(&id, limit.unwrap_or(0)).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.create" => match (arg::<GoalCreate>(params, "request"), goal_caller(who, params)) {
+            (Ok(req), _) if req.extensions.contains_key(OPENDAN_EXTENSION) => Err(OpenDanError::Forbidden(
+                format!("extensions.{OPENDAN_EXTENSION} is set by the host's seeding, not over kRPC"),
+            )),
+            (Ok(req), Ok(c)) => agent.goals().create(&req, &c).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.revise" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalRevise>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (_, Ok(req), _) if req.extensions.as_ref().is_some_and(|e| e.contains_key(OPENDAN_EXTENSION)) => {
+                Err(OpenDanError::Forbidden(format!(
+                    "extensions.{OPENDAN_EXTENSION} is changed by the host's seeding, not over kRPC"
+                )))
+            }
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().revise(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.set_status" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalStatusChange>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().set_status(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.reopen" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalReopen>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().reopen(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.restart" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<GoalRestart>(params, "request"),
+            goal_caller(who, params),
+        ) {
+            (Ok(id), Ok(req), Ok(c)) => agent.goals().restart(&id, &req, &c).await.and_then(out),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+        },
+        "goals.state" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().state(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        "goals.epoch_state" => match (arg::<String>(params, "goal_id"), arg::<u64>(params, "epoch")) {
+            (Ok(id), Ok(epoch)) => agent.goals().epoch_state(&id, epoch).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.activations" => match (
+            arg::<String>(params, "goal_id"),
+            arg::<Option<ActivationQuery>>(params, "query"),
+        ) {
+            (Ok(id), Ok(q)) => agent.goals().activations(&id, &q.unwrap_or_default()).await.and_then(out),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        },
+        "goals.schedule" => match arg::<String>(params, "goal_id") {
+            Ok(id) => agent.goals().schedule(&id).await.and_then(out),
+            Err(e) => Err(e),
+        },
+        m if GOAL_DRIVER_ONLY.contains(&m) => Err(driver_only(m)),
+        m if m.starts_with("notify.") => serve_notify(agent, m, params).await,
+        _ => return None,
+    })
+}
+
+/// `notify.*` onto the host's notification service. The source of a
+/// notification is completed here, from the session it names.
+async fn serve_notify(agent: &dyn AgentStateClient, method: &str, params: &Value) -> Result<Value> {
+    let Some(notify) = agent.notifies() else {
+        return Err(crate::notify::unavailable());
+    };
+    match method {
+        "notify.send" => {
+            let mut req: crate::notify::NotifySendReq = arg(params, "request")?;
+            let mut source = req.source.take().unwrap_or_default();
+            crate::notify::complete_notify_source(agent, &mut source).await;
+            req.source = Some(source);
+            notify.send(req).await.and_then(out)
+        }
+        "notify.state" => notify.state(&arg::<String>(params, "notify_id")?).await.and_then(out),
+        "notify.list" => notify
+            .list(arg::<Option<crate::notify::NotifyListReq>>(params, "request")?.unwrap_or_default())
+            .await
+            .and_then(out),
+        "notify.cancel" => notify
+            .cancel(&arg::<String>(params, "notify_id")?, &arg::<String>(params, "reason")?)
+            .await
+            .and_then(out),
+        "notify.answer" => notify
+            .answer(
+                &arg::<String>(params, "notify_id")?,
+                arg(params, "answer")?,
+                arg(params, "via")?,
+            )
+            .await
+            .and_then(out),
+        other => Err(OpenDanError::InvalidArgument(format!("unknown method {other}"))),
+    }
+}
+
+/// accept / discard on behalf of `who`: the serving side takes the
+/// `artifact:<aid>` lock for the call.
+async fn decide_as(
+    agent: &dyn AgentStateClient,
+    who: &str,
+    aid: &str,
+    ver: &str,
+    decision: &str,
+) -> Result<DecideResult> {
+    let resource = format!("artifact:{aid}");
+    let holder = HolderInfo {
+        runner_id: crate::ids::new_runner_id(),
+        principal: who.to_string(),
+        host: Some(crate::runtime::native_host_id()),
+        pid: std::process::id(),
+        runtime_id: None,
+    };
+    match agent.locks().acquire(&resource, holder)? {
+        Acquire::Acquired(lease) => agent.artifacts().decide(&lease, aid, ver, decision).await,
+        Acquire::Busy(holder) => Err(OpenDanError::Busy {
+            resource,
+            holder: holder.and_then(|h| serde_json::to_value(h).ok()),
+        }),
+    }
+}
+
+pub const ENV_AGENT_STATE_TOKEN: &str = "OPENDAN_AGENT_STATE_TOKEN";
+
+/// kRPC transport to the service at `endpoint`. The caller's identity is
+/// its BuckyOS session token: a fixed one, or the token of the process's
+/// BuckyOS runtime read for every call (it is renewed while the process
+/// lives).
+pub struct KrpcTransport {
+    endpoint: String,
+    token: Option<String>,
+}
+
+impl KrpcTransport {
+    pub fn new(endpoint: &str, token: Option<String>) -> Self {
+        Self {
+            endpoint: endpoint.to_string(),
+            token,
+        }
+    }
+
+    async fn token(&self) -> Option<String> {
+        if self.token.is_some() {
+            return self.token.clone();
+        }
+        if let Ok(rt) = buckyos_api::get_buckyos_api_runtime() {
+            return Some(rt.get_session_token().await).filter(|t| !t.is_empty());
+        }
+        std::env::var(ENV_AGENT_STATE_TOKEN).ok().filter(|t| !t.is_empty())
+    }
+}
+
+#[async_trait]
+impl StateTransport for KrpcTransport {
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        let client = ::kRPC::kRPC::new(&self.endpoint, self.token().await);
+        client.call(method, params).await.map_err(|e| match e {
+            ::kRPC::RPCErrors::ReasonError(text) => error_from_wire(&text),
+            other => OpenDanError::Channel(format!("{}: {other}", self.endpoint)),
+        })
+    }
+}
+
+/// [`AgentStateClient`] of a process that does not see the AgentRoot.
+pub struct KrpcAgentStateClient {
+    transport: Arc<dyn StateTransport>,
+    agent_did: String,
+    agent_id: String,
+}
+
+fn driver_only(what: &str) -> OpenDanError {
+    OpenDanError::Other(format!(
+        "{what} is a driver's write under its lease: it needs the AgentRoot (files + flock) and is not served over kRPC"
+    ))
+}
+
+impl KrpcAgentStateClient {
+    pub fn new(agent_did: &str, transport: Arc<dyn StateTransport>) -> Self {
+        Self {
+            transport,
+            agent_did: agent_did.to_string(),
+            agent_id: crate::ids::agent_id_from_did(agent_did),
+        }
+    }
+
+    /// Connect and check that the service serves `agent_did`.
+    pub async fn connect(agent_did: &str, transport: Arc<dyn StateTransport>) -> Result<Self> {
+        let info = transport.call("agent.info", json!({})).await?;
+        let served = info["agent_did"].as_str().unwrap_or_default();
+        if served != agent_did {
+            return Err(OpenDanError::NotFound(format!(
+                "agent state of {agent_did}: the service serves {served}"
+            )));
+        }
+        let mut c = Self::new(agent_did, transport);
+        if let Some(id) = info["agent_id"].as_str() {
+            c.agent_id = id.to_string();
+        }
+        Ok(c)
+    }
+
+    async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        let v = self.transport.call(method, params).await?;
+        serde_json::from_value(v)
+            .map_err(|e| OpenDanError::Other(format!("{method}: unexpected result: {e}")))
+    }
+
+    /// accept / discard: the service takes the artifact lock for the call.
+    pub async fn decide(&self, aid: &str, ver: &str, decision: &str) -> Result<DecideResult> {
+        self.call("artifacts.decide", json!({ "aid": aid, "ver": ver, "decision": decision }))
+            .await
+    }
+}
+
+#[async_trait]
+impl SessionRegistry for KrpcAgentStateClient {
+    async fn reserve_id(
+        &self,
+        kind: SessionKind,
+        key: &str,
+        parent_dir: Option<&Path>,
+    ) -> Result<String> {
+        self.call(
+            "sessions.reserve_id",
+            json!({ "kind": kind, "key": key, "parent_dir": parent_dir }),
+        )
+        .await
+    }
+
+    async fn register(&self, entry: RegistryEntry, _who: &str) -> Result<RegistryEntry> {
+        self.call("sessions.register", json!({ "entry": entry })).await
+    }
+    async fn report_state(&self, _lease: &Lease, _sid: &str, _status: SessionStatus) -> Result<bool> {
+        Err(driver_only("report_state"))
+    }
+    async fn lookup(&self, sid: &str) -> Result<Option<RegistryEntry>> {
+        self.call("sessions.lookup", json!({ "sid": sid })).await
+    }
+    async fn query(&self, q: &RegistryQuery) -> Result<Vec<RegistryEntry>> {
+        self.call("sessions.query", json!({ "query": q })).await
+    }
+    async fn children_of(&self, parents: &[String]) -> Result<Vec<RegistryEntry>> {
+        self.call("sessions.children_of", json!({ "parents": parents })).await
+    }
+    async fn update_location(&self, _lease: &Lease, _sid: &str, _location: &Path) -> Result<()> {
+        Err(driver_only("update_location"))
+    }
+    async fn verify(&self) -> Result<Vec<String>> {
+        self.call("sessions.verify", json!({})).await
+    }
+    async fn post_input(&self, sid: &str, input: &PostedInput) -> Result<u64> {
+        self.call("sessions.post_input", json!({ "sid": sid, "input": input })).await
+    }
+}
+
+#[async_trait]
+impl ActivityView for KrpcAgentStateClient {
+    async fn active(&self, me: Option<&RegistryEntry>, limit: usize) -> Result<Vec<ActiveSession>> {
+        self.call(
+            "activity.active",
+            json!({ "me": me.map(|e| e.session_id.clone()), "limit": limit }),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl Perception for KrpcAgentStateClient {
+    async fn append(&self, _lease: &Lease, _sid: &str, _records: Vec<PerceptionRecord>) -> Result<u64> {
+        Err(driver_only("perception.append"))
+    }
+    async fn last_seq(&self, sid: &str) -> Result<u64> {
+        self.call("perception.last_seq", json!({ "sid": sid })).await
+    }
+}
+
+#[async_trait]
+impl Cognition for KrpcAgentStateClient {
+    async fn recall_hints(&self, q: &RecallQuery) -> Result<Vec<Hint>> {
+        self.call("cognition.recall_hints", json!({ "query": q })).await
+    }
+    async fn notebook_append(&self, note: &NotebookNote, _who: &str) -> Result<()> {
+        self.call("cognition.notebook_append", json!({ "note": note })).await
+    }
+}
+
+#[async_trait]
+impl Artifacts for KrpcAgentStateClient {
+    async fn head(&self, aid: &str) -> Result<Option<ArtifactHead>> {
+        self.call("artifacts.head", json!({ "aid": aid })).await
+    }
+    async fn version(&self, aid: &str, ver: &str) -> Result<Option<ArtifactVersion>> {
+        self.call("artifacts.version", json!({ "aid": aid, "ver": ver })).await
+    }
+    async fn versions(&self, aid: &str) -> Result<Vec<ArtifactVersion>> {
+        self.call("artifacts.versions", json!({ "aid": aid })).await
+    }
+    async fn list(&self) -> Result<Vec<ArtifactHead>> {
+        self.call("artifacts.list", json!({})).await
+    }
+    async fn register_version(
+        &self,
+        _session_lease: &Lease,
+        _aid: &str,
+        _workspace: Option<WorkspaceRef>,
+        _version: ArtifactVersion,
+    ) -> Result<()> {
+        Err(driver_only("artifacts.register_version"))
+    }
+    async fn decide(
+        &self,
+        _artifact_lease: &Lease,
+        aid: &str,
+        ver: &str,
+        decision: &str,
+    ) -> Result<DecideResult> {
+        KrpcAgentStateClient::decide(self, aid, ver, decision).await
+    }
+}
+
+impl LockManager for KrpcAgentStateClient {
+    fn acquire(&self, _resource: &str, _holder: HolderInfo) -> Result<Acquire> {
+        Err(driver_only("an Agent-level lock"))
+    }
+    fn is_held(&self, _resource: &str) -> Result<bool> {
+        Err(driver_only("an Agent-level lock"))
+    }
+}
+
+#[async_trait]
+impl BehaviorCatalog for KrpcAgentStateClient {
+    async fn identity(&self) -> Result<IdentityText> {
+        self.call("behaviors.identity", json!({})).await
+    }
+    async fn get(&self, name: &str) -> Result<Option<BehaviorConfig>> {
+        self.call("behaviors.get", json!({ "name": name })).await
+    }
+    async fn list(&self) -> Result<Vec<BehaviorMeta>> {
+        self.call("behaviors.list", json!({})).await
+    }
+    async fn revision(&self) -> Result<String> {
+        self.call("behaviors.revision", json!({})).await
+    }
+    async fn cmd_skill(&self, name: &str) -> Result<Option<String>> {
+        self.call("behaviors.cmd_skill", json!({ "name": name })).await
+    }
+    async fn skills(&self, kind: Option<SkillKind>) -> Result<Vec<SkillMeta>> {
+        self.call("skills.list", json!({ "kind": kind })).await
+    }
+    async fn install_skills(
+        &self,
+        pkg: &crate::skills::SkillPackage,
+        replace: bool,
+        _who: &str,
+    ) -> Result<crate::skills::InstallReport> {
+        self.call("skills.install", json!({ "package": pkg, "replace": replace })).await
+    }
+    async fn remove_skill(&self, kind: SkillKind, name: &str, _who: &str) -> Result<SkillMeta> {
+        self.call("skills.remove", json!({ "kind": kind, "name": name })).await
+    }
+}
+
+impl AgentStateClient for KrpcAgentStateClient {
+    fn agent_did(&self) -> &str {
+        &self.agent_did
+    }
+    fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    fn agent_root(&self) -> Option<&Path> {
+        None
+    }
+    fn sessions(&self) -> &dyn SessionRegistry {
+        self
+    }
+    fn activity(&self) -> &dyn ActivityView {
+        self
+    }
+    fn perception(&self) -> &dyn Perception {
+        self
+    }
+    fn cognition(&self) -> &dyn Cognition {
+        self
+    }
+    fn artifacts(&self) -> &dyn Artifacts {
+        self
+    }
+    fn workspaces(&self) -> &dyn WorkspaceManager {
+        self
+    }
+    fn runtimes(&self) -> &dyn RuntimeRegistry {
+        self
+    }
+    fn locks(&self) -> &dyn LockManager {
+        self
+    }
+    fn behaviors(&self) -> &dyn BehaviorCatalog {
+        self
+    }
+    fn goals(&self) -> &dyn GoalStore {
+        self
+    }
+    fn notifies(&self) -> Option<&dyn crate::notify::NotifyHost> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::notify::NotifyHost for KrpcAgentStateClient {
+    async fn send(&self, req: crate::notify::NotifySendReq) -> Result<crate::notify::NotifyView> {
+        self.call("notify.send", json!({ "request": req })).await
+    }
+    async fn state(&self, notify_id: &str) -> Result<crate::notify::NotifyView> {
+        self.call("notify.state", json!({ "notify_id": notify_id })).await
+    }
+    async fn list(&self, req: crate::notify::NotifyListReq) -> Result<Vec<crate::notify::NotifyView>> {
+        self.call("notify.list", json!({ "request": req })).await
+    }
+    async fn cancel(&self, notify_id: &str, reason: &str) -> Result<crate::notify::NotifyView> {
+        self.call("notify.cancel", json!({ "notify_id": notify_id, "reason": reason }))
+            .await
+    }
+    async fn answer(
+        &self,
+        notify_id: &str,
+        answer: crate::notify::NotifyAnswer,
+        via: Option<crate::notify::NotifyVia>,
+    ) -> Result<crate::notify::NotifyView> {
+        self.call(
+            "notify.answer",
+            json!({ "notify_id": notify_id, "answer": answer, "via": via }),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl GoalStore for KrpcAgentStateClient {
+    async fn list(&self) -> Result<Vec<GoalDefinition>> {
+        self.call("goals.list", json!({})).await
+    }
+    async fn get(&self, goal_id: &str) -> Result<Option<GoalDefinition>> {
+        self.call("goals.get", json!({ "goal_id": goal_id })).await
+    }
+    async fn revision(&self, goal_id: &str, revision: u64) -> Result<Option<GoalDefinition>> {
+        self.call("goals.revision", json!({ "goal_id": goal_id, "revision": revision })).await
+    }
+    async fn changes(&self, goal_id: &str, limit: usize) -> Result<Vec<GoalChange>> {
+        self.call("goals.changes", json!({ "goal_id": goal_id, "limit": limit })).await
+    }
+    async fn create(&self, req: &GoalCreate, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call("goals.create", json!({ "request": req, "session": caller.session })).await
+    }
+    async fn revise(&self, goal_id: &str, req: &GoalRevise, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.revise",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn set_status(
+        &self,
+        goal_id: &str,
+        req: &GoalStatusChange,
+        caller: &GoalCaller,
+    ) -> Result<GoalDefinition> {
+        self.call(
+            "goals.set_status",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn reopen(&self, goal_id: &str, req: &GoalReopen, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.reopen",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn restart(&self, goal_id: &str, req: &GoalRestart, caller: &GoalCaller) -> Result<GoalDefinition> {
+        self.call(
+            "goals.restart",
+            json!({ "goal_id": goal_id, "request": req, "session": caller.session }),
+        )
+        .await
+    }
+    async fn state(&self, goal_id: &str) -> Result<Option<GoalState>> {
+        self.call("goals.state", json!({ "goal_id": goal_id })).await
+    }
+    async fn epoch_state(&self, goal_id: &str, epoch: u64) -> Result<Option<GoalState>> {
+        self.call("goals.epoch_state", json!({ "goal_id": goal_id, "epoch": epoch })).await
+    }
+    async fn activations(&self, goal_id: &str, q: &ActivationQuery) -> Result<Vec<GoalActivation>> {
+        self.call("goals.activations", json!({ "goal_id": goal_id, "query": q })).await
+    }
+    async fn schedule(&self, goal_id: &str) -> Result<Option<GoalSchedule>> {
+        self.call("goals.schedule", json!({ "goal_id": goal_id })).await
+    }
+    async fn write_state(&self, _lease: &Lease, _state: &GoalState) -> Result<()> {
+        Err(driver_only("goals.write_state"))
+    }
+    async fn append_activations(&self, _lease: &Lease, _records: &[GoalActivation]) -> Result<()> {
+        Err(driver_only("goals.append_activations"))
+    }
+    async fn prepare_epoch(&self, _goal_id: &str, _epoch: u64) -> Result<GoalState> {
+        Err(driver_only("goals.prepare_epoch"))
+    }
+    async fn end_epoch(
+        &self,
+        _goal_id: &str,
+        _epoch: u64,
+        _end: EpochEnd,
+        _reason: Option<String>,
+    ) -> Result<GoalDefinition> {
+        Err(driver_only("goals.end_epoch"))
+    }
+    async fn write_schedule(&self, _schedule: &GoalSchedule) -> Result<()> {
+        Err(driver_only("goals.write_schedule"))
+    }
+}
+
+#[async_trait]
+impl RuntimeRegistry for KrpcAgentStateClient {
+    async fn list(&self) -> Result<Vec<RuntimeRecord>> {
+        self.call("runtimes.list", json!({})).await
+    }
+    async fn lookup(&self, runtime_id: &str) -> Result<Option<RuntimeRecord>> {
+        self.call("runtimes.lookup", json!({ "runtime_id": runtime_id })).await
+    }
+    async fn register(&self, request: &RuntimeRegister, _who: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.register", json!({ "request": request })).await
+    }
+    async fn update(&self, runtime_id: &str, request: &RuntimeUpdate, _who: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.update", json!({ "runtime_id": runtime_id, "request": request })).await
+    }
+    async fn check(&self, runtime_id: &str) -> Result<RuntimeRecord> {
+        self.call("runtimes.check", json!({ "runtime_id": runtime_id })).await
+    }
+    async fn unregister(&self, runtime_id: &str, expected_revision: u64, _who: &str) -> Result<()> {
+        self.call(
+            "runtimes.unregister",
+            json!({ "runtime_id": runtime_id, "expected_revision": expected_revision }),
+        )
+        .await
+    }
+    async fn ensure_builtin(&self, _builtin: &[RuntimeRegister], _who: &str) -> Result<Vec<RuntimeRecord>> {
+        Err(OpenDanError::Forbidden(
+            "built-in runtimes are registered by the host on the AgentRoot".into(),
+        ))
+    }
+}
+
+#[async_trait]
+impl WorkspaceManager for KrpcAgentStateClient {
+    async fn create(&self, request: &WorkspaceCreate, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.create", json!({"request": request})).await
+    }
+    async fn import(&self, request: &WorkspaceImport, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.import", json!({"request": request})).await
+    }
+    async fn discover(&self, request: &WorkspaceDiscover, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.discover", json!({"request": request})).await
+    }
+    async fn lookup(&self, workspace_id: &str) -> Result<Option<WorkspaceRecord>> {
+        self.call("workspaces.lookup", json!({"workspace_id": workspace_id})).await
+    }
+    async fn query(&self, query: &WorkspaceQuery) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.query", json!({"query": query})).await
+    }
+    async fn check(&self, workspace_id: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.check", json!({"workspace_id": workspace_id})).await
+    }
+    async fn update(&self, workspace_id: &str, request: &WorkspaceUpdate, _who: &str) -> Result<WorkspaceRecord> {
+        self.call("workspaces.update", json!({"workspace_id": workspace_id, "request": request})).await
+    }
+    async fn unregister(&self, workspace_id: &str, expected_revision: u64, _who: &str) -> Result<()> {
+        self.call("workspaces.unregister", json!({"workspace_id": workspace_id, "expected_revision": expected_revision})).await
+    }
+    async fn runtime_impact(&self, runtime_id: &str) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.runtime_impact", json!({"runtime_id": runtime_id})).await
+    }
+    async fn set_runtime_available(&self, runtime_id: &str, available: bool, _who: &str) -> Result<Vec<WorkspaceRecord>> {
+        self.call("workspaces.set_runtime_available", json!({"runtime_id": runtime_id, "available": available})).await
+    }
+}

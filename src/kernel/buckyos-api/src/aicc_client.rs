@@ -1,17 +1,52 @@
-use crate::{AppDoc, AppType, SelectorType};
+use crate::aicc_usage_log::{
+    QueryRouteTraceRequest, QueryRouteTraceResponse, QueryUsageRequest, QueryUsageResponse,
+};
+use crate::{
+    quota_methods, video_error, AiccListView, AiccOnBehalfOf, AppDoc, AppType, DecisionAnswer,
+    DecisionQuestion, DecisionRequirements, GeneratedVideo, QuotaQueryRequest, QuotaQueryResponse,
+    SelectorType, VideoGenerateHelperRequest, VideoGenerateRequest, VideoGenerationRequirement,
+    VideoOutputSpec, AICC_ON_BEHALF_OF_PARAM,
+};
 use ::kRPC::*;
 use async_trait::async_trait;
 use name_lib::DID;
 use ndn_lib::ObjId;
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 
 pub const AICC_SERVICE_UNIQUE_ID: &str = "aicc";
 pub const AICC_SERVICE_SERVICE_NAME: &str = "aicc";
 pub const AICC_SERVICE_SERVICE_PORT: u16 = 4040;
+
+/// `user/aicc/<user>/outputs`: what a call produced for its user, kept
+/// [`AICC_OUTPUTS_TTL_DAYS`]; whoever keeps a result longer copies it into its own bucket.
+pub const AICC_BUCKET_OUTPUTS: &str = "outputs";
+/// `user/aicc/<user>/inputs`: files uploaded for a call or derived from its inputs.
+pub const AICC_BUCKET_INPUTS: &str = "inputs";
+pub const AICC_OUTPUTS_TTL_DAYS: u32 = 7;
+pub const AICC_INPUTS_TTL_DAYS: u32 = 1;
+/// Per-user app pool over `outputs` + `inputs`.
+pub const AICC_STORAGE_QUOTA_MIB: u64 = 8192;
+
+pub fn aicc_bucket_decls() -> HashMap<String, crate::bucket_client::BucketDecl> {
+    use crate::bucket_client::{BucketDecl, BucketKind, BucketScope, DataPolicy};
+    let temp = |days| BucketDecl {
+        kind: BucketKind::Data,
+        data_policy: DataPolicy::Temp,
+        scope: BucketScope::User,
+        versioning: None,
+        quota_mib: None,
+        max_objects: None,
+        default_ttl_days: Some(days),
+        lifecycle: Vec::new(),
+    };
+    HashMap::from([
+        (AICC_BUCKET_OUTPUTS.to_string(), temp(AICC_OUTPUTS_TTL_DAYS)),
+        (AICC_BUCKET_INPUTS.to_string(), temp(AICC_INPUTS_TTL_DAYS)),
+    ])
+}
 
 pub mod ai_methods {
     pub const ROUTE_RESOLVE: &str = "route.resolve";
@@ -19,12 +54,12 @@ pub mod ai_methods {
     pub const IMAGES_GENERATE: &str = "images.generate";
     pub const HELPER_LLM_CHAT: &str = "helper.llm_chat";
     pub const HELPER_TEXT_TO_IMAGE: &str = "helper.text_to_image";
+    pub const HELPER_VIDEO_GENERATE: &str = "helper.video_generate";
 
-    pub const LLM_CHAT: &str = "llm.chat";
     pub const EMBEDDING_TEXT: &str = "embedding.text";
     pub const EMBEDDING_MULTIMODAL: &str = "embedding.multimodal";
     pub const RERANK: &str = "rerank";
-    pub const IMAGE_TXT2IMG: &str = "image.txt2img";
+    pub const DECISION_EVALUATE: &str = "decision.evaluate";
     pub const IMAGE_IMG2IMG: &str = "image.img2img";
     pub const IMAGE_INPAINT: &str = "image.inpaint";
     pub const IMAGE_UPSCALE: &str = "image.upscale";
@@ -37,30 +72,44 @@ pub mod ai_methods {
     pub const AUDIO_ASR: &str = "audio.asr";
     pub const AUDIO_MUSIC: &str = "audio.music";
     pub const AUDIO_ENHANCE: &str = "audio.enhance";
-    pub const VIDEO_TXT2VIDEO: &str = "video.txt2video";
-    pub const VIDEO_IMG2VIDEO: &str = "video.img2video";
-    pub const VIDEO_VIDEO2VIDEO: &str = "video.video2video";
+    pub const VIDEO_GENERATE: &str = "video.generate";
+    pub const VIDEO_EDIT: &str = "video.edit";
     pub const VIDEO_EXTEND: &str = "video.extend";
     pub const VIDEO_UPSCALE: &str = "video.upscale";
     pub const AGENT_COMPUTER_USE: &str = "agent.computer_use";
 
     pub const CANCEL: &str = "cancel";
-    pub const RELOAD_SETTINGS: &str = "reload_settings";
     pub const SERVICE_RELOAD_SETTINGS: &str = "service.reload_settings";
     pub const QUOTA_QUERY: &str = "quota.query";
+    pub const USAGE_QUERY: &str = "usage.query";
+    pub const TRACE_QUERY: &str = "trace.query";
+    pub const ROUTING_GET: &str = "routing.get";
+    pub const ROUTING_UPDATE: &str = "routing.update";
+    pub const ROUTING_PREVIEW: &str = "routing.preview";
+    pub const EVENTS_LIST: &str = "events.list";
+    pub const PROVIDER_PREVIEW_RULES: &str = "provider.preview_rules";
+    pub const PROVIDER_CATALOG: &str = "provider.catalog";
+    pub const PROTOCOL_ADAPTER_LIST: &str = "protocol_adapter.list";
+    pub const PROVIDER_VALIDATE: &str = "provider.validate";
+    pub const PROVIDER_ADD: &str = "provider.add";
     pub const PROVIDER_LIST: &str = "provider.list";
     pub const PROVIDER_HEALTH: &str = "provider.health";
+    pub const PROVIDER_UPDATE: &str = "provider.update";
+    pub const PROVIDER_DELETE: &str = "provider.delete";
+    pub const PROVIDER_REFRESH_MODELS: &str = "provider.refresh_models";
+    pub const MODELS_LIST: &str = "models.list";
     pub const DRIVER_METADATA_UPDATE_GET: &str = "driver_metadata_update.get";
     pub const DRIVER_METADATA_UPDATE_SET: &str = "driver_metadata_update.set";
 
     pub fn is_ai_method(method: &str) -> bool {
         matches!(
             method,
-            LLM_CHAT
+            CHAT_COMPLETIONS_CREATE
+                | IMAGES_GENERATE
                 | EMBEDDING_TEXT
                 | EMBEDDING_MULTIMODAL
+                | DECISION_EVALUATE
                 | RERANK
-                | IMAGE_TXT2IMG
                 | IMAGE_IMG2IMG
                 | IMAGE_INPAINT
                 | IMAGE_UPSCALE
@@ -73,9 +122,8 @@ pub mod ai_methods {
                 | AUDIO_ASR
                 | AUDIO_MUSIC
                 | AUDIO_ENHANCE
-                | VIDEO_TXT2VIDEO
-                | VIDEO_IMG2VIDEO
-                | VIDEO_VIDEO2VIDEO
+                | VIDEO_GENERATE
+                | VIDEO_EDIT
                 | VIDEO_EXTEND
                 | VIDEO_UPSCALE
                 | AGENT_COMPUTER_USE
@@ -85,18 +133,1200 @@ pub mod ai_methods {
     pub fn is_aicc_core_method(method: &str) -> bool {
         matches!(
             method,
-            ROUTE_RESOLVE
-                | CHAT_COMPLETIONS_CREATE
-                | IMAGES_GENERATE
-                | HELPER_LLM_CHAT
-                | HELPER_TEXT_TO_IMAGE
+            ROUTE_RESOLVE | HELPER_LLM_CHAT | HELPER_TEXT_TO_IMAGE | HELPER_VIDEO_GENERATE
         ) || is_ai_method(method)
     }
+
+    pub fn is_management_method(method: &str) -> bool {
+        matches!(
+            method,
+            SERVICE_RELOAD_SETTINGS
+                | QUOTA_QUERY
+                | USAGE_QUERY
+                | TRACE_QUERY
+                | ROUTING_GET
+                | ROUTING_UPDATE
+                | ROUTING_PREVIEW
+                | EVENTS_LIST
+                | PROVIDER_PREVIEW_RULES
+                | PROVIDER_CATALOG
+                | PROTOCOL_ADAPTER_LIST
+                | PROVIDER_VALIDATE
+                | PROVIDER_ADD
+                | PROVIDER_LIST
+                | PROVIDER_HEALTH
+                | PROVIDER_UPDATE
+                | PROVIDER_DELETE
+                | PROVIDER_REFRESH_MODELS
+                | MODELS_LIST
+                | DRIVER_METADATA_UPDATE_GET
+                | DRIVER_METADATA_UPDATE_SET
+        ) || crate::quota_methods::is_quota_method(method)
+    }
+}
+
+#[cfg(test)]
+mod canonical_contract_tests {
+    use super::*;
+
+    fn named_object() -> ResourceRef {
+        ResourceRef::named_object(ObjId::new("chunk:123456").unwrap())
+    }
+
+    #[test]
+    fn provider_rule_preview_request_is_strict() {
+        let value = json!({"provider_instance_name":"custom-test", "rules_catalog":{}, "model_ids":["openai/gpt-6-sol"]});
+        let request: ProviderRulesPreviewRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        let mut invalid = value;
+        invalid["credential"] = json!("must-not-be-sent");
+        assert!(serde_json::from_value::<ProviderRulesPreviewRequest>(invalid).is_err());
+        assert!(ai_methods::is_management_method(ai_methods::PROVIDER_PREVIEW_RULES));
+    }
+
+    #[test]
+    fn aicc_buckets_are_valid_service_declarations() {
+        let decls = aicc_bucket_decls();
+        assert_eq!(
+            crate::validate_app_buckets(&decls, Some(AICC_STORAGE_QUOTA_MIB)),
+            Vec::<String>::new()
+        );
+        assert_eq!(crate::validate_app_buckets(&decls, None).len(), 1);
+        assert_eq!(decls[AICC_BUCKET_OUTPUTS].default_ttl_days, Some(7));
+        assert_eq!(decls[AICC_BUCKET_INPUTS].default_ttl_days, Some(1));
+    }
+
+    #[test]
+    fn method_api_type_and_capability_are_distinct_contracts() {
+        assert_eq!(
+            serde_json::to_value(ApiType::ImageTextToImage).unwrap(),
+            json!("image.txt2img")
+        );
+        assert_eq!(
+            ApiType::ImageTextToImage.typed_method(),
+            ai_methods::IMAGES_GENERATE
+        );
+        assert_eq!(ApiType::ImageTextToImage.capability(), Capability::Image);
+        assert_ne!(
+            ApiType::ImageTextToImage.typed_method(),
+            serde_json::to_value(ApiType::ImageTextToImage)
+                .unwrap()
+                .as_str()
+                .unwrap()
+        );
+
+        let route = AiccCall::RouteResolve(RouteResolveRequest::new(ApiType::Llm, "llm.chat"));
+        assert_eq!(route.api_type(), None);
+        let image = AiccCall::ImagesGenerate(TextToImageInvokeRequest::new(
+            "image-model@provider",
+            "draw a fox",
+        ));
+        assert_eq!(image.api_type(), Some(ApiType::ImageTextToImage));
+        assert_eq!(image.to_params().unwrap()["prompt"], "draw a fox");
+    }
+
+    #[test]
+    fn model_requirement_uses_canonical_capability_names() {
+        assert_eq!(features::TOOL_CALL, "tool_call");
+        assert_eq!(features::JSON_SCHEMA, "json_schema");
+
+        let requirement = ModelRequirement {
+            tool_call: true,
+            json_schema: true,
+            ..ModelRequirement::default()
+        };
+        assert_eq!(
+            requirement.feature_names(),
+            vec!["tool_call".to_string(), "json_schema".to_string()]
+        );
+        assert!(requirement.requires_feature("tool_call"));
+        assert!(requirement.requires_feature("json_schema"));
+        assert!(!requirement.requires_feature("tool_calling"));
+        assert!(!requirement.requires_feature("json_output"));
+
+        let mut fields = ModelRequirement::default();
+        fields.canonical_fields.insert(
+            "/voice".to_string(),
+            CanonicalFieldRequirement::strict(json!({"style": "warm"})),
+        );
+        let value = serde_json::to_value(&fields).unwrap();
+        assert_eq!(
+            value["canonical_fields"]["/voice"]["value"]["style"],
+            "warm"
+        );
+        assert_eq!(value["canonical_fields"]["/voice"]["strict"], true);
+        assert_eq!(value["canonical_fields"]["/voice"]["allow_fuzzy"], false);
+        let defaulted: CanonicalFieldRequirement =
+            serde_json::from_value(json!({"value": {"style": "warm"}})).unwrap();
+        assert!(!defaulted.strict);
+        assert!(defaulted.allow_fuzzy);
+    }
+
+    #[test]
+    fn canonical_ir_round_trips_without_losing_opaque_state() {
+        let message = AiMessage::new(
+            AiRole::Assistant,
+            vec![
+                AiContent::text("answer"),
+                AiContent::Thinking {
+                    source: ProviderStateCoordinate::unbound(),
+                    summary: Some("summary".to_string()),
+                    text: None,
+                    provider_metadata: Some(json!({"signature": "opaque"})),
+                },
+                AiContent::ProviderState {
+                    source: ProviderStateCoordinate {
+                        provider_profile_id: "openai".to_string(),
+                        adapter_type: "openai-responses".to_string(),
+                        origin_provider: "openai".to_string(),
+                        origin_model: "gpt-test".to_string(),
+                    },
+                    provider: "openai".to_string(),
+                    value: json!({"type": "reasoning", "id": "rs_1"}),
+                },
+            ],
+        );
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value["content"][2]["source"]["provider_profile_id"],
+            "openai"
+        );
+        assert_eq!(serde_json::from_value::<AiMessage>(value).unwrap(), message);
+
+        let resource = named_object();
+        let value = serde_json::to_value(&resource).unwrap();
+        assert_eq!(value["kind"], "named_object");
+        assert_eq!(
+            serde_json::from_value::<ResourceRef>(value).unwrap(),
+            resource
+        );
+    }
+
+    #[test]
+    fn typed_requests_round_trip_and_reject_unknown_fields() {
+        let request = EmbeddingTextRequest::new(
+            "text-embedding-3-large@openai_primary",
+            vec![EmbeddingTextItem::Text {
+                text: "hello".to_string(),
+                id: Some("item-1".to_string()),
+            }],
+        );
+        let mut request = request;
+        request.trace_id = Some("trace-embedding-1".to_string());
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["trace_id"], "trace-embedding-1");
+        assert_eq!(EmbeddingTextRequest::from_json(value).unwrap(), request);
+        assert!(EmbeddingTextRequest::from_json(json!({
+            "exact_model": "m@p",
+            "items": [],
+            "payload": {}
+        }))
+        .is_err());
+        assert!(AudioTextToSpeechRequest::from_json(json!({
+            "exact_model": "audio.tts@provider",
+            "text": "hello",
+            "voice": {"style": "provider_specific_style"}
+        }))
+        .is_err());
+        assert!(VideoGenerateRequest::from_json(json!({
+            "exact_model": "m@p",
+            "prompt": "fox",
+            "image": {"kind": "named_object", "obj_id": "chunk:123456"}
+        }))
+        .is_err());
+        assert!(EmbeddingTextRequest::from_json(json!({
+            "exact_model": "embedding.text",
+            "items": []
+        }))
+        .is_err());
+        let tts = AudioTextToSpeechRequest::from_json(json!({
+            "exact_model": "audio.tts@provider",
+            "text": "hello",
+            "voice": {
+                "language": "en-US",
+                "style": "warm",
+                "instructions": "Speak calmly"
+            }
+        }))
+        .unwrap();
+        assert_eq!(tts.voice.style, Some(VoiceStyle::Warm));
+        assert!(AudioTextToSpeechRequest::from_json(json!({
+            "exact_model": "audio.tts@provider",
+            "text": "hello",
+            "voice": {"voice_id": "alloy"}
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn helpers_reject_exact_model_and_legacy_envelopes() {
+        assert!(LlmChatHelperRequest::from_json(json!({
+            "logical_model": "llm.chat",
+            "exact_model": "gpt@provider",
+            "messages": []
+        }))
+        .is_err());
+        assert!(TextToImageHelperRequest::from_json(json!({
+            "capability": "image",
+            "model": {"alias": "image.txt2img"},
+            "payload": {"text": "fox"}
+        }))
+        .is_err());
+        assert!(RouteResolveRequest::from_json(json!({
+            "api_type": "llm",
+            "logical_model": "gpt@provider"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn trace_id_round_trips_on_route_inference_and_helpers() {
+        let mut route = RouteResolveRequest::new(ApiType::Llm, "llm.chat");
+        route.trace_id = Some("trace-route".to_string());
+        let route = RouteResolveRequest::from_json(serde_json::to_value(route).unwrap()).unwrap();
+        assert_eq!(route.trace_id.as_deref(), Some("trace-route"));
+
+        let mut chat = LlmChatInvokeRequest::new("gpt@provider", Vec::new());
+        chat.trace_id = Some("trace-chat".to_string());
+        let call = AiccCall::from_method_and_params(
+            ai_methods::CHAT_COMPLETIONS_CREATE,
+            serde_json::to_value(chat).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(call.trace_id(), Some("trace-chat"));
+
+        let mut image = TextToImageInvokeRequest::new("image@provider", "fox");
+        image.trace_id = Some("trace-image".to_string());
+        assert_eq!(
+            TextToImageInvokeRequest::from_json(serde_json::to_value(image).unwrap())
+                .unwrap()
+                .trace_id
+                .as_deref(),
+            Some("trace-image")
+        );
+
+        let mut chat_helper = LlmChatHelperRequest::new("llm.chat", Vec::new());
+        chat_helper.trace_id = Some("trace-chat-helper".to_string());
+        assert_eq!(
+            LlmChatHelperRequest::from_json(serde_json::to_value(chat_helper).unwrap())
+                .unwrap()
+                .trace_id
+                .as_deref(),
+            Some("trace-chat-helper")
+        );
+
+        let mut image_helper = TextToImageHelperRequest::new("image.generate", "fox");
+        image_helper.trace_id = Some("trace-image-helper".to_string());
+        assert_eq!(
+            TextToImageHelperRequest::from_json(serde_json::to_value(image_helper).unwrap())
+                .unwrap()
+                .trace_id
+                .as_deref(),
+            Some("trace-image-helper")
+        );
+    }
+
+    #[test]
+    fn execution_mode_defaults_is_strict_and_round_trips_on_canonical_requests() {
+        let route = RouteResolveRequest::from_json(json!({
+            "api_type": "llm",
+            "logical_model": "llm.chat"
+        }))
+        .unwrap();
+        assert_eq!(route.execution_mode, AiccExecutionMode::Immediate);
+        assert_eq!(
+            serde_json::to_value(&route).unwrap()["execution_mode"],
+            "immediate"
+        );
+
+        let mut chat = LlmChatInvokeRequest::new("gpt@provider", Vec::new());
+        chat.execution_mode = AiccExecutionMode::Stream;
+        let chat = LlmChatInvokeRequest::from_json(serde_json::to_value(chat).unwrap()).unwrap();
+        assert_eq!(chat.execution_mode, AiccExecutionMode::Stream);
+        assert_eq!(
+            AiccCall::ChatCompletionsCreate(chat).execution_mode(),
+            AiccExecutionMode::Stream
+        );
+
+        let embedding = EmbeddingTextRequest::from_json(json!({
+            "exact_model": "embedding@provider",
+            "items": []
+        }))
+        .unwrap();
+        assert_eq!(embedding.execution_mode, AiccExecutionMode::Immediate);
+
+        let mut chat_helper = LlmChatHelperRequest::new("llm.chat", Vec::new());
+        chat_helper.execution_mode = AiccExecutionMode::Stream;
+        assert_eq!(
+            LlmChatHelperRequest::from_json(serde_json::to_value(chat_helper).unwrap())
+                .unwrap()
+                .execution_mode,
+            AiccExecutionMode::Stream
+        );
+
+        let mut image_helper = TextToImageHelperRequest::new("image.generate", "fox");
+        image_helper.execution_mode = AiccExecutionMode::Stream;
+        assert_eq!(
+            TextToImageHelperRequest::from_json(serde_json::to_value(image_helper).unwrap())
+                .unwrap()
+                .execution_mode,
+            AiccExecutionMode::Stream
+        );
+
+        assert!(LlmChatInvokeRequest::from_json(json!({
+            "exact_model": "gpt@provider",
+            "messages": [],
+            "execution_mode": "native_task"
+        }))
+        .is_err());
+        assert!(RouteResolveRequest::from_json(json!({
+            "api_type": "llm",
+            "logical_model": "llm.chat",
+            "execution_mode": "streaming"
+        }))
+        .is_err());
+
+        assert_eq!(
+            AiccErrorCode::UnsupportedExecutionMode.as_str(),
+            "unsupported_execution_mode"
+        );
+        assert_eq!(
+            serde_json::to_value(AiccErrorCode::UnsupportedExecutionMode).unwrap(),
+            json!("unsupported_execution_mode")
+        );
+        let error = AiccError::new(
+            AiccErrorCode::UnsupportedExecutionMode,
+            "requested execution mode is unsupported",
+        );
+        assert_eq!(
+            AiccError::from_krpc_error(&error.to_krpc_error()),
+            Some(error)
+        );
+    }
+
+    #[test]
+    fn stable_error_round_trips_through_krpc() {
+        let error = AiccError {
+            code: AiccErrorCode::ProviderError,
+            message: "rate limited".to_string(),
+            provider_code: Some("openai/rate_limit".to_string()),
+            retriable: true,
+            details: Some(json!({"request_id": "req-1"})),
+        };
+        assert_eq!(error.to_task_event_data()["code"], "provider_error");
+        let krpc_error = error.to_krpc_error();
+        assert_eq!(AiccError::from_krpc_error(&krpc_error), Some(error));
+    }
+
+    #[test]
+    fn canonical_reload_is_the_only_reload_method() {
+        assert_eq!(
+            ai_methods::SERVICE_RELOAD_SETTINGS,
+            "service.reload_settings"
+        );
+        assert!(!ai_methods::is_aicc_core_method("reload_settings"));
+        assert!(!ai_methods::is_aicc_core_method("service.reaload_settings"));
+    }
+
+    struct TypedHandler;
+
+    #[async_trait]
+    impl AiccHandler for TypedHandler {
+        async fn handle_cancel(
+            &self,
+            task_id: &str,
+            _ctx: RPCContext,
+        ) -> std::result::Result<CancelResponse, RPCErrors> {
+            Ok(CancelResponse::new(task_id.to_string(), true))
+        }
+
+        async fn handle_embedding_text(
+            &self,
+            request: EmbeddingTextRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<EmbeddingTextResponse, RPCErrors> {
+            let mut response = EmbeddingTextResponse::new("task-1", AiMethodStatus::Succeeded);
+            response.data.push(EmbeddingValue {
+                index: 0,
+                id: request
+                    .trace_id
+                    .or_else(|| Some(request.items.len().to_string())),
+                embedding: vec![0.25, 0.75],
+                embedding_space_id: "test:2:cosine:v1".to_string(),
+            });
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_client_and_server_dispatch_without_generic_envelope() {
+        let request = EmbeddingTextRequest::new(
+            "embed@test",
+            vec![EmbeddingTextItem::Text {
+                text: "hello".to_string(),
+                id: None,
+            }],
+        );
+        let mut request = request;
+        request.trace_id = Some("trace-body".to_string());
+        let client = AiccClient::new_in_process(Box::new(TypedHandler));
+        let response = client.embedding_text(request.clone()).await.unwrap();
+        assert_eq!(response.data[0].embedding, vec![0.25, 0.75]);
+        assert_eq!(response.data[0].id.as_deref(), Some("trace-body"));
+
+        let server = AiccServerHandler::new(TypedHandler);
+        let response = server
+            .handle_rpc_call(
+                RPCRequest {
+                    method: ai_methods::EMBEDDING_TEXT.to_string(),
+                    params: serde_json::to_value(request).unwrap(),
+                    seq: 7,
+                    token: None,
+                    trace_id: Some("trace-1".to_string()),
+                },
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.seq, 7);
+
+        let legacy_reload = server
+            .handle_rpc_call(
+                RPCRequest {
+                    method: "reload_settings".to_string(),
+                    params: json!({}),
+                    seq: 8,
+                    token: None,
+                    trace_id: None,
+                },
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await;
+        assert!(matches!(legacy_reload, Err(RPCErrors::UnknownMethod(_))));
+    }
+
+    #[test]
+    fn management_requests_are_strict_and_methods_are_canonical() {
+        for method in [
+            ai_methods::PROVIDER_PREVIEW_RULES,
+            ai_methods::PROVIDER_CATALOG,
+            ai_methods::PROTOCOL_ADAPTER_LIST,
+            ai_methods::PROVIDER_VALIDATE,
+            ai_methods::PROVIDER_ADD,
+            ai_methods::PROVIDER_DELETE,
+            ai_methods::PROVIDER_REFRESH_MODELS,
+            ai_methods::USAGE_QUERY,
+            ai_methods::TRACE_QUERY,
+            ai_methods::ROUTING_GET,
+            ai_methods::ROUTING_UPDATE,
+            ai_methods::ROUTING_PREVIEW,
+            ai_methods::EVENTS_LIST,
+        ] {
+            assert!(ai_methods::is_management_method(method));
+        }
+
+        let commands: Vec<AiccRoutingCommand> = serde_json::from_value(json!([
+            {"kind": "vendor_factor", "vendor": "claude", "factor": 1.5},
+            {"kind": "spec_factor", "spec": "llm.gpt-pro", "factor": 0.5},
+            {"kind": "model_factor", "vendor": "openai", "model": "gpt-5.6", "factor": 2.0},
+            {"kind": "item_weight", "path": "llm.chat", "item": "gpt-pro", "weight": 3.0}
+        ]))
+        .unwrap();
+        assert!(commands.iter().all(|command| command.validate().is_ok()));
+        assert!(!commands[0].same_subject(&commands[1]));
+        assert!(serde_json::from_value::<AiccRoutingCommand>(
+            json!({"kind": "vendor_factor", "vendor": "claude", "factor": 1.5, "extra": 1})
+        )
+        .is_err());
+        assert!(AiccRoutingCommand::VendorFactor {
+            vendor: "claude".into(),
+            factor: -1.0
+        }
+        .validate()
+        .is_err());
+        let update = RoutingUpdateRequest::with_routing_commands(3, commands);
+        let value = serde_json::to_value(&update).unwrap();
+        assert!(value.get("provider_weights").is_none());
+        assert_eq!(RoutingUpdateRequest::from_json(value).unwrap(), update);
+        assert!(
+            RoutingPreviewRequest::from_json(json!({"paths": ["llm.chat"], "explain": true}))
+                .is_ok()
+        );
+        assert!(RoutingPreviewRequest::from_json(json!({"unknown": true})).is_err());
+        assert!(EventsListRequest::from_json(json!({"limit": 10})).is_ok());
+
+        let request = ProviderAddRequest::new(
+            "openai-main",
+            ProviderInstanceType::CloudApi,
+            "openai",
+            "https://api.openai.com/v1",
+            serde_json::from_value(json!({"api_token": {"inline_secret": "redacted"}})).unwrap(),
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(ProviderAddRequest::from_json(value).unwrap(), request);
+        assert!(ProviderAddRequest::from_json(json!({
+            "provider_instance_name": "openai-main",
+            "provider_type": "cloud_api",
+            "provider_profile_id": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "credentials": {},
+            "endpoint": "https://legacy.invalid"
+        }))
+        .is_err());
+        assert!(QueryUsageRequest::from_json(json!({
+            "time_range": {"kind": "last30d"},
+            "filters": {"unknown_filter": "value"}
+        }))
+        .is_err());
+        assert!(QueryRouteTraceRequest::from_json(json!({"unknown": true})).is_err());
+        assert!(QueryRouteTraceRequest::from_json(json!({
+            "api_type": "llm",
+            "limit": 5
+        }))
+        .is_err());
+        let trace_query = QueryRouteTraceRequest::from_json(json!({
+            "api_types": ["llm"],
+            "limit": 5
+        }))
+        .unwrap();
+        assert_eq!(trace_query.api_types, vec!["llm"]);
+
+        let provider_weights = BTreeMap::from([("openai-main".to_string(), 1.5)]);
+        let request = RoutingUpdateRequest::new(12, provider_weights.clone());
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(RoutingUpdateRequest::from_json(value).unwrap(), request);
+        assert!(RoutingGetRequest::from_json(json!({"unknown": true})).is_err());
+        assert!(RoutingUpdateRequest::from_json(json!({
+            "settings_revision": 12,
+            "provider_weights": provider_weights,
+            "merge": true
+        }))
+        .is_err());
+
+        let clear_request = RoutingUpdateRequest::new(12, BTreeMap::new());
+        assert!(
+            RoutingUpdateRequest::from_json(serde_json::to_value(clear_request).unwrap())
+                .unwrap()
+                .provider_weights
+                .is_some_and(|weights| weights.is_empty())
+        );
+
+        let response = RoutingGetResponse {
+            settings_revision: 12,
+            routing: AiccRouteOverlay::default(),
+            command_status: Vec::new(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RoutingGetResponse>(value).unwrap(),
+            response
+        );
+        assert!(serde_json::from_value::<RoutingGetResponse>(json!({
+            "settings_revision": 12,
+            "routing": {},
+            "unknown": true
+        }))
+        .is_err());
+
+        let response = RoutingUpdateResponse {
+            ok: true,
+            settings_revision: 13,
+            routing: AiccRouteOverlay {
+                provider_weights: BTreeMap::from([("openai-main".to_string(), 1.5)]),
+                ..Default::default()
+            },
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RoutingUpdateResponse>(value).unwrap(),
+            response
+        );
+        assert!(serde_json::from_value::<ProviderDeleteResponse>(json!({
+            "ok": false,
+            "reason": "provider_not_found"
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn metadata_view_exposes_target_and_per_provider_applied_sequences() {
+        let view = DriverMetadataUpdateView {
+            enabled: true,
+            source_url: Some("ndn://metadata.example/aicc".to_string()),
+            source_configured: true,
+            interval_secs: 900,
+            metadata_target_seq: 42,
+            providers: vec![DriverMetadataProviderStatus::new("openai-main", 41)],
+            status: DriverMetadataUpdateStatus::Updating,
+            active_revision: Some(42),
+            last_attempt_at_ms: None,
+            last_success_at_ms: None,
+            last_error: None,
+            consecutive_failures: 0,
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["metadata_target_seq"], 42);
+        assert_eq!(value["providers"][0]["metadata_applied_seq"], 41);
+        assert_eq!(
+            serde_json::from_value::<DriverMetadataUpdateView>(value).unwrap(),
+            view
+        );
+        assert!(serde_json::from_value::<DriverMetadataUpdateView>(json!({
+            "enabled": true,
+            "source_configured": true,
+            "interval_secs": 900,
+            "status": "updating",
+            "consecutive_failures": 0
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn quota_refusals_travel_as_detailed_errors_with_their_code() {
+        let mut error = AiccError::new(AiccErrorCode::QuotaExhausted, "token quota is exhausted");
+        error.details = Some(json!({"required_tokens": 10}));
+        let wire = error.to_krpc_error();
+        let RPCErrors::Detailed(detail) = &wire else {
+            panic!("quota refusals are detailed errors");
+        };
+        assert_eq!(detail.code, "quota_exhausted");
+        assert_eq!(AiccError::from_krpc_error(&wire), Some(error));
+        let other = AiccError::new(AiccErrorCode::ProviderError, "upstream failed");
+        assert!(matches!(other.to_krpc_error(), RPCErrors::ReasonError(_)));
+        assert_eq!(
+            AiccError::from_krpc_error(&other.to_krpc_error()),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn policy_money_is_currency_explicit_and_strict() {
+        let money = Money::new(12.5, "USD");
+        let policy = AiccPolicyConfig {
+            max_estimated_cost: Some(LockedValue::locked(money.clone())),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(value["max_estimated_cost"]["value"], json!(money));
+        assert!(value.get("max_estimated_cost_usd").is_none());
+        assert!(serde_json::from_value::<AiccPolicyConfig>(json!({
+            "max_estimated_cost_usd": 0.25
+        }))
+        .is_err());
+
+        let route_policy = RoutePolicy {
+            max_cost: Some(Money::new(0.25, "USD")),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(route_policy).unwrap();
+        assert_eq!(
+            value["max_cost"],
+            json!({"amount": 0.25, "currency": "USD"})
+        );
+        assert!(value.get("max_cost_usd").is_none());
+        assert!(serde_json::from_value::<RoutePolicy>(json!({
+            "max_cost_usd": 0.25
+        }))
+        .is_err());
+
+        assert!(serde_json::from_value::<Money>(json!({
+            "amount": 1.0,
+            "currency": "USD",
+            "unit": "dollar"
+        }))
+        .is_err());
+    }
+
+    fn provider_instance_view(enabled: bool) -> ProviderInstanceView {
+        ProviderInstanceView {
+            resolved_model_rules: BTreeMap::new(),
+            discovered_model_ids: BTreeSet::new(),
+            rules_catalog: None,
+            provider_rules_id: None,
+            instance_rules: None,
+            provider_instance_name: "openai-main".to_string(),
+            provider_type: ProviderInstanceType::CloudApi,
+            provider_profile_id: "openai".to_string(),
+            protocol_adapter_id: "openai-responses".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            operation_base_urls: BTreeMap::new(),
+            enabled,
+            auth: ProviderInstanceAuthView {
+                mode: Some(ProviderInstanceAuthMode::ApiKey),
+                credential_kind: Some("bearer".to_string()),
+                configured: true,
+            },
+            inventory: ProviderInstanceInventoryView {
+                filtered_capabilities: Vec::new(),
+                unmatched_models: Vec::new(),
+                unavailable_presets: Vec::new(),
+                unpriced_models: Vec::new(),
+                state: if enabled {
+                    ProviderInstanceInventoryState::Loaded
+                } else {
+                    ProviderInstanceInventoryState::Disabled
+                },
+                revision: enabled.then(|| "inventory-1".to_string()),
+                model_count: u64::from(enabled),
+                updated_at_ms: enabled.then_some(1_750_000_000_000),
+            },
+            health: ProviderInstanceHealthView {
+                state: if enabled {
+                    ProviderInstanceHealthState::Healthy
+                } else {
+                    ProviderInstanceHealthState::Disabled
+                },
+                checked_at_ms: enabled.then_some(1_750_000_000_000),
+            },
+        }
+    }
+
+    #[test]
+    fn provider_list_view_is_typed_revisioned_and_secret_free() {
+        let response = ProviderListResponse {
+            providers: vec![provider_instance_view(false)],
+            settings_revision: 12,
+            inventory_revision: "inventory-1".to_string(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["settings_revision"], 12);
+        assert_eq!(value["providers"][0]["inventory"]["state"], "disabled");
+        assert_eq!(value["providers"][0]["health"]["state"], "disabled");
+        let wire = serde_json::to_string(&value).unwrap();
+        assert!(!wire.contains("credential_ref"));
+        assert!(!wire.contains("secret"));
+        assert_eq!(
+            serde_json::from_value::<ProviderListResponse>(value).unwrap(),
+            response
+        );
+        assert!(serde_json::from_value::<ProviderListResponse>(json!({
+            "providers": [],
+            "inventory_revision": "inventory-1"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn settings_revision_conflict_has_stable_code_and_details() {
+        let error = AiccError::settings_revision_conflict(12, 13);
+        assert_eq!(
+            serde_json::to_value(error.code).unwrap(),
+            "settings_revision_conflict"
+        );
+        assert_eq!(error.code.as_str(), "settings_revision_conflict");
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "expected_revision": 12,
+                "actual_revision": 13
+            }))
+        );
+        assert_eq!(
+            AiccError::from_krpc_error(&error.to_krpc_error()),
+            Some(error)
+        );
+    }
+
+    struct ManagementHandler;
+
+    #[async_trait]
+    impl AiccHandler for ManagementHandler {
+        async fn handle_cancel(
+            &self,
+            task_id: &str,
+            _ctx: RPCContext,
+        ) -> std::result::Result<CancelResponse, RPCErrors> {
+            Ok(CancelResponse::new(task_id.to_string(), true))
+        }
+
+        async fn handle_get_routing(
+            &self,
+            _request: RoutingGetRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<RoutingGetResponse, RPCErrors> {
+            Ok(RoutingGetResponse {
+                settings_revision: 12,
+                routing: AiccRouteOverlay::default(),
+                command_status: Vec::new(),
+            })
+        }
+
+        async fn handle_update_routing(
+            &self,
+            request: RoutingUpdateRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<RoutingUpdateResponse, RPCErrors> {
+            Ok(RoutingUpdateResponse {
+                ok: true,
+                settings_revision: request.settings_revision + 1,
+                routing: AiccRouteOverlay {
+                    provider_weights: request.provider_weights.unwrap_or_default(),
+                    ..Default::default()
+                },
+            })
+        }
+
+        async fn handle_provider_catalog(
+            &self,
+            _request: ProviderCatalogRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderCatalogResponse, RPCErrors> {
+            Ok(ProviderCatalogResponse::default())
+        }
+
+        async fn handle_list_protocol_adapters(
+            &self,
+            _request: ProtocolAdapterListRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProtocolAdapterListResponse, RPCErrors> {
+            Ok(ProtocolAdapterListResponse::default())
+        }
+
+        async fn handle_validate_provider(
+            &self,
+            _request: ProviderValidateRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderValidateResponse, RPCErrors> {
+            Ok(ProviderValidateResponse::default())
+        }
+
+        async fn handle_add_provider(
+            &self,
+            request: ProviderAddRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderAddResponse, RPCErrors> {
+            Ok(ProviderAddResponse {
+                ok: true,
+                provider_instance_name: request.provider_instance_name,
+                settings_revision: 1,
+                reload: ProviderReloadResult {
+                    ok: true,
+                    providers_registered: 1,
+                },
+            })
+        }
+
+        async fn handle_list_providers(
+            &self,
+            _request: ProviderListRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderListResponse, RPCErrors> {
+            Ok(ProviderListResponse {
+                providers: vec![provider_instance_view(true)],
+                settings_revision: 12,
+                inventory_revision: "inventory-1".to_string(),
+            })
+        }
+
+        async fn handle_delete_provider(
+            &self,
+            request: ProviderDeleteRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderDeleteResponse, RPCErrors> {
+            Ok(ProviderDeleteResponse {
+                ok: true,
+                provider_instance_name: Some(request.provider_instance_name),
+                settings_revision: Some(2),
+                reload: None,
+                reason: None,
+            })
+        }
+
+        async fn handle_refresh_provider_models(
+            &self,
+            request: ProviderRefreshModelsRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<ProviderRefreshModelsResponse, RPCErrors> {
+            Ok(ProviderRefreshModelsResponse {
+                unmatched_count: 0,
+                ok: true,
+                provider_instance_name: request.provider_instance_name,
+                inventory_revision: "inventory-1".to_string(),
+            })
+        }
+
+        async fn handle_query_usage(
+            &self,
+            _request: QueryUsageRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<QueryUsageResponse, RPCErrors> {
+            Ok(QueryUsageResponse::default())
+        }
+
+        async fn handle_query_trace(
+            &self,
+            _request: QueryRouteTraceRequest,
+            _ctx: RPCContext,
+        ) -> std::result::Result<QueryRouteTraceResponse, RPCErrors> {
+            Ok(QueryRouteTraceResponse::default())
+        }
+    }
+
+    fn provider_validate_request() -> ProviderValidateRequest {
+        ProviderValidateRequest::new(
+            ProviderInstanceType::CloudApi,
+            "openai",
+            "https://api.openai.com/v1",
+            serde_json::from_value(json!({"api_token": {"inline_secret": "redacted"}})).unwrap(),
+        )
+    }
+
+    fn provider_add_request() -> ProviderAddRequest {
+        ProviderAddRequest::new(
+            "openai-main",
+            ProviderInstanceType::CloudApi,
+            "openai",
+            "https://api.openai.com/v1",
+            serde_json::from_value(json!({"api_token": {"inline_secret": "redacted"}})).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn management_client_and_server_dispatch_all_canonical_methods() {
+        let client = AiccClient::new_in_process(Box::new(ManagementHandler));
+        let routing = client.get_routing(RoutingGetRequest::new()).await.unwrap();
+        assert_eq!(routing.settings_revision, 12);
+        let routing = client
+            .update_routing(RoutingUpdateRequest::new(12, BTreeMap::new()))
+            .await
+            .unwrap();
+        assert_eq!(routing.settings_revision, 13);
+        assert!(routing.routing.provider_weights.is_empty());
+        client
+            .provider_catalog(ProviderCatalogRequest::new())
+            .await
+            .unwrap();
+        client
+            .list_protocol_adapters(ProtocolAdapterListRequest::new())
+            .await
+            .unwrap();
+        client
+            .validate_provider(provider_validate_request())
+            .await
+            .unwrap();
+        client.add_provider(provider_add_request()).await.unwrap();
+        let providers = client
+            .list_providers(ProviderListRequest::new(None))
+            .await
+            .unwrap();
+        assert_eq!(providers.settings_revision, 12);
+        assert_eq!(providers.providers[0].provider_instance_name, "openai-main");
+        client
+            .delete_provider(ProviderDeleteRequest::new("openai-main"))
+            .await
+            .unwrap();
+        client
+            .refresh_provider_models(ProviderRefreshModelsRequest::new("openai-main"))
+            .await
+            .unwrap();
+        client
+            .query_usage(QueryUsageRequest::new(crate::UsageQueryTimeRange::Last30d))
+            .await
+            .unwrap();
+        client
+            .query_trace(QueryRouteTraceRequest::new())
+            .await
+            .unwrap();
+
+        let calls = [
+            (
+                ai_methods::ROUTING_GET,
+                serde_json::to_value(RoutingGetRequest::new()).unwrap(),
+            ),
+            (
+                ai_methods::ROUTING_UPDATE,
+                serde_json::to_value(RoutingUpdateRequest::new(12, BTreeMap::new())).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_CATALOG,
+                serde_json::to_value(ProviderCatalogRequest::new()).unwrap(),
+            ),
+            (
+                ai_methods::PROTOCOL_ADAPTER_LIST,
+                serde_json::to_value(ProtocolAdapterListRequest::new()).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_VALIDATE,
+                serde_json::to_value(provider_validate_request()).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_ADD,
+                serde_json::to_value(provider_add_request()).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_LIST,
+                serde_json::to_value(ProviderListRequest::new(None)).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_DELETE,
+                serde_json::to_value(ProviderDeleteRequest::new("openai-main")).unwrap(),
+            ),
+            (
+                ai_methods::PROVIDER_REFRESH_MODELS,
+                serde_json::to_value(ProviderRefreshModelsRequest::new("openai-main")).unwrap(),
+            ),
+            (
+                ai_methods::USAGE_QUERY,
+                serde_json::to_value(QueryUsageRequest::new(crate::UsageQueryTimeRange::Last30d))
+                    .unwrap(),
+            ),
+            (
+                ai_methods::TRACE_QUERY,
+                serde_json::to_value(QueryRouteTraceRequest::new()).unwrap(),
+            ),
+        ];
+        let server = AiccServerHandler::new(ManagementHandler);
+        for (seq, (method, params)) in calls.into_iter().enumerate() {
+            let response = server
+                .handle_rpc_call(
+                    RPCRequest {
+                        method: method.to_string(),
+                        params,
+                        seq: seq as u64,
+                        token: None,
+                        trace_id: Some(format!("management-{seq}")),
+                    },
+                    "127.0.0.1".parse().unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.seq, seq as u64);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub enum ApiType {
+    #[serde(rename = "llm")]
+    Llm,
+    #[serde(rename = "embedding.text")]
+    EmbeddingText,
+    #[serde(rename = "embedding.multimodal")]
+    EmbeddingMultimodal,
+    #[serde(rename = "decision")]
+    Decision,
+    #[serde(rename = "rerank")]
+    Rerank,
+    #[serde(rename = "image.txt2img")]
+    ImageTextToImage,
+    #[serde(rename = "image.img2img")]
+    ImageImageToImage,
+    #[serde(rename = "image.inpaint")]
+    ImageInpaint,
+    #[serde(rename = "image.upscale")]
+    ImageUpscale,
+    #[serde(rename = "image.bg_remove")]
+    ImageBackgroundRemove,
+    #[serde(rename = "vision.ocr")]
+    VisionOcr,
+    #[serde(rename = "vision.caption")]
+    VisionCaption,
+    #[serde(rename = "vision.detect")]
+    VisionDetect,
+    #[serde(rename = "vision.segment")]
+    VisionSegment,
+    #[serde(rename = "audio.tts")]
+    AudioTextToSpeech,
+    #[serde(rename = "audio.asr")]
+    AudioSpeechRecognition,
+    #[serde(rename = "audio.music")]
+    AudioMusic,
+    #[serde(rename = "audio.enhance")]
+    AudioEnhance,
+    #[serde(rename = "video.generate")]
+    VideoGenerate,
+    #[serde(rename = "video.edit")]
+    VideoEdit,
+    #[serde(rename = "video.extend")]
+    VideoExtend,
+    #[serde(rename = "video.upscale")]
+    VideoUpscale,
+    #[serde(rename = "agent.computer_use")]
+    AgentComputerUse,
+}
+
+impl ApiType {
+    pub fn capability(self) -> Capability {
+        match self {
+            Self::Llm => Capability::Llm,
+            Self::EmbeddingText | Self::EmbeddingMultimodal => Capability::Embedding,
+            Self::Rerank => Capability::Rerank,
+            Self::Decision => Capability::Decision,
+            Self::ImageTextToImage
+            | Self::ImageImageToImage
+            | Self::ImageInpaint
+            | Self::ImageUpscale
+            | Self::ImageBackgroundRemove => Capability::Image,
+            Self::VisionOcr | Self::VisionCaption | Self::VisionDetect | Self::VisionSegment => {
+                Capability::Vision
+            }
+            Self::AudioTextToSpeech
+            | Self::AudioSpeechRecognition
+            | Self::AudioMusic
+            | Self::AudioEnhance => Capability::Audio,
+            Self::VideoGenerate | Self::VideoEdit | Self::VideoExtend | Self::VideoUpscale => {
+                Capability::Video
+            }
+            Self::AgentComputerUse => Capability::Agent,
+        }
+    }
+
+    pub fn typed_method(self) -> &'static str {
+        match self {
+            Self::Llm => ai_methods::CHAT_COMPLETIONS_CREATE,
+            Self::EmbeddingText => ai_methods::EMBEDDING_TEXT,
+            Self::EmbeddingMultimodal => ai_methods::EMBEDDING_MULTIMODAL,
+            Self::Rerank => ai_methods::RERANK,
+            Self::Decision => ai_methods::DECISION_EVALUATE,
+            Self::ImageTextToImage => ai_methods::IMAGES_GENERATE,
+            Self::ImageImageToImage => ai_methods::IMAGE_IMG2IMG,
+            Self::ImageInpaint => ai_methods::IMAGE_INPAINT,
+            Self::ImageUpscale => ai_methods::IMAGE_UPSCALE,
+            Self::ImageBackgroundRemove => ai_methods::IMAGE_BG_REMOVE,
+            Self::VisionOcr => ai_methods::VISION_OCR,
+            Self::VisionCaption => ai_methods::VISION_CAPTION,
+            Self::VisionDetect => ai_methods::VISION_DETECT,
+            Self::VisionSegment => ai_methods::VISION_SEGMENT,
+            Self::AudioTextToSpeech => ai_methods::AUDIO_TTS,
+            Self::AudioSpeechRecognition => ai_methods::AUDIO_ASR,
+            Self::AudioMusic => ai_methods::AUDIO_MUSIC,
+            Self::AudioEnhance => ai_methods::AUDIO_ENHANCE,
+            Self::VideoGenerate => ai_methods::VIDEO_GENERATE,
+            Self::VideoEdit => ai_methods::VIDEO_EDIT,
+            Self::VideoExtend => ai_methods::VIDEO_EXTEND,
+            Self::VideoUpscale => ai_methods::VIDEO_UPSCALE,
+            Self::AgentComputerUse => ai_methods::AGENT_COMPUTER_USE,
+        }
+    }
+}
+
+pub fn validate_exact_model_name(value: &str) -> std::result::Result<(), AiccError> {
+    let mut parts = value.split('@');
+    let provider_model_id = parts.next().unwrap_or_default();
+    let provider_instance_name = parts.next().unwrap_or_default();
+    if provider_model_id.is_empty() || provider_instance_name.is_empty() || parts.next().is_some() {
+        return Err(AiccError::new(
+            AiccErrorCode::InvalidModelName,
+            "exact_model must be `<provider_model_id>[:<variant>]@<provider_instance_name>`",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_logical_model_name(value: &str) -> std::result::Result<(), AiccError> {
+    if value.trim().is_empty() || value.contains('@') {
+        return Err(AiccError::new(
+            AiccErrorCode::InvalidModelName,
+            "logical_model must be a non-empty logical path without `@`",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Capability {
+    Decision,
     Llm,
     Embedding,
     Rerank,
@@ -111,30 +1341,72 @@ pub type Feature = String;
 
 pub mod features {
     pub const PLAN: &str = "plan";
-    pub const TOOL_CALLING: &str = "tool_calling";
-    pub const JSON_OUTPUT: &str = "json_output";
+    pub const TOOL_CALL: &str = "tool_call";
+    pub const JSON_SCHEMA: &str = "json_schema";
     pub const WEB_SEARCH: &str = "web_search";
     pub const VISION: &str = "vision";
+    pub const IMAGE_GENERATION: &str = "image_generation";
     pub const ASR: &str = "asr";
     pub const VIDEO_UNDERSTAND: &str = "video_understand";
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RespFormat {
-    #[default]
-    #[serde(alias = "Text")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmResponseFormatType {
     Text,
-    #[serde(alias = "Json", alias = "JSON")]
     Json,
-}
-
-fn is_default_resp_format(resp_format: &RespFormat) -> bool {
-    matches!(resp_format, RespFormat::Text)
+    JsonObject,
+    JsonSchema,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub struct LlmJsonSchema {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmResponseFormat {
+    #[serde(rename = "type")]
+    pub format_type: LlmResponseFormatType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<LlmJsonSchema>,
+}
+
+impl LlmResponseFormat {
+    pub fn text() -> Self {
+        Self {
+            format_type: LlmResponseFormatType::Text,
+            json_schema: None,
+        }
+    }
+
+    pub fn json_object() -> Self {
+        Self {
+            format_type: LlmResponseFormatType::JsonObject,
+            json_schema: None,
+        }
+    }
+
+    pub fn json_schema(name: Option<String>, schema: Value, strict: Option<bool>) -> Self {
+        Self {
+            format_type: LlmResponseFormatType::JsonSchema,
+            json_schema: Some(LlmJsonSchema {
+                name,
+                schema,
+                strict,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResourceRef {
     Url {
         url: String,
@@ -164,24 +1436,198 @@ impl ResourceRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelSpec {
-    pub alias: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_model_hint: Option<String>,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccErrorCode {
+    InvalidRequest,
+    InvalidMethod,
+    SchemaValidationFailed,
+    InvalidModelName,
+    ResourceInvalid,
+    NoProviderAvailable,
+    NoCandidateModel,
+    FallbackNotAllowed,
+    ProviderStartFailed,
+    ProviderError,
+    UnsupportedOperation,
+    UnsupportedExecutionMode,
+    Timeout,
+    BudgetExceeded,
+    PolicyDenied,
+    IdempotencyConflict,
+    SettingsRevisionConflict,
+    Cancelled,
+    InternalError,
+    /// An enabled token quota rule has nothing left (§7.4).
+    QuotaExhausted,
+    /// Every rule has tokens left, but fewer than this call reserves.
+    QuotaBudgetExceeded,
+    /// A configured rule could not be read or reserved; never treated as unlimited.
+    QuotaUnavailable,
+    /// The Provider / Model is outside the caller's visibility, or no
+    /// permitted candidate is left; hidden identities are not disclosed.
+    ResourceNotPermitted,
+    /// The AICC user of a delegated run cannot be determined.
+    AttributionUnavailable,
 }
 
-impl ModelSpec {
-    pub fn new(alias: String, provider_model_hint: Option<String>) -> Self {
-        Self {
-            alias,
-            provider_model_hint,
+impl AiccErrorCode {
+    /// Token quota and resource policy refusals (AI Center Quota PRD §7.4).
+    pub fn is_policy_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::QuotaExhausted
+                | Self::QuotaBudgetExceeded
+                | Self::QuotaUnavailable
+                | Self::ResourceNotPermitted
+                | Self::AttributionUnavailable
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::InvalidMethod => "invalid_method",
+            Self::SchemaValidationFailed => "schema_validation_failed",
+            Self::InvalidModelName => "invalid_model_name",
+            Self::ResourceInvalid => "resource_invalid",
+            Self::NoProviderAvailable => "no_provider_available",
+            Self::NoCandidateModel => "no_candidate_model",
+            Self::FallbackNotAllowed => "fallback_not_allowed",
+            Self::ProviderStartFailed => "provider_start_failed",
+            Self::ProviderError => "provider_error",
+            Self::UnsupportedOperation => "unsupported_operation",
+            Self::UnsupportedExecutionMode => "unsupported_execution_mode",
+            Self::Timeout => "timeout",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::PolicyDenied => "policy_denied",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::SettingsRevisionConflict => "settings_revision_conflict",
+            Self::Cancelled => "cancelled",
+            Self::InternalError => "internal_error",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::QuotaBudgetExceeded => "quota_budget_exceeded",
+            Self::QuotaUnavailable => "quota_unavailable",
+            Self::ResourceNotPermitted => "resource_not_permitted",
+            Self::AttributionUnavailable => "attribution_unavailable",
         }
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AiccError {
+    pub code: AiccErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retriable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsRevisionConflictDetails {
+    pub expected_revision: u64,
+    pub actual_revision: u64,
+}
+
+impl AiccError {
+    pub fn new(code: AiccErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            provider_code: None,
+            retriable: false,
+            details: None,
+        }
+    }
+
+    pub fn settings_revision_conflict(expected_revision: u64, actual_revision: u64) -> Self {
+        Self {
+            code: AiccErrorCode::SettingsRevisionConflict,
+            message: "settings revision conflict".to_string(),
+            provider_code: None,
+            retriable: false,
+            details: Some(
+                serde_json::to_value(SettingsRevisionConflictDetails {
+                    expected_revision,
+                    actual_revision,
+                })
+                .expect("settings revision conflict details are serializable"),
+            ),
+        }
+    }
+
+    pub fn to_krpc_error(&self) -> RPCErrors {
+        if self.code.is_policy_refusal() {
+            // The wire carries the code and the whole error as data, so every
+            // client branches on `code` (PRD §7.4) instead of parsing text.
+            return RPCErrors::Detailed(RPCErrorDetail {
+                code: self.code.as_str().to_string(),
+                message: self.message.clone(),
+                data: serde_json::to_value(self).ok(),
+            });
+        }
+        let body = serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                "{{\"code\":\"internal_error\",\"message\":{:?}}}",
+                self.message
+            )
+        });
+        match self.code {
+            AiccErrorCode::InvalidRequest
+            | AiccErrorCode::InvalidMethod
+            | AiccErrorCode::SchemaValidationFailed
+            | AiccErrorCode::InvalidModelName => RPCErrors::ParseRequestError(body),
+            AiccErrorCode::PolicyDenied
+            | AiccErrorCode::ResourceNotPermitted
+            | AiccErrorCode::AttributionUnavailable => RPCErrors::NoPermission(body),
+            _ => RPCErrors::ReasonError(body),
+        }
+    }
+
+    pub fn to_task_event_data(&self) -> Value {
+        serde_json::to_value(self).unwrap_or_else(|_| {
+            json!({
+                "code": "internal_error",
+                "message": self.message,
+                "retriable": false
+            })
+        })
+    }
+
+    pub fn from_krpc_error(error: &RPCErrors) -> Option<Self> {
+        if let RPCErrors::Detailed(detail) = error {
+            return detail
+                .data
+                .clone()
+                .and_then(|data| serde_json::from_value(data).ok());
+        }
+        let body = match error {
+            RPCErrors::ParseRequestError(body)
+            | RPCErrors::ReasonError(body)
+            | RPCErrors::NoPermission(body) => body,
+            _ => return None,
+        };
+        serde_json::from_str(body).ok()
+    }
+}
+
+impl std::fmt::Display for AiccError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for AiccError {}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelRequirement {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<DecisionRequirements>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -192,49 +1638,123 @@ pub struct ModelRequirement {
     pub web_search: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vision: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image_generation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub canonical_fields: BTreeMap<String, CanonicalFieldRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoGenerationRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CanonicalFieldRequirement {
+    pub value: Value,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
+    #[serde(default = "default_allow_fuzzy")]
+    pub allow_fuzzy: bool,
+}
+
+fn default_allow_fuzzy() -> bool {
+    true
+}
+
+impl CanonicalFieldRequirement {
+    pub fn new(value: Value) -> Self {
+        Self {
+            value,
+            strict: false,
+            allow_fuzzy: true,
+        }
+    }
+
+    pub fn strict(value: Value) -> Self {
+        Self {
+            value,
+            strict: true,
+            allow_fuzzy: false,
+        }
+    }
 }
 
 impl ModelRequirement {
     pub fn set_feature_required(&mut self, feature: &str) {
         match feature {
-            features::TOOL_CALLING => self.tool_call = true,
-            features::JSON_OUTPUT => self.json_schema = true,
+            features::TOOL_CALL => self.tool_call = true,
+            features::JSON_SCHEMA => self.json_schema = true,
             features::WEB_SEARCH => self.web_search = true,
             features::VISION => self.vision = true,
+            features::IMAGE_GENERATION => self.image_generation = true,
             "streaming" => self.streaming = true,
+            "decision.choice" | "decision.score" | "decision.boolean" => {
+                let kind = match feature {
+                    "decision.choice" => crate::DecisionQuestionType::Choice,
+                    "decision.score" => crate::DecisionQuestionType::Score,
+                    _ => crate::DecisionQuestionType::Boolean,
+                };
+                self.decision
+                    .get_or_insert_with(Default::default)
+                    .question_types
+                    .insert(kind);
+            }
+            "decision.structured_state" => {
+                self.decision
+                    .get_or_insert_with(Default::default)
+                    .structured_state = true
+            }
+            "decision.structured_rules" => {
+                self.decision
+                    .get_or_insert_with(Default::default)
+                    .structured_rules = true
+            }
+            "decision.probabilities" => {
+                self.decision.get_or_insert_with(Default::default);
+            }
+
             _ => {}
         }
     }
 
     pub fn requires_feature(&self, feature: &str) -> bool {
         match feature {
-            features::TOOL_CALLING => self.tool_call,
-            features::JSON_OUTPUT => self.json_schema,
+            features::TOOL_CALL => self.tool_call,
+            features::JSON_SCHEMA => self.json_schema,
             features::WEB_SEARCH => self.web_search,
             features::VISION => self.vision,
+            features::IMAGE_GENERATION => self.image_generation,
             "streaming" => self.streaming,
-            _ => false,
+            _ => self
+                .decision
+                .as_ref()
+                .is_some_and(|decision| decision.features().iter().any(|name| name == feature)),
         }
     }
 
     pub fn feature_names(&self) -> Vec<Feature> {
         let mut features = Vec::new();
+        if let Some(decision) = &self.decision {
+            features.extend(decision.features());
+        }
         if self.streaming {
             features.push("streaming".to_string());
         }
         if self.tool_call {
-            features.push(features::TOOL_CALLING.to_string());
+            features.push(features::TOOL_CALL.to_string());
         }
         if self.json_schema {
-            features.push(features::JSON_OUTPUT.to_string());
+            features.push(features::JSON_SCHEMA.to_string());
         }
         if self.web_search {
             features.push(features::WEB_SEARCH.to_string());
         }
         if self.vision {
             features.push(features::VISION.to_string());
+        }
+        if self.image_generation {
+            features.push(features::IMAGE_GENERATION.to_string());
         }
         features
     }
@@ -252,6 +1772,8 @@ pub struct ModelDisable {
     pub web_search: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub vision: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image_generation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_context_tokens: Option<u64>,
 }
@@ -259,10 +1781,11 @@ pub struct ModelDisable {
 impl ModelDisable {
     pub fn set_feature_disabled(&mut self, feature: &str) {
         match feature {
-            features::TOOL_CALLING => self.tool_call = true,
-            features::JSON_OUTPUT => self.json_schema = true,
+            features::TOOL_CALL => self.tool_call = true,
+            features::JSON_SCHEMA => self.json_schema = true,
             features::WEB_SEARCH => self.web_search = true,
             features::VISION => self.vision = true,
+            features::IMAGE_GENERATION => self.image_generation = true,
             "streaming" => self.streaming = true,
             _ => {}
         }
@@ -270,10 +1793,11 @@ impl ModelDisable {
 
     pub fn disables_feature(&self, feature: &str) -> bool {
         match feature {
-            features::TOOL_CALLING => self.tool_call,
-            features::JSON_OUTPUT => self.json_schema,
+            features::TOOL_CALL => self.tool_call,
+            features::JSON_SCHEMA => self.json_schema,
             features::WEB_SEARCH => self.web_search,
             features::VISION => self.vision,
+            features::IMAGE_GENERATION => self.image_generation,
             "streaming" => self.streaming,
             _ => false,
         }
@@ -285,16 +1809,19 @@ impl ModelDisable {
             features.push("streaming".to_string());
         }
         if self.tool_call {
-            features.push(features::TOOL_CALLING.to_string());
+            features.push(features::TOOL_CALL.to_string());
         }
         if self.json_schema {
-            features.push(features::JSON_OUTPUT.to_string());
+            features.push(features::JSON_SCHEMA.to_string());
         }
         if self.web_search {
             features.push(features::WEB_SEARCH.to_string());
         }
         if self.vision {
             features.push(features::VISION.to_string());
+        }
+        if self.image_generation {
+            features.push(features::IMAGE_GENERATION.to_string());
         }
         if let Some(tokens) = self.min_context_tokens {
             features.push(format!("min_context_tokens:{}", tokens));
@@ -308,15 +1835,17 @@ fn is_default_model_disable(disable: &ModelDisable) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ModelItem {
+pub struct LogicalItem {
+    pub name: String,
     pub target: String,
     #[serde(default = "default_model_item_weight")]
     pub weight: f64,
 }
 
-impl ModelItem {
-    pub fn new(target: impl Into<String>, weight: f64) -> Self {
+impl LogicalItem {
+    pub fn new(name: impl Into<String>, target: impl Into<String>, weight: f64) -> Self {
         Self {
+            name: name.into(),
             target: target.into(),
             weight,
         }
@@ -327,7 +1856,7 @@ fn default_model_item_weight() -> f64 {
     1.0
 }
 
-pub type LogicalItems = BTreeMap<String, ModelItem>;
+pub type LogicalItems = Vec<LogicalItem>;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelItemPatch {
@@ -337,17 +1866,12 @@ pub struct ModelItemPatch {
     pub weight: Option<f64>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayMergeMode {
+    #[default]
     Inherit,
     Replace,
-}
-
-impl Default for OverlayMergeMode {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -367,21 +1891,16 @@ pub struct AiccFallbackRule {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiccSchedulerProfile {
+    #[default]
     CostFirst,
     LatencyFirst,
     QualityFirst,
     Balanced,
     LocalFirst,
     StrictLocal,
-}
-
-impl Default for AiccSchedulerProfile {
-    fn default() -> Self {
-        Self::CostFirst
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -436,7 +1955,26 @@ impl<T> LockedValue<T> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AiCost {
+    pub amount: f64,
+    pub currency: String,
+}
+
+impl AiCost {
+    pub fn new(amount: f64, currency: impl Into<String>) -> Self {
+        Self {
+            amount,
+            currency: currency.into(),
+        }
+    }
+}
+
+pub type Money = AiCost;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AiccPolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<LockedValue<AiccSchedulerProfile>>,
@@ -457,7 +1995,7 @@ pub struct AiccPolicyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_provider_instances: Option<LockedValue<Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_estimated_cost_usd: Option<LockedValue<f64>>,
+    pub max_estimated_cost: Option<LockedValue<Money>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -480,10 +2018,6 @@ pub struct AiccSchedulerProfileConfig {
 pub struct AiccSchedulerProfileWeights {
     #[serde(default)]
     pub cost: f64,
-    #[serde(default)]
-    pub latency: f64,
-    #[serde(default)]
-    pub reliability: f64,
     #[serde(default)]
     pub quality: f64,
     #[serde(default)]
@@ -531,7 +2065,7 @@ pub struct AiccLogicalTreeOverlay {
     pub path: String,
     #[serde(default, skip_serializing_if = "is_default_overlay_merge_mode")]
     pub merge_mode: OverlayMergeMode,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub items: LogicalItems,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub item_overrides: BTreeMap<String, ModelItemPatch>,
@@ -567,6 +2101,8 @@ pub struct AiccRouteOverlay {
     pub global_exact_model_weights: BTreeMap<String, f64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_weights: BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routing_commands: Vec<AiccRoutingCommand>,
     #[serde(default, skip_serializing_if = "is_default_aicc_policy_config")]
     pub policy: AiccPolicyConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,61 +2111,95 @@ pub struct AiccRouteOverlay {
     pub ttl_seconds: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AiccRoutingCommand {
+    VendorFactor {
+        vendor: String,
+        factor: f64,
+    },
+    SpecFactor {
+        spec: String,
+        factor: f64,
+    },
+    ModelFactor {
+        vendor: String,
+        model: String,
+        factor: f64,
+    },
+    ItemWeight {
+        path: String,
+        item: String,
+        weight: f64,
+    },
+}
+
+impl AiccRoutingCommand {
+    pub fn same_subject(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::VendorFactor { vendor: a, .. }, Self::VendorFactor { vendor: b, .. }) => a == b,
+            (Self::SpecFactor { spec: a, .. }, Self::SpecFactor { spec: b, .. }) => a == b,
+            (
+                Self::ModelFactor {
+                    vendor: av,
+                    model: am,
+                    ..
+                },
+                Self::ModelFactor {
+                    vendor: bv,
+                    model: bm,
+                    ..
+                },
+            ) => av == bv && am == bm,
+            (
+                Self::ItemWeight {
+                    path: ap, item: ai, ..
+                },
+                Self::ItemWeight {
+                    path: bp, item: bi, ..
+                },
+            ) => ap == bp && ai == bi,
+            _ => false,
+        }
+    }
+
+    pub fn value(&self) -> f64 {
+        match self {
+            Self::VendorFactor { factor, .. }
+            | Self::SpecFactor { factor, .. }
+            | Self::ModelFactor { factor, .. } => *factor,
+            Self::ItemWeight { weight, .. } => *weight,
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let names: &[&str] = match self {
+            Self::VendorFactor { vendor, .. } => &[vendor],
+            Self::SpecFactor { spec, .. } => &[spec],
+            Self::ModelFactor { vendor, model, .. } => &[vendor, model],
+            Self::ItemWeight { path, item, .. } => &[path, item],
+        };
+        if names.iter().any(|name| name.trim().is_empty()) {
+            return Err("routing command subject must not be empty".to_string());
+        }
+        let value = self.value();
+        if !value.is_finite() || value < 0.0 {
+            return Err("routing command value must be finite and non-negative".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiccRoutingCommandStatus {
+    pub command: AiccRoutingCommand,
+    pub matched_items: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+}
+
 fn is_default_aicc_policy_config(policy: &AiccPolicyConfig) -> bool {
     policy == &AiccPolicyConfig::default()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct Requirements {
-    #[serde(default, flatten)]
-    pub required: ModelRequirement,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub must_features: Vec<Feature>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_latency_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_cost_usd: Option<f64>,
-    #[serde(default, skip_serializing_if = "is_default_resp_format")]
-    pub resp_format: RespFormat,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra: Option<Value>,
-}
-
-impl Requirements {
-    pub fn new(
-        must_features: Vec<Feature>,
-        max_latency_ms: Option<u64>,
-        max_cost_usd: Option<f64>,
-        extra: Option<Value>,
-    ) -> Self {
-        Self {
-            required: ModelRequirement::default(),
-            must_features,
-            max_latency_ms,
-            max_cost_usd,
-            resp_format: RespFormat::default(),
-            extra,
-        }
-    }
-
-    pub fn set_feature_required(&mut self, feature: &str) {
-        self.required.set_feature_required(feature);
-    }
-
-    pub fn requires_feature(&self, feature: &str) -> bool {
-        self.required.requires_feature(feature)
-            || self.must_features.iter().any(|item| item == feature)
-    }
-
-    pub fn effective_feature_names(&self) -> Vec<Feature> {
-        let mut features = self.required.feature_names();
-        for feature in &self.must_features {
-            if !features.iter().any(|item| item == feature) {
-                features.push(feature.clone());
-            }
-        }
-        features
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -651,6 +2221,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RoutePolicy {
     #[serde(default, skip_serializing_if = "is_default_route_policy_profile")]
     pub profile: RoutePolicyProfile,
@@ -667,7 +2238,7 @@ pub struct RoutePolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_provider_instances: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_cost_usd: Option<f64>,
+    pub max_cost: Option<Money>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_latency_ms: Option<u64>,
 }
@@ -690,18 +2261,26 @@ impl Default for RoutePolicy {
             explain: false,
             allowed_provider_instances: Vec::new(),
             blocked_provider_instances: Vec::new(),
-            max_cost_usd: None,
+            max_cost: None,
             max_latency_ms: None,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AiToolSpec {
+    #[serde(rename = "type", default = "default_tool_type")]
+    pub tool_type: String,
     pub name: String,
     pub description: String,
-    pub args_schema: HashMap<String, Value>,
-    pub output_schema: Value,
+    pub args_json_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+}
+
+fn default_tool_type() -> String {
+    "function".to_string()
 }
 
 pub fn value_to_object_map(value: Value) -> HashMap<String, Value> {
@@ -744,7 +2323,7 @@ impl AiRole {
 /// excludes ToolUse / ToolResult / Thinking, which have no meaning nested
 /// inside a tool result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AiToolResultContent {
     Text {
         text: String,
@@ -775,7 +2354,7 @@ impl AiToolResultContent {
 /// Content block. Mirrors the Anthropic content-block model, generalized
 /// enough to round-trip OpenAI Responses items and Gemini parts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AiContent {
     /// Plain text segment.
     Text { text: String },
@@ -812,6 +2391,11 @@ pub enum AiContent {
     /// `provider_metadata` holds per-provider signature/state bits that
     /// aren't worth a dedicated field.
     Thinking {
+        /// Provider instance + model that produced the block. AICC binds it
+        /// on every response and only replays the block to that same source;
+        /// an unbound or foreign block is dropped from the request.
+        #[serde(default = "ProviderStateCoordinate::unbound")]
+        source: ProviderStateCoordinate,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -824,10 +2408,38 @@ pub enum AiContent {
     /// abstracted across providers (OpenAI reasoning item id/encrypted_content,
     /// Claude server_tool_use / web_search_tool_result, etc.).
     ///
-    /// `provider` is the stable owner/consumer namespace for the opaque item,
-    /// not the native item's protocol or type name. Each adapter defines the
-    /// provider namespaces it can restore; the rest are dropped.
-    ProviderState { provider: String, value: Value },
+    ProviderState {
+        source: ProviderStateCoordinate,
+        provider: String,
+        value: Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStateCoordinate {
+    pub provider_profile_id: String,
+    pub adapter_type: String,
+    pub origin_provider: String,
+    pub origin_model: String,
+}
+
+impl ProviderStateCoordinate {
+    pub fn unbound() -> Self {
+        Self {
+            provider_profile_id: String::new(),
+            adapter_type: String::new(),
+            origin_provider: String::new(),
+            origin_model: String::new(),
+        }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        !self.provider_profile_id.is_empty()
+            && !self.adapter_type.is_empty()
+            && !self.origin_provider.is_empty()
+            && !self.origin_model.is_empty()
+    }
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -892,6 +2504,7 @@ impl AiContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AiMessage {
     pub role: AiRole,
     pub content: Vec<AiContent>,
@@ -1065,8 +2678,7 @@ impl AiMessage {
     }
 
     /// Validate role × content combinations per §1.1 of the design doc.
-    /// `AiPayload::validate_all_messages` calls this for every message before
-    /// the request leaves the aicc client.
+    /// Typed chat clients call this before the request leaves the AICC client.
     pub fn validate(&self) -> std::result::Result<(), AiMessageError> {
         match self.role {
             AiRole::System | AiRole::Developer => {
@@ -1142,173 +2754,73 @@ impl AiMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AiPayload {
-    pub text: Option<String>,
-    pub messages: Vec<AiMessage>,
-    pub tool_specs: Vec<AiToolSpec>,
-    pub resources: Vec<ResourceRef>,
-    pub input_json: Option<Value>,
-    pub options: Option<Value>,
-}
-
-impl AiPayload {
-    pub fn new(
-        text: Option<String>,
-        messages: Vec<AiMessage>,
-        tool_specs: Vec<AiToolSpec>,
-        resources: Vec<ResourceRef>,
-        input_json: Option<Value>,
-        options: Option<Value>,
-    ) -> Self {
-        Self {
-            text,
-            messages,
-            tool_specs,
-            resources,
-            input_json,
-            options,
-        }
-    }
-
-    /// Validate every message in `messages`. Called by the aicc client right
-    /// before serializing the payload, so all paths funnel through one gate.
-    pub fn validate_all_messages(&self) -> std::result::Result<(), AiMessageError> {
-        for msg in &self.messages {
-            msg.validate()?;
-        }
-        Ok(())
-    }
-
-    fn protocol_input_json(&self) -> Value {
-        let mut input_json = match self.input_json.clone() {
-            Some(Value::Object(map)) => map,
-            Some(value) => {
-                let mut map = serde_json::Map::new();
-                map.insert("value".to_string(), value);
-                map
-            }
-            None => serde_json::Map::new(),
-        };
-
-        if let Some(text) = self.text.as_ref() {
-            input_json
-                .entry("text".to_string())
-                .or_insert_with(|| Value::String(text.clone()));
-        }
-        if !self.messages.is_empty() && !input_json.contains_key("messages") {
-            if let Ok(value) = serde_json::to_value(&self.messages) {
-                input_json.insert("messages".to_string(), value);
-            }
-        }
-        if !self.tool_specs.is_empty() && !input_json.contains_key("tool_specs") {
-            if let Ok(value) = serde_json::to_value(&self.tool_specs) {
-                input_json.insert("tool_specs".to_string(), value);
-            }
-        }
-
-        Value::Object(input_json)
-    }
-}
-
-impl Default for AiPayload {
-    fn default() -> Self {
-        Self {
-            text: None,
-            messages: vec![],
-            tool_specs: vec![],
-            resources: vec![],
-            input_json: Some(json!({})),
-            options: Some(json!({})),
-        }
-    }
-}
-
-impl Serialize for AiPayload {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let options = self.options.clone().unwrap_or_else(|| json!({}));
-        let mut state = serializer.serialize_struct("AiPayload", 3)?;
-        state.serialize_field("input_json", &self.protocol_input_json())?;
-        state.serialize_field("resources", &self.resources)?;
-        state.serialize_field("options", &options)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for AiPayload {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct AiPayloadHelper {
-            #[serde(default)]
-            input_json: Option<Value>,
-            #[serde(default)]
-            resources: Vec<ResourceRef>,
-            #[serde(default)]
-            options: Option<Value>,
-        }
-
-        let helper = AiPayloadHelper::deserialize(deserializer)?;
-        let mut payload = Self {
-            text: None,
-            messages: vec![],
-            tool_specs: vec![],
-            resources: helper.resources,
-            input_json: helper.input_json,
-            options: helper.options,
-        };
-        if let Some(Value::Object(body)) = payload.input_json.as_mut() {
-            if let Some(Value::String(text)) = body.remove("text") {
-                payload.text = Some(text);
-            }
-            if let Some(value) = body.get("messages").cloned() {
-                match serde_json::from_value::<Vec<AiMessage>>(value) {
-                    Ok(messages) => {
-                        payload.messages = messages;
-                        body.remove("messages");
-                    }
-                    Err(_) => {
-                        // Legacy/non-typed shape; leave it in input_json so the
-                        // provider's compat path can still pick it up.
-                    }
-                }
-            }
-            if let Some(value) = body.get("tool_specs").cloned() {
-                match serde_json::from_value::<Vec<AiToolSpec>>(value) {
-                    Ok(specs) => {
-                        payload.tool_specs = specs;
-                        body.remove("tool_specs");
-                    }
-                    Err(_) => {
-                        // Same reasoning as messages — preserve the raw shape
-                        // for any provider that knows how to handle it.
-                    }
-                }
-            }
-        }
-        Ok(payload)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AiUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_seconds: Option<f64>,
+    /// Reference images a video request submitted, for per-image prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_images: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_units: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub characters: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<AiCost>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AiCost {
-    pub amount: f64,
-    pub currency: String,
+impl AiUsage {
+    pub fn request_units(request_units: u64) -> Self {
+        Self {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cache_read_input_tokens: None,
+            audio_input_tokens: None,
+            image_input_tokens: None,
+            audio_output_tokens: None,
+            image_output_tokens: None,
+            reported_cost: None,
+            cache_write_input_tokens: None,
+            cache_write_1h_input_tokens: None,
+            reasoning_tokens: None,
+            image_units: None,
+            audio_seconds: None,
+            video_seconds: None,
+            reference_images: None,
+            request_units: Some(request_units),
+            characters: None,
+            cost: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1319,6 +2831,38 @@ pub struct AiArtifact {
     pub mime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteAttemptOutcome {
+    Succeeded,
+    Failed,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTraceAttempt {
+    pub step: u32,
+    pub exact_model: String,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    pub outcome: RouteAttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<AiccErrorCode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTrace {
+    #[serde(default)]
+    pub attempts: Vec<RouteTraceAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1475,66 +3019,14 @@ fn resource_ref_mime(source: &ResourceRef) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AiMethodRequest {
-    pub capability: Capability,
-    pub model: ModelSpec,
-    pub requirements: Requirements,
-    #[serde(default, skip_serializing_if = "is_default_model_disable")]
-    pub disable: ModelDisable,
-    pub payload: AiPayload,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub policy: Option<RoutePolicy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idempotency_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_options: Option<AiTaskOptions>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AiTaskOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
 }
 
-impl AiMethodRequest {
-    pub fn new(
-        capability: Capability,
-        model: ModelSpec,
-        requirements: Requirements,
-        payload: AiPayload,
-        idempotency_key: Option<String>,
-    ) -> Self {
-        Self {
-            capability,
-            model,
-            requirements,
-            disable: ModelDisable::default(),
-            payload,
-            policy: None,
-            idempotency_key,
-            task_options: None,
-        }
-    }
-
-    pub fn with_policy(mut self, policy: Option<RoutePolicy>) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    pub fn with_task_options(mut self, task_options: Option<AiTaskOptions>) -> Self {
-        self.task_options = task_options;
-        self
-    }
-
-    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
-        serde_json::from_value(value).map_err(|error| {
-            RPCErrors::ParseRequestError(format!("Failed to parse AiMethodRequest: {}", error))
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AiMethodStatus {
     Succeeded,
@@ -1542,42 +3034,27 @@ pub enum AiMethodStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AiMethodResponse {
-    /// For `running`, this is the stable TaskMgr task id and can be passed
-    /// directly to `task-manager.get_task({ task_id })`.
-    pub task_id: String,
-    pub status: AiMethodStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<AiResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_ref: Option<String>,
-}
-
-impl AiMethodResponse {
-    pub fn new(
-        task_id: String,
-        status: AiMethodStatus,
-        result: Option<AiResponse>,
-        event_ref: Option<String>,
-    ) -> Self {
-        Self {
-            task_id,
-            status,
-            result,
-            event_ref,
-        }
-    }
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccExecutionMode {
+    #[default]
+    Immediate,
+    Stream,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RouteResolveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub execution_mode: AiccExecutionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
-    pub api_type: String,
+    pub api_type: ApiType,
     pub logical_model: String,
     #[serde(default)]
-    pub requirements: Requirements,
+    pub requirements: ModelRequirement,
     #[serde(default, skip_serializing_if = "is_default_model_disable")]
     pub disable: ModelDisable,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1588,13 +3065,35 @@ pub struct RouteResolveRequest {
     pub estimated_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_overlay: Option<AiccRouteOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl RouteResolveRequest {
+    pub fn new(api_type: ApiType, logical_model: impl Into<String>) -> Self {
+        Self {
+            trace_id: None,
+            execution_mode: AiccExecutionMode::Immediate,
+            request_id: None,
+            api_type,
+            logical_model: logical_model.into(),
+            requirements: ModelRequirement::default(),
+            disable: ModelDisable::default(),
+            policy: None,
+            estimated_input_tokens: None,
+            estimated_output_tokens: None,
+            session_overlay: None,
+            session_id: None,
+        }
+    }
+
     pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
-        serde_json::from_value(value).map_err(|error| {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
             RPCErrors::ParseRequestError(format!("Failed to parse RouteResolveRequest: {}", error))
-        })
+        })?;
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
+        Ok(request)
     }
 }
 
@@ -1603,59 +3102,213 @@ pub struct RouteFallbackAttempt {
     pub exact_model: String,
     pub provider_instance_name: String,
     pub provider_model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_options: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RouteResolveResponse {
     pub selected_exact_model: String,
+    pub selected_model_uid: String,
     pub provider_instance_name: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub model_driver_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_driver: Option<String>,
+    pub origin_model_id: String,
     pub provider_model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_options: Option<Value>,
+    pub operation: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_capabilities: Vec<Feature>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_capabilities: Vec<Feature>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_attempts: Vec<RouteFallbackAttempt>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_trace: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inventory_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub route_trace: RouteTrace,
+    pub inventory_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LlmChatInvokeRequest {
     pub exact_model: String,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub execution_mode: AiccExecutionMode,
     #[serde(default)]
     pub messages: Vec<AiMessage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<AiToolSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<RespFormat>,
+    pub response_format: Option<LlmResponseFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<AiPayload>,
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_options: Option<Value>,
+    pub output: Option<AiOutputOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_options: Option<AiTaskOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LlmChatHelperRequest {
+    pub logical_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub execution_mode: AiccExecutionMode,
+    #[serde(default)]
+    pub requirements: HelperModelRequirement,
+    #[serde(default, skip_serializing_if = "is_default_model_disable")]
+    pub disable: ModelDisable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RoutePolicy>,
+    #[serde(default)]
+    pub messages: Vec<AiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<AiToolSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<LlmResponseFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<AiOutputOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_options: Option<AiTaskOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_overlay: Option<AiccRouteOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HelperModelRequirement {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub streaming: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tool_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json_schema: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vision: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub image_generation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub canonical_fields: BTreeMap<String, CanonicalFieldRequirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoGenerationRequirement>,
+}
+
+impl From<HelperModelRequirement> for ModelRequirement {
+    fn from(value: HelperModelRequirement) -> Self {
+        Self {
+            decision: None,
+            streaming: value.streaming,
+            tool_call: value.tool_call,
+            json_schema: value.json_schema,
+            web_search: value.web_search,
+            vision: value.vision,
+            image_generation: value.image_generation,
+            min_context_tokens: value.min_context_tokens,
+            canonical_fields: value.canonical_fields,
+            video: value.video,
+        }
+    }
+}
+
+impl LlmChatHelperRequest {
+    pub fn new(logical_model: impl Into<String>, messages: Vec<AiMessage>) -> Self {
+        Self {
+            logical_model: logical_model.into(),
+            trace_id: None,
+            execution_mode: AiccExecutionMode::Immediate,
+            requirements: HelperModelRequirement::default(),
+            disable: ModelDisable::default(),
+            policy: None,
+            messages,
+            tools: Vec::new(),
+            response_format: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            seed: None,
+            stop: Vec::new(),
+            output: None,
+            idempotency_key: None,
+            task_options: None,
+            session_overlay: None,
+            session_id: None,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("Failed to parse LlmChatHelperRequest: {}", error))
+        })?;
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
+        Ok(request)
+    }
 }
 
 impl LlmChatInvokeRequest {
+    pub fn new(exact_model: impl Into<String>, messages: Vec<AiMessage>) -> Self {
+        Self {
+            exact_model: exact_model.into(),
+            web_search: false,
+            trace_id: None,
+            execution_mode: AiccExecutionMode::Immediate,
+            messages,
+            tools: Vec::new(),
+            response_format: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            seed: None,
+            stop: Vec::new(),
+            output: None,
+            idempotency_key: None,
+            task_options: None,
+            session_id: None,
+        }
+    }
+
     pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
-        serde_json::from_value(value).map_err(|error| {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
             RPCErrors::ParseRequestError(format!("Failed to parse LlmChatInvokeRequest: {}", error))
-        })
+        })?;
+        validate_exact_model_name(&request.exact_model).map_err(|error| error.to_krpc_error())?;
+        Ok(request)
     }
 }
 
@@ -1676,52 +3329,28 @@ pub struct LlmChatInvokeResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_trace: Option<Value>,
+    pub route_trace: Option<RouteTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ref: Option<String>,
-}
-
-impl From<AiMethodResponse> for LlmChatInvokeResponse {
-    fn from(value: AiMethodResponse) -> Self {
-        let tool_calls = value
-            .result
-            .as_ref()
-            .map(|result| result.tool_calls())
-            .unwrap_or_default();
-        Self {
-            task_id: value.task_id,
-            status: value.status,
-            message: value.result.as_ref().map(|result| result.message.clone()),
-            tool_calls,
-            usage: value
-                .result
-                .as_ref()
-                .and_then(|result| result.usage.clone()),
-            cost: value.result.as_ref().and_then(|result| result.cost.clone()),
-            finish_reason: value
-                .result
-                .as_ref()
-                .and_then(|result| result.finish_reason.clone()),
-            provider_task_ref: value
-                .result
-                .as_ref()
-                .and_then(|result| result.provider_task_ref.clone()),
-            route_trace: value
-                .result
-                .as_ref()
-                .and_then(|result| result.extra.as_ref())
-                .and_then(|extra| extra.get("route_trace").cloned()),
-            event_ref: value.event_ref,
-        }
-    }
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AiccError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TextToImageInvokeRequest {
     pub exact_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub execution_mode: AiccExecutionMode,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1731,25 +3360,124 @@ pub struct TextToImageInvokeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<AiPayload>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_options: Option<Value>,
+    pub output: Option<AiOutputOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_options: Option<AiTaskOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl TextToImageInvokeRequest {
+    pub fn new(exact_model: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            exact_model: exact_model.into(),
+            trace_id: None,
+            execution_mode: AiccExecutionMode::Immediate,
+            prompt: prompt.into(),
+            negative_prompt: None,
+            n: None,
+            aspect_ratio: None,
+            size: None,
+            quality: None,
+            style: None,
+            seed: None,
+            output: None,
+            idempotency_key: None,
+            task_options: None,
+            session_id: None,
+        }
+    }
+
     pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
-        serde_json::from_value(value).map_err(|error| {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
             RPCErrors::ParseRequestError(format!(
                 "Failed to parse TextToImageInvokeRequest: {}",
                 error
             ))
-        })
+        })?;
+        validate_exact_model_name(&request.exact_model).map_err(|error| error.to_krpc_error())?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TextToImageHelperRequest {
+    pub logical_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub execution_mode: AiccExecutionMode,
+    #[serde(default)]
+    pub requirements: HelperModelRequirement,
+    #[serde(default, skip_serializing_if = "is_default_model_disable")]
+    pub disable: ModelDisable,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<RoutePolicy>,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<AiOutputOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_options: Option<AiTaskOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_overlay: Option<AiccRouteOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+impl TextToImageHelperRequest {
+    pub fn new(logical_model: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            logical_model: logical_model.into(),
+            trace_id: None,
+            execution_mode: AiccExecutionMode::Immediate,
+            requirements: HelperModelRequirement::default(),
+            disable: ModelDisable::default(),
+            policy: None,
+            prompt: prompt.into(),
+            negative_prompt: None,
+            n: None,
+            aspect_ratio: None,
+            size: None,
+            quality: None,
+            style: None,
+            seed: None,
+            output: None,
+            idempotency_key: None,
+            task_options: None,
+            session_overlay: None,
+            session_id: None,
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse TextToImageHelperRequest: {}",
+                error
+            ))
+        })?;
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
+        Ok(request)
     }
 }
 
@@ -1758,49 +3486,1723 @@ pub struct TextToImageInvokeResponse {
     pub task_id: String,
     pub status: AiMethodStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<AiArtifact>,
+    pub images: Vec<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_states: Vec<AiContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<AiUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<AiCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_task_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route_trace: Option<Value>,
+    pub route_trace: Option<RouteTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<AiccError>,
 }
 
-impl From<AiMethodResponse> for TextToImageInvokeResponse {
-    fn from(value: AiMethodResponse) -> Self {
+macro_rules! impl_request_json {
+    ($request:ty) => {
+        impl $request {
+            pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+                serde_json::from_value(value).map_err(|error| {
+                    RPCErrors::ParseRequestError(format!(
+                        "Failed to parse {}: {}",
+                        stringify!($request),
+                        error
+                    ))
+                })
+            }
+        }
+    };
+}
+
+macro_rules! typed_request {
+    (
+        $name:ident,
+        required { $( $required:ident : $required_ty:ty ),* $(,)? },
+        optional { $( $optional:ident : $optional_ty:ty ),* $(,)? }
+        $(validate $validate:ident)?
+    ) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        #[serde(deny_unknown_fields)]
+        pub struct $name {
+            pub exact_model: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub trace_id: Option<String>,
+            #[serde(default)]
+            pub execution_mode: AiccExecutionMode,
+            $(pub $required: $required_ty,)*
+            $(
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                pub $optional: Option<$optional_ty>,
+            )*
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub idempotency_key: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub task_options: Option<AiTaskOptions>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub session_id: Option<String>,
+        }
+
+        impl $name {
+            pub fn new(exact_model: impl Into<String>, $($required: $required_ty),*) -> Self {
+                Self {
+                    exact_model: exact_model.into(),
+                    trace_id: None,
+                    execution_mode: AiccExecutionMode::Immediate,
+                    $($required,)*
+                    $($optional: None,)*
+                    idempotency_key: None,
+                    task_options: None,
+                    session_id: None,
+                }
+            }
+        }
+
+        impl $name {
+            pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+                let request: Self = serde_json::from_value(value).map_err(|error| {
+                    RPCErrors::ParseRequestError(format!(
+                        "Failed to parse {}: {}",
+                        stringify!($name),
+                        error
+                    ))
+                })?;
+                validate_exact_model_name(&request.exact_model)
+                    .map_err(|error| error.to_krpc_error())?;
+                $(request.$validate().map_err(|error| error.to_krpc_error())?;)?
+                Ok(request)
+            }
+        }
+    };
+}
+
+macro_rules! typed_response {
+    ($name:ident { $( $field:ident : $field_ty:ty ),* $(,)? }) => {
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+        pub struct $name {
+            pub task_id: String,
+            pub status: AiMethodStatus,
+            $(
+                #[serde(default, skip_serializing_if = "is_default")]
+                pub $field: $field_ty,
+            )*
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub usage: Option<AiUsage>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub cost: Option<AiCost>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub finish_reason: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub provider_task_ref: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub route_trace: Option<RouteTrace>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub event_ref: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub error: Option<AiccError>,
+        }
+
+        impl $name {
+            pub fn new(task_id: impl Into<String>, status: AiMethodStatus) -> Self {
+                Self {
+                    task_id: task_id.into(),
+                    status,
+                    $($field: Default::default(),)*
+                    usage: None,
+                    cost: None,
+                    finish_reason: None,
+                    provider_task_ref: None,
+                    route_trace: None,
+                    event_ref: None,
+                    error: None,
+                }
+            }
+        }
+    };
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    value == &T::default()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AiOutputOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EmbeddingTextItem {
+    Text {
+        text: String,
+        id: Option<String>,
+    },
+    Resource {
+        resource: ResourceRef,
+        id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingMultimodalItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ResourceRef>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingChunking {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingValue {
+    pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub embedding: Vec<f32>,
+    pub embedding_space_id: String,
+}
+
+typed_request!(EmbeddingTextRequest,
+    required { items: Vec<EmbeddingTextItem> },
+    optional {
+        chunking: EmbeddingChunking,
+        embedding_space_id: String,
+        dimensions: u32,
+        normalize: bool,
+        prefer_artifact: Value
+    }
+);
+typed_request!(EmbeddingMultimodalRequest,
+    required { items: Vec<EmbeddingMultimodalItem> },
+    optional { dimensions: u32, normalize: bool }
+);
+typed_response!(EmbeddingTextResponse {
+    data: Vec<EmbeddingValue>,
+    data_resource: Option<ResourceRef>
+});
+typed_response!(EmbeddingMultimodalResponse {
+    data: Vec<EmbeddingValue>,
+    data_resource: Option<ResourceRef>
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RerankDocument {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RerankResult {
+    pub index: usize,
+    pub id: String,
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document: Option<RerankDocument>,
+}
+
+typed_request!(RerankRequest,
+    required { query: String, documents: Vec<RerankDocument> },
+    optional { n: u32, return_documents: bool }
+);
+typed_response!(RerankResponse { results: Vec<RerankResult> });
+
+typed_request!(DecisionEvaluateRequest,
+    required { state: Value, questions: Vec<DecisionQuestion> },
+    optional {}
+    validate validate
+);
+typed_response!(DecisionEvaluateResponse { answers: Vec<DecisionAnswer>, model: Option<String> });
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskSemantics {
+    WhiteAreaIsEditArea,
+    BlackAreaIsEditArea,
+    AlphaZeroIsEditArea,
+}
+
+typed_request!(ImageToImageRequest,
+    required { images: Vec<ResourceRef>, prompt: String },
+    optional { strength: f64, output: AiOutputOptions }
+);
+typed_request!(
+    ImageInpaintRequest,
+    required {
+        image: ResourceRef,
+        mask: ResourceRef,
+        prompt: String
+    },
+    optional {
+        mask_semantics: MaskSemantics,
+        output: AiOutputOptions
+    }
+);
+typed_request!(
+    ImageUpscaleRequest,
+    required { image: ResourceRef },
+    optional {
+        scale: u32,
+        target_width: u32,
+        target_height: u32,
+        preserve_faces: bool,
+        output: AiOutputOptions
+    }
+);
+typed_request!(
+    ImageBackgroundRemoveRequest,
+    required { image: ResourceRef },
+    optional {
+        mode: String,
+        output: AiOutputOptions
+    }
+);
+typed_response!(ImageToImageResponse {
+    images: Vec<ResourceRef>,
+    provider_states: Vec<AiContent>
+});
+typed_response!(ImageInpaintResponse {
+    images: Vec<ResourceRef>,
+    provider_states: Vec<AiContent>
+});
+typed_response!(ImageUpscaleResponse { image: Option<ResourceRef> });
+typed_response!(ImageBackgroundRemoveResponse { image: Option<ResourceRef> });
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundingBoxFormat {
+    Xywh,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundingBoxUnit {
+    Px,
+    Relative,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BoundingBox {
+    pub format: BoundingBoxFormat,
+    pub unit: BoundingBoxUnit,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OcrLine {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OcrBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub bbox: BoundingBox,
+    #[serde(default)]
+    pub lines: Vec<OcrLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OcrPage {
+    pub page_index: u32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub blocks: Vec<OcrBlock>,
+}
+
+typed_request!(VisionOcrRequest,
+    required { document: ResourceRef },
+    optional {
+        level: String,
+        language_hints: Vec<String>,
+        return_layout: bool,
+        return_artifacts: Vec<String>
+    }
+);
+typed_response!(VisionOcrResponse {
+    text: Option<String>,
+    pages: Vec<OcrPage>,
+    artifacts: BTreeMap<String, ResourceRef>
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Caption {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+typed_request!(
+    VisionCaptionRequest,
+    required { image: ResourceRef },
+    optional {
+        style: String,
+        language: String,
+        n: u32
+    }
+);
+typed_response!(VisionCaptionResponse { captions: Vec<Caption> });
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Detection {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_id: Option<String>,
+    pub score: f64,
+    pub bbox: BoundingBox,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BoundingBoxSpec {
+    pub format: BoundingBoxFormat,
+    pub unit: BoundingBoxUnit,
+}
+
+typed_request!(VisionDetectRequest,
+    required { image: ResourceRef },
+    optional { classes: Vec<String>, score_threshold: f64, bbox_spec: BoundingBoxSpec }
+);
+typed_response!(VisionDetectResponse { detections: Vec<Detection> });
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SegmentationPrompt {
+    Box {
+        bbox: BoundingBox,
+    },
+    Point {
+        x: f64,
+        y: f64,
+        label: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "format", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AiMask {
+    Rle { size: [u32; 2], counts: String },
+    Polygon { points: Vec<[f64; 2]> },
+    BitmapResource { resource: ResourceRef },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentationMask {
+    pub id: String,
+    pub score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<BoundingBox>,
+    pub mask: AiMask,
+}
+
+typed_request!(
+    VisionSegmentRequest,
+    required {
+        image: ResourceRef,
+        prompt: SegmentationPrompt
+    },
+    optional {
+        mask_format: String,
+        return_bitmap_mask: bool
+    }
+);
+typed_response!(VisionSegmentResponse { masks: Vec<SegmentationMask> });
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gender: Option<VoiceGender>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<VoiceStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceGender {
+    Female,
+    Male,
+    Neutral,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceStyle {
+    Bright,
+    Upbeat,
+    Informative,
+    Firm,
+    Excitable,
+    Youthful,
+    Breezy,
+    EasyGoing,
+    Breathy,
+    Clear,
+    Smooth,
+    Gravelly,
+    Soft,
+    Even,
+    Mature,
+    Forward,
+    Friendly,
+    Casual,
+    Gentle,
+    Lively,
+    Knowledgeable,
+    Warm,
+}
+
+typed_request!(
+    AudioTextToSpeechRequest,
+    required {
+        text: String,
+        voice: VoiceSpec
+    },
+    optional {
+        speed: f64,
+        output: AiOutputOptions
+    }
+);
+typed_response!(AudioTextToSpeechResponse { audio: Option<ResourceRef> });
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AsrSegment {
+    pub id: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+typed_request!(AudioSpeechRecognitionRequest,
+    required { audio: ResourceRef },
+    optional {
+        language: String,
+        timestamps: String,
+        diarization: bool,
+        output_formats: Vec<String>
+    }
+);
+typed_response!(AudioSpeechRecognitionResponse {
+    text: Option<String>,
+    segments: Vec<AsrSegment>,
+    artifacts: BTreeMap<String, ResourceRef>,
+    diagnostic: Option<Value>
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MusicSection {
+    pub name: String,
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MusicStructure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lyrics: Option<String>,
+    #[serde(default)]
+    pub sections: Vec<MusicSection>,
+}
+
+typed_request!(
+    AudioMusicRequest,
+    required { prompt: String },
+    optional {
+        duration_seconds: f64,
+        instrumental: bool,
+        lyrics: String,
+        seed: u64,
+        output: AiOutputOptions
+    }
+);
+typed_response!(AudioMusicResponse {
+    audio: Option<ResourceRef>,
+    structure: Option<MusicStructure>
+});
+
+typed_request!(
+    AudioEnhanceRequest,
+    required {
+        audio: ResourceRef,
+        task: String
+    },
+    optional {
+        strength: f64,
+        return_stems: bool
+    }
+);
+typed_response!(AudioEnhanceResponse {
+    audio: Option<ResourceRef>,
+    stems: Vec<ResourceRef>
+});
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TimeRange {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+}
+
+typed_request!(
+    VideoEditRequest,
+    required {
+        video: ResourceRef,
+        prompt: String
+    },
+    optional { output: VideoOutputSpec }
+    validate validate
+);
+
+impl VideoEditRequest {
+    pub fn validate(&self) -> std::result::Result<(), AiccError> {
+        if self.prompt.trim().is_empty() {
+            return Err(video_error(
+                AiccErrorCode::InvalidRequest,
+                "video edit requires a non-blank prompt",
+                "/prompt",
+                None,
+                None,
+                None,
+            ));
+        }
+        if let Some(output) = &self.output {
+            output.validate("/output")?;
+        }
+        Ok(())
+    }
+}
+typed_request!(
+    VideoExtendRequest,
+    required {
+        video: ResourceRef,
+        prompt: String
+    },
+    optional {
+        continuation_handle: String,
+        duration_seconds: f64,
+        resolution: String
+    }
+);
+typed_request!(
+    VideoUpscaleRequest,
+    required {
+        video: ResourceRef,
+        target_resolution: String
+    },
+    optional {
+        denoise: bool,
+        sharpen: f64,
+        output: AiOutputOptions
+    }
+);
+typed_response!(VideoGenerateResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoEditResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoExtendResponse { videos: Vec<GeneratedVideo> });
+typed_response!(VideoUpscaleResponse { videos: Vec<GeneratedVideo> });
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerEnvironment {
+    pub environment_id: String,
+    pub session_id: String,
+    pub screenshot: ResourceRef,
+    pub viewport: Viewport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComputerAction {
+    Screenshot,
+    LeftClick { x: f64, y: f64 },
+    RightClick { x: f64, y: f64 },
+    Type { text: String },
+    Key { key: String },
+    Scroll { delta_x: f64, delta_y: f64 },
+    Wait { duration_ms: u64 },
+}
+
+typed_request!(ComputerUseRequest,
+    required {
+        task: String,
+        environment: ComputerEnvironment,
+        allowed_actions: Vec<String>
+    },
+    optional {}
+);
+typed_response!(ComputerUseResponse {
+    actions: Vec<ComputerAction>,
+    requires_next_observation: bool
+});
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceReloadSettingsRequest {}
+
+impl_request_json!(ServiceReloadSettingsRequest);
+
+impl ServiceReloadSettingsRequest {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceReloadSettingsResponse {
+    pub ok: bool,
+    pub settings_revision: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingGetRequest {}
+
+impl_request_json!(RoutingGetRequest);
+
+impl RoutingGetRequest {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingGetResponse {
+    pub settings_revision: u64,
+    pub routing: AiccRouteOverlay,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_status: Vec<AiccRoutingCommandStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingUpdateRequest {
+    pub settings_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_weights: Option<BTreeMap<String, f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_commands: Option<Vec<AiccRoutingCommand>>,
+}
+
+impl_request_json!(RoutingUpdateRequest);
+
+impl RoutingUpdateRequest {
+    pub fn new(settings_revision: u64, provider_weights: BTreeMap<String, f64>) -> Self {
         Self {
-            task_id: value.task_id,
-            status: value.status,
-            artifacts: value
-                .result
-                .as_ref()
-                .map(|result| result.artifacts())
-                .unwrap_or_default(),
-            usage: value
-                .result
-                .as_ref()
-                .and_then(|result| result.usage.clone()),
-            cost: value.result.as_ref().and_then(|result| result.cost.clone()),
-            provider_task_ref: value
-                .result
-                .as_ref()
-                .and_then(|result| result.provider_task_ref.clone()),
-            route_trace: value
-                .result
-                .as_ref()
-                .and_then(|result| result.extra.as_ref())
-                .and_then(|extra| extra.get("route_trace").cloned()),
-            event_ref: value.event_ref,
+            settings_revision,
+            provider_weights: Some(provider_weights),
+            routing_commands: None,
+        }
+    }
+
+    pub fn with_routing_commands(
+        settings_revision: u64,
+        routing_commands: Vec<AiccRoutingCommand>,
+    ) -> Self {
+        Self {
+            settings_revision,
+            provider_weights: None,
+            routing_commands: Some(routing_commands),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPreviewRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<ModelRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub explain: bool,
+}
+
+impl_request_json!(RoutingPreviewRequest);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccLogicalDirectoryKind {
+    Task,
+    Spec,
+    Family,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingPreviewEntry {
+    pub path: String,
+    pub api_type: String,
+    pub kind: AiccLogicalDirectoryKind,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_exact_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingPreviewResponse {
+    pub settings_revision: u64,
+    pub entries: Vec<RoutingPreviewEntry>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EventsListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+impl_request_json!(EventsListRequest);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiccEventLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AiccSystemEvent {
+    pub event_id: u64,
+    pub created_at_ms: u64,
+    pub level: AiccEventLevel,
+    pub kind: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventsListResponse {
+    pub events: Vec<AiccSystemEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_warnings: Vec<AiccSystemEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingUpdateResponse {
+    pub ok: bool,
+    pub settings_revision: u64,
+    pub routing: AiccRouteOverlay,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ListModelsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<AiccListView>,
+}
+
+impl_request_json!(ListModelsRequest);
+
+impl ListModelsRequest {
+    pub fn new() -> Self {
+        Self { view: None }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCatalogRequest {}
+
+impl_request_json!(ProviderCatalogRequest);
+
+impl ProviderCatalogRequest {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCatalogEntry {
+    pub provider_profile_id: String,
+    pub display_name: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub region_base_urls: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub protocol_adapter_id: String,
+    pub discovery_behavior_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_login_behavior_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_behavior_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_driver_overrides: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ui_hints: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCatalogResponse {
+    pub catalog_revision: u64,
+    #[serde(default)]
+    pub providers: Vec<ProviderCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRulesPreviewRequest {
+    pub provider_instance_name: String,
+    pub rules_catalog: Value,
+    pub model_ids: BTreeSet<String>,
+}
+impl_request_json!(ProviderRulesPreviewRequest);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRulesPreviewResponse {
+    pub resolved_model_rules: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolAdapterListRequest {}
+
+impl_request_json!(ProtocolAdapterListRequest);
+
+impl ProtocolAdapterListRequest {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolAdapterStatus {
+    Stable,
+    Preview,
+    Deprecated,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolExecutionMode {
+    Immediate,
+    Stream,
+    NativeTask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolAdapterOperation {
+    pub operation_id: String,
+    #[serde(default)]
+    pub api_types: Vec<ApiType>,
+    #[serde(default)]
+    pub capabilities: Vec<Capability>,
+    #[serde(default)]
+    pub supported_features: Vec<String>,
+    #[serde(default)]
+    pub execution_modes: Vec<ProtocolExecutionMode>,
+    pub supports_cancel: bool,
+    pub supports_webhook: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolAdapterView {
+    #[serde(default)]
+    pub default_operations: BTreeMap<String, String>,
+    pub protocol_family_id: String,
+    pub protocol_adapter_id: String,
+    #[serde(default)]
+    pub custom_provider_selectable: bool,
+    pub interface_generation: String,
+    pub status: ProtocolAdapterStatus,
+    pub probe_priority: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_adapter_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub component_adapter_ids: Vec<String>,
+    #[serde(default)]
+    pub operations: Vec<ProtocolAdapterOperation>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolAdapterListResponse {
+    #[serde(default)]
+    pub adapters: Vec<ProtocolAdapterView>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCredentialKind {
+    Bearer,
+    NamedHeader,
+    FalKey,
+    GlmJwt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderAuthSettings {
+    ApiKey {
+        credential_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential_kind: Option<ProviderCredentialKind>,
+    },
+    DynamicLogin {
+        login_profile: String,
+        login_endpoint: String,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCredential {
+    InlineSecret(String),
+    SecretRef(String),
+    RuntimeRef(String),
+}
+
+impl std::fmt::Debug for ProviderCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let variant = match self {
+            Self::InlineSecret(_) => "InlineSecret",
+            Self::SecretRef(_) => "SecretRef",
+            Self::RuntimeRef(_) => "RuntimeRef",
+        };
+        formatter.debug_tuple(variant).field(&"<redacted>").finish()
+    }
+}
+
+impl ProviderCredential {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::InlineSecret(value) | Self::SecretRef(value) | Self::RuntimeRef(value) => value,
+        }
+    }
+}
+
+pub type ProviderCredentials = BTreeMap<String, ProviderCredential>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDiscoveryHealth {
+    Unknown,
+    Healthy,
+    Degraded,
+    Unavailable,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModelAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDiscoveredModel {
+    pub provider_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_types: Option<Vec<ApiType>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_methods: Option<BTreeSet<String>>,
+    pub availability: ProviderModelAvailability,
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDiscoverySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub discovered_at_ms: i64,
+    pub health: ProviderDiscoveryHealth,
+    #[serde(default)]
+    pub models: Vec<ProviderDiscoveredModel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance_name: Option<String>,
+    pub provider_type: ProviderInstanceType,
+    pub provider_profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_adapter_id: Option<String>,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub credentials: ProviderCredentials,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProviderAuthSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<ProviderDiscoverySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<ProviderInstanceRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_sync_models: Option<bool>,
+}
+
+impl_request_json!(ProviderValidateRequest);
+
+impl ProviderValidateRequest {
+    pub fn new(
+        provider_type: ProviderInstanceType,
+        provider_profile_id: impl Into<String>,
+        base_url: impl Into<String>,
+        credentials: ProviderCredentials,
+    ) -> Self {
+        Self {
+            provider_instance_name: None,
+            provider_type,
+            provider_profile_id: provider_profile_id.into(),
+            protocol_family_id: None,
+            protocol_adapter_id: None,
+            base_url: base_url.into(),
+            operation_base_urls: BTreeMap::new(),
+            credentials,
+            region: None,
+            workspace: None,
+            account: None,
+            provider_rules_id: None,
+            auth: None,
+            discovery: None,
+            instance_rules: None,
+            timeout_ms: None,
+            auto_sync_models: None,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderValidationErrorKind {
+    Configuration,
+    BaseUrl,
+    Authentication,
+    Protocol,
+    Models,
+    Balance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidationErrorDetail {
+    pub kind: ProviderValidationErrorKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FilteredProviderCapability {
+    pub provider_model_id: String,
+    pub protocol_adapter_id: String,
+    pub api_type: String,
+    pub operation_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderValidateResponse {
+    pub filtered_capabilities: Vec<FilteredProviderCapability>,
+    #[serde(default)]
+    pub models_recognized: Vec<String>,
+    #[serde(default)]
+    pub unmatched_models: Vec<Value>,
+    #[serde(default)]
+    pub unavailable_presets: Vec<Value>,
+    #[serde(default)]
+    pub routing_candidates: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub base_url_reachable: bool,
+    pub auth_valid: bool,
+    #[serde(default)]
+    pub models_discovered: Vec<String>,
+    pub balance_available: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub error_details: Vec<ProviderValidationErrorDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_protocol_adapter_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAddRequest {
+    pub provider_instance_name: String,
+    pub provider_type: ProviderInstanceType,
+    pub provider_profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_adapter_id: Option<String>,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub credentials: ProviderCredentials,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<ProviderAuthSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<ProviderDiscoverySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<ProviderInstanceRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_sync_models: Option<bool>,
+}
+
+impl_request_json!(ProviderAddRequest);
+
+impl ProviderAddRequest {
+    pub fn new(
+        provider_instance_name: impl Into<String>,
+        provider_type: ProviderInstanceType,
+        provider_profile_id: impl Into<String>,
+        base_url: impl Into<String>,
+        credentials: ProviderCredentials,
+    ) -> Self {
+        Self {
+            provider_instance_name: provider_instance_name.into(),
+            provider_type,
+            provider_profile_id: provider_profile_id.into(),
+            protocol_family_id: None,
+            protocol_adapter_id: None,
+            base_url: base_url.into(),
+            operation_base_urls: BTreeMap::new(),
+            credentials,
+            region: None,
+            workspace: None,
+            account: None,
+            provider_rules_id: None,
+            auth: None,
+            discovery: None,
+            instance_rules: None,
+            timeout_ms: None,
+            auto_sync_models: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderReloadResult {
+    pub ok: bool,
+    pub providers_registered: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderAddResponse {
+    pub ok: bool,
+    pub provider_instance_name: String,
+    pub settings_revision: u64,
+    pub reload: ProviderReloadResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDeleteRequest {
+    pub provider_instance_name: String,
+}
+
+impl_request_json!(ProviderDeleteRequest);
+
+impl ProviderDeleteRequest {
+    pub fn new(provider_instance_name: impl Into<String>) -> Self {
+        Self {
+            provider_instance_name: provider_instance_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDeleteResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload: Option<ProviderReloadResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRefreshModelsRequest {
+    pub provider_instance_name: String,
+}
+
+impl_request_json!(ProviderRefreshModelsRequest);
+
+impl ProviderRefreshModelsRequest {
+    pub fn new(provider_instance_name: impl Into<String>) -> Self {
+        Self {
+            provider_instance_name: provider_instance_name.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRefreshModelsResponse {
+    pub unmatched_count: u64,
+    pub ok: bool,
+    pub provider_instance_name: String,
+    pub inventory_revision: String,
+}
+
+impl_request_json!(QueryUsageRequest);
+
+impl_request_json!(QueryRouteTraceRequest);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaState {
+    Normal,
+    NearLimit,
+    Exhausted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderListRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<AiccListView>,
+}
+
+impl_request_json!(ProviderListRequest);
+
+impl ProviderListRequest {
+    pub fn new(method: Option<String>) -> Self {
+        Self { method, view: None }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderListResponse {
+    #[serde(default)]
+    pub providers: Vec<ProviderInstanceView>,
+    pub settings_revision: u64,
+    pub inventory_revision: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInstanceAuthMode {
+    ApiKey,
+    DynamicLogin,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceAuthView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ProviderInstanceAuthMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_kind: Option<String>,
+    pub configured: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInstanceInventoryState {
+    Disabled,
+    NotLoaded,
+    Loaded,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInstanceType {
+    LocalInference,
+    CloudApi,
+    ProxyUnknown,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceRules {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub server_default_routes: BTreeMap<String, BTreeSet<String>>,
+    /// Legal/account residency used by Provider metadata policy matching.
+    /// `unknown` deliberately remains routable unless a rule explicitly denies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_region: Option<String>,
+    #[serde(default)]
+    pub exclude_models: BTreeSet<String>,
+    #[serde(default)]
+    pub model_driver_overrides: BTreeMap<String, String>,
+    /// Operator-facing allowlist over the provider's `static_inventory_models`.
+    /// `None` publishes every declared static model (backward compatible);
+    /// `Some(set)` publishes only the selected subset. Models that arrive from a
+    /// live discovery response are never filtered by this list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_inventory_models: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceInventoryView {
+    pub filtered_capabilities: Vec<FilteredProviderCapability>,
+    pub unmatched_models: Vec<Value>,
+    pub unavailable_presets: Vec<Value>,
+    pub unpriced_models: Vec<String>,
+    pub state: ProviderInstanceInventoryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub model_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInstanceHealthState {
+    Disabled,
+    NotLoaded,
+    Unknown,
+    Healthy,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceHealthView {
+    pub state: ProviderInstanceHealthState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInstanceView {
+    #[serde(default)]
+    pub resolved_model_rules: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub discovered_model_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_catalog: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<ProviderInstanceRules>,
+    pub provider_instance_name: String,
+    pub provider_type: ProviderInstanceType,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub base_url: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub enabled: bool,
+    pub auth: ProviderInstanceAuthView,
+    pub inventory: ProviderInstanceInventoryView,
+    pub health: ProviderInstanceHealthView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHealthRequest {
+    pub exact_model: String,
+}
+
+impl ProviderHealthRequest {
+    pub fn new(exact_model: impl Into<String>) -> Self {
+        Self {
+            exact_model: exact_model.into(),
+        }
+    }
+
+    pub fn from_json(value: Value) -> std::result::Result<Self, RPCErrors> {
+        let request: Self = serde_json::from_value(value).map_err(|error| {
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse ProviderHealthRequest: {}",
+                error
+            ))
+        })?;
+        validate_exact_model_name(&request.exact_model).map_err(|error| error.to_krpc_error())?;
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderHealthResponse {
+    pub health: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_id: Option<String>,
+    pub provider_instance_name: String,
+    pub settings_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_base_urls: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<ProviderCredentials>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_family_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_adapter_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<ProviderDiscoverySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<ProviderInstanceRules>,
+}
+
+impl_request_json!(ProviderUpdateRequest);
+
+impl ProviderUpdateRequest {
+    pub fn new(provider_instance_name: impl Into<String>, settings_revision: u64) -> Self {
+        Self {
+            provider_rules_id: None,
+            provider_instance_name: provider_instance_name.into(),
+            settings_revision,
+            enabled: None,
+            base_url: None,
+            operation_base_urls: None,
+            credential: None,
+            provider_profile_id: None,
+            protocol_family_id: None,
+            protocol_adapter_id: None,
+            discovery: None,
+            instance_rules: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderUpdateResponse {
+    pub ok: bool,
+    pub settings_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<Value>,
+}
+
+macro_rules! define_aicc_calls {
+    ($( $variant:ident($request:ty) => $method:path, $api_type:expr, $model:ident; )+) => {
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum AiccCall {
+            $( $variant($request), )+
+        }
+
+        impl AiccCall {
+            pub fn method(&self) -> &'static str {
+                match self {
+                    $( Self::$variant(_) => $method, )+
+                }
+            }
+
+            pub fn trace_id(&self) -> Option<&str> {
+                match self {
+                    $( Self::$variant(request) => request.trace_id.as_deref(), )+
+                }
+            }
+
+            pub fn execution_mode(&self) -> AiccExecutionMode {
+                match self {
+                    $( Self::$variant(request) => request.execution_mode, )+
+                }
+            }
+
+            pub fn api_type(&self) -> Option<ApiType> {
+                match self {
+                    $( Self::$variant(_) => $api_type, )+
+                }
+            }
+
+            pub fn exact_model(&self) -> Option<&str> {
+                match self {
+                    $( Self::$variant(request) => aicc_call_exact_model!(request, $model), )+
+                }
+            }
+
+            pub fn to_params(&self) -> std::result::Result<Value, serde_json::Error> {
+                match self {
+                    $( Self::$variant(request) => serde_json::to_value(request), )+
+                }
+            }
+
+            pub fn from_method_and_params(
+                method: &str,
+                params: Value,
+            ) -> std::result::Result<Self, RPCErrors> {
+                match method {
+                    $( $method => <$request>::from_json(params).map(Self::$variant), )+
+                    _ => Err(RPCErrors::UnknownMethod(method.to_string())),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! aicc_call_exact_model {
+    ($request:ident, exact) => {
+        Some($request.exact_model.as_str())
+    };
+    ($request:ident, none) => {{
+        let _ = $request;
+        None
+    }};
+}
+
+define_aicc_calls! {
+    RouteResolve(RouteResolveRequest) => ai_methods::ROUTE_RESOLVE, None, none;
+    ChatCompletionsCreate(LlmChatInvokeRequest) => ai_methods::CHAT_COMPLETIONS_CREATE, Some(ApiType::Llm), exact;
+    ImagesGenerate(TextToImageInvokeRequest) => ai_methods::IMAGES_GENERATE, Some(ApiType::ImageTextToImage), exact;
+    HelperLlmChat(LlmChatHelperRequest) => ai_methods::HELPER_LLM_CHAT, Some(ApiType::Llm), none;
+    HelperTextToImage(TextToImageHelperRequest) => ai_methods::HELPER_TEXT_TO_IMAGE, Some(ApiType::ImageTextToImage), none;
+    HelperVideoGenerate(VideoGenerateHelperRequest) => ai_methods::HELPER_VIDEO_GENERATE, Some(ApiType::VideoGenerate), none;
+    EmbeddingText(EmbeddingTextRequest) => ai_methods::EMBEDDING_TEXT, Some(ApiType::EmbeddingText), exact;
+    EmbeddingMultimodal(EmbeddingMultimodalRequest) => ai_methods::EMBEDDING_MULTIMODAL, Some(ApiType::EmbeddingMultimodal), exact;
+    DecisionEvaluate(DecisionEvaluateRequest) => ai_methods::DECISION_EVALUATE, Some(ApiType::Decision), exact;
+    Rerank(RerankRequest) => ai_methods::RERANK, Some(ApiType::Rerank), exact;
+    ImageToImage(ImageToImageRequest) => ai_methods::IMAGE_IMG2IMG, Some(ApiType::ImageImageToImage), exact;
+    ImageInpaint(ImageInpaintRequest) => ai_methods::IMAGE_INPAINT, Some(ApiType::ImageInpaint), exact;
+    ImageUpscale(ImageUpscaleRequest) => ai_methods::IMAGE_UPSCALE, Some(ApiType::ImageUpscale), exact;
+    ImageBackgroundRemove(ImageBackgroundRemoveRequest) => ai_methods::IMAGE_BG_REMOVE, Some(ApiType::ImageBackgroundRemove), exact;
+    VisionOcr(VisionOcrRequest) => ai_methods::VISION_OCR, Some(ApiType::VisionOcr), exact;
+    VisionCaption(VisionCaptionRequest) => ai_methods::VISION_CAPTION, Some(ApiType::VisionCaption), exact;
+    VisionDetect(VisionDetectRequest) => ai_methods::VISION_DETECT, Some(ApiType::VisionDetect), exact;
+    VisionSegment(VisionSegmentRequest) => ai_methods::VISION_SEGMENT, Some(ApiType::VisionSegment), exact;
+    AudioTextToSpeech(AudioTextToSpeechRequest) => ai_methods::AUDIO_TTS, Some(ApiType::AudioTextToSpeech), exact;
+    AudioSpeechRecognition(AudioSpeechRecognitionRequest) => ai_methods::AUDIO_ASR, Some(ApiType::AudioSpeechRecognition), exact;
+    AudioMusic(AudioMusicRequest) => ai_methods::AUDIO_MUSIC, Some(ApiType::AudioMusic), exact;
+    AudioEnhance(AudioEnhanceRequest) => ai_methods::AUDIO_ENHANCE, Some(ApiType::AudioEnhance), exact;
+    VideoGenerate(VideoGenerateRequest) => ai_methods::VIDEO_GENERATE, Some(ApiType::VideoGenerate), exact;
+    VideoEdit(VideoEditRequest) => ai_methods::VIDEO_EDIT, Some(ApiType::VideoEdit), exact;
+    VideoExtend(VideoExtendRequest) => ai_methods::VIDEO_EXTEND, Some(ApiType::VideoExtend), exact;
+    VideoUpscale(VideoUpscaleRequest) => ai_methods::VIDEO_UPSCALE, Some(ApiType::VideoUpscale), exact;
+    ComputerUse(ComputerUseRequest) => ai_methods::AGENT_COMPUTER_USE, Some(ApiType::AgentComputerUse), exact;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CancelRequest {
     pub task_id: String,
 }
@@ -1883,12 +5285,31 @@ pub enum DriverMetadataUpdateStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DriverMetadataProviderStatus {
+    pub provider_instance_name: String,
+    pub metadata_applied_seq: u64,
+}
+
+impl DriverMetadataProviderStatus {
+    pub fn new(provider_instance_name: impl Into<String>, metadata_applied_seq: u64) -> Self {
+        Self {
+            provider_instance_name: provider_instance_name.into(),
+            metadata_applied_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DriverMetadataUpdateView {
     pub enabled: bool,
     #[serde(default)]
     pub source_url: Option<String>,
     pub source_configured: bool,
     pub interval_secs: u64,
+    pub metadata_target_seq: u64,
+    pub providers: Vec<DriverMetadataProviderStatus>,
     pub status: DriverMetadataUpdateStatus,
     #[serde(default)]
     pub active_revision: Option<u64>,
@@ -1924,9 +5345,101 @@ impl CancelResponse {
     }
 }
 
+/// kRPC transport of [`AiccClient`]; a delegated client adds the
+/// `on_behalf_of` parameter to every call.
+pub struct AiccKrpcClient {
+    client: Box<kRPC>,
+    on_behalf_of: Option<Value>,
+}
+
+impl AiccKrpcClient {
+    pub async fn call(
+        &self,
+        method: &str,
+        mut params: Value,
+    ) -> std::result::Result<Value, RPCErrors> {
+        if let (Some(on_behalf_of), Value::Object(map)) = (&self.on_behalf_of, &mut params) {
+            map.insert(AICC_ON_BEHALF_OF_PARAM.to_string(), on_behalf_of.clone());
+        }
+        self.client.call(method, params).await
+    }
+
+    pub async fn set_context(&self, context: RPCContext) {
+        self.client.set_context(context).await;
+    }
+}
+
 pub enum AiccClient {
     InProcess(Box<dyn AiccHandler>),
-    KRPC(Box<kRPC>),
+    KRPC(Box<AiccKrpcClient>),
+}
+
+macro_rules! client_typed_method {
+    ($method_fn:ident, $handler_fn:ident, $method:expr, $request:ty, $response:ty) => {
+        pub async fn $method_fn(
+            &self,
+            request: $request,
+        ) -> std::result::Result<$response, RPCErrors> {
+            match self {
+                Self::InProcess(handler) => {
+                    let ctx = RPCContext::default();
+                    handler.$handler_fn(request, ctx).await
+                }
+                Self::KRPC(client) => {
+                    let request = serde_json::to_value(request).map_err(|error| {
+                        RPCErrors::ReasonError(format!(
+                            "Failed to serialize {}: {}",
+                            stringify!($request),
+                            error
+                        ))
+                    })?;
+                    let result = client.call($method, request).await?;
+                    serde_json::from_value(result).map_err(|error| {
+                        RPCErrors::ParserResponseError(format!(
+                            "Failed to parse {}: {}",
+                            stringify!($response),
+                            error
+                        ))
+                    })
+                }
+            }
+        }
+    };
+}
+
+macro_rules! client_inference_method {
+    ($method_fn:ident, $handler_fn:ident, $method:expr, $request:ty, $response:ty) => {
+        pub async fn $method_fn(
+            &self,
+            request: $request,
+        ) -> std::result::Result<$response, RPCErrors> {
+            validate_exact_model_name(&request.exact_model)
+                .map_err(|error| error.to_krpc_error())?;
+            match self {
+                Self::InProcess(handler) => {
+                    let ctx = RPCContext::default();
+                    handler.$handler_fn(request, ctx).await
+                }
+                Self::KRPC(client) => {
+                    let request = serde_json::to_value(request).map_err(|error| {
+                        RPCErrors::ReasonError(format!(
+                            "Failed to serialize {}: {}",
+                            stringify!($request),
+                            error
+                        ))
+                    })?;
+                    let result = client.call($method, request).await?;
+                    serde_json::from_value(result).map_err(|error| {
+                        RPCErrors::ParserResponseError(format!(
+                            "Failed to parse {}: {}",
+                            stringify!($response),
+                            error
+                        ))
+                    })
+                }
+            }
+        }
+    };
 }
 
 impl AiccClient {
@@ -1939,7 +5452,56 @@ impl AiccClient {
     }
 
     pub fn new_krpc(krpc_client: Box<kRPC>) -> Self {
-        Self::KRPC(krpc_client)
+        Self::KRPC(Box::new(AiccKrpcClient {
+            client: krpc_client,
+            on_behalf_of: None,
+        }))
+    }
+
+    /// Calls made through this client are charged to `on_behalf_of.user_id`.
+    /// AICC accepts it only from a system service granted
+    /// [`AICC_ON_BEHALF_OF_RESOURCE`]; the business App is that service.
+    pub fn with_on_behalf_of(self, on_behalf_of: &AiccOnBehalfOf) -> Self {
+        match self {
+            Self::KRPC(mut client) => {
+                client.on_behalf_of = serde_json::to_value(on_behalf_of).ok();
+                Self::KRPC(client)
+            }
+            in_process => in_process,
+        }
+    }
+
+    /// One `quota.*` / `visibility.*` method (see [`quota_methods`]).
+    pub async fn quota_call<Req, Resp>(
+        &self,
+        method: &str,
+        request: &Req,
+    ) -> std::result::Result<Resp, RPCErrors>
+    where
+        Req: Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let params = serde_json::to_value(request).map_err(|error| {
+            RPCErrors::ReasonError(format!("Failed to serialize {method} request: {error}"))
+        })?;
+        let result = match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_quota_rpc(method, params, RPCContext::default())
+                    .await?
+            }
+            Self::KRPC(client) => client.call(method, params).await?,
+        };
+        serde_json::from_value(result).map_err(|error| {
+            RPCErrors::ParserResponseError(format!("Failed to parse {method} response: {error}"))
+        })
+    }
+
+    pub async fn query_quota(
+        &self,
+        request: QuotaQueryRequest,
+    ) -> std::result::Result<QuotaQueryResponse, RPCErrors> {
+        self.quota_call(quota_methods::QUERY, &request).await
     }
 
     pub async fn set_context(&self, context: RPCContext) {
@@ -1951,47 +5513,120 @@ impl AiccClient {
         }
     }
 
-    pub async fn call_method(
+    pub async fn invoke(&self, call: AiccCall) -> std::result::Result<Value, RPCErrors> {
+        let result = match call {
+            AiccCall::RouteResolve(request) => {
+                serde_json::to_value(self.route_resolve(request).await?)
+            }
+            AiccCall::ChatCompletionsCreate(request) => {
+                serde_json::to_value(self.chat_completions_create(request).await?)
+            }
+            AiccCall::ImagesGenerate(request) => {
+                serde_json::to_value(self.images_generate(request).await?)
+            }
+            AiccCall::HelperLlmChat(request) => {
+                serde_json::to_value(self.helper_llm_chat(request).await?)
+            }
+            AiccCall::HelperTextToImage(request) => {
+                serde_json::to_value(self.helper_text_to_image(request).await?)
+            }
+            AiccCall::HelperVideoGenerate(request) => {
+                serde_json::to_value(self.helper_video_generate(request).await?)
+            }
+            AiccCall::EmbeddingText(request) => {
+                serde_json::to_value(self.embedding_text(request).await?)
+            }
+            AiccCall::EmbeddingMultimodal(request) => {
+                serde_json::to_value(self.embedding_multimodal(request).await?)
+            }
+            AiccCall::DecisionEvaluate(request) => {
+                serde_json::to_value(self.decision_evaluate(request).await?)
+            }
+            AiccCall::Rerank(request) => serde_json::to_value(self.rerank(request).await?),
+            AiccCall::ImageToImage(request) => {
+                serde_json::to_value(self.image_to_image(request).await?)
+            }
+            AiccCall::ImageInpaint(request) => {
+                serde_json::to_value(self.image_inpaint(request).await?)
+            }
+            AiccCall::ImageUpscale(request) => {
+                serde_json::to_value(self.image_upscale(request).await?)
+            }
+            AiccCall::ImageBackgroundRemove(request) => {
+                serde_json::to_value(self.image_background_remove(request).await?)
+            }
+            AiccCall::VisionOcr(request) => serde_json::to_value(self.vision_ocr(request).await?),
+            AiccCall::VisionCaption(request) => {
+                serde_json::to_value(self.vision_caption(request).await?)
+            }
+            AiccCall::VisionDetect(request) => {
+                serde_json::to_value(self.vision_detect(request).await?)
+            }
+            AiccCall::VisionSegment(request) => {
+                serde_json::to_value(self.vision_segment(request).await?)
+            }
+            AiccCall::AudioTextToSpeech(request) => {
+                serde_json::to_value(self.audio_text_to_speech(request).await?)
+            }
+            AiccCall::AudioSpeechRecognition(request) => {
+                serde_json::to_value(self.audio_speech_recognition(request).await?)
+            }
+            AiccCall::AudioMusic(request) => serde_json::to_value(self.audio_music(request).await?),
+            AiccCall::AudioEnhance(request) => {
+                serde_json::to_value(self.audio_enhance(request).await?)
+            }
+            AiccCall::VideoGenerate(request) => {
+                serde_json::to_value(self.video_generate(request).await?)
+            }
+            AiccCall::VideoEdit(request) => serde_json::to_value(self.video_edit(request).await?),
+            AiccCall::VideoExtend(request) => {
+                serde_json::to_value(self.video_extend(request).await?)
+            }
+            AiccCall::VideoUpscale(request) => {
+                serde_json::to_value(self.video_upscale(request).await?)
+            }
+            AiccCall::ComputerUse(request) => {
+                serde_json::to_value(self.computer_use(request).await?)
+            }
+        };
+        result.map_err(|error| {
+            RPCErrors::ReasonError(format!("Failed to serialize AICC response: {error}"))
+        })
+    }
+
+    pub async fn decision_evaluate(
         &self,
-        method: &str,
-        request: AiMethodRequest,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
-        if !ai_methods::is_ai_method(method) {
-            return Err(RPCErrors::UnknownMethod(method.to_string()));
-        }
-
-        request
-            .payload
-            .validate_all_messages()
-            .map_err(|err| RPCErrors::ParseRequestError(format!("invalid AiMessage: {err}")))?;
-
-        match self {
+        request: DecisionEvaluateRequest,
+    ) -> std::result::Result<DecisionEvaluateResponse, RPCErrors> {
+        request.validate().map_err(|error| error.to_krpc_error())?;
+        let response: DecisionEvaluateResponse = match self {
             Self::InProcess(handler) => {
-                let ctx = RPCContext::default();
-                handler.handle_method(method, request, ctx).await
+                handler
+                    .handle_decision_evaluate(request.clone(), RPCContext::default())
+                    .await?
             }
             Self::KRPC(client) => {
-                let req_json = serde_json::to_value(&request).map_err(|error| {
-                    RPCErrors::ReasonError(format!(
-                        "Failed to serialize AiMethodRequest: {}",
-                        error
-                    ))
-                })?;
-                let result = client.call(method, req_json).await?;
-                serde_json::from_value(result).map_err(|error| {
-                    RPCErrors::ParserResponseError(format!(
-                        "Failed to parse AI method response: {}",
-                        error
-                    ))
-                })
+                let params = serde_json::to_value(&request)
+                    .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+                let result = client.call(ai_methods::DECISION_EVALUATE, params).await?;
+                serde_json::from_value(result)
+                    .map_err(|e| RPCErrors::ParserResponseError(e.to_string()))?
             }
+        };
+        if response.status == AiMethodStatus::Succeeded {
+            request
+                .validate_answers(&response.answers)
+                .map_err(|e| e.to_krpc_error())?;
         }
+        Ok(response)
     }
 
     pub async fn route_resolve(
         &self,
         request: RouteResolveRequest,
     ) -> std::result::Result<RouteResolveResponse, RPCErrors> {
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -2019,6 +5654,7 @@ impl AiccClient {
         &self,
         request: LlmChatInvokeRequest,
     ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        validate_exact_model_name(&request.exact_model).map_err(|error| error.to_krpc_error())?;
         request
             .messages
             .iter()
@@ -2053,6 +5689,7 @@ impl AiccClient {
         &self,
         request: TextToImageInvokeRequest,
     ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        validate_exact_model_name(&request.exact_model).map_err(|error| error.to_krpc_error())?;
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -2078,11 +5715,14 @@ impl AiccClient {
 
     pub async fn helper_llm_chat(
         &self,
-        request: AiMethodRequest,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        request: LlmChatHelperRequest,
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
         request
-            .payload
-            .validate_all_messages()
+            .messages
+            .iter()
+            .try_for_each(AiMessage::validate)
             .map_err(|err| RPCErrors::ParseRequestError(format!("invalid AiMessage: {err}")))?;
 
         match self {
@@ -2093,7 +5733,7 @@ impl AiccClient {
             Self::KRPC(client) => {
                 let req_json = serde_json::to_value(&request).map_err(|error| {
                     RPCErrors::ReasonError(format!(
-                        "Failed to serialize AiMethodRequest: {}",
+                        "Failed to serialize LlmChatHelperRequest: {}",
                         error
                     ))
                 })?;
@@ -2110,8 +5750,10 @@ impl AiccClient {
 
     pub async fn helper_text_to_image(
         &self,
-        request: AiMethodRequest,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+        request: TextToImageHelperRequest,
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
+        validate_logical_model_name(&request.logical_model)
+            .map_err(|error| error.to_krpc_error())?;
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -2120,7 +5762,7 @@ impl AiccClient {
             Self::KRPC(client) => {
                 let req_json = serde_json::to_value(&request).map_err(|error| {
                     RPCErrors::ReasonError(format!(
-                        "Failed to serialize AiMethodRequest: {}",
+                        "Failed to serialize TextToImageHelperRequest: {}",
                         error
                     ))
                 })?;
@@ -2137,6 +5779,315 @@ impl AiccClient {
         }
     }
 
+    client_inference_method!(
+        embedding_text,
+        handle_embedding_text,
+        ai_methods::EMBEDDING_TEXT,
+        EmbeddingTextRequest,
+        EmbeddingTextResponse
+    );
+    client_inference_method!(
+        embedding_multimodal,
+        handle_embedding_multimodal,
+        ai_methods::EMBEDDING_MULTIMODAL,
+        EmbeddingMultimodalRequest,
+        EmbeddingMultimodalResponse
+    );
+    client_inference_method!(
+        rerank,
+        handle_rerank,
+        ai_methods::RERANK,
+        RerankRequest,
+        RerankResponse
+    );
+    client_inference_method!(
+        image_to_image,
+        handle_image_to_image,
+        ai_methods::IMAGE_IMG2IMG,
+        ImageToImageRequest,
+        ImageToImageResponse
+    );
+    client_inference_method!(
+        image_inpaint,
+        handle_image_inpaint,
+        ai_methods::IMAGE_INPAINT,
+        ImageInpaintRequest,
+        ImageInpaintResponse
+    );
+    client_inference_method!(
+        image_upscale,
+        handle_image_upscale,
+        ai_methods::IMAGE_UPSCALE,
+        ImageUpscaleRequest,
+        ImageUpscaleResponse
+    );
+    client_inference_method!(
+        image_background_remove,
+        handle_image_background_remove,
+        ai_methods::IMAGE_BG_REMOVE,
+        ImageBackgroundRemoveRequest,
+        ImageBackgroundRemoveResponse
+    );
+    client_inference_method!(
+        vision_ocr,
+        handle_vision_ocr,
+        ai_methods::VISION_OCR,
+        VisionOcrRequest,
+        VisionOcrResponse
+    );
+    client_inference_method!(
+        vision_caption,
+        handle_vision_caption,
+        ai_methods::VISION_CAPTION,
+        VisionCaptionRequest,
+        VisionCaptionResponse
+    );
+    client_inference_method!(
+        vision_detect,
+        handle_vision_detect,
+        ai_methods::VISION_DETECT,
+        VisionDetectRequest,
+        VisionDetectResponse
+    );
+    client_inference_method!(
+        vision_segment,
+        handle_vision_segment,
+        ai_methods::VISION_SEGMENT,
+        VisionSegmentRequest,
+        VisionSegmentResponse
+    );
+    client_inference_method!(
+        audio_text_to_speech,
+        handle_audio_text_to_speech,
+        ai_methods::AUDIO_TTS,
+        AudioTextToSpeechRequest,
+        AudioTextToSpeechResponse
+    );
+    client_inference_method!(
+        audio_speech_recognition,
+        handle_audio_speech_recognition,
+        ai_methods::AUDIO_ASR,
+        AudioSpeechRecognitionRequest,
+        AudioSpeechRecognitionResponse
+    );
+    client_inference_method!(
+        audio_music,
+        handle_audio_music,
+        ai_methods::AUDIO_MUSIC,
+        AudioMusicRequest,
+        AudioMusicResponse
+    );
+    client_inference_method!(
+        audio_enhance,
+        handle_audio_enhance,
+        ai_methods::AUDIO_ENHANCE,
+        AudioEnhanceRequest,
+        AudioEnhanceResponse
+    );
+    pub async fn video_generate(
+        &self,
+        request: VideoGenerateRequest,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        request.validate().map_err(|error| error.to_krpc_error())?;
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_video_generate(request, RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let params = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize VideoGenerateRequest: {error}"
+                    ))
+                })?;
+                let result = client.call(ai_methods::VIDEO_GENERATE, params).await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse video.generate response: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn helper_video_generate(
+        &self,
+        request: VideoGenerateHelperRequest,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        request.validate().map_err(|error| error.to_krpc_error())?;
+        match self {
+            Self::InProcess(handler) => {
+                handler
+                    .handle_helper_video_generate(request, RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let params = serde_json::to_value(&request).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize VideoGenerateHelperRequest: {error}"
+                    ))
+                })?;
+                let result = client
+                    .call(ai_methods::HELPER_VIDEO_GENERATE, params)
+                    .await?;
+                serde_json::from_value(result).map_err(|error| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Failed to parse helper.video_generate response: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
+    client_inference_method!(
+        video_edit,
+        handle_video_edit,
+        ai_methods::VIDEO_EDIT,
+        VideoEditRequest,
+        VideoEditResponse
+    );
+    client_inference_method!(
+        video_extend,
+        handle_video_extend,
+        ai_methods::VIDEO_EXTEND,
+        VideoExtendRequest,
+        VideoExtendResponse
+    );
+    client_inference_method!(
+        video_upscale,
+        handle_video_upscale,
+        ai_methods::VIDEO_UPSCALE,
+        VideoUpscaleRequest,
+        VideoUpscaleResponse
+    );
+    client_inference_method!(
+        computer_use,
+        handle_computer_use,
+        ai_methods::AGENT_COMPUTER_USE,
+        ComputerUseRequest,
+        ComputerUseResponse
+    );
+    client_typed_method!(
+        reload_settings,
+        handle_reload_settings,
+        ai_methods::SERVICE_RELOAD_SETTINGS,
+        ServiceReloadSettingsRequest,
+        ServiceReloadSettingsResponse
+    );
+    client_typed_method!(
+        get_routing,
+        handle_get_routing,
+        ai_methods::ROUTING_GET,
+        RoutingGetRequest,
+        RoutingGetResponse
+    );
+    client_typed_method!(
+        update_routing,
+        handle_update_routing,
+        ai_methods::ROUTING_UPDATE,
+        RoutingUpdateRequest,
+        RoutingUpdateResponse
+    );
+    client_typed_method!(
+        preview_routing,
+        handle_preview_routing,
+        ai_methods::ROUTING_PREVIEW,
+        RoutingPreviewRequest,
+        RoutingPreviewResponse
+    );
+    client_typed_method!(
+        list_events,
+        handle_list_events,
+        ai_methods::EVENTS_LIST,
+        EventsListRequest,
+        EventsListResponse
+    );
+    client_typed_method!(
+        query_usage,
+        handle_query_usage,
+        ai_methods::USAGE_QUERY,
+        QueryUsageRequest,
+        QueryUsageResponse
+    );
+    client_typed_method!(
+        query_trace,
+        handle_query_trace,
+        ai_methods::TRACE_QUERY,
+        QueryRouteTraceRequest,
+        QueryRouteTraceResponse
+    );
+    client_typed_method!(
+        preview_provider_rules,
+        handle_preview_provider_rules,
+        ai_methods::PROVIDER_PREVIEW_RULES,
+        ProviderRulesPreviewRequest,
+        ProviderRulesPreviewResponse
+    );
+    client_typed_method!(
+        provider_catalog,
+        handle_provider_catalog,
+        ai_methods::PROVIDER_CATALOG,
+        ProviderCatalogRequest,
+        ProviderCatalogResponse
+    );
+    client_typed_method!(
+        list_protocol_adapters,
+        handle_list_protocol_adapters,
+        ai_methods::PROTOCOL_ADAPTER_LIST,
+        ProtocolAdapterListRequest,
+        ProtocolAdapterListResponse
+    );
+    client_typed_method!(
+        validate_provider,
+        handle_validate_provider,
+        ai_methods::PROVIDER_VALIDATE,
+        ProviderValidateRequest,
+        ProviderValidateResponse
+    );
+    client_typed_method!(
+        add_provider,
+        handle_add_provider,
+        ai_methods::PROVIDER_ADD,
+        ProviderAddRequest,
+        ProviderAddResponse
+    );
+    client_typed_method!(
+        list_providers,
+        handle_list_providers,
+        ai_methods::PROVIDER_LIST,
+        ProviderListRequest,
+        ProviderListResponse
+    );
+    client_inference_method!(
+        provider_health,
+        handle_provider_health,
+        ai_methods::PROVIDER_HEALTH,
+        ProviderHealthRequest,
+        ProviderHealthResponse
+    );
+    client_typed_method!(
+        update_provider,
+        handle_update_provider,
+        ai_methods::PROVIDER_UPDATE,
+        ProviderUpdateRequest,
+        ProviderUpdateResponse
+    );
+    client_typed_method!(
+        delete_provider,
+        handle_delete_provider,
+        ai_methods::PROVIDER_DELETE,
+        ProviderDeleteRequest,
+        ProviderDeleteResponse
+    );
+    client_typed_method!(
+        refresh_provider_models,
+        handle_refresh_provider_models,
+        ai_methods::PROVIDER_REFRESH_MODELS,
+        ProviderRefreshModelsRequest,
+        ProviderRefreshModelsResponse
+    );
+
     pub async fn cancel(&self, task_id: &str) -> std::result::Result<CancelResponse, RPCErrors> {
         match self {
             Self::InProcess(handler) => {
@@ -2148,7 +6099,7 @@ impl AiccClient {
                 let req_json = serde_json::to_value(&req).map_err(|error| {
                     RPCErrors::ReasonError(format!("Failed to serialize CancelRequest: {}", error))
                 })?;
-                let result = client.call("cancel", req_json).await?;
+                let result = client.call(ai_methods::CANCEL, req_json).await?;
                 serde_json::from_value(result).map_err(|error| {
                     RPCErrors::ParserResponseError(format!(
                         "Failed to parse cancel response: {}",
@@ -2161,8 +6112,20 @@ impl AiccClient {
 
     pub async fn list_models(&self) -> std::result::Result<Value, RPCErrors> {
         match self {
-            Self::InProcess(_) => Err(RPCErrors::UnknownMethod("models.list".to_string())),
-            Self::KRPC(client) => client.call("models.list", serde_json::json!({})).await,
+            Self::InProcess(handler) => {
+                handler
+                    .handle_list_models(ListModelsRequest::new(), RPCContext::default())
+                    .await
+            }
+            Self::KRPC(client) => {
+                let request = serde_json::to_value(ListModelsRequest::new()).map_err(|error| {
+                    RPCErrors::ReasonError(format!(
+                        "Failed to serialize ListModelsRequest: {}",
+                        error
+                    ))
+                })?;
+                client.call(ai_methods::MODELS_LIST, request).await
+            }
         }
     }
 
@@ -2229,13 +6192,6 @@ impl AiccClient {
 
 #[async_trait]
 pub trait AiccHandler: Send + Sync {
-    async fn handle_method(
-        &self,
-        method: &str,
-        request: AiMethodRequest,
-        ctx: RPCContext,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors>;
-
     async fn handle_cancel(
         &self,
         task_id: &str,
@@ -2274,9 +6230,9 @@ pub trait AiccHandler: Send + Sync {
 
     async fn handle_helper_llm_chat(
         &self,
-        _request: AiMethodRequest,
+        _request: LlmChatHelperRequest,
         _ctx: RPCContext,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+    ) -> std::result::Result<LlmChatInvokeResponse, RPCErrors> {
         Err(RPCErrors::UnknownMethod(
             ai_methods::HELPER_LLM_CHAT.to_string(),
         ))
@@ -2284,11 +6240,406 @@ pub trait AiccHandler: Send + Sync {
 
     async fn handle_helper_text_to_image(
         &self,
-        _request: AiMethodRequest,
+        _request: TextToImageHelperRequest,
         _ctx: RPCContext,
-    ) -> std::result::Result<AiMethodResponse, RPCErrors> {
+    ) -> std::result::Result<TextToImageInvokeResponse, RPCErrors> {
         Err(RPCErrors::UnknownMethod(
             ai_methods::HELPER_TEXT_TO_IMAGE.to_string(),
+        ))
+    }
+
+    async fn handle_embedding_text(
+        &self,
+        _request: EmbeddingTextRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<EmbeddingTextResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::EMBEDDING_TEXT.to_string(),
+        ))
+    }
+
+    async fn handle_embedding_multimodal(
+        &self,
+        _request: EmbeddingMultimodalRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<EmbeddingMultimodalResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::EMBEDDING_MULTIMODAL.to_string(),
+        ))
+    }
+
+    async fn handle_decision_evaluate(
+        &self,
+        _request: DecisionEvaluateRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<DecisionEvaluateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::DECISION_EVALUATE.to_owned(),
+        ))
+    }
+
+    async fn handle_rerank(
+        &self,
+        _request: RerankRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<RerankResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::RERANK.to_string()))
+    }
+
+    async fn handle_image_to_image(
+        &self,
+        _request: ImageToImageRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ImageToImageResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::IMAGE_IMG2IMG.to_string(),
+        ))
+    }
+
+    async fn handle_image_inpaint(
+        &self,
+        _request: ImageInpaintRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ImageInpaintResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::IMAGE_INPAINT.to_string(),
+        ))
+    }
+
+    async fn handle_image_upscale(
+        &self,
+        _request: ImageUpscaleRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ImageUpscaleResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::IMAGE_UPSCALE.to_string(),
+        ))
+    }
+
+    async fn handle_image_background_remove(
+        &self,
+        _request: ImageBackgroundRemoveRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ImageBackgroundRemoveResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::IMAGE_BG_REMOVE.to_string(),
+        ))
+    }
+
+    async fn handle_vision_ocr(
+        &self,
+        _request: VisionOcrRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VisionOcrResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::VISION_OCR.to_string()))
+    }
+
+    async fn handle_vision_caption(
+        &self,
+        _request: VisionCaptionRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VisionCaptionResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VISION_CAPTION.to_string(),
+        ))
+    }
+
+    async fn handle_vision_detect(
+        &self,
+        _request: VisionDetectRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VisionDetectResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VISION_DETECT.to_string(),
+        ))
+    }
+
+    async fn handle_vision_segment(
+        &self,
+        _request: VisionSegmentRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VisionSegmentResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VISION_SEGMENT.to_string(),
+        ))
+    }
+
+    async fn handle_audio_text_to_speech(
+        &self,
+        _request: AudioTextToSpeechRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AudioTextToSpeechResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::AUDIO_TTS.to_string()))
+    }
+
+    async fn handle_audio_speech_recognition(
+        &self,
+        _request: AudioSpeechRecognitionRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AudioSpeechRecognitionResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::AUDIO_ASR.to_string()))
+    }
+
+    async fn handle_audio_music(
+        &self,
+        _request: AudioMusicRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AudioMusicResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::AUDIO_MUSIC.to_string(),
+        ))
+    }
+
+    async fn handle_audio_enhance(
+        &self,
+        _request: AudioEnhanceRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<AudioEnhanceResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::AUDIO_ENHANCE.to_string(),
+        ))
+    }
+
+    async fn handle_video_generate(
+        &self,
+        _request: VideoGenerateRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VIDEO_GENERATE.to_string(),
+        ))
+    }
+
+    async fn handle_helper_video_generate(
+        &self,
+        _request: VideoGenerateHelperRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VideoGenerateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::HELPER_VIDEO_GENERATE.to_string(),
+        ))
+    }
+
+    async fn handle_video_edit(
+        &self,
+        _request: VideoEditRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VideoEditResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::VIDEO_EDIT.to_string()))
+    }
+
+    async fn handle_video_extend(
+        &self,
+        _request: VideoExtendRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VideoExtendResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VIDEO_EXTEND.to_string(),
+        ))
+    }
+
+    async fn handle_video_upscale(
+        &self,
+        _request: VideoUpscaleRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<VideoUpscaleResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::VIDEO_UPSCALE.to_string(),
+        ))
+    }
+
+    async fn handle_computer_use(
+        &self,
+        _request: ComputerUseRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ComputerUseResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::AGENT_COMPUTER_USE.to_string(),
+        ))
+    }
+
+    async fn handle_reload_settings(
+        &self,
+        _request: ServiceReloadSettingsRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ServiceReloadSettingsResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::SERVICE_RELOAD_SETTINGS.to_string(),
+        ))
+    }
+
+    async fn handle_get_routing(
+        &self,
+        _request: RoutingGetRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<RoutingGetResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::ROUTING_GET.to_string(),
+        ))
+    }
+
+    async fn handle_update_routing(
+        &self,
+        _request: RoutingUpdateRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<RoutingUpdateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::ROUTING_UPDATE.to_string(),
+        ))
+    }
+
+    async fn handle_preview_routing(
+        &self,
+        _request: RoutingPreviewRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<RoutingPreviewResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::ROUTING_PREVIEW.to_string(),
+        ))
+    }
+
+    async fn handle_list_events(
+        &self,
+        _request: EventsListRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<EventsListResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::EVENTS_LIST.to_string(),
+        ))
+    }
+
+    /// Every `quota.*` and `visibility.*` method; the typed requests and
+    /// responses are in `aicc_quota`.
+    async fn handle_quota_rpc(
+        &self,
+        method: &str,
+        _params: Value,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Value, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(method.to_string()))
+    }
+
+    async fn handle_query_usage(
+        &self,
+        _request: QueryUsageRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<QueryUsageResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::USAGE_QUERY.to_string(),
+        ))
+    }
+
+    async fn handle_query_trace(
+        &self,
+        _request: QueryRouteTraceRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<QueryRouteTraceResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::TRACE_QUERY.to_string(),
+        ))
+    }
+
+    async fn handle_preview_provider_rules(&self, _request: ProviderRulesPreviewRequest, _ctx: RPCContext) -> std::result::Result<ProviderRulesPreviewResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(ai_methods::PROVIDER_PREVIEW_RULES.to_string()))
+    }
+
+    async fn handle_provider_catalog(
+        &self,
+        _request: ProviderCatalogRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderCatalogResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_CATALOG.to_string(),
+        ))
+    }
+
+    async fn handle_list_protocol_adapters(
+        &self,
+        _request: ProtocolAdapterListRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProtocolAdapterListResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROTOCOL_ADAPTER_LIST.to_string(),
+        ))
+    }
+
+    async fn handle_validate_provider(
+        &self,
+        _request: ProviderValidateRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderValidateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_VALIDATE.to_string(),
+        ))
+    }
+
+    async fn handle_add_provider(
+        &self,
+        _request: ProviderAddRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderAddResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_ADD.to_string(),
+        ))
+    }
+
+    async fn handle_list_providers(
+        &self,
+        _request: ProviderListRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderListResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_LIST.to_string(),
+        ))
+    }
+
+    async fn handle_provider_health(
+        &self,
+        _request: ProviderHealthRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderHealthResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_HEALTH.to_string(),
+        ))
+    }
+
+    async fn handle_update_provider(
+        &self,
+        _request: ProviderUpdateRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderUpdateResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_UPDATE.to_string(),
+        ))
+    }
+
+    async fn handle_delete_provider(
+        &self,
+        _request: ProviderDeleteRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderDeleteResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_DELETE.to_string(),
+        ))
+    }
+
+    async fn handle_refresh_provider_models(
+        &self,
+        _request: ProviderRefreshModelsRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<ProviderRefreshModelsResponse, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::PROVIDER_REFRESH_MODELS.to_string(),
+        ))
+    }
+
+    async fn handle_list_models(
+        &self,
+        _request: ListModelsRequest,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Value, RPCErrors> {
+        Err(RPCErrors::UnknownMethod(
+            ai_methods::MODELS_LIST.to_string(),
         ))
     }
 
@@ -2323,6 +6674,52 @@ impl<T: AiccHandler> AiccServerHandler<T> {
 #[async_trait]
 impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
     async fn handle_rpc_call(
+        &self,
+        mut req: RPCRequest,
+        ip_from: IpAddr,
+    ) -> std::result::Result<RPCResponse, RPCErrors> {
+        let on_behalf_of = take_on_behalf_of(&mut req.params)?;
+        AICC_REQUEST_ON_BEHALF_OF
+            .scope(on_behalf_of, self.dispatch(req, ip_from))
+            .await
+    }
+}
+
+tokio::task_local! {
+    static AICC_REQUEST_ON_BEHALF_OF: Option<AiccOnBehalfOf>;
+}
+
+/// The `on_behalf_of` parameter of the AICC request being served; AICC
+/// decides whether the caller may send it.
+pub fn current_aicc_on_behalf_of() -> Option<AiccOnBehalfOf> {
+    AICC_REQUEST_ON_BEHALF_OF
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+}
+
+/// Run `future` as a request carrying `on_behalf_of` (in-process callers, tests).
+pub async fn with_aicc_on_behalf_of<F: std::future::Future>(
+    on_behalf_of: Option<AiccOnBehalfOf>,
+    future: F,
+) -> F::Output {
+    AICC_REQUEST_ON_BEHALF_OF.scope(on_behalf_of, future).await
+}
+
+fn take_on_behalf_of(params: &mut Value) -> std::result::Result<Option<AiccOnBehalfOf>, RPCErrors> {
+    let Some(value) = params
+        .as_object_mut()
+        .and_then(|params| params.remove(AICC_ON_BEHALF_OF_PARAM))
+    else {
+        return Ok(None);
+    };
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| RPCErrors::ParseRequestError(format!("invalid on_behalf_of: {error}")))
+}
+
+impl<T: AiccHandler> AiccServerHandler<T> {
+    async fn dispatch(
         &self,
         req: RPCRequest,
         ip_from: IpAddr,
@@ -2364,12 +6761,12 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
                 RPCResult::Success(json!(result))
             }
             ai_methods::HELPER_LLM_CHAT => {
-                let method_req = AiMethodRequest::from_json(req.params)?;
+                let method_req = LlmChatHelperRequest::from_json(req.params)?;
                 let result = self.0.handle_helper_llm_chat(method_req, ctx).await?;
                 RPCResult::Success(json!(result))
             }
             ai_methods::HELPER_TEXT_TO_IMAGE => {
-                let method_req = AiMethodRequest::from_json(req.params)?;
+                let method_req = TextToImageHelperRequest::from_json(req.params)?;
                 let result = self.0.handle_helper_text_to_image(method_req, ctx).await?;
                 RPCResult::Success(json!(result))
             }
@@ -2386,11 +6783,235 @@ impl<T: AiccHandler> RPCHandler for AiccServerHandler<T> {
                     .await?;
                 RPCResult::Success(json!(result))
             }
-            method if ai_methods::is_ai_method(method) => {
-                let method_req = AiMethodRequest::from_json(req.params)?;
-                let result = self.0.handle_method(method, method_req, ctx).await?;
+            ai_methods::EMBEDDING_TEXT => RPCResult::Success(json!(
+                self.0
+                    .handle_embedding_text(EmbeddingTextRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::EMBEDDING_MULTIMODAL => RPCResult::Success(json!(
+                self.0
+                    .handle_embedding_multimodal(
+                        EmbeddingMultimodalRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::DECISION_EVALUATE => {
+                let result = self
+                    .0
+                    .handle_decision_evaluate(DecisionEvaluateRequest::from_json(req.params)?, ctx)
+                    .await?;
                 RPCResult::Success(json!(result))
             }
+            ai_methods::RERANK => RPCResult::Success(json!(
+                self.0
+                    .handle_rerank(RerankRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::IMAGE_IMG2IMG => RPCResult::Success(json!(
+                self.0
+                    .handle_image_to_image(ImageToImageRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::IMAGE_INPAINT => RPCResult::Success(json!(
+                self.0
+                    .handle_image_inpaint(ImageInpaintRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::IMAGE_UPSCALE => RPCResult::Success(json!(
+                self.0
+                    .handle_image_upscale(ImageUpscaleRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::IMAGE_BG_REMOVE => RPCResult::Success(json!(
+                self.0
+                    .handle_image_background_remove(
+                        ImageBackgroundRemoveRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::VISION_OCR => RPCResult::Success(json!(
+                self.0
+                    .handle_vision_ocr(VisionOcrRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VISION_CAPTION => RPCResult::Success(json!(
+                self.0
+                    .handle_vision_caption(VisionCaptionRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VISION_DETECT => RPCResult::Success(json!(
+                self.0
+                    .handle_vision_detect(VisionDetectRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VISION_SEGMENT => RPCResult::Success(json!(
+                self.0
+                    .handle_vision_segment(VisionSegmentRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::AUDIO_TTS => RPCResult::Success(json!(
+                self.0
+                    .handle_audio_text_to_speech(
+                        AudioTextToSpeechRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::AUDIO_ASR => RPCResult::Success(json!(
+                self.0
+                    .handle_audio_speech_recognition(
+                        AudioSpeechRecognitionRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::AUDIO_MUSIC => RPCResult::Success(json!(
+                self.0
+                    .handle_audio_music(AudioMusicRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::AUDIO_ENHANCE => RPCResult::Success(json!(
+                self.0
+                    .handle_audio_enhance(AudioEnhanceRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VIDEO_GENERATE => RPCResult::Success(json!(
+                self.0
+                    .handle_video_generate(VideoGenerateRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::HELPER_VIDEO_GENERATE => RPCResult::Success(json!(
+                self.0
+                    .handle_helper_video_generate(
+                        VideoGenerateHelperRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::VIDEO_EDIT => RPCResult::Success(json!(
+                self.0
+                    .handle_video_edit(VideoEditRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VIDEO_EXTEND => RPCResult::Success(json!(
+                self.0
+                    .handle_video_extend(VideoExtendRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::VIDEO_UPSCALE => RPCResult::Success(json!(
+                self.0
+                    .handle_video_upscale(VideoUpscaleRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::AGENT_COMPUTER_USE => RPCResult::Success(json!(
+                self.0
+                    .handle_computer_use(ComputerUseRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::SERVICE_RELOAD_SETTINGS => RPCResult::Success(json!(
+                self.0
+                    .handle_reload_settings(
+                        ServiceReloadSettingsRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::ROUTING_GET => RPCResult::Success(json!(
+                self.0
+                    .handle_get_routing(RoutingGetRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::ROUTING_UPDATE => RPCResult::Success(json!(
+                self.0
+                    .handle_update_routing(RoutingUpdateRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::ROUTING_PREVIEW => RPCResult::Success(json!(
+                self.0
+                    .handle_preview_routing(RoutingPreviewRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::EVENTS_LIST => RPCResult::Success(json!(
+                self.0
+                    .handle_list_events(EventsListRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            method if quota_methods::is_quota_method(method) => {
+                RPCResult::Success(self.0.handle_quota_rpc(method, req.params, ctx).await?)
+            }
+            ai_methods::USAGE_QUERY => RPCResult::Success(json!(
+                self.0
+                    .handle_query_usage(QueryUsageRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::TRACE_QUERY => RPCResult::Success(json!(
+                self.0
+                    .handle_query_trace(QueryRouteTraceRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_PREVIEW_RULES => {
+                let request = ProviderRulesPreviewRequest::from_json(req.params)?;
+                let result = self.0.handle_preview_provider_rules(request, ctx).await?;
+                RPCResult::Success(json!(result))
+            }
+            ai_methods::PROVIDER_CATALOG => RPCResult::Success(json!(
+                self.0
+                    .handle_provider_catalog(ProviderCatalogRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROTOCOL_ADAPTER_LIST => RPCResult::Success(json!(
+                self.0
+                    .handle_list_protocol_adapters(
+                        ProtocolAdapterListRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::PROVIDER_VALIDATE => RPCResult::Success(json!(
+                self.0
+                    .handle_validate_provider(ProviderValidateRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_ADD => RPCResult::Success(json!(
+                self.0
+                    .handle_add_provider(ProviderAddRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_LIST => RPCResult::Success(json!(
+                self.0
+                    .handle_list_providers(ProviderListRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_HEALTH => RPCResult::Success(json!(
+                self.0
+                    .handle_provider_health(ProviderHealthRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_UPDATE => RPCResult::Success(json!(
+                self.0
+                    .handle_update_provider(ProviderUpdateRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_DELETE => RPCResult::Success(json!(
+                self.0
+                    .handle_delete_provider(ProviderDeleteRequest::from_json(req.params)?, ctx)
+                    .await?
+            )),
+            ai_methods::PROVIDER_REFRESH_MODELS => RPCResult::Success(json!(
+                self.0
+                    .handle_refresh_provider_models(
+                        ProviderRefreshModelsRequest::from_json(req.params)?,
+                        ctx
+                    )
+                    .await?
+            )),
+            ai_methods::MODELS_LIST => RPCResult::Success(
+                self.0
+                    .handle_list_models(ListModelsRequest::from_json(req.params)?, ctx)
+                    .await?,
+            ),
             _ => return Err(RPCErrors::UnknownMethod(req.method.clone())),
         };
 
@@ -2416,331 +7037,4 @@ pub fn generate_aicc_service_doc() -> AppDoc {
     .selector_type(SelectorType::Random)
     .build()
     .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Default, Debug)]
-    struct MockCalls {
-        method: Option<String>,
-        request: Option<AiMethodRequest>,
-        cancel_task_id: Option<String>,
-    }
-
-    #[derive(Clone)]
-    struct MockAicc {
-        calls: Arc<Mutex<MockCalls>>,
-    }
-
-    impl MockAicc {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(MockCalls::default())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl AiccHandler for MockAicc {
-        async fn handle_method(
-            &self,
-            method: &str,
-            request: AiMethodRequest,
-            _ctx: RPCContext,
-        ) -> std::result::Result<AiMethodResponse, RPCErrors> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.method = Some(method.to_string());
-            calls.request = Some(request);
-            Ok(AiMethodResponse::new(
-                "task-001".to_string(),
-                AiMethodStatus::Succeeded,
-                Some(AiResponse {
-                    message: AiMessage::text(AiRole::Assistant, "mock result"),
-                    usage: Some(AiUsage {
-                        input_tokens: Some(4),
-                        output_tokens: Some(8),
-                        total_tokens: Some(12),
-                    }),
-                    cost: Some(AiCost {
-                        amount: 0.001,
-                        currency: "USD".to_string(),
-                    }),
-                    finish_reason: Some("stop".to_string()),
-                    provider_task_ref: Some("provider-task-001".to_string()),
-                    extra: None,
-                }),
-                Some("task://task-001/events".to_string()),
-            ))
-        }
-
-        async fn handle_cancel(
-            &self,
-            task_id: &str,
-            _ctx: RPCContext,
-        ) -> std::result::Result<CancelResponse, RPCErrors> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.cancel_task_id = Some(task_id.to_string());
-            Ok(CancelResponse::new(task_id.to_string(), true))
-        }
-
-        async fn handle_driver_metadata_update_get(
-            &self,
-            _ctx: RPCContext,
-        ) -> std::result::Result<DriverMetadataUpdateView, RPCErrors> {
-            Ok(DriverMetadataUpdateView {
-                enabled: true,
-                source_url: Some(
-                    "https://metadata.example/aicc/driver-metadata/index.json".to_string(),
-                ),
-                source_configured: true,
-                interval_secs: 900,
-                status: DriverMetadataUpdateStatus::Healthy,
-                active_revision: Some(7),
-                last_attempt_at_ms: None,
-                last_success_at_ms: None,
-                last_error: None,
-                consecutive_failures: 0,
-            })
-        }
-
-        async fn handle_driver_metadata_update_set(
-            &self,
-            request: DriverMetadataUpdateSetReq,
-            ctx: RPCContext,
-        ) -> std::result::Result<DriverMetadataUpdateSetResponse, RPCErrors> {
-            let mut settings = self.handle_driver_metadata_update_get(ctx).await?;
-            settings.enabled = request.enabled;
-            Ok(DriverMetadataUpdateSetResponse {
-                ok: true,
-                settings_revision: 42,
-                settings,
-                runtime_apply: DriverMetadataRuntimeApply {
-                    ok: true,
-                    refresh_scheduled: Some(true),
-                    error: None,
-                },
-            })
-        }
-    }
-
-    fn sample_method_request() -> AiMethodRequest {
-        AiMethodRequest::new(
-            Capability::Llm,
-            ModelSpec::new("llm.plan.default".to_string(), None),
-            Requirements::new(vec![features::PLAN.to_string()], Some(3000), None, None),
-            AiPayload::new(
-                Some("write a release note".to_string()),
-                vec![AiMessage::text(AiRole::User, "summarize this commit")],
-                vec![],
-                vec![
-                    ResourceRef::url(
-                        "cyfs://example/object/1".to_string(),
-                        Some("text/plain".to_string()),
-                    ),
-                    ResourceRef::named_object(ObjId::new("chunk:123456").unwrap()),
-                ],
-                Some(json!({})),
-                Some(json!({"temperature": 0.3})),
-            ),
-            Some("idem-1".to_string()),
-        )
-    }
-
-    #[test]
-    fn test_generate_aicc_service_doc() {
-        let doc = generate_aicc_service_doc();
-        let json_str = serde_json::to_string_pretty(&doc).unwrap();
-        println!("json: {}", json_str);
-    }
-
-    #[test]
-    fn test_protocol_field_names() {
-        let mut request = sample_method_request();
-        request.requirements.resp_format = RespFormat::Json;
-        request.policy = Some(RoutePolicy::default());
-
-        let value = serde_json::to_value(&request).unwrap();
-        assert_eq!(value.pointer("/capability"), Some(&json!("llm")));
-        assert_eq!(
-            value.pointer("/requirements/resp_format"),
-            Some(&json!("json"))
-        );
-        assert!(value.pointer("/requirements/resp_foramt").is_none());
-        assert!(value.pointer("/payload/text").is_none());
-        assert!(value.pointer("/payload/messages").is_none());
-        assert!(value.pointer("/payload/tool_specs").is_none());
-        assert_eq!(
-            value.pointer("/payload/input_json/messages/0/content/0/type"),
-            Some(&json!("text"))
-        );
-        assert_eq!(
-            value.pointer("/payload/input_json/messages/0/content/0/text"),
-            Some(&json!("summarize this commit"))
-        );
-        assert_eq!(
-            value.pointer("/payload/input_json/messages/0/role"),
-            Some(&json!("user"))
-        );
-    }
-
-    #[test]
-    fn ai_message_tool_calls_preserve_block_order() {
-        let mut first_args = HashMap::new();
-        first_args.insert("q".to_string(), json!("first"));
-        let mut second_args = HashMap::new();
-        second_args.insert("q".to_string(), json!("second"));
-        let msg = AiMessage::new(
-            AiRole::Assistant,
-            vec![
-                AiContent::text("before"),
-                AiContent::tool_use("call-1", "lookup", first_args),
-                AiContent::text("middle"),
-                AiContent::tool_use("call-2", "search", second_args),
-            ],
-        );
-
-        let calls = msg.tool_calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].call_id, "call-1");
-        assert_eq!(calls[0].name, "lookup");
-        assert_eq!(calls[1].call_id, "call-2");
-        assert_eq!(calls[1].name, "search");
-    }
-
-    #[tokio::test]
-    async fn test_in_process_client_with_mock() {
-        let mock = MockAicc::new();
-        let calls = mock.calls.clone();
-        let client = AiccClient::new_in_process(Box::new(mock));
-
-        let request = sample_method_request();
-        let method_result = client
-            .call_method(ai_methods::LLM_CHAT, request.clone())
-            .await
-            .unwrap();
-        assert_eq!(method_result.task_id, "task-001");
-        assert_eq!(method_result.status, AiMethodStatus::Succeeded);
-        assert_eq!(
-            method_result
-                .result
-                .as_ref()
-                .map(|summary| summary.text_content()),
-            Some("mock result".to_string())
-        );
-
-        let cancel_result = client.cancel("task-001").await.unwrap();
-        assert_eq!(cancel_result.task_id, "task-001");
-        assert!(cancel_result.accepted);
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.method.as_deref(), Some(ai_methods::LLM_CHAT));
-        assert_eq!(calls.request, Some(request));
-        assert_eq!(calls.cancel_task_id.as_deref(), Some("task-001"));
-    }
-
-    #[tokio::test]
-    async fn driver_metadata_update_protocol_is_typed_end_to_end() {
-        let client = AiccClient::new_in_process(Box::new(MockAicc::new()));
-        let view = client.get_driver_metadata_update().await.unwrap();
-        assert_eq!(view.status, DriverMetadataUpdateStatus::Healthy);
-        assert_eq!(view.active_revision, Some(7));
-
-        let response = client
-            .set_driver_metadata_update(DriverMetadataUpdateSetReq::new(false, None, Some(900)))
-            .await
-            .unwrap();
-        assert!(response.ok);
-        assert!(!response.settings.enabled);
-        assert_eq!(response.settings_revision, 42);
-        assert!(DriverMetadataUpdateSetReq::from_json(json!({
-            "enabled": true,
-            "unexpected": true
-        }))
-        .is_err());
-    }
-
-    #[tokio::test]
-    async fn test_rpc_handler_adapter_with_mock() {
-        let mock = MockAicc::new();
-        let calls = mock.calls.clone();
-        let rpc_handler = AiccServerHandler::new(mock);
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-
-        let request = sample_method_request();
-        let method_req = RPCRequest {
-            method: ai_methods::LLM_CHAT.to_string(),
-            params: serde_json::to_value(&request).unwrap(),
-            seq: 9,
-            token: None,
-            trace_id: None,
-        };
-        let method_resp = rpc_handler.handle_rpc_call(method_req, ip).await.unwrap();
-        match method_resp.result {
-            RPCResult::Success(value) => {
-                let method_result: AiMethodResponse = serde_json::from_value(value).unwrap();
-                assert_eq!(method_result.task_id, "task-001");
-                assert_eq!(method_result.status, AiMethodStatus::Succeeded);
-            }
-            _ => panic!("Expected success response"),
-        }
-
-        let cancel_req = RPCRequest {
-            method: "cancel".to_string(),
-            params: json!({"task_id": "task-001"}),
-            seq: 10,
-            token: None,
-            trace_id: None,
-        };
-        let cancel_resp = rpc_handler.handle_rpc_call(cancel_req, ip).await.unwrap();
-        match cancel_resp.result {
-            RPCResult::Success(value) => {
-                let cancel_result: CancelResponse = serde_json::from_value(value).unwrap();
-                assert_eq!(cancel_result.task_id, "task-001");
-                assert!(cancel_result.accepted);
-            }
-            _ => panic!("Expected success response"),
-        }
-
-        let metadata_get = RPCRequest {
-            method: ai_methods::DRIVER_METADATA_UPDATE_GET.to_string(),
-            params: json!({}),
-            seq: 11,
-            token: None,
-            trace_id: None,
-        };
-        let metadata_get = rpc_handler.handle_rpc_call(metadata_get, ip).await.unwrap();
-        match metadata_get.result {
-            RPCResult::Success(value) => {
-                let view: DriverMetadataUpdateView = serde_json::from_value(value).unwrap();
-                assert_eq!(view.status, DriverMetadataUpdateStatus::Healthy);
-            }
-            _ => panic!("Expected success response"),
-        }
-
-        let metadata_set = RPCRequest {
-            method: ai_methods::DRIVER_METADATA_UPDATE_SET.to_string(),
-            params: json!({"enabled": false, "interval_secs": 900}),
-            seq: 12,
-            token: None,
-            trace_id: None,
-        };
-        let metadata_set = rpc_handler.handle_rpc_call(metadata_set, ip).await.unwrap();
-        match metadata_set.result {
-            RPCResult::Success(value) => {
-                let response: DriverMetadataUpdateSetResponse =
-                    serde_json::from_value(value).unwrap();
-                assert!(!response.settings.enabled);
-            }
-            _ => panic!("Expected success response"),
-        }
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.method.as_deref(), Some(ai_methods::LLM_CHAT));
-        assert_eq!(calls.request, Some(request));
-        assert_eq!(calls.cancel_task_id.as_deref(), Some("task-001"));
-    }
 }

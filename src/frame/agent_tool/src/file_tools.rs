@@ -1,16 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::runtime::files::{FileBackend, LocalFileBackend, WholeWriteMode};
 use async_trait::async_trait;
 use log::warn;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
+#[cfg(test)]
 use tokio::fs;
 
 use crate::{
-    resolve_path_from_root, rewrite_path_with_shell_cwd, u64_to_usize_arg, AgentToolError,
-    CallingConventions, CliInvocation, ContentInput, SessionRuntimeContext, ToolCtx, TypedTool,
+    rewrite_path_with_shell_cwd, u64_to_usize_arg, AgentToolError, CallingConventions,
+    CliInvocation, ContentInput, SessionRuntimeContext, ToolCtx, TypedTool,
 };
 
 pub const TOOL_EDIT_FILE: &str = "edit_file";
@@ -23,6 +25,7 @@ const READ_FILE_PREVIEW_MAX_LINES: usize = 200;
 #[derive(Clone, Debug)]
 pub struct FileToolConfig {
     pub root_dir: PathBuf,
+    pub backend: Arc<dyn FileBackend>,
     pub allowed_read_roots: Vec<PathBuf>,
     pub allowed_write_roots: Vec<PathBuf>,
     pub allow_create: bool,
@@ -40,39 +43,8 @@ impl FileToolConfig {
             max_write_bytes: usize::MAX,
             max_diff_lines: usize::MAX,
             root_dir,
+            backend: Arc::new(LocalFileBackend),
         }
-    }
-
-    fn ensure_read_path_allowed(
-        &self,
-        abs_path: &Path,
-        raw_path: &str,
-    ) -> Result<(), AgentToolError> {
-        if self.allowed_read_roots.is_empty() {
-            return Ok(());
-        }
-        if is_path_under_any(abs_path, &self.allowed_read_roots) {
-            return Ok(());
-        }
-        Err(AgentToolError::InvalidArgs(format!(
-            "read path not allowed by policy: {raw_path}"
-        )))
-    }
-
-    fn ensure_write_path_allowed(
-        &self,
-        abs_path: &Path,
-        raw_path: &str,
-    ) -> Result<(), AgentToolError> {
-        if self.allowed_write_roots.is_empty() {
-            return Ok(());
-        }
-        if is_path_under_any(abs_path, &self.allowed_write_roots) {
-            return Ok(());
-        }
-        Err(AgentToolError::InvalidArgs(format!(
-            "write path not allowed by policy: {raw_path}"
-        )))
     }
 
     fn ensure_create_allowed(&self, raw_path: &str) -> Result<(), AgentToolError> {
@@ -150,8 +122,11 @@ impl EditFileTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct EditFileArgs {
+    /// File to edit, relative to the working directory.
     pub path: String,
+    /// The exact text to replace; it must occur exactly once.
     pub old_string: String,
+    /// The replacement text.
     pub new_string: String,
 }
 
@@ -178,7 +153,7 @@ impl TypedTool for EditFileTool {
         TOOL_EDIT_FILE
     }
     fn description(&self) -> &str {
-        "Edit file."
+        "Replace the one exact occurrence of old_string with new_string in a text file. Fails when old_string is absent or occurs more than once: include enough surrounding text to make it unique. Paths are relative to the working directory; paths outside it only where the run's filesystem policy allows."
     }
     fn calling(&self) -> CallingConventions {
         CallingConventions::ACTION
@@ -264,10 +239,44 @@ impl TypedTool for EditFileTool {
                 "`new_string` must be different from `old_string`".to_string(),
             ));
         }
-        let abs_path = resolve_path_from_root(&self.cfg.root_dir, &file_path)?;
-        self.cfg.ensure_write_path_allowed(&abs_path, &file_path)?;
+        let abs_path = self
+            .cfg
+            .backend
+            .resolve(
+                &self.cfg.root_dir,
+                &file_path,
+                &self.cfg.allowed_write_roots,
+            )
+            .await?;
 
-        let original_content = read_text_file_lossy(&abs_path).await?;
+        if let Some(result) = self
+            .cfg
+            .backend
+            .edit_once(&abs_path, &old_string, &new_string)
+            .await
+        {
+            let result = result?;
+            let original_content = String::from_utf8_lossy(&result.original).to_string();
+            let updated_content = original_content.replacen(old_string.as_str(), &new_string, 1);
+            let (diff, diff_truncated) = build_simple_diff(
+                &file_path,
+                &original_content,
+                &updated_content,
+                self.cfg.max_diff_lines,
+            );
+            return Ok(EditFileOutput {
+                matched: true,
+                changed: result.changed,
+                operation: "replace".to_string(),
+                line_no: Some(result.line),
+                diff,
+                diff_truncated,
+                file_path,
+            });
+        }
+
+        let original_content =
+            String::from_utf8_lossy(&self.cfg.backend.read(&abs_path).await?).to_string();
         let matches: Vec<usize> = original_content
             .match_indices(old_string.as_str())
             .map(|(pos, _)| pos)
@@ -296,14 +305,10 @@ impl TypedTool for EditFileTool {
         if changed {
             self.cfg
                 .ensure_write_size_allowed(&file_path, updated_content.len())?;
-            if let Some(parent) = abs_path.parent() {
-                fs::create_dir_all(parent).await.map_err(|err| {
-                    AgentToolError::ExecFailed(format!("create parent dir failed: {err}"))
-                })?;
-            }
-            fs::write(&abs_path, updated_content.as_bytes())
-                .await
-                .map_err(|err| AgentToolError::ExecFailed(format!("write file failed: {err}")))?;
+            self.cfg
+                .backend
+                .write(&abs_path, updated_content.as_bytes())
+                .await?;
         }
 
         let (diff, diff_truncated) = build_simple_diff(
@@ -376,8 +381,12 @@ impl WriteFileTool {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
+    /// File to write, relative to the working directory.
     pub path: String,
+    /// The text to write.
     pub content: String,
+    /// `write` (default): create or overwrite; `append`: add to the end;
+    /// `new`: create, fail if the file exists.
     #[serde(default)]
     pub mode: Option<String>,
 }
@@ -409,7 +418,7 @@ impl TypedTool for WriteFileTool {
         TOOL_WRITE_FILE
     }
     fn description(&self) -> &str {
-        "Write file."
+        "Write a text file: mode \"write\" (default) creates or overwrites it, \"append\" adds to its end, \"new\" creates it and fails if it exists. Parent directories are created. Paths are relative to the working directory; paths outside it only where the run's filesystem policy allows."
     }
     fn calling(&self) -> CallingConventions {
         CallingConventions::ACTION
@@ -470,10 +479,52 @@ impl TypedTool for WriteFileTool {
         }
         let content = args.content;
         let mode = normalize_write_mode(args.mode.as_deref())?;
-        let abs_path = resolve_path_from_root(&self.cfg.root_dir, &file_path)?;
-        self.cfg.ensure_write_path_allowed(&abs_path, &file_path)?;
+        let abs_path = self
+            .cfg
+            .backend
+            .resolve(
+                &self.cfg.root_dir,
+                &file_path,
+                &self.cfg.allowed_write_roots,
+            )
+            .await?;
 
-        let exists = fs::metadata(&abs_path).await.is_ok();
+        let whole_mode = match mode {
+            "append" => WholeWriteMode::Append,
+            "new" => WholeWriteMode::CreateNew,
+            _ => WholeWriteMode::Replace,
+        };
+        self.cfg.ensure_write_size_allowed(&file_path, content.len())?;
+        if self.cfg.allow_create {
+            if let Some(result) = self
+                .cfg
+                .backend
+                .write_whole(&abs_path, whole_mode, content.as_bytes())
+                .await
+            {
+                let result = result?;
+                let operation = match mode {
+                    "append" => "append",
+                    "new" => "new",
+                    _ if result.created => "create",
+                    _ => "write",
+                }
+                .to_string();
+                return Ok(WriteFileOutput {
+                    created: result.created,
+                    changed: result.changed,
+                    bytes_written: result.size,
+                    line_count: count_content_lines(&content),
+                    file_path,
+                    operation,
+                    content_preview: build_content_preview(&content),
+                    content_len: content.len(),
+                    bytes_after: result.size,
+                });
+            }
+        }
+
+        let exists = self.cfg.backend.exists(&abs_path).await?;
         if mode == "new" && exists {
             return Err(AgentToolError::InvalidArgs(format!(
                 "write mode `new` requires target file not exist: {file_path}"
@@ -481,7 +532,7 @@ impl TypedTool for WriteFileTool {
         }
 
         let original_content = if exists {
-            read_text_file_lossy(&abs_path).await?
+            String::from_utf8_lossy(&self.cfg.backend.read(&abs_path).await?).to_string()
         } else {
             String::new()
         };
@@ -506,14 +557,10 @@ impl TypedTool for WriteFileTool {
         self.cfg
             .ensure_write_size_allowed(&file_path, updated_content.len())?;
 
-        if let Some(parent) = abs_path.parent() {
-            fs::create_dir_all(parent).await.map_err(|err| {
-                AgentToolError::ExecFailed(format!("create parent dir failed: {err}"))
-            })?;
-        }
-        fs::write(&abs_path, updated_content.as_bytes())
-            .await
-            .map_err(|err| AgentToolError::ExecFailed(format!("write file failed: {err}")))?;
+        self.cfg
+            .backend
+            .write(&abs_path, updated_content.as_bytes())
+            .await?;
 
         let changed = original_content != updated_content;
         let (diff, diff_truncated) = build_simple_diff(
@@ -593,9 +640,14 @@ details:
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
+    /// File to read, relative to the working directory.
     pub path: String,
+    /// 1-based line range: "120-200", "120:$" (to the end), "120:+20"
+    /// (20 lines from 120); negative numbers count from the end ("-50:$").
     #[serde(default)]
     pub range: Option<Json>,
+    /// Start the read at the first occurrence of this text (range then
+    /// counts from there).
     #[serde(default)]
     pub first_chunk: Option<String>,
 }
@@ -627,7 +679,7 @@ impl TypedTool for ReadFileTool {
         TOOL_READ_FILE
     }
     fn description(&self) -> &str {
-        "Read file."
+        "Read a text file. range selects 1-based lines (\"120-200\", \"120:$\", \"120:+20\", \"-50:$\" for the last 50); first_chunk starts the read at the first occurrence of that text. Paths are relative to the working directory; paths outside it only where the run's filesystem policy allows."
     }
     fn calling(&self) -> CallingConventions {
         CallingConventions::from_legacy(true, false, true)
@@ -719,10 +771,14 @@ impl TypedTool for ReadFileTool {
                 "missing required arg `path`".to_string(),
             ));
         }
-        let abs_path = resolve_path_from_root(&self.cfg.root_dir, &file_path)?;
-        self.cfg.ensure_read_path_allowed(&abs_path, &file_path)?;
+        let abs_path = self
+            .cfg
+            .backend
+            .resolve(&self.cfg.root_dir, &file_path, &self.cfg.allowed_read_roots)
+            .await?;
 
-        let full_content = read_text_file_lossy(&abs_path).await?;
+        let full_content =
+            String::from_utf8_lossy(&self.cfg.backend.read(&abs_path).await?).to_string();
         let first_chunk = args.first_chunk.clone();
         let (chunk_content, matched, chunk_start_line) =
             if let Some(first_chunk) = first_chunk.as_deref() {
@@ -1197,13 +1253,6 @@ fn resolve_line_marker(marker: LineMarker, total_lines: i64) -> i64 {
     }
 }
 
-async fn read_text_file_lossy(path: &Path) -> Result<String, AgentToolError> {
-    let bytes = fs::read(path)
-        .await
-        .map_err(|err| AgentToolError::ExecFailed(format!("read file failed: {err}")))?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
-}
-
 fn compact_cmd_param_preview(raw: &str) -> String {
     let escaped = raw
         .replace('\\', "\\\\")
@@ -1396,10 +1445,6 @@ fn build_simple_diff(
     (diff.join("\n"), false)
 }
 
-fn is_path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
-    roots.iter().any(|root| path.starts_with(root))
-}
-
 /// Shared shape for the `write_file` and `edit_file` CLI parsers — the
 /// two tools share path + a stdin-capable content field, and `edit_file`
 /// adds a required `--old-string` argument.
@@ -1552,7 +1597,7 @@ mod tests {
             trace_id: "trace".to_string(),
             agent_name: "agent".to_string(),
             behavior: "test".to_string(),
-            step_idx: 0,
+            tool_call_index: 0,
             wakeup_id: "wake".to_string(),
             session_id: "session".to_string(),
             read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,

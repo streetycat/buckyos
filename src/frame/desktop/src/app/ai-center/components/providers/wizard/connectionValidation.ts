@@ -1,12 +1,45 @@
+import { z } from 'zod'
+import { parseProviderAdvancedRules } from '../../../../../api/provider_model_selection'
 import type { WizardDraft } from '../../../../../api/aicc_mgr'
 
-export function isConnectionValid(draft: WizardDraft): boolean {
-  if (!draft.provider_type) return false
-  if (draft.provider_type === 'sn_router') return true
-  if (!draft.api_key.trim()) return false
-  if (draft.provider_type === 'custom') {
-    if (!draft.endpoint.trim()) return false
-    if (!draft.protocol_type) return false
+export const wizardDraftSchema = z.object({
+  provider_rules_id: z.string().optional(),
+  model_driver_overrides_json: z.string().optional(),
+  server_default_routes_json: z.string().optional(),
+  provider_instance_name: z.string().trim().min(1).max(64).optional(),
+  provider_profile_id: z.string().trim().min(1).max(64).nullable(),
+  display_name: z.string().trim().max(80),
+  base_url: z.string().trim(),
+  operation_base_urls: z.record(z.string(), z.string()),
+  protocol_family_id: z.string().nullable(),
+  protocol_adapter_id: z.string().optional(),
+  region: z.string().optional(),
+  workspace: z.string().optional(),
+  account: z.string().optional(),
+  policy_region: z.string().optional(),
+  auth_mode: z.enum(['api_key', 'dynamic_login']),
+  api_key: z.string(),
+  auto_sync_models: z.boolean(),
+  discovery_behavior_id: z.string().optional(),
+  selectable_inventory_models: z.array(z.string()).optional(),
+  selected_inventory_models: z.array(z.string()).optional(),
+}).superRefine((draft, context) => {
+  try { parseProviderAdvancedRules(draft) } catch (error) {
+    context.addIssue({ code: 'custom', path: ['model_driver_overrides_json'], message: error instanceof Error ? error.message : 'Invalid advanced provider rules' })
   }
-  return true
+  if (!draft.provider_profile_id) return
+  if (!draft.base_url) context.addIssue({ code: 'custom', path: ['base_url'], message: 'Base URL is required' })
+  for (const [operation, url] of Object.entries(draft.operation_base_urls)) {
+    if (!url.trim()) context.addIssue({ code: 'custom', path: ['operation_base_urls', operation], message: 'Operation Base URL is required' })
+  }
+  if (draft.provider_profile_id === 'custom' && (!draft.protocol_family_id || !draft.protocol_adapter_id)) {
+    context.addIssue({ code: 'custom', path: ['protocol_family_id'], message: 'Protocol family is required' })
+  }
+  if (draft.auth_mode === 'api_key' && !draft.api_key.trim()) {
+    context.addIssue({ code: 'custom', path: ['api_key'], message: 'API key is required' })
+  }
+})
+
+export function isConnectionValid(draft: WizardDraft): boolean {
+  return wizardDraftSchema.safeParse(draft).success
 }

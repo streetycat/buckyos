@@ -13,29 +13,35 @@ use crate::app_install_planner::{
     build_install_plan, default_install_params, ContentLocator, PlannerInput,
 };
 use crate::app_install_resolver::{
-    bind_candidate_document, normalize_identifier, AppDidResolver, NameClientAppResolver,
-    NormalizedIdentifier,
+    bind_candidate_document, normalize_identifier, resolve_domain_alias, AppDidResolver,
+    NameClientAppResolver, NormalizedIdentifier,
 };
 use crate::app_package_namespace::{
     validate_app_package_namespace, validate_package_meta_namespace,
 };
+use crate::app_staging::PikgStagingStore;
 use crate::pikg::{PikgInspection, PikgReader};
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, AppInstallTaskData, CandidateHandle, ContentLocation, InstallError,
-    InstallErrorCode, InstallPlan, InstallSource, InstallStage, InstallTarget, PreparedDeployment,
-    StagingHandle, VerificationReport, APP_CAPABILITY_MINI_GPU_MEMORY,
+    get_buckyos_api_runtime, install_record_key, AdmissionOrigin, AppId, AppInstallTaskData, AppServiceSpec,
+    CandidateHandle, ContentLocation, InspectedContent, InstallError, InstallErrorCode,
+    InstallInspection, InstallParams, InstallPlan, InstallPlanStatus, InstallPlanUse,
+    InstallRecord, InstallSource, InstallSourceIdentity, InstallStage, InstallTarget,
+    PikgStagingPurpose, PreparedDeployment, ProductProfile, ServiceExposeSetting, ServiceSetting, ServiceState,
+    SystemConfigError, VerificationReport, APP_CAPABILITY_MINI_GPU_MEMORY,
     APP_CAPABILITY_MINI_GPU_TFLOPS, APP_CAPABILITY_MINI_MEMORY, OBJ_TYPE_APP_DOC,
+    TASK_DATA_TYPE_APP_UPDATE,
 };
 use log::warn;
 use name_lib::{DeviceInfo, DID};
-use ndn_lib::{build_named_object_by_json, ObjId};
+use ndn_lib::{build_named_object_by_json, ChunkId, FileObject, NdnResult, ObjId, StoreMode};
+use ndn_toolkit::{cacl_file_object, CheckMode};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-/// pikg staging root：Control Panel 数据目录下的受控子目录（D5）。
+/// 外部投放 pikg 的受控目录（D5，只用 `incoming/`）；staged pikg 本身在 named store。
 pub fn pikg_staging_root() -> PathBuf {
     buckyos_kit::get_buckyos_root_dir()
         .join("cache")
@@ -43,24 +49,235 @@ pub fn pikg_staging_root() -> PathBuf {
         .join("pikg_staging")
 }
 
+/// 处理期间的临时文件（解出的 payload、构造中的 Agent runtime 包）。
+pub fn work_root() -> PathBuf {
+    buckyos_kit::get_buckyos_root_dir()
+        .join("tmp")
+        .join(buckyos_api::CONTROL_PANEL_SERVICE_NAME)
+}
+
+fn inherit_upgrade_params(mut params: InstallParams, spec: &AppServiceSpec) -> InstallParams {
+    params.auto_start = spec.enable && spec.state != ServiceState::Stopped;
+    params.expected_instance_count = spec.expected_instance_count;
+    params.selected_components = spec.selected_components.clone();
+    params.permissions = spec.permission.clone();
+    params.data_mount_points = spec.spec_config.data_mount_point.clone();
+    params.local_cache_mount_points = spec.spec_config.local_cache_mount_point.clone();
+    params.external_mount_points = spec.spec_config.external_mount_point.clone();
+    params.bash_envs = spec.spec_config.bash_envs.clone();
+    params.res_pool_id = Some(spec.spec_config.res_pool_id.clone());
+    for service_name in spec.app_doc.service_config_tips.service_endpoints.keys() {
+        let enabled = spec.spec_config.service_config.contains_key(service_name);
+        let expose = spec
+            .spec_config
+            .expose_config
+            .get(service_name)
+            .map(|current| ServiceExposeSetting {
+                route: current.route.clone(),
+                scope: current.scope.clone(),
+                allow_guest: current.allow_guest,
+            });
+        params
+            .service_settings
+            .services
+            .insert(service_name.clone(), ServiceSetting { enabled, expose });
+    }
+    params
+}
+
 pub struct ProductionInstallDriver {
     resolver: Arc<dyn AppDidResolver>,
-    staging_root: PathBuf,
+    staging_store: Arc<PikgStagingStore>,
+}
+
+fn retain_error(stage: InstallStage, error: kRPC::RPCErrors) -> InstallError {
+    InstallError::new(
+        stage,
+        InstallErrorCode::AcquisitionFailed,
+        true,
+        format!("retain installed packages failed: {error}"),
+    )
 }
 
 impl ProductionInstallDriver {
-    pub fn new() -> Self {
+    pub fn new(staging_store: Arc<PikgStagingStore>) -> Self {
         Self {
             resolver: Arc::new(NameClientAppResolver::new()),
-            staging_root: pikg_staging_root(),
+            staging_store,
         }
     }
 
-    pub fn with_parts(resolver: Arc<dyn AppDidResolver>, staging_root: PathBuf) -> Self {
-        Self {
-            resolver,
-            staging_root,
+    /// Writes the candidate PIKG's AppDoc, Package Metas and payloads into the
+    /// named store, then binds everything the plan deploys into the package buckets.
+    pub(crate) async fn materialize_candidate_pikg(
+        &self,
+        data: &AppInstallTaskData,
+    ) -> Result<(), InstallError> {
+        let plan = data.state.plan.as_ref().ok_or_else(|| {
+            InstallError::new(
+                InstallStage::Prepare,
+                InstallErrorCode::Internal,
+                false,
+                "materialize without install plan",
+            )
+        })?;
+        let runtime = get_buckyos_api_runtime().map_err(|error| {
+            InstallError::new(
+                InstallStage::Prepare,
+                InstallErrorCode::Internal,
+                true,
+                format!("get runtime for pikg materialization failed: {error}"),
+            )
+        })?;
+        let named_store = runtime.get_local_named_store().await.map_err(|error| {
+            InstallError::new(
+                InstallStage::Prepare,
+                InstallErrorCode::Internal,
+                true,
+                format!("open named store for pikg materialization failed: {error}"),
+            )
+        })?;
+        if let Some(reader) = self.open_candidate_pikg(data).await? {
+            self.materialize_pikg(&reader, plan, data, &named_store)
+                .await?;
         }
+        crate::buckets::PackageBuckets::zone()
+            .retain_plan(&named_store, plan, true)
+            .await
+            .map_err(|error| retain_error(InstallStage::Prepare, error))
+    }
+
+    async fn materialize_pikg(
+        &self,
+        reader: &PikgReader,
+        plan: &InstallPlan,
+        data: &AppInstallTaskData,
+        named_store: &named_store::NamedDataMgr,
+    ) -> Result<(), InstallError> {
+        let app_doc_value = data.state.resolved_app_doc.clone().ok_or_else(|| {
+            InstallError::new(
+                InstallStage::Prepare,
+                InstallErrorCode::InvalidPackage,
+                false,
+                "resolved AppDoc is missing during materialization",
+            )
+        })?;
+        let (app_doc_id, app_doc_body) =
+            build_named_object_by_json(OBJ_TYPE_APP_DOC, &app_doc_value);
+        if app_doc_id != plan.app.object_id {
+            return Err(InstallError::new(
+                InstallStage::Prepare,
+                InstallErrorCode::VerificationFailed,
+                false,
+                "AppDoc changed after verification",
+            ));
+        }
+        named_store
+            .put_object(&app_doc_id, app_doc_body.as_str())
+            .await
+            .map_err(|error| {
+                InstallError::new(
+                    InstallStage::Prepare,
+                    InstallErrorCode::AcquisitionFailed,
+                    true,
+                    format!("materialize AppDoc `{app_doc_id}` failed: {error}"),
+                )
+            })?;
+
+        for package in &plan.selected_packages {
+            let Some(meta_id) = package.package_meta_id.as_ref() else {
+                continue;
+            };
+            let body = reader
+                .read_object(meta_id)
+                .await
+                .map_err(|error| {
+                    InstallError::new(
+                        InstallStage::Prepare,
+                        InstallErrorCode::InvalidPackage,
+                        false,
+                        format!("read PackageMeta `{meta_id}` from pikg failed: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    InstallError::new(
+                        InstallStage::Prepare,
+                        InstallErrorCode::InvalidPackage,
+                        false,
+                        format!("PackageMeta `{meta_id}` is absent from pikg"),
+                    )
+                })?;
+            named_store
+                .put_object(meta_id, body.as_str())
+                .await
+                .map_err(|error| {
+                    InstallError::new(
+                        InstallStage::Prepare,
+                        InstallErrorCode::AcquisitionFailed,
+                        true,
+                        format!("materialize PackageMeta `{meta_id}` failed: {error}"),
+                    )
+                })?;
+        }
+
+        for content in &plan.required_contents {
+            if !reader.has_content(content.content_id.as_str()) {
+                continue;
+            }
+            let chunk_id = ChunkId::new(content.content_id.as_str()).map_err(|error| {
+                InstallError::new(
+                    InstallStage::Prepare,
+                    InstallErrorCode::InvalidPackage,
+                    false,
+                    format!(
+                        "pikg content `{}` is not a ChunkId: {error}",
+                        content.content_id
+                    ),
+                )
+            })?;
+            if named_store.have_chunk(&chunk_id).await {
+                continue;
+            }
+            let temp_path = work_root().join(format!(
+                ".materialize-{}-{}.tmp",
+                plan.task_id,
+                uuid::Uuid::new_v4().simple()
+            ));
+            let result = async {
+                reader
+                    .copy_content_to_file(content.content_id.as_str(), &temp_path)
+                    .await
+                    .map_err(|error| {
+                        InstallError::new(
+                            InstallStage::Prepare,
+                            InstallErrorCode::InvalidPackage,
+                            false,
+                            format!(
+                                "extract pikg content `{}` failed: {error}",
+                                content.content_id
+                            ),
+                        )
+                    })?;
+                store_pikg_payload(named_store, &temp_path, &chunk_id)
+                    .await
+                    .map_err(|error| {
+                        InstallError::new(
+                            InstallStage::Prepare,
+                            InstallErrorCode::AcquisitionFailed,
+                            true,
+                            format!(
+                                "write pikg content `{}` into named store failed: {error}",
+                                content.content_id
+                            ),
+                        )
+                    })?;
+                Ok(())
+            }
+            .await;
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            result?;
+        }
+        Ok(())
     }
 
     fn invalid_request(message: impl Into<String>) -> InstallError {
@@ -83,71 +300,82 @@ impl ProductionInstallDriver {
         if candidate.kind != "pikg" {
             return Ok(None);
         }
-        let (Some(path), Some(digest)) = (
-            candidate.staging_path.as_ref(),
+        let (Some(handle), Some(digest)) = (
+            candidate.staging_handle.as_ref(),
             candidate.pikg_digest.as_ref(),
         ) else {
             return Ok(None);
         };
-        let reader = PikgReader::open(std::path::Path::new(path), Some(digest))
+        let runtime = get_buckyos_api_runtime().map_err(|error| {
+            Self::invalid_request(format!("get runtime for staging handle failed: {error}"))
+        })?;
+        let reopen_error = |err: kRPC::RPCErrors| {
+            InstallError::new(
+                InstallStage::Inspect,
+                InstallErrorCode::InvalidPackage,
+                false,
+                format!("reopen staged pikg failed: {err}"),
+            )
+        };
+        let (_, obj_id) = self
+            .staging_store
+            .resolve(
+                handle,
+                data.request.creator_user_id.as_str(),
+                data.request.creator_app_id.as_str(),
+                &runtime.zone_id,
+                PikgStagingPurpose::Inspect,
+                None,
+            )
             .await
-            .map_err(|err| {
-                InstallError::new(
-                    InstallStage::Inspect,
-                    InstallErrorCode::InvalidPackage,
-                    false,
-                    format!("reopen staged pikg failed: {err}"),
-                )
-            })?;
+            .map_err(reopen_error)?;
+        let reader = self
+            .staging_store
+            .reader(&obj_id, digest)
+            .await
+            .map_err(reopen_error)?;
         Ok(Some(reader))
     }
 
     /// 解析本地 pikg 入口：staging handle -> 打开 staged 文件。
     async fn resolve_local_pikg(
         &self,
+        view: &InstallTaskView,
+        data: &AppInstallTaskData,
         staging_handle: &str,
         policy: buckyos_api::InstallPolicy,
     ) -> Result<ResolveOutcome, InstallError> {
-        let handle = StagingHandle::parse(staging_handle).map_err(Self::invalid_request)?;
-        let (digest, staged_path) = match handle {
-            StagingHandle::PikgDigest(hex) => {
-                let path = self.staging_root.join(format!("{hex}.pikg"));
-                if !path.exists() {
-                    return Err(Self::invalid_request(format!(
-                        "staging handle does not resolve to a staged pikg: {staging_handle}"
-                    )));
-                }
-                (hex, path)
-            }
-            StagingHandle::NamedObject(obj_id) => {
-                // NDN 上传通道进入本机的 chunk：物化到 staging root 后按
-                // digest 固定（与 pikg:sha256 handle 汇合到同一 immutable 面）。
-                self.materialize_ndn_pikg(&obj_id).await?
-            }
+        let runtime = get_buckyos_api_runtime().map_err(|error| {
+            Self::invalid_request(format!("get runtime for staging handle failed: {error}"))
+        })?;
+        let purpose = if view.id == "inspect-only" {
+            PikgStagingPurpose::Inspect
+        } else {
+            PikgStagingPurpose::Install
         };
-
-        // canonical path 必须仍在 staging root 内（D5）。
-        let canonical = staged_path
-            .canonicalize()
-            .map_err(|err| Self::invalid_request(format!("staging path invalid: {err}")))?;
-        let root_canonical = self
-            .staging_root
-            .canonicalize()
-            .map_err(|err| Self::invalid_request(format!("staging root invalid: {err}")))?;
-        if !canonical.starts_with(&root_canonical) {
-            return Err(Self::invalid_request(
-                "staging handle escaped staging root".to_string(),
-            ));
-        }
-
-        let reader = PikgReader::open(&canonical, Some(&digest))
+        let lease = (view.id != "inspect-only").then_some(view.id.as_str());
+        let (metadata, obj_id) = self
+            .staging_store
+            .resolve(
+                staging_handle,
+                data.request.creator_user_id.as_str(),
+                data.request.creator_app_id.as_str(),
+                &runtime.zone_id,
+                purpose,
+                lease,
+            )
+            .await
+            .map_err(|error| Self::invalid_request(error.to_string()))?;
+        let reader = self
+            .staging_store
+            .reader(&obj_id, &metadata.pikg_digest)
             .await
             .map_err(|err| {
                 InstallError::new(
                     InstallStage::Resolve,
                     InstallErrorCode::InvalidPackage,
                     false,
-                    format!("open staged pikg failed: {err}"),
+                    err.to_string(),
                 )
             })?;
         let inspection = reader.inspection();
@@ -156,23 +384,29 @@ impl ProductionInstallDriver {
             Self::invalid_request(format!("serialize candidate app doc failed: {err}"))
         })?;
 
-        let resolved = self.resolver.resolve_app(&app_did, policy).await?;
+        let mut resolved = self.resolver.resolve_app(&app_did, policy).await?;
         // candidate 绑定：did/owner 硬约束（owner 冒充在这里拒绝）。
-        let binding = bind_candidate_document(&app_did, &resolved.snapshot, &candidate_value)?;
+        let candidate_obj_id =
+            bind_candidate_document(&app_did, &resolved.snapshot, &candidate_value)?;
 
-        // 文档取舍：权威 body 优先；无权威 body 时 candidate 作为待信任候选
-        // 进入 Inspect（trust 未 ready 时引擎会停在 WAITING_FOR_TRUST_RESOLUTION）。
-        let resolved_app_doc = resolved
-            .document_value
-            .clone()
-            .or(Some(candidate_value.clone()));
+        let resolved_app_doc = if matches!(policy, buckyos_api::InstallPolicy::LocalDeveloper) {
+            resolved.snapshot.evidence =
+                Some(buckyos_api::DidEvidenceLevel::LocalDeveloperAuthority);
+            resolved.snapshot.local_authority_app_doc_object_id = Some(candidate_obj_id.clone());
+            Some(candidate_value.clone())
+        } else {
+            resolved
+                .document_value
+                .clone()
+                .or(Some(candidate_value.clone()))
+        };
 
         Ok(ResolveOutcome {
             candidate: Some(CandidateHandle {
                 kind: "pikg".to_string(),
                 pikg_digest: Some(inspection.pikg_digest.clone()),
-                staging_path: Some(canonical.to_string_lossy().to_string()),
-                app_doc_object_id: Some(binding.candidate_obj_id),
+                staging_handle: Some(staging_handle.to_string()),
+                app_doc_object_id: Some(candidate_obj_id),
                 source_url: None,
             }),
             resolution: resolved.snapshot,
@@ -186,6 +420,15 @@ impl ProductionInstallDriver {
         policy: buckyos_api::InstallPolicy,
     ) -> Result<ResolveOutcome, InstallError> {
         match normalize_identifier(identifier)? {
+            NormalizedIdentifier::DomainAlias(alias) => {
+                let app_did = resolve_domain_alias(alias.as_str()).await?;
+                let resolved = self.resolver.resolve_app(&app_did, policy).await?;
+                Ok(ResolveOutcome {
+                    candidate: None,
+                    resolution: resolved.snapshot,
+                    resolved_app_doc: resolved.document_value,
+                })
+            }
             NormalizedIdentifier::AppDid(app_did) => {
                 let resolved = self.resolver.resolve_app(&app_did, policy).await?;
                 Ok(ResolveOutcome {
@@ -217,7 +460,7 @@ impl ProductionInstallDriver {
                     Self::invalid_request(format!("candidate app document did invalid: {err}"))
                 })?;
                 let resolved = self.resolver.resolve_app(&app_did, policy).await?;
-                let binding =
+                let candidate_obj_id =
                     bind_candidate_document(&app_did, &resolved.snapshot, &candidate_value)?;
                 let resolved_app_doc = resolved
                     .document_value
@@ -227,8 +470,8 @@ impl ProductionInstallDriver {
                     candidate: Some(CandidateHandle {
                         kind: "named_object".to_string(),
                         pikg_digest: None,
-                        staging_path: None,
-                        app_doc_object_id: Some(binding.candidate_obj_id),
+                        staging_handle: None,
+                        app_doc_object_id: Some(candidate_obj_id),
                         source_url: None,
                     }),
                     resolution: resolved.snapshot,
@@ -236,53 +479,9 @@ impl ProductionInstallDriver {
                 })
             }
             NormalizedIdentifier::Url(url) => {
-                // 最小 Acquisition：仅支持内嵌 ObjId 的 URL（cyfs:// 等），
-                // 下载该对象后按 ObjectId 入口继续；纯 HTTPS Manifest URL
-                // 属 Web-to-Native 兼容层，本轮不做。
-                let Some(obj_id) = infer_obj_id_from_url(&url) else {
-                    return Err(Self::invalid_request(format!(
-                        "url identifier `{url}` does not embed an object id; \
-                         use apps.install_package with a staging handle instead"
-                    )));
-                };
-                if read_named_object_value(&obj_id).await?.is_none() {
-                    download_object_by_id(&url, &obj_id, "system", "control-panel", None).await?;
-                }
-                let candidate_value = read_named_object_value(&obj_id).await?.ok_or_else(|| {
-                    InstallError::new(
-                        InstallStage::Resolve,
-                        InstallErrorCode::AcquisitionFailed,
-                        true,
-                        format!("object `{obj_id}` still missing after download"),
-                    )
-                })?;
-                let app_did_raw = candidate_value
-                    .get("did")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        Self::invalid_request("candidate app document has no did".to_string())
-                    })?;
-                let app_did = DID::from_str(app_did_raw).map_err(|err| {
-                    Self::invalid_request(format!("candidate app document did invalid: {err}"))
-                })?;
-                let resolved = self.resolver.resolve_app(&app_did, policy).await?;
-                let binding =
-                    bind_candidate_document(&app_did, &resolved.snapshot, &candidate_value)?;
-                let resolved_app_doc = resolved
-                    .document_value
-                    .clone()
-                    .or(Some(candidate_value.clone()));
-                Ok(ResolveOutcome {
-                    candidate: Some(CandidateHandle {
-                        kind: "named_object".to_string(),
-                        pikg_digest: None,
-                        staging_path: None,
-                        app_doc_object_id: Some(binding.candidate_obj_id),
-                        source_url: Some(url),
-                    }),
-                    resolution: resolved.snapshot,
-                    resolved_app_doc,
-                })
+                Err(Self::invalid_request(format!(
+                    "Control Panel does not fetch client URLs (`{url}`); the Tool must upload bytes and finalize an opaque staging handle"
+                )))
             }
         }
     }
@@ -307,100 +506,12 @@ impl ProductionInstallDriver {
         }
     }
 
-    /// NDN 上传的 pikg（chunk/fileobj）物化为 staging root 下的 immutable
-    /// 文件，返回 (digest, staged_path)。
-    async fn materialize_ndn_pikg(
-        &self,
-        obj_id: &ObjId,
-    ) -> Result<(String, PathBuf), InstallError> {
-        use tokio::io::AsyncWriteExt;
-        let runtime = get_buckyos_api_runtime().map_err(|err| {
-            InstallError::new(
-                InstallStage::Resolve,
-                InstallErrorCode::Internal,
-                true,
-                format!("get runtime failed: {err}"),
-            )
-        })?;
-        let named_store = runtime.get_named_store().await.map_err(|err| {
-            InstallError::new(
-                InstallStage::Resolve,
-                InstallErrorCode::Internal,
-                true,
-                format!("open named store failed: {err}"),
-            )
-        })?;
-        if !obj_id.is_chunk() {
-            return Err(Self::invalid_request(format!(
-                "staging handle `{obj_id}` is not a chunk id"
-            )));
-        }
-        let chunk_id = ndn_lib::ChunkId::from_obj_id(obj_id);
-        let (mut reader, _total) =
-            named_store
-                .open_chunk_reader(&chunk_id, 0)
-                .await
-                .map_err(|err| {
-                    InstallError::new(
-                        InstallStage::Resolve,
-                        InstallErrorCode::AcquisitionFailed,
-                        true,
-                        format!("staging chunk `{obj_id}` is not available locally: {err}"),
-                    )
-                })?;
-
-        tokio::fs::create_dir_all(&self.staging_root)
-            .await
-            .map_err(|err| {
-                InstallError::new(
-                    InstallStage::Resolve,
-                    InstallErrorCode::Internal,
-                    true,
-                    format!("create staging root failed: {err}"),
-                )
-            })?;
-        let tmp_path = self.staging_root.join(format!(
-            ".ndn-{}.tmp",
-            chunk_id.to_string().replace(':', "_")
-        ));
-        {
-            let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|err| {
-                InstallError::new(
-                    InstallStage::Resolve,
-                    InstallErrorCode::Internal,
-                    true,
-                    format!("create staging tmp failed: {err}"),
-                )
-            })?;
-            tokio::io::copy(&mut reader, &mut file)
-                .await
-                .map_err(|err| {
-                    InstallError::new(
-                        InstallStage::Resolve,
-                        InstallErrorCode::AcquisitionFailed,
-                        true,
-                        format!("copy staging chunk failed: {err}"),
-                    )
-                })?;
-            file.flush().await.ok();
-        }
-        let result = PikgReader::stage_pikg_file(&tmp_path, &self.staging_root)
-            .await
-            .map_err(|err| {
-                InstallError::new(
-                    InstallStage::Resolve,
-                    InstallErrorCode::InvalidPackage,
-                    false,
-                    format!("stage ndn pikg failed: {err}"),
-                )
-            });
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        result
-    }
-
     /// 用真实位置重建 plan（fingerprint 只绑定身份/目标/参数，不含位置，
     /// 因此刷新不会作废已绑定的 approval）。
-    async fn rebuild_plan(&self, data: &AppInstallTaskData) -> Result<InstallPlan, InstallError> {
+    async fn rebuild_plan(
+        &self,
+        data: &AppInstallTaskData,
+    ) -> Result<InstallInspection, InstallError> {
         let snapshot = data.state.resolution.clone().ok_or_else(|| {
             InstallError::new(
                 InstallStage::Acquire,
@@ -440,6 +551,14 @@ impl ProductionInstallDriver {
                     "acquire without plan",
                 )
             })?;
+        let persisted_plan = data.state.plan.as_ref().ok_or_else(|| {
+            InstallError::new(
+                InstallStage::Acquire,
+                InstallErrorCode::Internal,
+                false,
+                "acquire without plan",
+            )
+        })?;
         let install_params = data
             .state
             .plan
@@ -449,19 +568,29 @@ impl ProductionInstallDriver {
         let pikg_reader = self.open_candidate_pikg(data).await?;
         let pikg_inspection: Option<&PikgInspection> =
             pikg_reader.as_ref().map(|reader| reader.inspection());
-        build_install_plan(
+        let mut inspection = build_install_plan(
             PlannerInput {
                 app_doc: &app_doc,
                 app_doc_object_id,
                 snapshot: &snapshot,
                 policy: data.request.policy,
+                plan_use: persisted_plan.plan_use,
+                task_id: persisted_plan.task_id.clone(),
+                owner_user_id: persisted_plan.owner_user_id.clone(),
                 target,
                 install_params,
                 pikg: pikg_inspection,
             },
             &NamedStoreContentLocator,
         )
-        .await
+        .await?;
+        crate::product::apply_admission(
+            &product_for_install(InstallStage::Acquire).await?,
+            &app_doc,
+            AdmissionOrigin::Deployed,
+            &mut inspection,
+        );
+        Ok(inspection)
     }
 
     fn offline_requested(data: &AppInstallTaskData) -> bool {
@@ -472,13 +601,80 @@ impl ProductionInstallDriver {
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
     }
+
+    async fn release_candidate_staging(
+        &self,
+        view: &InstallTaskView,
+        data: &AppInstallTaskData,
+    ) -> Result<(), InstallError> {
+        let handle = data
+            .state
+            .candidate
+            .as_ref()
+            .and_then(|candidate| candidate.staging_handle.as_deref());
+        let runtime = get_buckyos_api_runtime().map_err(|error| {
+            InstallError::new(
+                InstallStage::Resolve,
+                InstallErrorCode::Internal,
+                true,
+                format!("get runtime for staging release failed: {error}"),
+            )
+        })?;
+        if let Some(handle) = handle {
+            self.staging_store
+                .release_task_lease(
+                    handle,
+                    data.request.creator_user_id.as_str(),
+                    data.request.creator_app_id.as_str(),
+                    &runtime.zone_id,
+                    view.id.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    InstallError::new(
+                        InstallStage::Resolve,
+                        InstallErrorCode::Internal,
+                        true,
+                        format!("release staging lease failed: {error}"),
+                    )
+                })?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl InstallStageDriver for ProductionInstallDriver {
+    async fn ensure_mutation(
+        &self,
+        view: &InstallTaskView,
+        data: &AppInstallTaskData,
+    ) -> Result<(), InstallError> {
+        let Some(target) = crate::app_mutation::installation_target(data) else {
+            return Ok(());
+        };
+        let lease = crate::ControlPanelServer::acquire_app_mutation(
+            target,
+            &data.request.creator_user_id,
+            &data.request.creator_app_id,
+            &data.request.idempotency_key,
+        )
+        .await
+        .map_err(|error| {
+            InstallError::new(
+                InstallStage::Inspect,
+                InstallErrorCode::AppMutationInProgress,
+                true,
+                error.to_string(),
+            )
+        })?;
+        crate::ControlPanelServer::bind_app_mutation_task(&lease, &view.id)
+            .await
+            .map_err(|error| cleanup_error(error.to_string()))
+    }
     async fn resolve(
         &self,
-        _view: &InstallTaskView,
+        view: &InstallTaskView,
         data: &AppInstallTaskData,
     ) -> Result<ResolveOutcome, InstallError> {
         match &data.request.source {
@@ -487,7 +683,7 @@ impl InstallStageDriver for ProductionInstallDriver {
                     .await
             }
             InstallSource::LocalPikg { staging_handle } => {
-                self.resolve_local_pikg(staging_handle, data.request.policy)
+                self.resolve_local_pikg(view, data, staging_handle, data.request.policy)
                     .await
             }
         }
@@ -495,9 +691,9 @@ impl InstallStageDriver for ProductionInstallDriver {
 
     async fn inspect(
         &self,
-        _view: &InstallTaskView,
+        view: &InstallTaskView,
         data: &AppInstallTaskData,
-    ) -> Result<Option<InstallPlan>, InstallError> {
+    ) -> Result<Option<InstallInspection>, InstallError> {
         let snapshot = data.state.resolution.clone().ok_or_else(|| {
             InstallError::new(
                 InstallStage::Inspect,
@@ -526,40 +722,158 @@ impl InstallStageDriver for ProductionInstallDriver {
         let pikg_inspection: Option<&PikgInspection> =
             pikg_reader.as_ref().map(|reader| reader.inspection());
 
-        let install_params = data
-            .state
-            .requested_params
-            .clone()
-            .unwrap_or_else(|| default_install_params(&app_doc, data.request.policy));
-
         let locator = NamedStoreContentLocator;
-        build_install_plan(
+        let runtime = get_buckyos_api_runtime().map_err(|err| {
+            InstallError::new(
+                InstallStage::Inspect,
+                InstallErrorCode::Internal,
+                true,
+                format!("get runtime failed: {err}"),
+            )
+        })?;
+        let owner_user_id = data.request.owner_user_id.clone();
+        let app_id = AppId::from_app_did(app_doc.app_did()).map_err(|error| {
+            InstallError::new(
+                InstallStage::Inspect,
+                InstallErrorCode::InvalidRequest,
+                false,
+                error,
+            )
+        })?;
+        let is_update = view.task_type == TASK_DATA_TYPE_APP_UPDATE;
+        let inherited_params = if is_update {
+            let record_key = install_record_key(&owner_user_id, &app_id);
+            let client = runtime.get_system_config_client().await.map_err(|error| {
+                InstallError::new(
+                    InstallStage::Inspect,
+                    InstallErrorCode::Internal,
+                    true,
+                    format!("get system config for upgrade baseline failed: {error}"),
+                )
+            })?;
+            let record_value = client.get(&record_key).await.map_err(|error| match error {
+                SystemConfigError::KeyNotFound(_) => InstallError::new(
+                    InstallStage::Inspect,
+                    InstallErrorCode::PlanNotApplicable,
+                    false,
+                    "upgrade target is not installed",
+                ),
+                other => InstallError::new(
+                    InstallStage::Inspect,
+                    InstallErrorCode::Internal,
+                    true,
+                    format!("read upgrade install record failed: {other}"),
+                ),
+            })?;
+            let record: InstallRecord =
+                serde_json::from_str(&record_value.value).map_err(|error| {
+                    InstallError::new(
+                        InstallStage::Inspect,
+                        InstallErrorCode::Internal,
+                        false,
+                        format!("invalid upgrade install record: {error}"),
+                    )
+                })?;
+            let spec_path = buckyos_api::user_app_spec_key(&owner_user_id, &app_id);
+            let spec: AppServiceSpec = client
+                .get(&spec_path)
+                .await
+                .map_err(|error| {
+                    InstallError::new(
+                        InstallStage::Inspect,
+                        InstallErrorCode::PlanNotApplicable,
+                        false,
+                        format!("upgrade desired spec is missing: {error}"),
+                    )
+                })
+                .and_then(|value| {
+                    serde_json::from_str(&value.value).map_err(|error| {
+                        InstallError::new(
+                            InstallStage::Inspect,
+                            InstallErrorCode::Internal,
+                            false,
+                            format!("invalid upgrade desired spec: {error}"),
+                        )
+                    })
+                })?;
+            if !spec.is_installed() {
+                return Err(InstallError::new(
+                    InstallStage::Inspect,
+                    InstallErrorCode::PlanNotApplicable,
+                    false,
+                    "upgrade target has been deleted",
+                ));
+            }
+            Some(inherit_upgrade_params(record.install_params, &spec))
+        } else {
+            None
+        };
+        let requested_params = data.state.requested_params.clone();
+        let install_params = requested_params.clone().unwrap_or_else(|| {
+            inherited_params
+                .unwrap_or_else(|| default_install_params(&app_doc, data.request.policy))
+        });
+
+        let mut inspection = build_install_plan(
             PlannerInput {
                 app_doc: &app_doc,
                 app_doc_object_id,
                 snapshot: &snapshot,
                 policy: data.request.policy,
+                plan_use: if is_update {
+                    InstallPlanUse::Upgrade
+                } else {
+                    InstallPlanUse::FreshInstall
+                },
+                task_id: view.planning_task_id.clone(),
+                owner_user_id,
                 target,
                 install_params,
                 pikg: pikg_inspection,
             },
             &locator,
         )
-        .await
-        .map(Some)
+        .await?;
+        // Whatever submitted it (a retry, a batch update, a recovered task),
+        // the product only carries out what it runs (submission checks the
+        // exact origin).
+        crate::product::apply_admission(
+            &product_for_install(InstallStage::Inspect).await?,
+            &app_doc,
+            AdmissionOrigin::Deployed,
+            &mut inspection,
+        );
+        Ok(Some(inspection))
     }
 
     async fn acquire(
         &self,
         view: &InstallTaskView,
         data: &AppInstallTaskData,
-    ) -> Result<InstallPlan, InstallError> {
+    ) -> Result<InstallPlanStatus, InstallError> {
         let offline = Self::offline_requested(data);
         // 最多几轮：meta 下载后 payload 清单才展开，需要再补一轮。
-        let mut plan = self.rebuild_plan(data).await?;
+        let persisted_plan = data.state.plan.as_ref().ok_or_else(|| {
+            InstallError::new(
+                InstallStage::Acquire,
+                InstallErrorCode::Internal,
+                false,
+                "acquire without plan",
+            )
+        })?;
+        let mut inspection = self.rebuild_plan(data).await?;
+        if inspection.plan.plan_fingerprint != persisted_plan.plan_fingerprint {
+            return Err(InstallError::new(
+                InstallStage::Acquire,
+                InstallErrorCode::PlanStale,
+                false,
+                "source or immutable plan material changed before acquisition",
+            ));
+        }
         for round in 0..4 {
-            let missing: Vec<_> = plan
-                .required_contents
+            let missing: Vec<_> = inspection
+                .status
+                .contents
                 .iter()
                 .filter(|content| matches!(content.location, ContentLocation::Missing))
                 .cloned()
@@ -584,8 +898,17 @@ impl InstallStageDriver for ProductionInstallDriver {
                 self.download_missing_content(view, content).await?;
             }
             let refreshed = self.rebuild_plan(data).await?;
+            if refreshed.plan.plan_fingerprint != persisted_plan.plan_fingerprint {
+                return Err(InstallError::new(
+                    InstallStage::Acquire,
+                    InstallErrorCode::PlanStale,
+                    false,
+                    "acquisition revealed immutable content not present in the approved plan",
+                ));
+            }
             let still_missing = refreshed
-                .required_contents
+                .status
+                .contents
                 .iter()
                 .filter(|content| matches!(content.location, ContentLocation::Missing))
                 .count();
@@ -597,11 +920,12 @@ impl InstallStageDriver for ProductionInstallDriver {
                     format!("{still_missing} contents remain missing after acquisition round"),
                 ));
             }
-            plan = refreshed;
+            inspection = refreshed;
         }
 
-        let still_missing: Vec<_> = plan
-            .required_contents
+        let still_missing: Vec<_> = inspection
+            .status
+            .contents
             .iter()
             .filter(|content| matches!(content.location, ContentLocation::Missing))
             .map(|content| content.content_id.clone())
@@ -614,7 +938,16 @@ impl InstallStageDriver for ProductionInstallDriver {
                 format!("missing after acquire: {}", still_missing.join(", ")),
             ));
         }
-        Ok(plan)
+        let named_store = get_buckyos_api_runtime()
+            .map_err(|error| retain_error(InstallStage::Acquire, error))?
+            .get_local_named_store()
+            .await
+            .map_err(|error| retain_error(InstallStage::Acquire, error))?;
+        crate::buckets::PackageBuckets::zone()
+            .retain_plan(&named_store, persisted_plan, false)
+            .await
+            .map_err(|error| retain_error(InstallStage::Acquire, error))?;
+        Ok(inspection.status)
     }
 
     async fn verify(
@@ -643,12 +976,19 @@ impl InstallStageDriver for ProductionInstallDriver {
         let mut checks: Vec<VerificationCheck> = Vec::new();
 
         let recomputed_fingerprint = InstallPlan::compute_fingerprint(
+            plan.plan_use,
+            &plan.task_id,
+            &plan.app_instance_id,
+            &plan.owner_user_id,
+            &plan.source_identity,
             &plan.app,
+            &plan.app_doc,
             &plan.resolution,
             &plan.target,
             &plan.install_params,
             &plan.service_spec_config,
             &plan.selected_packages,
+            &plan.required_contents,
         );
         checks.push(if recomputed_fingerprint == plan.plan_fingerprint {
             VerificationCheck::pass("plan", "fingerprint")
@@ -689,7 +1029,18 @@ impl InstallStageDriver for ProductionInstallDriver {
                 format!("recomputed {doc_obj_id} != plan {}", plan.app.object_id),
             )
         });
-        if let Some(published) = plan.resolution.app_doc_object_id.as_ref() {
+        let uses_local_developer_authority = plan
+            .source_identity
+            .uses_local_developer_authority(data.request.policy)
+            && plan
+                .resolution
+                .has_local_developer_authority_for(&plan.source_identity);
+        if uses_local_developer_authority {
+            checks.push(VerificationCheck::pass(
+                "appdoc",
+                "local_developer_authority",
+            ));
+        } else if let Some(published) = plan.resolution.app_doc_object_id.as_ref() {
             checks.push(if *published == plan.app.object_id {
                 VerificationCheck::pass("appdoc", "publication_binding")
             } else {
@@ -710,6 +1061,61 @@ impl InstallStageDriver for ProductionInstallDriver {
         });
 
         let pikg_reader = self.open_candidate_pikg(data).await?;
+
+        match (&plan.source_identity, pikg_reader.as_ref()) {
+            (
+                InstallSourceIdentity::Pikg {
+                    app_doc_object_id,
+                    pikg_digest,
+                },
+                Some(reader),
+            ) => {
+                checks.push(if reader.pikg_digest() == pikg_digest {
+                    VerificationCheck::pass("pikg", "digest_binding")
+                } else {
+                    VerificationCheck::fail(
+                        "pikg",
+                        "digest_binding",
+                        format!("staged {} != plan {pikg_digest}", reader.pikg_digest()),
+                    )
+                });
+                checks.push(
+                    if reader.inspection().app_doc_object_id == *app_doc_object_id
+                        && plan.app.object_id == *app_doc_object_id
+                    {
+                        VerificationCheck::pass("pikg", "appdoc_binding")
+                    } else {
+                        VerificationCheck::fail(
+                            "pikg",
+                            "appdoc_binding",
+                            "PIKG AppDoc ObjectId, source identity and plan AppDoc do not match",
+                        )
+                    },
+                );
+                checks.push(if reader.inspection().app_doc.app_did() == &plan.app.did {
+                    VerificationCheck::pass("pikg", "app_did_binding")
+                } else {
+                    VerificationCheck::fail(
+                        "pikg",
+                        "app_did_binding",
+                        "PIKG AppDID does not match the plan AppDID",
+                    )
+                });
+            }
+            (InstallSourceIdentity::Pikg { .. }, None) => checks.push(VerificationCheck::fail(
+                "pikg",
+                "source_binding",
+                "PIKG plan has no available immutable staged source",
+            )),
+            (InstallSourceIdentity::Catalog { .. }, Some(_)) => {
+                checks.push(VerificationCheck::fail(
+                    "pikg",
+                    "source_binding",
+                    "staged PIKG candidate produced a Catalog source identity",
+                ))
+            }
+            (InstallSourceIdentity::Catalog { .. }, None) => {}
+        }
 
         let app_doc: buckyos_api::AppDoc =
             serde_json::from_value(doc_value.clone()).map_err(|err| {
@@ -748,11 +1154,24 @@ impl InstallStageDriver for ProductionInstallDriver {
                                 format!("package meta `{subject}` schema invalid: {err}"),
                             )
                         })?;
+                    let declared =
+                        app_doc.pkg_list.get(&package.sub_pkg_name).ok_or_else(|| {
+                            InstallError::new(
+                                InstallStage::Verify,
+                                InstallErrorCode::InvalidPackage,
+                                false,
+                                format!(
+                                    "selected package `{}` is absent from AppDoc",
+                                    package.sub_pkg_name
+                                ),
+                            )
+                        })?;
                     validate_package_meta_namespace(
                         &namespace,
                         &package.sub_pkg_name,
-                        &package.pkg_id,
+                        &declared.pkg_id,
                         meta.name.as_str(),
+                        meta.version.as_str(),
                         InstallStage::Verify,
                     )?;
                     checks.push(VerificationCheck::pass(&subject, "package_meta_obj_id"));
@@ -768,14 +1187,41 @@ impl InstallStageDriver for ProductionInstallDriver {
 
         // 3. 逐内容 digest：pikg 内容全量重哈希；NamedStore 内容按内容寻址
         //    存在性复核（chunk 写入即校验）。
+        let plan_status = data.state.plan_status.as_ref().ok_or_else(|| {
+            InstallError::new(
+                InstallStage::Verify,
+                InstallErrorCode::Internal,
+                false,
+                "verify without dynamic plan status",
+            )
+        })?;
         for content in &plan.required_contents {
             if content.format.as_deref() == Some("named_object") {
                 continue; // 上面已查。
             }
             let subject = content.content_id.clone();
-            match content.location {
+            let location = plan_status
+                .contents
+                .iter()
+                .find(|item| item.content_id == content.content_id)
+                .map(|item| item.location)
+                .unwrap_or(ContentLocation::Missing);
+            match location {
                 ContentLocation::Pikg => match pikg_reader.as_ref() {
                     Some(reader) => match reader.verify_content(&subject).await {
+                        Ok(()) if content.format.as_deref() == Some("archive") => {
+                            match reader.verify_package_archive(&subject).await {
+                                Ok(()) => checks.push(VerificationCheck::pass(
+                                    &subject,
+                                    "digest_and_archive_safety",
+                                )),
+                                Err(err) => checks.push(VerificationCheck::fail(
+                                    &subject,
+                                    "archive_safety",
+                                    err.to_string(),
+                                )),
+                            }
+                        }
                         Ok(()) => checks.push(VerificationCheck::pass(&subject, "digest")),
                         Err(err) => checks.push(VerificationCheck::fail(
                             &subject,
@@ -813,8 +1259,15 @@ impl InstallStageDriver for ProductionInstallDriver {
             let ok = desc
                 .and_then(|desc| {
                     buckyos_api::SubPkgList::effective_selector(&package.sub_pkg_name, desc)
+                        .map(|selector| (desc, selector))
                 })
-                .map(|selector| selector.matches_platform(&plan.target.os, &plan.target.arch))
+                .map(|(desc, selector)| {
+                    crate::app_install_planner::package_matches_target(
+                        &selector,
+                        desc,
+                        &plan.target,
+                    )
+                })
                 .unwrap_or(false);
             checks.push(if ok {
                 VerificationCheck::pass(&package.sub_pkg_name, "selector")
@@ -926,6 +1379,94 @@ impl InstallStageDriver for ProductionInstallDriver {
     ) -> Result<(), InstallError> {
         self.rollback_impl(view, data).await
     }
+
+    async fn release_staging(
+        &self,
+        view: &InstallTaskView,
+        data: &AppInstallTaskData,
+    ) -> Result<(), InstallError> {
+        self.release_candidate_staging(view, data).await
+    }
+
+    async fn release_mutation(
+        &self,
+        view: &InstallTaskView,
+        data: &AppInstallTaskData,
+    ) -> Result<(), InstallError> {
+        let Some(target) = crate::app_mutation::installation_target(data) else {
+            return Ok(());
+        };
+        let runtime =
+            get_buckyos_api_runtime().map_err(|error| cleanup_error(error.to_string()))?;
+        let client = runtime
+            .get_system_config_client()
+            .await
+            .map_err(|error| cleanup_error(error.to_string()))?;
+        crate::app_mutation::release_owned(
+            &client,
+            &format!("{}/{}", crate::app_mutation::MUTATION_PREFIX, target),
+            &view.id,
+        )
+        .await
+        .map_err(|error| cleanup_error(error.to_string()))
+    }
+
+    async fn reconcile_cleanup(&self) -> Result<(), InstallError> {
+        let runtime =
+            get_buckyos_api_runtime().map_err(|error| cleanup_error(error.to_string()))?;
+        let client = runtime
+            .get_system_config_client()
+            .await
+            .map_err(|error| cleanup_error(error.to_string()))?;
+        let tasks = runtime
+            .get_task_mgr_client()
+            .await
+            .map_err(|error| cleanup_error(error.to_string()))?;
+        let mutations = crate::app_mutation::reconcile(&client, &tasks).await;
+        self.staging_store
+            .reconcile_task_leases(&tasks)
+            .await
+            .map_err(|error| cleanup_error(error.to_string()))?;
+        mutations.map_err(|error| cleanup_error(error.to_string()))
+    }
+}
+
+fn cleanup_error(message: String) -> InstallError {
+    InstallError::new(
+        InstallStage::Resolve,
+        InstallErrorCode::Internal,
+        true,
+        message,
+    )
+}
+
+pub(crate) async fn store_pikg_payload(
+    named_store: &named_store::NamedDataMgr,
+    path: &Path,
+    expected_content: &ChunkId,
+) -> NdnResult<()> {
+    let (file, _, _) = cacl_file_object(
+        Some(named_store),
+        path,
+        &FileObject::default(),
+        true,
+        &CheckMode::ByFullHash,
+        StoreMode::StoreInNamedMgr,
+        None,
+    )
+    .await?;
+    let content = ObjId::new(&file.content)?;
+    if content.is_chunk_list() {
+        named_store
+            .add_chunk_by_same_as(expected_content, file.size, &content)
+            .await?;
+    } else if file.content != expected_content.to_string() {
+        let (reader, size) = named_store.open_reader(&content, None).await?;
+        named_store
+            .put_chunk_by_reader(expected_content, size, reader)
+            .await?;
+    }
+    Ok(())
 }
 
 fn valid_sha256_digest(raw: &str) -> bool {
@@ -966,7 +1507,7 @@ impl ContentLocator for NamedStoreContentLocator {
         let Ok(runtime) = get_buckyos_api_runtime() else {
             return ContentLocation::Missing;
         };
-        let Ok(named_store) = runtime.get_named_store().await else {
+        let Ok(named_store) = runtime.get_local_named_store().await else {
             return ContentLocation::Missing;
         };
         if obj_id.is_chunk() {
@@ -997,7 +1538,7 @@ async fn read_named_object_value(obj_id: &ObjId) -> Result<Option<Value>, Instal
             format!("get runtime failed: {err}"),
         )
     })?;
-    let named_store = runtime.get_named_store().await.map_err(|err| {
+    let named_store = runtime.get_local_named_store().await.map_err(|err| {
         InstallError::new(
             InstallStage::Resolve,
             InstallErrorCode::Internal,
@@ -1029,19 +1570,6 @@ async fn read_named_object_value(obj_id: &ObjId) -> Result<Option<Value>, Instal
         }
         Err(_) => Ok(None),
     }
-}
-
-fn infer_obj_id_from_url(url: &str) -> Option<ObjId> {
-    // cyfs://{objid}/... 或路径段中内嵌 objid 的 URL。
-    let stripped = url.strip_prefix("cyfs://").unwrap_or(url);
-    for segment in stripped.split(['/', '?', '#']) {
-        if segment.contains(':') {
-            if let Ok(obj_id) = ObjId::new(segment) {
-                return Some(obj_id);
-            }
-        }
-    }
-    None
 }
 
 /// 通过 TaskManager child download task 按指定 ObjId 下载对象。
@@ -1077,7 +1605,7 @@ impl ProductionInstallDriver {
     async fn download_missing_content(
         &self,
         view: &InstallTaskView,
-        content: &buckyos_api::PlannedContent,
+        content: &InspectedContent,
     ) -> Result<(), InstallError> {
         let Ok(obj_id) = ObjId::new(&content.content_id) else {
             return Err(InstallError::new(
@@ -1137,6 +1665,17 @@ impl ProductionInstallDriver {
     }
 }
 
+async fn product_for_install(stage: InstallStage) -> Result<ProductProfile, InstallError> {
+    crate::product::current_product().await.map_err(|error| {
+        InstallError::new(
+            stage,
+            InstallErrorCode::Internal,
+            true,
+            format!("read product profile failed: {error}"),
+        )
+    })
+}
+
 /// 默认安装目标：zone 默认 OOD 的 devices/{node}/info（DeviceInfo.os/arch）。
 async fn default_node_target() -> Result<InstallTarget, String> {
     let runtime = get_buckyos_api_runtime().map_err(|err| err.to_string())?;
@@ -1187,7 +1726,6 @@ async fn default_node_target() -> Result<InstallTarget, String> {
             .device_doc
             .extra_info
             .get("runtime_version")
-            .or_else(|| info.device_doc.extra_info.get("buckyos_version"))
             .and_then(Value::as_str)
             .map(str::to_string);
         let kernel_version = info

@@ -20,7 +20,7 @@ def _windows_subprocess_kwargs(detached: bool = False) -> dict[str, object]:
 
     creationflags = subprocess.CREATE_NO_WINDOW
     if detached:
-        creationflags |= subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
 
     return {
         "startupinfo": startupinfo,
@@ -47,20 +47,10 @@ def get_app_data_dir(app_id: str, owner_user_id: str) -> str:
     return os.path.join(get_buckyos_root(), "data", "home", owner_user_id, ".local", "share", app_id)
 
 def get_app_cache_dir(app_id: str, owner_user_id: str) -> str:
-    return os.path.join(get_buckyos_root(), "data", "cache", get_full_appid(app_id, owner_user_id))
+    return os.path.join(get_buckyos_root(), "data", "cache", owner_user_id, app_id)
 
 def get_app_local_cache_dir(app_id: str, owner_user_id: str) -> str:
-    return os.path.join("/tmp", "buckyos", get_full_appid(app_id, owner_user_id))
-
-def get_session_token_env_key(app_full_id: str, is_app_service: bool) -> str:
-    app_id = app_full_id.upper().replace("-", "_")
-    if not is_app_service:
-        return f"{app_id}_SESSION_TOKEN"
-    else:
-        return f"{app_id}_TOKEN"
-    
-def get_full_appid(app_id: str, owner_user_id: str) -> str:
-    return f"{owner_user_id}-{app_id}"
+    return os.path.join("/tmp", "buckyos", owner_user_id, app_id)
 
 # TODO:process_full_path是目标进程的完整路径
 def check_process_exists(process_full_path):
@@ -71,7 +61,7 @@ def check_process_exists(process_full_path):
         try:
             process_name = os.path.basename(process_full_path)
             check_args = ["tasklist", "/FI", f"IMAGENAME eq {process_name}", "/FO", "CSV"]
-            output = subprocess.check_output(check_args).decode(get_system_encoding(), errors='ignore')
+            output = subprocess.check_output(check_args, **_windows_subprocess_kwargs()).decode(get_system_encoding(), errors='ignore')
             # 检查输出中是否包含进程名（排除标题行）
             lines = output.strip().split('\n')
             if len(lines) > 1:  # 有数据行
@@ -81,7 +71,7 @@ def check_process_exists(process_full_path):
             # 如果tasklist失败，尝试使用wmic（兼容性）
             try:
                 check_args = ["wmic", "process", "where", f"ExecutablePath like '%{process_full_path}%'", "get", "ProcessId", "/format:list"]
-                output = subprocess.check_output(check_args).decode(get_system_encoding(), errors='ignore')
+                output = subprocess.check_output(check_args, **_windows_subprocess_kwargs()).decode(get_system_encoding(), errors='ignore')
                 return bool(output.strip())
             except (subprocess.CalledProcessError, FileNotFoundError):
                 print(f"Warning: Unable to check process existence on Windows. Both tasklist and wmic failed.")
@@ -174,10 +164,7 @@ def get_buckyos_root():
         return buckyos_root
 
     if system == "Windows":
-        user_data_dir = os.environ.get("APPDATA")
-        if not user_data_dir:
-            user_data_dir = os.environ.get("USERPROFILE", ".")
-        return os.path.join(user_data_dir, "buckyos")
+        return r"C:\buckyos"
     else:
         return "/opt/buckyos/"
 

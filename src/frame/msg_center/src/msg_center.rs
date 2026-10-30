@@ -1,29 +1,25 @@
 use crate::contact_mgr::{ContactMgr, ZoneUserContactSeed};
-use crate::group_mgr::GroupMgr;
 use crate::msg_box_db::{IdempotencyCommitOutcome, IdempotencyStoredResult, MsgBoxDbMgr};
+use crate::msg_tunnel::{EditCapability, TunnelIngressHandler, INGRESS_PRINCIPAL_KEY};
+use crate::owner_session::TokenVerifierSlot;
 use async_trait::async_trait;
 use buckyos_api::{
     get_buckyos_api_runtime, AccessDecision, AccessGroupLevel, AccountBinding, Contact,
     ContactPatch, ContactQuery, DeliveryEnvelope, DeliveryError, DeliveryRecord,
     DeliveryRecordWithObject, DeliveryReportResult, DeliverySnapshot, DeliveryState,
-    DispatchResult, GrantTemporaryAccessResult, GroupAccessDecision, GroupApproveMemberReq,
-    GroupCheckAccessReq, GroupCreateReq, GroupCreateSubgroupReq, GroupDoc, GroupExpandMembersReq,
-    GroupExpansionSnapshot, GroupGetDocReq, GroupInviteMemberReq, GroupListByMemberReq,
-    GroupListMembersReq, GroupListParentsReq, GroupListSubgroupsReq, GroupMemberRecord,
-    GroupRejectMemberReq, GroupRemoveMemberReq, GroupRequestJoinReq, GroupSubgroup,
-    GroupSubmitMemberProofReq, GroupSummary, GroupUpdateAttributionPolicyReq,
-    GroupUpdateCollectionPolicyReq, GroupUpdateMemberRoleReq, GroupUpdateProfileReq,
-    GroupUpdateSubgroupReq, ImportContactEntry, ImportReport, IngressContext, KEventClient,
-    MailboxKind, MailboxRecord, MailboxRecordPage, MailboxRecordWithObject, MsgCenterHandler,
-    MsgReceiptObj, PostSendDelivery, PostSendResult, ReadReceiptState, RecipientState,
-    SessionDeliveryOverall, SessionDeliveryTarget, SessionDeliveryView, SessionMessageDirection,
+    DispatchResult, GrantTemporaryAccessResult, ImportContactEntry, ImportReport, IngressContext,
+    KEventClient, MailboxAddress, MailboxKind, MailboxRecord, MailboxRecordPage,
+    MailboxRecordWithObject, MsgCenterCreateSessionReq, MsgCenterHandler, MsgEditCapability,
+    MsgReceiptObj, OwnerSessionState, PostSendDelivery, PostSendResult, ReadReceiptState,
+    RecipientState, SessionDeliveryOverall, SessionDeliveryTarget, SessionDeliveryView,
+    SessionLifecycle, SessionListLifecycleFilter, SessionListOrder, SessionMessageDirection,
     SessionMessageItem, SessionMessagePage, SessionSummary, SessionSummaryPage,
     SetGroupSubscribersResult, TransportKind, UiSessionStateEntry,
 };
 use kRPC::{RPCContext, RPCErrors};
 use log::{info, warn};
 use name_lib::DID;
-use ndn_lib::{MsgObjKind, MsgObject, NamedObject, ObjId};
+use ndn_lib::{MsgObjKind, MsgObject, MsgRelType, NamedObject, ObjId};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -42,7 +38,7 @@ const MAX_DELIVERY_RETRY: u32 = 5;
 const DELIVERY_SENDING_LEASE_MS: u64 = 60_000;
 const DELIVERY_RETRY_BASE_MS: u64 = 2_000;
 const DELIVERY_RETRY_MAX_MS: u64 = 300_000;
-const MSG_CENTER_BOX_CHANGED_EVENT_NAME: &str = "changed";
+const PRIVATE_EDIT_REDACT_SCAN_PAGE: usize = 200;
 const IDEMPOTENCY_SCOPE_DISPATCH: &str = "dispatch";
 const IDEMPOTENCY_SCOPE_POST_SEND: &str = "post_send";
 const IDEMPOTENCY_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -53,8 +49,24 @@ const IDEMPOTENCY_GLOBAL_MAX_ROWS: u64 = 100_000;
 const IDEMPOTENCY_GLOBAL_TARGET_ROWS: u64 = 80_000;
 const IDEMPOTENCY_GLOBAL_SWEEP_BATCH_ROWS: u64 = 10_000;
 
+/// The account records of this Zone as the last zone sync saw them
+/// (product/users_and_agents/UserType.md).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ZoneAccounts {
+    /// Active accounts with a personal inbox (Admin, User): the local
+    /// recipients among the Zone's users.
+    pub(crate) recipients: HashSet<String>,
+    /// Every account record's DID, whatever its type or state.
+    pub(crate) dids: HashSet<String>,
+    /// Every account name: `<name>.<zone host>` is an account DID as well.
+    pub(crate) names: HashSet<String>,
+    /// Account DID → user id. Both are stable: the DID comes from the
+    /// account's `users/<id>/doc` and user ids are never reused.
+    pub(crate) user_ids: HashMap<String, String>,
+}
+
 #[derive(Debug, Default)]
-struct MessageCenterState {
+pub(crate) struct MessageCenterState {
     messages: HashMap<String, MsgObject>,
     receipts: HashMap<String, MsgReceiptObj>,
 }
@@ -63,26 +75,49 @@ struct MessageCenterState {
 /// `tunnel_instance_id` (embedded in shadow endpoint DIDs) to the tunnel's
 /// `transport_did` (the DELIVERY_QUEUE owner) and its platform.
 #[derive(Clone, Debug)]
-struct TunnelRegistryEntry {
-    transport_did: DID,
-    platform: String,
+pub(crate) struct TunnelRegistryEntry {
+    pub(crate) transport_did: DID,
+    pub(crate) platform: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct MessageCenter {
     state: Arc<RwLock<MessageCenterState>>,
-    contact_mgr: ContactMgr,
-    group_mgr: GroupMgr,
-    msg_box_db: MsgBoxDbMgr,
+    pub(crate) contact_mgr: ContactMgr,
+    pub(crate) groups: crate::group_store::GroupStore,
+    pub(crate) msg_box_db: MsgBoxDbMgr,
     /// tunnel_instance_id -> (transport_did, platform).
     tunnel_registry: Arc<RwLock<HashMap<String, TunnelRegistryEntry>>>,
+    /// transport_did -> edit capability declared by that delivery executor.
+    edit_capabilities: Arc<RwLock<HashMap<String, EditCapability>>>,
     /// DIDs hosted by this zone (zone users / agents / hosted groups): the
     /// message hub delivers to them natively via local dispatch.
     local_recipients: Arc<RwLock<HashSet<String>>>,
+    /// Account records of the Zone: which users are local recipients.
+    zone_accounts: Arc<RwLock<ZoneAccounts>>,
     /// Transport DID of the MessageHub executor. Unset means shareable-DID
     /// targets cannot be planned (post_send fails them with a clear reason
     /// instead of parking records in a queue nobody consumes).
     message_hub_did: Arc<OnceLock<DID>>,
+    pub(crate) cyfs_dispatch: Arc<RwLock<crate::cyfs_dispatch::CyfsDispatchSettings>>,
+    /// Session token verifier used to derive the caller identity for
+    /// owner-scoped authorization (see `owner_session.rs`).
+    pub(crate) token_verifier: Arc<TokenVerifierSlot>,
+    /// System Notify (`notify.rs`).
+    pub(crate) notifies: crate::notify::NotifyStore,
+    pub(crate) notify_tasks: Arc<crate::notify::NotifyTasksSlot>,
+    pub(crate) notify_identity: Arc<RwLock<Option<(DID, Option<String>)>>>,
+    pub(crate) notify_lock: Arc<tokio::sync::Mutex<()>>,
+    /// DID → Zone / profile / signing device Zone (`network_directory.rs`).
+    pub(crate) directory: Arc<crate::network_directory::DirectorySlot>,
+    /// OOD device key used to sign native messages of this Zone's users.
+    pub(crate) zone_signer: Arc<crate::network_directory::ZoneSignerSlot>,
+    /// Serializes friend request state changes (`friend_service.rs`).
+    pub(crate) friend_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Unauthenticated signed ingress per sender: (window start, count).
+    pub(crate) ingress_budget: Arc<std::sync::Mutex<HashMap<String, (u64, u32)>>>,
+    /// Where stored messages and their attachments are bound (`buckets.rs`).
+    pub(crate) buckets: Arc<crate::buckets::BucketSlot>,
 }
 
 impl MessageCenter {
@@ -96,15 +131,36 @@ impl MessageCenter {
     /// Build a MessageCenter that reuses an already-opened `MsgBoxDbMgr`.
     pub async fn open_with_db(msg_box_db: MsgBoxDbMgr) -> std::result::Result<Self, RPCErrors> {
         let contact_mgr = ContactMgr::new_with_msg_box(msg_box_db.clone()).await?;
-        let group_mgr = GroupMgr::new_with_msg_box(msg_box_db.clone());
+        let groups = crate::group_store::GroupStore::open(msg_box_db.clone()).await?;
+        let notifies = crate::notify::NotifyStore::open(msg_box_db.clone()).await?;
+        let hosted = groups
+            .list()
+            .await?
+            .into_iter()
+            .filter(|g| g.lifecycle != "deleted")
+            .map(|g| g.group_did.to_string())
+            .collect();
         Ok(Self {
+            groups,
             state: Arc::new(RwLock::new(MessageCenterState::default())),
             contact_mgr,
-            group_mgr,
             msg_box_db,
             tunnel_registry: Arc::new(RwLock::new(HashMap::new())),
-            local_recipients: Arc::new(RwLock::new(HashSet::new())),
+            edit_capabilities: Arc::new(RwLock::new(HashMap::new())),
+            local_recipients: Arc::new(RwLock::new(hosted)),
+            zone_accounts: Arc::new(RwLock::new(ZoneAccounts::default())),
             message_hub_did: Arc::new(OnceLock::new()),
+            cyfs_dispatch: Arc::new(RwLock::new(Default::default())),
+            token_verifier: Arc::new(TokenVerifierSlot::default()),
+            notifies,
+            notify_tasks: Arc::new(crate::notify::NotifyTasksSlot::default()),
+            notify_identity: crate::notify::notify_identity_slot(),
+            notify_lock: Arc::new(tokio::sync::Mutex::new(())),
+            directory: Arc::new(Default::default()),
+            zone_signer: Arc::new(Default::default()),
+            friend_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ingress_budget: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            buckets: Arc::new(Default::default()),
         })
     }
 
@@ -146,12 +202,24 @@ impl MessageCenter {
         self.tunnel_registry.write().unwrap().clear();
     }
 
-    fn lookup_tunnel_route(&self, tunnel_instance_id: &str) -> Option<TunnelRegistryEntry> {
+    pub(crate) fn lookup_tunnel_route(
+        &self,
+        tunnel_instance_id: &str,
+    ) -> Option<TunnelRegistryEntry> {
         self.tunnel_registry
             .read()
             .unwrap()
             .get(tunnel_instance_id)
             .cloned()
+    }
+
+    /// Record what a delivery executor declares about editing delivered
+    /// messages. An executor that never declared anything is "unknown".
+    pub fn declare_edit_capability(&self, transport_did: &DID, capability: EditCapability) {
+        self.edit_capabilities
+            .write()
+            .unwrap()
+            .insert(transport_did.to_string(), capability);
     }
 
     /// Install the MessageHub transport DID (start-up wiring).
@@ -171,17 +239,154 @@ impl MessageCenter {
         }
     }
 
-    /// Is this DID hosted by this zone? True for explicitly registered
-    /// recipients and for DIDs under the zone host (`jarvis.<zone>`,
-    /// `telegram.<zone>` aliases, the zone DID itself).
-    pub fn is_local_recipient(&self, did: &DID) -> bool {
-        if self
-            .local_recipients
+    /// Registered explicitly (Agents from the Zone sync, hosted groups, the
+    /// Zone's users with a personal inbox); the agreed native receive path
+    /// serves only these.
+    pub(crate) fn is_registered_recipient(&self, did: &DID) -> bool {
+        let did = did.to_string();
+        self.local_recipients.read().unwrap().contains(&did)
+            || self.zone_accounts.read().unwrap().recipients.contains(&did)
+    }
+
+    /// Replace what the Zone's account records say (zone sync).
+    pub(crate) fn set_zone_accounts(&self, accounts: ZoneAccounts) {
+        *self.zone_accounts.write().unwrap() = accounts;
+    }
+
+    /// An account record of this Zone, by DID or as `<name>.<zone host>`.
+    pub(crate) fn is_zone_account(&self, did: &DID) -> bool {
+        let accounts = self.zone_accounts.read().unwrap();
+        if accounts.dids.contains(&did.to_string()) {
+            return true;
+        }
+        let Ok(runtime) = get_buckyos_api_runtime() else {
+            return false;
+        };
+        let zone_host = runtime.zone_id.to_host_name();
+        did.to_host_name()
+            .strip_suffix(&format!(".{zone_host}"))
+            .is_some_and(|name| accounts.names.contains(name))
+    }
+
+    /// Session Only guests (restricted sessions) do not upload media in the
+    /// first phase (SSO-12): their messages reference no objects.
+    pub(crate) fn refuse_guest_attachments(
+        caller: Option<&crate::owner_session::CallerIdentity>,
+        msg: &MsgObject,
+    ) -> std::result::Result<(), RPCErrors> {
+        match caller.filter(|caller| caller.restricted()) {
+            Some(caller) if !crate::buckets::attachment_ids(msg).is_empty() => {
+                Err(crate::owner_session::gate_denial(
+                    buckyos_api::DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A restricted visitor removed from, banned in or never admitted to the
+    /// Session gets a D-4 denial instead of a rejected post, so its page
+    /// stops; the full checks run when the message is accepted.
+    async fn require_guest_session(
+        &self,
+        caller: &crate::owner_session::CallerIdentity,
+        actor: &crate::group_types::GroupActor,
+        msg: &MsgObject,
+    ) -> std::result::Result<(), RPCErrors> {
+        let group = self
+            .groups
+            .load(&msg.to[0])
+            .await?
+            .ok_or_else(crate::group_types::missing);
+        match group.and_then(|g| g.require_session(actor, msg.to_session.as_deref(), false)) {
+            Err(RPCErrors::NoPermission(reason)) => Err(
+                crate::owner_session::restricted_group_denial(&caller.user_id, reason),
+            ),
+            result => result,
+        }
+    }
+
+    /// Whether `did` gets personal records here (INBOX, SENT, owner sessions,
+    /// a delivered notice). The synced snapshot decides for what it knows; a
+    /// DID under the Zone host it does not know may be an account created
+    /// since the last sync and counts only when its settings, read now, say
+    /// Active Admin or User. An answer that cannot be read creates nothing.
+    pub(crate) async fn is_personal_recipient(&self, did: &DID) -> bool {
+        if self.is_registered_recipient(did) {
+            return true;
+        }
+        if !self.is_local_recipient(did) {
+            return false;
+        }
+        let zone_host = get_buckyos_api_runtime()
+            .map(|runtime| runtime.zone_id.to_host_name())
+            .unwrap_or_default();
+        self.unsynced_account_is_personal(did, &zone_host).await
+    }
+
+    /// `did` is local by its host name only: an account named by its first
+    /// labels (`<user_id>.<zone host>`) has a personal inbox only as an Active
+    /// Admin or User; no account of that name is an Agent or an alias.
+    pub(crate) async fn unsynced_account_is_personal(&self, did: &DID, zone_host: &str) -> bool {
+        let host = did.to_host_name();
+        let Some(user_id) = host
+            .strip_suffix(&format!(".{zone_host}"))
+            .filter(|user_id| !zone_host.is_empty() && !user_id.is_empty())
+        else {
+            return true;
+        };
+        match self.token_verifier.get().account_settings(user_id).await {
+            Ok(None) => true,
+            Ok(Some(settings)) => {
+                settings.is_active() && settings.user_type.can_receive_direct_messages()
+            }
+            Err(error) => {
+                warn!("read account {} failed; no personal records: {}", user_id, error);
+                false
+            }
+        }
+    }
+
+    /// An account of this Zone without a personal inbox, by the snapshot or,
+    /// for a local DID the snapshot does not know, by its settings now.
+    pub(crate) async fn lacks_personal_inbox(&self, did: &DID) -> bool {
+        self.is_account_without_inbox(did)
+            || (self.is_local_recipient(did) && !self.is_personal_recipient(did).await)
+    }
+
+    /// The user id of an account of this Zone by its DID.
+    pub(crate) fn zone_account_user_id(&self, did: &DID) -> Option<String> {
+        self.zone_accounts
             .read()
             .unwrap()
-            .contains(&did.to_string())
-        {
+            .user_ids
+            .get(&did.to_string())
+            .cloned()
+    }
+
+    /// An account of this Zone that cannot receive direct messages: it takes
+    /// part through group sessions only.
+    pub(crate) fn is_account_without_inbox(&self, did: &DID) -> bool {
+        !self.is_registered_recipient(did) && self.is_zone_account(did)
+    }
+
+    /// An identity this Zone holds custody of: a local recipient or any of its
+    /// accounts (a Limited account has no inbox but is still signed for).
+    pub(crate) fn is_hosted_identity(&self, did: &DID) -> bool {
+        self.is_local_recipient(did) || self.is_zone_account(did)
+    }
+
+    /// Is this DID hosted by this zone? True for registered recipients, the
+    /// zone DID and other DIDs under the zone host (`<agent>.<zone>`,
+    /// `telegram.<zone>` aliases). An account of the Zone is local only with a
+    /// personal inbox (Admin, User), never by its host name.
+    pub fn is_local_recipient(&self, did: &DID) -> bool {
+        if self.is_registered_recipient(did) {
             return true;
+        }
+        if self.is_zone_account(did) {
+            return false;
         }
         let Ok(runtime) = get_buckyos_api_runtime() else {
             return false;
@@ -198,27 +403,65 @@ impl MessageCenter {
         target_host == zone_host || target_host.ends_with(&format!(".{}", zone_host))
     }
 
-    /// Read-only accessor for the group manager. Used by tests and by the
-    /// in-process `MsgCenterClient` adapter so callers do not need to lift
-    /// the GroupMgr through every API surface.
-    #[allow(dead_code)]
-    pub fn group_mgr(&self) -> &GroupMgr {
-        &self.group_mgr
+    fn is_zone_user_contact(contact: &Contact) -> bool {
+        contact
+            .tags
+            .iter()
+            .any(|tag| tag == buckyos_api::CONTACT_TAG_ZONE_USER)
     }
 
+    /// A user (not a service) reading the system scope.
+    async fn user_reads_system_scope(
+        &self,
+        ctx: &RPCContext,
+        owner: Option<&DID>,
+    ) -> std::result::Result<bool, RPCErrors> {
+        if owner.is_some() {
+            return Ok(false);
+        }
+        Ok(self.caller_identity(ctx).await?.is_some_and(|caller| {
+            caller.principal_kind == buckyos_api::TokenPrincipalKind::User
+        }))
+    }
+
+    /// What the owner's address book shows of a contact: an owner that may
+    /// not change its address book sees only the projected Zone users.
+    pub(crate) fn contact_visible(&self, owner: Option<&DID>, contact: &Contact) -> bool {
+        owner.map_or(true, |owner| self.contact_mgr.owner_can_edit(owner))
+            || !contact.projected_from.is_empty()
+    }
+
+    /// Write Zone user contacts into one store (system scope, an Agent's
+    /// store). Users' own address books get Zone users by projection instead.
     pub async fn upsert_zone_user_contacts(
         &self,
         contacts: Vec<ZoneUserContactSeed>,
         owner: Option<DID>,
     ) -> std::result::Result<usize, RPCErrors> {
-        // Zone users are native local recipients of the message hub.
-        self.register_local_recipients(contacts.iter().map(|seed| seed.did.clone()));
         self.contact_mgr
             .upsert_zone_user_contacts(contacts, owner)
             .await
     }
 
-    fn now_ms() -> u64 {
+    /// Signed messages that arrive without a Bearer token: at most
+    /// `INGRESS_BUDGET_PER_MINUTE` per sender and minute.
+    pub(crate) fn take_ingress_budget(&self, sender: &DID) -> bool {
+        const INGRESS_BUDGET_PER_MINUTE: u32 = 30;
+        const WINDOW_MS: u64 = 60_000;
+        let now = Self::now_ms();
+        let mut budget = self.ingress_budget.lock().unwrap();
+        if budget.len() > 10_000 {
+            budget.retain(|_, (start, _)| now.saturating_sub(*start) < WINDOW_MS);
+        }
+        let entry = budget.entry(sender.to_string()).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= WINDOW_MS {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= INGRESS_BUDGET_PER_MINUTE
+    }
+
+    pub(crate) fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -240,7 +483,7 @@ impl MessageCenter {
         f(&guard)
     }
 
-    fn with_state_write<T, F>(&self, f: F) -> std::result::Result<T, RPCErrors>
+    pub(crate) fn with_state_write<T, F>(&self, f: F) -> std::result::Result<T, RPCErrors>
     where
         F: FnOnce(&mut MessageCenterState) -> std::result::Result<T, RPCErrors>,
     {
@@ -375,15 +618,6 @@ impl MessageCenter {
         }
     }
 
-    fn box_id_prefix(box_kind: &MailboxKind) -> &'static str {
-        match box_kind {
-            MailboxKind::Inbox => "box_in",
-            MailboxKind::Sent => "box_sent",
-            MailboxKind::GroupInbox => "box_group_in",
-            MailboxKind::RequestBox => "box_request",
-        }
-    }
-
     /// Always go through the runtime: it owns the single process-wide client
     /// and decides which transport this deployment uses.
     async fn get_kevent_client() -> Option<KEventClient> {
@@ -403,25 +637,7 @@ impl MessageCenter {
         }
     }
 
-    fn build_box_id(owner: &DID, box_kind: &MailboxKind) -> String {
-        let owner_token = owner.to_raw_host_name();
-        format!(
-            "/msg_center/{}/{}_{}",
-            owner_token,
-            Self::box_id_prefix(box_kind),
-            owner_token
-        )
-    }
-
-    fn build_box_changed_event_id(owner: &DID, box_kind: &MailboxKind) -> String {
-        format!(
-            "{}/{}",
-            Self::build_box_id(owner, box_kind),
-            MSG_CENTER_BOX_CHANGED_EVENT_NAME
-        )
-    }
-
-    fn publish_event(event_id: String, payload: Value) {
+    pub(crate) fn publish_event(event_id: String, payload: Value) {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let Some(client) = Self::get_kevent_client().await else {
@@ -442,29 +658,27 @@ impl MessageCenter {
         }
     }
 
-    fn publish_box_changed_event(record: &MailboxRecord, operation: &str) {
-        let box_id = Self::build_box_id(&record.owner, &record.box_kind);
-        let event_id = Self::build_box_changed_event_id(&record.owner, &record.box_kind);
+    pub(crate) fn publish_box_changed_event(record: &MailboxRecord, operation: &str) {
+        let event_ids = record.mailbox.box_event_ids(record.box_kind.clone());
         let payload = json!({
             "operation": operation,
             "owner": record.owner.to_string(),
             "box_kind": Self::box_kind_name(&record.box_kind),
-            "box_id": box_id,
+            "box_id": event_ids.first(),
+            "mailbox": record.mailbox,
             "record_id": record.record_id.clone(),
             "msg_id": record.msg_id.to_string(),
             "state": record.state,
             "session_id": record.session_id.clone(),
             "updated_at_ms": record.updated_at_ms,
         });
-        Self::publish_event(event_id, payload);
+        for event_id in event_ids {
+            Self::publish_event(event_id, payload.clone());
+        }
     }
 
-    fn publish_delivery_changed_event(record: &DeliveryRecord, operation: &str) {
-        let executor_token = record.envelope.transport_did.to_raw_host_name();
-        let event_id = format!(
-            "/msg_center/{}/delivery_queue_{}/{}",
-            executor_token, executor_token, MSG_CENTER_BOX_CHANGED_EVENT_NAME
-        );
+    pub(crate) fn publish_delivery_changed_event(record: &DeliveryRecord, operation: &str) {
+        let event_id = buckyos_api::delivery_changed_event_id(&record.envelope.transport_did);
         let payload = json!({
             "operation": operation,
             "transport_did": record.envelope.transport_did.to_string(),
@@ -503,8 +717,25 @@ impl MessageCenter {
         result
     }
 
-    fn is_group_message(msg: &MsgObject) -> bool {
+    pub(crate) fn is_group_message(msg: &MsgObject) -> bool {
         msg.kind == MsgObjKind::GroupMsg
+    }
+
+    /// MsgObject v2 ingress rules (`CYFS 标准对象` §16): object-level validity,
+    /// plus the transition rule of Self-Host-Groupv2 §2.5: a group message that
+    /// carries `thread.topic` without `to_session` is rejected, so an old client
+    /// cannot write a message meant for a named session into the default one.
+    pub(crate) fn validate_ingress_message(msg: &MsgObject) -> std::result::Result<(), RPCErrors> {
+        msg.validate().map_err(|error| {
+            RPCErrors::ParseRequestError(format!("invalid MsgObject: {}", error))
+        })?;
+        if Self::is_group_message(msg) && msg.to_session.is_none() && msg.thread.topic.is_some() {
+            return Err(RPCErrors::ParseRequestError(
+                "missing-to-session: group message carries thread.topic but no to_session"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Group messages carry `from = actor, to = group`; a group message
@@ -556,14 +787,14 @@ impl MessageCenter {
                 .or_else(|| ctx.transport_did.as_ref().map(|did| did.to_string()))
                 .unwrap_or_else(|| "unknown".to_string());
             let session = Self::normalize_non_empty(ctx.chat_id.as_deref())
-                .or_else(|| Self::normalize_non_empty(msg.thread.topic.as_deref()))
+                .or_else(|| Self::normalize_non_empty(msg.to_session.as_deref()))
                 .or_else(|| Self::normalize_non_empty(ctx.context_id.as_deref()))
                 .unwrap_or_else(|| "unknown".to_string());
             return format!("dispatch:{}:{}:{}", platform, tunnel_account, session);
         }
 
-        if let Some(topic) = Self::normalize_non_empty(msg.thread.topic.as_deref()) {
-            return format!("dispatch:thread:{}", topic);
+        if let Some(session) = Self::normalize_non_empty(msg.to_session.as_deref()) {
+            return format!("dispatch:session:{}", session);
         }
         if Self::is_group_message(msg) {
             return msg
@@ -596,13 +827,20 @@ impl MessageCenter {
         format!("targets:{}", hex::encode(hasher.finalize()))
     }
 
-    fn post_send_idempotency_owner_scope(msg: &MsgObject) -> String {
-        msg.from.to_string()
+    fn post_send_idempotency_owner_scope(
+        msg: &MsgObject,
+    ) -> std::result::Result<String, RPCErrors> {
+        MailboxAddress::new(
+            msg.from.clone(),
+            Self::derive_session_id(&MailboxKind::Sent, msg),
+        )
+        .map(|address| address.to_string())
+        .map_err(RPCErrors::ParseRequestError)
     }
 
     fn post_send_idempotency_retention_key(msg: &MsgObject) -> String {
-        if let Some(topic) = Self::normalize_non_empty(msg.thread.topic.as_deref()) {
-            return format!("post_send:{}:{}", msg.from.to_string(), topic);
+        if let Some(session) = Self::normalize_non_empty(msg.to_session.as_deref()) {
+            return format!("post_send:{}:{}", msg.from.to_string(), session);
         }
         format!("post_send:{}", msg.from.to_string())
     }
@@ -630,7 +868,6 @@ impl MessageCenter {
             "/msg/thread_key",
             "/meta/thread_key",
             "/thread/correlation_id",
-            "/thread/topic",
             "/content/machine/data/session_id",
             "/content/machine/data/owner_session_id",
         ] {
@@ -666,18 +903,26 @@ impl MessageCenter {
     }
 
     /// Local session projection key of one record (`Message Center.md` §5.4):
-    /// the message's semantic hint (`thread.topic` / correlation id) wins;
-    /// otherwise group messages key on the group DID and direct messages key
-    /// on the peer DID, so both directions of a DM land in the same session.
-    fn derive_session_id(box_kind: &MailboxKind, msg: &MsgObject) -> Option<String> {
-        if let Some(topic) = Self::normalize_non_empty(msg.thread.topic.as_deref()) {
-            return Some(topic);
+    /// the sender-declared `to_session` (MsgObject v2) wins, for both the
+    /// sender's SENT record and the recipient's records. Group messages are
+    /// routed by `to_session` only, defaulting to the group DID. `thread.topic`
+    /// is a semantic hint and never a session key. Direct messages without
+    /// `to_session` fall back to the legacy session hints, then to the peer
+    /// DID, so both directions of a DM land in the same session.
+    pub(crate) fn derive_session_id(box_kind: &MailboxKind, msg: &MsgObject) -> Option<String> {
+        if Self::is_group_message(msg) {
+            if *box_kind == MailboxKind::GroupInbox {
+                return msg.to_session.clone();
+            }
+            return msg.to.first().and_then(|group| {
+                crate::group_types::session_key(group, msg.to_session.as_deref()).ok()
+            });
+        }
+        if let Some(session) = Self::normalize_non_empty(msg.to_session.as_deref()) {
+            return Some(session);
         }
         if let Some(session_id) = Self::extract_record_session_id(msg) {
             return Some(session_id);
-        }
-        if Self::is_group_message(msg) {
-            return msg.to.first().map(|group| group.to_string());
         }
         match box_kind {
             MailboxKind::Sent => msg
@@ -688,43 +933,19 @@ impl MessageCenter {
         }
     }
 
-    async fn store_message(
+    pub(crate) async fn load_message(
+        &self,
         msg_id: &ObjId,
-        msg_json_str: &str,
-    ) -> std::result::Result<(), RPCErrors> {
+    ) -> std::result::Result<MsgObject, RPCErrors> {
+        if let Some((_, body, _)) = self.groups.object(msg_id).await? {
+            return serde_json::from_str(&body.ok_or_else(crate::group_types::missing)?)
+                .map_err(|e| RPCErrors::ReasonError(e.to_string()));
+        }
+        if let Some(msg) = self.with_state_read(|state| Ok(state.messages.get(&msg_id.to_string()).cloned()))? {
+            return Ok(msg);
+        }
         let msg_id = msg_id.clone();
-        let msg_json = msg_json_str.to_string();
-        let runtime = match get_buckyos_api_runtime() {
-            Ok(runtime) => runtime,
-            Err(RPCErrors::ReasonError(reason))
-                if reason.contains("BuckyOSRuntime is not initialized") =>
-            {
-                warn!(
-                    "skip storing message {} to named_store because runtime is not initialized",
-                    msg_id.to_string()
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        let named_store = runtime.get_named_store().await?;
-        named_store
-            .put_object(&msg_id, &msg_json)
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!(
-                    "store message {} in named_store failed: {}",
-                    msg_id.to_string(),
-                    error
-                ))
-            })?;
-        Ok(())
-    }
-
-    async fn load_message(msg_id: &ObjId) -> std::result::Result<MsgObject, RPCErrors> {
-        let msg_id = msg_id.clone();
-        let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await?;
+        let named_store = self.named_store().await?;
         let msg_json = named_store.get_object(&msg_id).await.map_err(|error| {
             RPCErrors::ReasonError(format!(
                 "load message {} from named_store failed: {}",
@@ -746,7 +967,7 @@ impl MessageCenter {
         msg.gen_obj_id().0
     }
 
-    fn ensure_message(state: &mut MessageCenterState, msg: MsgObject) -> MsgObject {
+    pub(crate) fn ensure_message(state: &mut MessageCenterState, msg: MsgObject) -> MsgObject {
         let msg_key = Self::message_obj_id(&msg).to_string();
         if let Some(existing) = state.messages.get(&msg_key) {
             return existing.clone();
@@ -755,7 +976,7 @@ impl MessageCenter {
         msg
     }
 
-    fn build_record_id(
+    pub(crate) fn build_record_id(
         owner: &DID,
         box_kind: &MailboxKind,
         msg_id: &ObjId,
@@ -772,7 +993,11 @@ impl MessageCenter {
 
     /// Deterministic idempotency key of one delivery:
     /// hash(msg_id + target_did + transport_did).
-    fn build_delivery_id(msg_id: &ObjId, target_did: &DID, transport_did: &DID) -> String {
+    pub(crate) fn build_delivery_id(
+        msg_id: &ObjId,
+        target_did: &DID,
+        transport_did: &DID,
+    ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(msg_id.to_string().as_bytes());
         hasher.update(b"|");
@@ -782,7 +1007,18 @@ impl MessageCenter {
         format!("dlv-{}", hex::encode(&hasher.finalize()[..16]))
     }
 
-    fn build_mailbox_record(
+    /// Initial `RecipientState` of an inbound record. A reaction, or the
+    /// redaction that cancels one, is a quick interaction folded into its
+    /// target by every client: it has no row of its own to be read with, so it
+    /// is stored READ and never counts towards a session's `unread_count`.
+    pub(crate) fn inbound_initial_state(msg: &MsgObject) -> RecipientState {
+        match msg.relates_to.as_ref().map(|relation| &relation.rel) {
+            Some(MsgRelType::Reaction | MsgRelType::Redact) => RecipientState::Read,
+            _ => RecipientState::Unread,
+        }
+    }
+
+    pub(crate) fn build_mailbox_record(
         owner: DID,
         box_kind: MailboxKind,
         msg: &MsgObject,
@@ -790,16 +1026,19 @@ impl MessageCenter {
         ingress: Option<IngressContext>,
         tags: Vec<String>,
         variant: &str,
-    ) -> MailboxRecord {
+    ) -> std::result::Result<MailboxRecord, RPCErrors> {
         let msg_id = Self::message_obj_id(msg);
         let record_id = Self::build_record_id(&owner, &box_kind, &msg_id, variant);
         let session_id = Self::derive_session_id(&box_kind, msg);
+        let mailbox = MailboxAddress::new(owner.clone(), session_id.clone())
+            .map_err(RPCErrors::ParseRequestError)?;
         let now_ms = Self::now_ms();
         let record_to = match box_kind {
             MailboxKind::Inbox | MailboxKind::GroupInbox | MailboxKind::RequestBox => owner.clone(),
             MailboxKind::Sent => msg.to.first().cloned().unwrap_or_else(|| owner.clone()),
         };
-        MailboxRecord {
+        Ok(MailboxRecord {
+            mailbox,
             record_id,
             owner,
             box_kind,
@@ -819,22 +1058,22 @@ impl MessageCenter {
             ingress,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
-        }
+        })
     }
 
     async fn load_box_records(
         &self,
-        owner: &DID,
+        mailbox: &MailboxAddress,
         box_kind: &MailboxKind,
         state_filter: Option<&[RecipientState]>,
         descending: bool,
     ) -> std::result::Result<Vec<MailboxRecord>, RPCErrors> {
         self.msg_box_db
-            .list_records(owner, box_kind, state_filter, descending)
+            .list_records(mailbox, box_kind, state_filter, descending)
             .await
     }
 
-    fn filter_after_cursor(
+    pub(crate) fn filter_after_cursor(
         records: Vec<MailboxRecord>,
         cursor_sort_key: Option<u64>,
         cursor_record_id: Option<&str>,
@@ -861,25 +1100,36 @@ impl MessageCenter {
             .collect()
     }
 
-    fn owner_from_record_id(record_id: &str) -> std::result::Result<DID, RPCErrors> {
+    pub(crate) fn owner_from_record_id(record_id: &str) -> std::result::Result<DID, RPCErrors> {
         let owner = record_id.split('|').next().ok_or_else(|| {
             RPCErrors::ReasonError(format!("invalid record id '{}': missing owner", record_id))
         })?;
-        DID::from_str(owner).map_err(|error| {
-            RPCErrors::ReasonError(format!(
-                "invalid record id '{}': owner DID parse failed: {}",
-                record_id, error
-            ))
-        })
+        let mailbox = MailboxAddress::try_from(owner.to_string()).map_err(|error| {
+            RPCErrors::ParseRequestError(format!("invalid record owner: {error}"))
+        })?;
+        if mailbox.session_id().is_some() {
+            return Err(RPCErrors::ParseRequestError(
+                "record owner must be a bare DID".into(),
+            ));
+        }
+        Ok(mailbox.owner().clone())
     }
 
-    async fn build_record_view(
+    pub(crate) async fn build_record_view(
+        &self,
         record: MailboxRecord,
         with_object: Option<bool>,
     ) -> std::result::Result<MailboxRecordWithObject, RPCErrors> {
         let mut result = MailboxRecordWithObject { record, msg: None };
         if with_object.unwrap_or(false) {
-            result.msg = Some(Self::load_message(&result.record.msg_id).await?);
+            if !self
+                .groups
+                .object(&result.record.msg_id)
+                .await?
+                .is_some_and(|(_, b, _)| b.is_none())
+            {
+                result.msg = Some(self.load_message(&result.record.msg_id).await?);
+            }
         }
         Ok(result)
     }
@@ -936,15 +1186,30 @@ impl MessageCenter {
             .unwrap_or(false))
     }
 
+    /// Who an ingress message speaks for, as identified by the transport
+    /// (`IngressContext.extra.principal_did`).
+    pub(crate) fn ingress_principal(ingress: Option<&IngressContext>) -> Option<DID> {
+        ingress?
+            .extra
+            .as_ref()?
+            .get(INGRESS_PRINCIPAL_KEY)?
+            .as_str()
+            .and_then(|did| DID::from_str(did).ok())
+    }
+
+    /// The target's admission policy towards the principal when the
+    /// transport identified one, otherwise towards the sender.
     async fn decide_inbox_kind(
         &self,
         sender: &DID,
+        principal: Option<&DID>,
         target: &DID,
         context_id: Option<String>,
     ) -> std::result::Result<Option<MailboxKind>, RPCErrors> {
+        let subject = principal.unwrap_or(sender);
         let decision: AccessDecision = self
             .contact_mgr
-            .check_access_permission(sender.clone(), context_id, Some(target.clone()))
+            .check_access_permission(subject.clone(), context_id, Some(target.clone()))
             .await?;
         if decision.allow_delivery {
             return Ok(Some(MailboxKind::Inbox));
@@ -971,7 +1236,7 @@ impl MessageCenter {
     ///
     /// Any resolution failure fails the whole `post_send`. There is no default
     /// tunnel, no default chat and no last-active fallback.
-    fn build_delivery_envelope(
+    pub(crate) fn build_delivery_envelope(
         &self,
         msg_id: &ObjId,
         target_did: DID,
@@ -1018,6 +1283,12 @@ impl MessageCenter {
             });
         }
 
+        if self.is_account_without_inbox(&target_did) {
+            return Err(format!(
+                "recipient-has-no-inbox: {} has no personal inbox in this Zone; message it in a group session",
+                target_did.to_string()
+            ));
+        }
         // Shareable DID → MessageHub native delivery.
         let hub_did = self.message_hub_did().ok_or_else(|| {
             format!(
@@ -1025,13 +1296,93 @@ impl MessageCenter {
                 target_did.to_string()
             )
         })?;
+        let route = self
+            .cyfs_dispatch
+            .read()
+            .unwrap()
+            .outgoing
+            .get(&target_did.to_string())
+            .cloned();
+        let address = route.map(|route| DeliverySnapshot {
+            platform: Some("cyfs".into()),
+            account_id: None,
+            account_type: None,
+            chat_id: None,
+            address: Some(route.target),
+            ext_ids: HashMap::new(),
+            extra: None,
+        });
         Ok(DeliveryEnvelope {
             msg_id: msg_id.clone(),
             target_did,
             transport_did: hub_did,
             transport: TransportKind::Native,
-            address: None,
+            address,
         })
+    }
+
+    /// CYFS dispatch receive. `jwt` is the verified JWT original when the
+    /// message arrived in signed form; it is kept next to the canonical JSON.
+    pub(crate) async fn dispatch_to_receiver(
+        &self,
+        msg: MsgObject,
+        jwt: Option<String>,
+        receiver: DID,
+        target: String,
+    ) -> std::result::Result<DispatchResult, RPCErrors> {
+        if !self.is_local_recipient(&receiver)
+            || !msg.to.contains(&receiver)
+            || (Self::is_group_message(&msg) && Self::group_did_from_message(&msg)? != receiver)
+        {
+            return Err(RPCErrors::NoPermission(
+                "not a local message receiver".into(),
+            ));
+        }
+        if self.groups.load(&receiver).await?.is_some() && !Self::is_group_message(&msg) {
+            return Err(RPCErrors::ParseRequestError(
+                "hosted-group-requires-group-msg".into(),
+            ));
+        }
+        if Self::is_group_message(&msg) {
+            return self
+                .accept_group_message(
+                    &crate::group_types::GroupActor {
+                        did: msg.from.clone(),
+                        client: None,
+                        remote: true,
+                    },
+                    msg,
+                    jwt,
+                )
+                .await;
+        }
+        let msg_id = msg.gen_obj_id().0;
+        if let Some(jwt) = jwt.as_deref() {
+            Self::validate_ingress_message(&msg)?;
+            self.msg_box_db
+                .put_msg_jwt(&msg_id, jwt, Self::now_ms())
+                .await?;
+        }
+        self.dispatch_internal(
+            msg,
+            None,
+            Some(msg_id.to_string()),
+            Some((receiver, target)),
+        )
+        .await
+    }
+
+    pub(crate) async fn query_cyfs_dispatch(
+        &self,
+        principal: &str,
+        target: &str,
+        obj_id: &ObjId,
+    ) -> std::result::Result<Option<DispatchResult>, RPCErrors> {
+        self.load_dispatch_idempotency(
+            &format!("cyfs:{}:{}", principal, target),
+            &obj_id.to_string(),
+        )
+        .await
     }
 
     async fn dispatch_internal(
@@ -1039,9 +1390,21 @@ impl MessageCenter {
         msg: MsgObject,
         ingress_ctx: Option<IngressContext>,
         idempotency_key: Option<String>,
+        receiver: Option<(DID, String)>,
     ) -> std::result::Result<DispatchResult, RPCErrors> {
-        let idempotency_owner_scope =
-            Self::dispatch_idempotency_owner_scope(&msg, ingress_ctx.as_ref());
+        Self::validate_ingress_message(&msg)?;
+        if Self::is_group_message(&msg) {
+            let actor = crate::group_types::GroupActor {
+                did: msg.from.clone(),
+                client: None,
+                remote: receiver.is_some(),
+            };
+            return self.accept_group_message(&actor, msg, None).await;
+        }
+        let idempotency_owner_scope = match &receiver {
+            Some((_, target)) => format!("cyfs:{}:{}", msg.from.to_string(), target),
+            None => Self::dispatch_idempotency_owner_scope(&msg, ingress_ctx.as_ref()),
+        };
         if let Some(key) = idempotency_key.as_ref() {
             if let Some(cached) = self
                 .load_dispatch_idempotency(&idempotency_owner_scope, key)
@@ -1050,10 +1413,6 @@ impl MessageCenter {
                 return Ok(cached);
             }
         }
-
-        let ingress_contact_mgr_owner = ingress_ctx
-            .as_ref()
-            .and_then(|ctx| ctx.contact_mgr_owner.clone());
 
         enum DispatchPrepare {
             Ready {
@@ -1102,19 +1461,7 @@ impl MessageCenter {
                 ),
             };
         let retention_key = Self::dispatch_idempotency_retention_key(&stored_msg, ingress.as_ref());
-
-        Self::store_message(&stored_msg_id, &stored_msg_json).await?;
-
-        // Re-check idempotency before doing any work; a concurrent caller may
-        // have completed the same dispatch while we were awaiting store_message.
-        if let Some(key) = idempotency_key.as_ref() {
-            if let Some(cached) = self
-                .load_dispatch_idempotency(&idempotency_owner_scope, key)
-                .await?
-            {
-                return Ok(cached);
-            }
-        }
+        let principal = Self::ingress_principal(ingress.as_ref());
 
         let mut result = DispatchResult {
             ok: true,
@@ -1126,116 +1473,13 @@ impl MessageCenter {
             reason: None,
         };
         let mut mailbox_records = Vec::<MailboxRecord>::new();
+        let mut rejected_edit = None;
 
-        if Self::is_group_message(&stored_msg) {
-            if self
-                .is_contact_blocked(&sender, ingress_contact_mgr_owner.clone())
-                .await?
-            {
-                warn!(
-                    "dispatch blocked by sender access policy: msg_id={}, sender={}, context_id={}, contact_mgr_owner={}",
-                    stored_msg_id.to_string(),
-                    sender.to_string(),
-                    context_id.as_deref().unwrap_or("-"),
-                    ingress_contact_mgr_owner
-                        .as_ref()
-                        .map(|did| did.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                );
-                let blocked = DispatchResult {
-                    ok: false,
-                    msg_id: stored_msg_id.clone(),
-                    delivered_recipients: Vec::new(),
-                    dropped_recipients: Vec::new(),
-                    delivered_group: None,
-                    delivered_agents: Vec::new(),
-                    reason: Some("blocked".to_string()),
-                };
-                let now_ms = Self::now_ms();
-                let expires_at_ms = Self::idempotency_expires_at(now_ms);
-                match self
-                    .msg_box_db
-                    .commit_dispatch_records(
-                        IDEMPOTENCY_SCOPE_DISPATCH,
-                        &idempotency_owner_scope,
-                        idempotency_key.as_deref(),
-                        Some(retention_key.as_str()),
-                        &stored_msg_id,
-                        &stored_msg,
-                        &[],
-                        &blocked,
-                        now_ms,
-                        expires_at_ms,
-                    )
-                    .await?
-                {
-                    IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
-                    IdempotencyCommitOutcome::Committed => {}
-                }
-                return Ok(blocked);
-            }
-
-            let group_id = Self::group_did_from_message(&stored_msg)?;
-            info!(
-                "dispatch about to write inbox record: msg_id={}, sender={}, owner={}, box_kind=GROUP_INBOX, context_id={}",
-                stored_msg_id.to_string(),
-                sender.to_string(),
-                group_id.to_string(),
-                context_id.as_deref().unwrap_or("-"),
-            );
-            mailbox_records.push(Self::build_mailbox_record(
-                group_id.clone(),
-                MailboxKind::GroupInbox,
-                &stored_msg,
-                RecipientState::Unread,
-                ingress.clone(),
-                Vec::new(),
-                "group-inbox",
-            ));
-
-            // Prefer the authoritative member list from GroupMgr when this
-            // group is hosted locally; fall back to the ContactMgr
-            // subscriber index for joined groups (whose member roster lives
-            // on the remote host Zone).
-            let owner_key_for_group = ingress_contact_mgr_owner
-                .as_ref()
-                .map(|did| did.to_string())
-                .unwrap_or_else(|| "__system__".to_string());
-            let readers = match self
-                .group_mgr
-                .active_singleton_members(&owner_key_for_group, &group_id)
-                .await?
-            {
-                Some(members) => members,
-                None => {
-                    self.contact_mgr
-                        .get_group_subscribers(
-                            group_id.clone(),
-                            None,
-                            None,
-                            ingress_contact_mgr_owner.clone(),
-                        )
-                        .await?
-                }
+        {
+            let recipients = match &receiver {
+                Some((recipient, _)) => vec![recipient.clone()],
+                None => Self::dedupe_dids(stored_msg.to.clone()),
             };
-            let readers = Self::dedupe_dids(readers);
-            for agent_did in readers.iter() {
-                let tag = format!("group:{}", group_id.to_string());
-                mailbox_records.push(Self::build_mailbox_record(
-                    agent_did.clone(),
-                    MailboxKind::Inbox,
-                    &stored_msg,
-                    RecipientState::Unread,
-                    ingress.clone(),
-                    vec![tag],
-                    &format!("group-agent-{}", group_id.to_string()),
-                ));
-            }
-
-            result.delivered_group = Some(group_id);
-            result.delivered_agents = readers;
-        } else {
-            let recipients = Self::dedupe_dids(stored_msg.to.clone());
             if recipients.is_empty() {
                 warn!(
                     "dispatch has no recipients, cannot write inbox: msg_id={}, sender={}, context_id={}",
@@ -1245,6 +1489,15 @@ impl MessageCenter {
                 );
             }
             for recipient in recipients {
+                if self.lacks_personal_inbox(&recipient).await {
+                    warn!(
+                        "dispatch dropped a recipient without a personal inbox: msg_id={}, recipient={}",
+                        stored_msg_id.to_string(),
+                        recipient.to_string(),
+                    );
+                    result.dropped_recipients.push(recipient);
+                    continue;
+                }
                 if self
                     .is_contact_blocked(&sender, Some(recipient.clone()))
                     .await?
@@ -1259,9 +1512,52 @@ impl MessageCenter {
                     result.dropped_recipients.push(recipient);
                     continue;
                 }
+                if let Some(relation) = stored_msg
+                    .relates_to
+                    .as_ref()
+                    .filter(|relation| relation.rel == MsgRelType::Edit)
+                {
+                    if let Err(error) = self
+                        .validate_private_edit(&stored_msg, &relation.target, &recipient)
+                        .await
+                    {
+                        warn!(
+                            "dispatch rejected private edit: msg_id={}, sender={}, recipient={}, target={}, error={}",
+                            stored_msg_id.to_string(),
+                            sender.to_string(),
+                            recipient.to_string(),
+                            relation.target.to_string(),
+                            error,
+                        );
+                        result.dropped_recipients.push(recipient);
+                        rejected_edit = Some(error);
+                        continue;
+                    }
+                }
+
+                if crate::friend_service::is_friend_message(&stored_msg) {
+                    let ingress = match crate::friend_service::friend_data(&stored_msg) {
+                        Some(data) => {
+                            self.accept_friend_message(&recipient, &stored_msg, data)
+                                .await?
+                        }
+                        None => crate::friend_service::FriendIngress::Drop,
+                    };
+                    match ingress {
+                        crate::friend_service::FriendIngress::Drop => {
+                            result.dropped_recipients.push(recipient);
+                            continue;
+                        }
+                        crate::friend_service::FriendIngress::Control => {
+                            result.delivered_recipients.push(recipient);
+                            continue;
+                        }
+                        crate::friend_service::FriendIngress::Mailbox => {}
+                    }
+                }
 
                 let decision = match self
-                    .decide_inbox_kind(&sender, &recipient, context_id.clone())
+                    .decide_inbox_kind(&sender, principal.as_ref(), &recipient, context_id.clone())
                     .await
                 {
                     Ok(value) => value,
@@ -1292,11 +1588,11 @@ impl MessageCenter {
                             recipient.clone(),
                             box_kind,
                             &stored_msg,
-                            RecipientState::Unread,
+                            Self::inbound_initial_state(&stored_msg),
                             ingress.clone(),
                             Vec::new(),
                             "inbox",
-                        ));
+                        )?);
                         result.delivered_recipients.push(recipient);
                     }
                     None => {
@@ -1313,8 +1609,27 @@ impl MessageCenter {
             }
         }
 
+        if result.delivered_recipients.is_empty() {
+            if let Some(error) = rejected_edit {
+                return Err(error);
+            }
+        }
+
+        if !mailbox_records.is_empty() {
+            let arrival = if receiver.is_some() {
+                crate::buckets::Arrival::Remote
+            } else {
+                crate::buckets::Arrival::Local
+            };
+            self.store_message(&stored_msg_id, &stored_msg_json, &stored_msg, arrival)
+                .await?;
+        }
         let now_ms = Self::now_ms();
-        let expires_at_ms = Self::idempotency_expires_at(now_ms);
+        let expires_at_ms = if receiver.is_some() {
+            None
+        } else {
+            Self::idempotency_expires_at(now_ms)
+        };
         match self
             .msg_box_db
             .commit_dispatch_records(
@@ -1333,6 +1648,7 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
+                self.note_records_committed(&mailbox_records).await;
                 for record in mailbox_records.iter() {
                     Self::publish_box_changed_event(record, "upsert");
                 }
@@ -1341,7 +1657,176 @@ impl MessageCenter {
         Ok(result)
     }
 
-    async fn post_send_internal(
+    /// Route planning of `post_send`: one delivery envelope per deduped
+    /// `msg.to` target. Pure, no writes; one unroutable target fails the plan.
+    async fn plan_delivery_envelopes(
+        &self,
+        msg: &MsgObject,
+        msg_id: &ObjId,
+    ) -> std::result::Result<Vec<DeliveryEnvelope>, String> {
+        let targets = Self::dedupe_dids(msg.to.clone());
+        let mut envelopes = Vec::with_capacity(targets.len());
+        for target in targets {
+            let mut envelope = self.build_delivery_envelope(msg_id, target.clone())?;
+            if msg.kind == MsgObjKind::GroupMsg {
+                let route = self.native_message_route(msg, &target).await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "joined-group-route-not-configured".to_string())?;
+                let snapshot = envelope.address.get_or_insert_with(Default::default);
+                snapshot.platform = Some("cyfs".into());
+                snapshot.address = Some(route.target);
+            }
+            envelopes.push(envelope);
+        }
+        Ok(envelopes)
+    }
+
+    async fn get_edit_capability_internal(
+        &self,
+        msg: MsgObject,
+    ) -> std::result::Result<MsgEditCapability, RPCErrors> {
+        if msg.to.is_empty() {
+            return Err(RPCErrors::ParseRequestError(
+                "get_edit_capability requires at least one target in msg.to".to_string(),
+            ));
+        }
+        Self::validate_ingress_message(&msg)?;
+        let not_editable = |reason: String| MsgEditCapability {
+            editable: false,
+            reason: Some(reason),
+            ..Default::default()
+        };
+
+        if Self::is_group_message(&msg) {
+            let hosted = match msg.to.as_slice() {
+                [group] => self.groups.load(group).await?,
+                _ => None,
+            };
+            // The rules of a group hosted elsewhere are not known here.
+            let Some(group) = hosted else {
+                return Ok(not_editable("unknown".to_string()));
+            };
+            let edit_window_ms = group.rules(msg.to_session.as_deref())?.edit.edit_window_ms;
+            return Ok(MsgEditCapability {
+                editable: edit_window_ms.is_none(),
+                reason: edit_window_ms.map(|_| "group edit window".to_string()),
+                edit_window_ms,
+                text_only: false,
+            });
+        }
+
+        let msg_id = msg.gen_obj_id().0;
+        let envelopes = match self.plan_delivery_envelopes(&msg, &msg_id).await {
+            Ok(envelopes) => envelopes,
+            Err(reason) => return Ok(not_editable(reason)),
+        };
+        let mut capability = MsgEditCapability {
+            editable: true,
+            ..Default::default()
+        };
+        for envelope in envelopes {
+            let declared = self
+                .edit_capabilities
+                .read()
+                .unwrap()
+                .get(&envelope.transport_did.to_string())
+                .cloned();
+            let reason = match declared {
+                Some(declared) if declared.supported => {
+                    capability.text_only |= declared.text_only;
+                    capability.edit_window_ms =
+                        match (capability.edit_window_ms, declared.edit_window_ms) {
+                            (Some(left), Some(right)) => Some(left.min(right)),
+                            (left, right) => left.or(right),
+                        };
+                    continue;
+                }
+                Some(_) => match &envelope.transport {
+                    TransportKind::Native => "native unsupported".to_string(),
+                    TransportKind::Tunnel { platform, .. } => {
+                        format!("tunnel:{} unsupported", platform)
+                    }
+                },
+                None => "unknown".to_string(),
+            };
+            capability.editable = false;
+            capability.reason.get_or_insert(reason);
+        }
+        Ok(capability)
+    }
+
+    /// Receive-side rule for a private (non-group) edit, mirroring the group
+    /// rule in `accept_group_message_tx`: the original is a plain message the
+    /// same author sent into the same conversation of `recipient`, and that
+    /// author has not redacted it since.
+    async fn validate_private_edit(
+        &self,
+        edit: &MsgObject,
+        target: &ObjId,
+        recipient: &DID,
+    ) -> std::result::Result<(), RPCErrors> {
+        use crate::group_types::{denied, missing};
+
+        let session_id = Self::derive_session_id(&MailboxKind::Inbox, edit);
+        let original_record = self
+            .msg_box_db
+            .list_message_records(target)
+            .await?
+            .into_iter()
+            .find(|record| {
+                record.owner == *recipient
+                    && matches!(
+                        record.box_kind,
+                        MailboxKind::Inbox | MailboxKind::RequestBox
+                    )
+            })
+            .ok_or_else(missing)?;
+        let original = self
+            .get_message_internal(target.clone())
+            .await?
+            .ok_or_else(missing)?;
+        if original.to_session != edit.to_session {
+            return Err(missing());
+        }
+        if original.from != edit.from || original.kind != edit.kind || original.relates_to.is_some()
+        {
+            return Err(denied("edit-not-allowed"));
+        }
+
+        let Some(session_id) = session_id.as_deref() else {
+            return Ok(());
+        };
+        let mut cursor = (original_record.sort_key, original_record.record_id.clone());
+        loop {
+            let page = self
+                .msg_box_db
+                .list_session_records(
+                    recipient,
+                    session_id,
+                    PRIVATE_EDIT_REDACT_SCAN_PAGE,
+                    Some(cursor.0),
+                    Some(cursor.1.as_str()),
+                    false,
+                )
+                .await?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            cursor = (last.sort_key, last.record_id.clone());
+            for record in page.iter().filter(|record| record.from == edit.from) {
+                let redacts = self
+                    .get_message_internal(record.msg_id.clone())
+                    .await?
+                    .and_then(|msg| msg.relates_to)
+                    .is_some_and(|rel| rel.rel == MsgRelType::Redact && rel.target == *target);
+                if redacts {
+                    return Err(missing());
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn post_send_internal(
         &self,
         msg: MsgObject,
         idempotency_key: Option<String>,
@@ -1351,8 +1836,9 @@ impl MessageCenter {
                 "post_send requires at least one target in msg.to".to_string(),
             ));
         }
+        Self::validate_ingress_message(&msg)?;
 
-        let idempotency_owner_scope = Self::post_send_idempotency_owner_scope(&msg);
+        let idempotency_owner_scope = Self::post_send_idempotency_owner_scope(&msg)?;
 
         if let Some(key) = idempotency_key.as_ref() {
             if let Some(cached) = self
@@ -1445,49 +1931,51 @@ impl MessageCenter {
         // Phase 1: resolve every target up front (pure, no writes). One
         // unroutable target fails the whole post_send with a clear reason —
         // the database keeps no partial state, never a silent fallback.
-        let delivery_targets = Self::dedupe_dids(stored_msg.to.clone());
-        let mut envelopes = Vec::with_capacity(delivery_targets.len());
-        for target in delivery_targets {
-            match self.build_delivery_envelope(&stored_msg_id, target) {
-                Ok(envelope) => envelopes.push(envelope),
-                Err(reason) => {
-                    let result = PostSendResult {
-                        ok: false,
-                        msg_id: stored_msg_id.clone(),
-                        deliveries: Vec::new(),
-                        reason: Some(reason),
-                    };
-                    let now_ms = Self::now_ms();
-                    let expires_at_ms = Self::idempotency_expires_at(now_ms);
-                    match self
-                        .msg_box_db
-                        .commit_post_send_records(
-                            IDEMPOTENCY_SCOPE_POST_SEND,
-                            &idempotency_owner_scope,
-                            idempotency_key.as_deref(),
-                            Some(retention_key.as_str()),
-                            &stored_msg_id,
-                            &stored_msg,
-                            None,
-                            &[],
-                            &result,
-                            now_ms,
-                            expires_at_ms,
-                        )
-                        .await?
-                    {
-                        IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
-                        IdempotencyCommitOutcome::Committed => {}
-                    }
-                    return Ok(result);
+        let envelopes = match self.plan_delivery_envelopes(&stored_msg, &stored_msg_id).await {
+            Ok(envelopes) => envelopes,
+            Err(reason) => {
+                let result = PostSendResult {
+                    ok: false,
+                    msg_id: stored_msg_id.clone(),
+                    deliveries: Vec::new(),
+                    reason: Some(reason),
+                };
+                let now_ms = Self::now_ms();
+                let expires_at_ms = Self::idempotency_expires_at(now_ms);
+                match self
+                    .msg_box_db
+                    .commit_post_send_records(
+                        IDEMPOTENCY_SCOPE_POST_SEND,
+                        &idempotency_owner_scope,
+                        idempotency_key.as_deref(),
+                        Some(retention_key.as_str()),
+                        &stored_msg_id,
+                        &stored_msg,
+                        None,
+                        &[],
+                        &result,
+                        now_ms,
+                        expires_at_ms,
+                    )
+                    .await?
+                {
+                    IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
+                    IdempotencyCommitOutcome::Committed => {}
                 }
+                return Ok(result);
             }
-        }
+        };
 
         // Phase 2: persist the message, the SENT mailbox record and one
         // delivery record per target. All ids are deterministic, so replays
         // converge onto the same rows.
-        Self::store_message(&stored_msg_id, &stored_msg_json).await?;
+        self.store_message(
+            &stored_msg_id,
+            &stored_msg_json,
+            &stored_msg,
+            crate::buckets::Arrival::Local,
+        )
+        .await?;
 
         if let Some(key) = idempotency_key.as_ref() {
             if let Some(cached) = self
@@ -1506,7 +1994,7 @@ impl MessageCenter {
             None,
             Vec::new(),
             "owner-sent",
-        );
+        )?;
 
         let now_ms = Self::now_ms();
         let mut delivery_records = Vec::with_capacity(envelopes.len());
@@ -1564,6 +2052,8 @@ impl MessageCenter {
         {
             IdempotencyCommitOutcome::Reused(cached) => return Ok(cached),
             IdempotencyCommitOutcome::Committed => {
+                self.note_records_committed(std::slice::from_ref(&sent_record))
+                    .await;
                 Self::publish_box_changed_event(&sent_record, "upsert");
                 for record in delivery_records.iter() {
                     Self::publish_delivery_changed_event(record, "enqueue");
@@ -1575,7 +2065,7 @@ impl MessageCenter {
 
     async fn get_next_internal(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         lock_on_take: Option<bool>,
@@ -1590,24 +2080,32 @@ impl MessageCenter {
         let effective_filter = state_filter.or(default_filter);
         let state_filter_ref = effective_filter.as_deref();
         let records = self
-            .load_box_records(&owner, &box_kind, state_filter_ref, false)
+            .load_box_records(&mailbox, &box_kind, state_filter_ref, false)
             .await?;
-        let mut selected = records.into_iter().next();
-        if let Some(record) = selected.as_mut() {
+        let mut selected = None;
+        for mut record in records {
             if lock_on_take.unwrap_or(true) {
                 if let Some(next_state) = Self::next_state_on_take(&box_kind, &record.state) {
+                    let before = record.clone();
                     record.state = next_state;
-                    record.updated_at_ms = Self::now_ms();
-                    self.msg_box_db.upsert_record(record).await?;
-                    Self::publish_box_changed_event(record, "take");
+                    record.updated_at_ms = Self::now_ms().max(before.updated_at_ms + 1);
+                    if !self
+                        .msg_box_db
+                        .compare_update_record(&before, &record)
+                        .await?
+                    {
+                        continue;
+                    }
+                    Self::publish_box_changed_event(&record, "take");
                 }
             }
+            selected = Some(record);
+            break;
         }
-
         let Some(record) = selected else {
             return Ok(None);
         };
-        let record = Self::build_record_view(record, with_object).await?;
+        let record = self.build_record_view(record, with_object).await?;
         Ok(Some(record))
     }
 
@@ -1644,7 +2142,7 @@ impl MessageCenter {
 
         let mut view = DeliveryRecordWithObject { record, msg: None };
         if with_object.unwrap_or(false) {
-            view.msg = Some(Self::load_message(&view.record.envelope.msg_id).await?);
+            view.msg = Some(self.load_message(&view.record.envelope.msg_id).await?);
         }
         Ok(Some(view))
     }
@@ -1667,6 +2165,9 @@ impl MessageCenter {
                 RPCErrors::ReasonError(format!("delivery record {} not found", delivery_id))
             })?;
 
+        if record.state == DeliveryState::Sent {
+            return Ok(record);
+        }
         let now_ms = Self::now_ms();
         record.attempts = record.attempts.saturating_add(1);
 
@@ -1705,21 +2206,45 @@ impl MessageCenter {
 
         record.updated_at_ms = now_ms;
         self.msg_box_db.upsert_delivery(&record).await?;
+        let record = self
+            .msg_box_db
+            .get_delivery(&delivery_id)
+            .await?
+            .unwrap_or(record);
         Self::publish_delivery_changed_event(&record, "delivery");
+        self.publish_sent_delivery_changed(&record.envelope.msg_id)
+            .await;
         Ok(record)
     }
 
-    async fn update_record_state_internal(
+    /// Delivery progress is aggregated into the sender's SENT timeline at read
+    /// time and never changes the SENT record itself, so the record is
+    /// announced as changed for the sender's own subscribers (MessageHub
+    /// refreshes its delivery state from that event).
+    pub(crate) async fn publish_sent_delivery_changed(&self, msg_id: &ObjId) {
+        match self.msg_box_db.list_message_records(msg_id).await {
+            Ok(records) => {
+                for record in records
+                    .iter()
+                    .filter(|record| record.box_kind == MailboxKind::Sent)
+                {
+                    Self::publish_box_changed_event(record, "delivery");
+                }
+            }
+            Err(error) => warn!(
+                "msg_center cannot announce delivery of {}: {:?}",
+                msg_id.to_string(),
+                error
+            ),
+        }
+    }
+
+    pub(crate) async fn update_record_state_internal(
         &self,
-        record_id: String,
+        mut record: MailboxRecord,
         new_state: RecipientState,
     ) -> std::result::Result<MailboxRecord, RPCErrors> {
-        let owner = Self::owner_from_record_id(&record_id)?;
-        let mut record = self
-            .msg_box_db
-            .get_record(&owner, &record_id)
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError(format!("record {} not found", record_id)))?;
+        let before = record.clone();
 
         if !Self::is_valid_transition(&record.box_kind, &record.state, &new_state) {
             return Err(RPCErrors::ReasonError(format!(
@@ -1729,15 +2254,26 @@ impl MessageCenter {
         }
 
         record.state = new_state;
-        record.updated_at_ms = Self::now_ms();
-        self.msg_box_db.upsert_record(&record).await?;
+        record.updated_at_ms = Self::now_ms().max(before.updated_at_ms + 1);
+        if !self
+            .msg_box_db
+            .compare_update_record(&before, &record)
+            .await?
+        {
+            return Err(RPCErrors::ReasonError(
+                "mailbox record changed; retry".into(),
+            ));
+        }
+        if record.state == RecipientState::Read {
+            self.advance_group_read_from_record(&record).await?;
+        }
         Self::publish_box_changed_event(&record, "state");
         Ok(record)
     }
 
     async fn update_record_session_internal(
         &self,
-        record_id: String,
+        mut record: MailboxRecord,
         session_id: String,
     ) -> std::result::Result<MailboxRecord, RPCErrors> {
         let session_id = session_id.trim();
@@ -1747,21 +2283,27 @@ impl MessageCenter {
             ));
         }
 
-        let owner = Self::owner_from_record_id(&record_id)?;
-        let mut record = self
-            .msg_box_db
-            .get_record(&owner, &record_id)
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError(format!("record {} not found", record_id)))?;
+        let before = record.clone();
 
         if record.session_id.as_deref() == Some(session_id) {
             return Ok(record);
         }
 
         record.session_id = Some(session_id.to_string());
-        record.updated_at_ms = Self::now_ms();
-        self.msg_box_db.upsert_record(&record).await?;
-        Self::publish_box_changed_event(&record, "session");
+        record.mailbox = MailboxAddress::new(record.owner.clone(), record.session_id.clone())
+            .map_err(RPCErrors::ParseRequestError)?;
+        record.updated_at_ms = Self::now_ms().max(before.updated_at_ms + 1);
+        if !self
+            .msg_box_db
+            .compare_update_record(&before, &record)
+            .await?
+        {
+            return Err(RPCErrors::ReasonError(
+                "mailbox record changed; retry".into(),
+            ));
+        }
+        Self::publish_box_changed_event(&before, "move_out");
+        Self::publish_box_changed_event(&record, "move_in");
         Ok(record)
     }
 
@@ -1807,7 +2349,7 @@ impl MessageCenter {
         })
     }
 
-    async fn build_session_item(
+    pub(crate) async fn build_session_item(
         &self,
         record: MailboxRecord,
         with_object: bool,
@@ -1826,8 +2368,14 @@ impl MessageCenter {
                 (None, Self::aggregate_delivery_view(&deliveries))
             }
         };
-        let msg = if with_object {
-            Some(Self::load_message(&record.msg_id).await?)
+        let msg = if with_object
+            && !self
+                .groups
+                .object(&record.msg_id)
+                .await?
+                .is_some_and(|(_, b, _)| b.is_none())
+        {
+            Some(self.load_message(&record.msg_id).await?)
         } else {
             None
         };
@@ -1845,6 +2393,7 @@ impl MessageCenter {
         })
     }
 
+    #[allow(dead_code)]
     async fn list_sessions_internal(
         &self,
         owner: DID,
@@ -1876,9 +2425,10 @@ impl MessageCenter {
                 .into_iter()
                 .next();
             let last_record = match last_record {
-                Some(record) => {
-                    Some(Self::build_record_view(record, Some(with_object.unwrap_or(false))).await?)
-                }
+                Some(record) => Some(
+                    self.build_record_view(record, Some(with_object.unwrap_or(false)))
+                        .await?,
+                ),
                 None => None,
             };
             items.push(SessionSummary {
@@ -1886,6 +2436,10 @@ impl MessageCenter {
                 last_record,
                 unread_count: entry.unread_count,
                 updated_at_ms: entry.updated_at_ms,
+                last_activity_ms: 0,
+                request_count: 0,
+                lifecycle: SessionLifecycle::Active,
+                state: None,
             });
         }
 
@@ -1905,6 +2459,7 @@ impl MessageCenter {
         })
     }
 
+    #[allow(dead_code)]
     async fn list_session_internal(
         &self,
         owner: DID,
@@ -1958,7 +2513,7 @@ impl MessageCenter {
 
     async fn peek_box_internal(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         limit: Option<usize>,
@@ -1967,7 +2522,7 @@ impl MessageCenter {
         let limit = Self::clamp_limit(limit, DEFAULT_PEEK_LIMIT, MAX_PEEK_LIMIT);
         let state_filter_ref = state_filter.as_deref();
         let records = self
-            .load_box_records(&owner, &box_kind, state_filter_ref, true)
+            .load_box_records(&mailbox, &box_kind, state_filter_ref, true)
             .await?
             .into_iter()
             .take(limit)
@@ -1975,14 +2530,14 @@ impl MessageCenter {
 
         let mut result = Vec::with_capacity(records.len());
         for record in records {
-            result.push(Self::build_record_view(record, with_object).await?);
+            result.push(self.build_record_view(record, with_object).await?);
         }
         Ok(result)
     }
 
     async fn list_box_by_time_internal(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         limit: Option<usize>,
@@ -1995,7 +2550,7 @@ impl MessageCenter {
         let limit = Self::clamp_limit(limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
         let state_filter_ref = state_filter.as_deref();
         let records = self
-            .load_box_records(&owner, &box_kind, state_filter_ref, descending)
+            .load_box_records(&mailbox, &box_kind, state_filter_ref, descending)
             .await?;
         let records = Self::filter_after_cursor(
             records,
@@ -2008,7 +2563,7 @@ impl MessageCenter {
 
         let mut items = Vec::with_capacity(page_records.len());
         for record in page_records {
-            items.push(Self::build_record_view(record, with_object).await?);
+            items.push(self.build_record_view(record, with_object).await?);
         }
 
         let (next_cursor_sort_key, next_cursor_record_id) = if has_more {
@@ -2108,24 +2663,17 @@ impl MessageCenter {
         })
     }
 
-    async fn get_record_internal(
-        &self,
-        record_id: String,
-        with_object: Option<bool>,
-    ) -> std::result::Result<Option<MailboxRecordWithObject>, RPCErrors> {
-        let owner = Self::owner_from_record_id(&record_id)?;
-        let record = self.msg_box_db.get_record(&owner, &record_id).await?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-        let with_object_record = Self::build_record_view(record, with_object).await?;
-        Ok(Some(with_object_record))
-    }
-
-    async fn get_message_internal(
+    pub(crate) async fn get_message_internal(
         &self,
         msg_id: ObjId,
     ) -> std::result::Result<Option<MsgObject>, RPCErrors> {
+        if let Some((_, body, _)) = self.groups.object(&msg_id).await? {
+            return body
+                .map(|body| {
+                    serde_json::from_str(&body).map_err(|e| RPCErrors::ReasonError(e.to_string()))
+                })
+                .transpose();
+        }
         if let Some(msg) =
             self.with_state_read(|state| Ok(state.messages.get(&msg_id.to_string()).cloned()))?
         {
@@ -2133,7 +2681,7 @@ impl MessageCenter {
         }
 
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await?;
+        let named_store = runtime.get_local_named_store().await?;
         match named_store.get_object(&msg_id).await {
             Ok(msg_json) => {
                 let msg = serde_json::from_str::<MsgObject>(&msg_json).map_err(|error| {
@@ -2220,15 +2768,64 @@ impl MessageCenter {
 }
 
 #[async_trait]
+impl TunnelIngressHandler for MessageCenter {
+    async fn resolve_owner_principal(
+        &self,
+        agent: &DID,
+        platform: &str,
+        account_id: &str,
+    ) -> std::result::Result<Option<DID>, RPCErrors> {
+        let Some(owner) = self.token_verifier.get().agent_owner(agent).await? else {
+            return Ok(None);
+        };
+        let contact = self
+            .contact_mgr
+            .find_binding_contact(platform, account_id, Some(agent))
+            .await?;
+        Ok((contact.as_ref() == Some(&owner)).then_some(owner))
+    }
+}
+
+#[async_trait]
 impl MsgCenterHandler for MessageCenter {
     async fn handle_dispatch(
         &self,
         msg: MsgObject,
         ingress_ctx: Option<IngressContext>,
         idempotency_key: Option<String>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DispatchResult, RPCErrors> {
-        self.dispatch_internal(msg, ingress_ctx, idempotency_key)
+        self.authorize_resource(&ctx, "obj://msg-center/dispatch", "write")
+            .await?;
+        let mut ingress_ctx = ingress_ctx;
+        if !crate::owner_session::is_in_process_call(&ctx) {
+            if let Some(extra) = ingress_ctx
+                .as_mut()
+                .and_then(|ingress| ingress.extra.as_mut())
+                .and_then(Value::as_object_mut)
+            {
+                extra.remove(INGRESS_PRINCIPAL_KEY);
+            }
+        }
+        if Self::is_group_message(&msg) {
+            Self::validate_ingress_message(&msg)?;
+            return self
+                .accept_group_message(&self.group_message_actor(&ctx, &msg).await?, msg, None)
+                .await;
+        }
+        if !Self::is_group_message(&msg) {
+            self.authorize_owner_write(&ctx, &msg.from).await?;
+        }
+        if !Self::is_group_message(&msg) {
+            for did in &msg.to {
+                if self.groups.load(did).await?.is_some() {
+                    return Err(RPCErrors::ParseRequestError(
+                        "hosted-group-requires-group-msg".into(),
+                    ));
+                }
+            }
+        }
+        self.dispatch_internal(msg, ingress_ctx, idempotency_key, None)
             .await
     }
 
@@ -2236,21 +2833,114 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         msg: MsgObject,
         idempotency_key: Option<String>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<PostSendResult, RPCErrors> {
+        let mailbox = MailboxAddress::new(
+            msg.from.clone(),
+            Self::derive_session_id(&MailboxKind::Sent, &msg),
+        )
+        .map_err(RPCErrors::ParseRequestError)?;
+        // An External user or a restricted session (Session Only guest) has
+        // no mailbox here: it may only post into a group hosted by this Zone,
+        // as a participant of it; no SENT record or mailbox is created.
+        let caller = self.caller_identity(&ctx).await?;
+        let guest = caller
+            .as_ref()
+            .is_some_and(|caller| caller.external || caller.restricted());
+        if !(guest && Self::is_group_message(&msg)) {
+            self.authorize_mailbox(&ctx, &mailbox, MailboxKind::Sent, "write")
+                .await?;
+        }
+        self.authorize_outgoing_attachments(&ctx, &msg).await?;
+        // Friend messages carry state msg-center keeps for the owner; only
+        // the `contact.*` friend RPCs build them.
+        if crate::friend_service::is_friend_message(&msg) {
+            return Err(RPCErrors::ParseRequestError(
+                "friend-messages-use-contact-rpc".into(),
+            ));
+        }
+        if Self::is_group_message(&msg) {
+            Self::validate_ingress_message(&msg)?;
+            let actor = self.group_message_actor(&ctx, &msg).await?;
+            if actor.did != msg.from {
+                return Err(crate::group_types::denied("sender-mismatch"));
+            }
+            if msg.to.len() == 1 && self.groups.load(&msg.to[0]).await?.is_some() {
+                if let Some(caller) = caller.as_ref().filter(|caller| caller.restricted()) {
+                    Self::refuse_guest_attachments(Some(caller), &msg)?;
+                    self.require_guest_session(caller, &actor, &msg).await?;
+                }
+                return self.post_hosted_group(&actor, msg).await;
+            }
+            if let Some(caller) = caller.as_ref().filter(|caller| caller.restricted()) {
+                return Err(crate::owner_session::gate_denial(
+                    buckyos_api::DenyReason::SessionKindNotAllowed,
+                    &caller.user_id,
+                ));
+            }
+            if guest {
+                return Err(crate::group_types::denied(
+                    "external-users-post-to-hosted-groups-only",
+                ));
+            }
+        }
         self.post_send_internal(msg, idempotency_key).await
+    }
+
+    async fn handle_get_edit_capability(
+        &self,
+        msg: MsgObject,
+        ctx: RPCContext,
+    ) -> std::result::Result<MsgEditCapability, RPCErrors> {
+        let mailbox = MailboxAddress::new(
+            msg.from.clone(),
+            Self::derive_session_id(&MailboxKind::Sent, &msg),
+        )
+        .map_err(RPCErrors::ParseRequestError)?;
+        self.authorize_mailbox(&ctx, &mailbox, MailboxKind::Sent, "write")
+            .await?;
+        self.get_edit_capability_internal(msg).await
     }
 
     async fn handle_get_next(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         lock_on_take: Option<bool>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<MailboxRecordWithObject>, RPCErrors> {
-        self.get_next_internal(owner, box_kind, state_filter, lock_on_take, with_object)
+        // Taking a record mutates its state: treat as a write of the mailbox.
+        self.authorize_mailbox(
+            &ctx,
+            &mailbox,
+            box_kind,
+            if lock_on_take.unwrap_or(true) {
+                "write"
+            } else {
+                "read"
+            },
+        )
+        .await?;
+        if box_kind == MailboxKind::GroupInbox {
+            return Ok(self
+                .list_group_mailbox(
+                    &self.group_actor(&ctx).await?,
+                    mailbox,
+                    state_filter,
+                    Some(1),
+                    None,
+                    None,
+                    false,
+                    with_object,
+                )
+                .await?
+                .items
+                .into_iter()
+                .next());
+        }
+        self.get_next_internal(mailbox, box_kind, state_filter, lock_on_take, with_object)
             .await
     }
 
@@ -2259,28 +2949,51 @@ impl MsgCenterHandler for MessageCenter {
         transport_did: DID,
         lock_on_take: Option<bool>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<DeliveryRecordWithObject>, RPCErrors> {
+        self.authorize_resource(
+            &ctx,
+            &format!("obj://msg-center/delivery/{}", transport_did.to_string()),
+            "write",
+        )
+        .await?;
         self.get_next_delivery_internal(transport_did, lock_on_take, with_object)
             .await
     }
 
     async fn handle_peek_box(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         limit: Option<usize>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<MailboxRecordWithObject>, RPCErrors> {
-        self.peek_box_internal(owner, box_kind, state_filter, limit, with_object)
+        self.authorize_mailbox(&ctx, &mailbox, box_kind, "read")
+            .await?;
+        if box_kind == MailboxKind::GroupInbox {
+            return Ok(self
+                .list_group_mailbox(
+                    &self.group_actor(&ctx).await?,
+                    mailbox,
+                    state_filter,
+                    limit,
+                    None,
+                    None,
+                    true,
+                    with_object,
+                )
+                .await?
+                .items);
+        }
+        self.peek_box_internal(mailbox, box_kind, state_filter, limit, with_object)
             .await
     }
 
     async fn handle_list_box_by_time(
         &self,
-        owner: DID,
+        mailbox: MailboxAddress,
         box_kind: MailboxKind,
         state_filter: Option<Vec<RecipientState>>,
         limit: Option<usize>,
@@ -2288,10 +3001,26 @@ impl MsgCenterHandler for MessageCenter {
         cursor_record_id: Option<String>,
         descending: Option<bool>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<MailboxRecordPage, RPCErrors> {
+        self.authorize_mailbox(&ctx, &mailbox, box_kind, "read")
+            .await?;
+        if box_kind == MailboxKind::GroupInbox {
+            return self
+                .list_group_mailbox(
+                    &self.group_actor(&ctx).await?,
+                    mailbox,
+                    state_filter,
+                    limit,
+                    cursor_sort_key,
+                    cursor_record_id,
+                    descending.unwrap_or(true),
+                    with_object,
+                )
+                .await;
+        }
         self.list_box_by_time_internal(
-            owner,
+            mailbox,
             box_kind,
             state_filter,
             limit,
@@ -2310,14 +3039,19 @@ impl MsgCenterHandler for MessageCenter {
         cursor_updated_at_ms: Option<u64>,
         cursor_session_id: Option<String>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        lifecycle: Option<SessionListLifecycleFilter>,
+        order_by: Option<SessionListOrder>,
+        ctx: RPCContext,
     ) -> std::result::Result<SessionSummaryPage, RPCErrors> {
-        self.list_sessions_internal(
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.list_sessions_scoped(
             owner,
             limit,
             cursor_updated_at_ms,
             cursor_session_id,
             with_object,
+            lifecycle,
+            order_by,
         )
         .await
     }
@@ -2331,9 +3065,10 @@ impl MsgCenterHandler for MessageCenter {
         cursor_record_id: Option<String>,
         descending: Option<bool>,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<SessionMessagePage, RPCErrors> {
-        self.list_session_internal(
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.list_session_scoped(
             owner,
             session_id,
             limit,
@@ -2345,13 +3080,100 @@ impl MsgCenterHandler for MessageCenter {
         .await
     }
 
+    async fn handle_create_session(
+        &self,
+        req: MsgCenterCreateSessionReq,
+        ctx: RPCContext,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        self.authorize_owner_write(&ctx, &req.owner).await?;
+        self.create_session_internal(req).await
+    }
+
+    async fn handle_archive_session(
+        &self,
+        owner: DID,
+        session_id: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        self.authorize_owner_write(&ctx, &owner).await?;
+        self.set_session_lifecycle_internal(owner, session_id, SessionLifecycle::Archived)
+            .await
+    }
+
+    async fn handle_restore_session(
+        &self,
+        owner: DID,
+        session_id: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        self.authorize_owner_write(&ctx, &owner).await?;
+        self.set_session_lifecycle_internal(owner, session_id, SessionLifecycle::Active)
+            .await
+    }
+
+    async fn handle_delete_session(
+        &self,
+        owner: DID,
+        session_id: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<OwnerSessionState, RPCErrors> {
+        self.authorize_owner_write(&ctx, &owner).await?;
+        self.delete_session_internal(owner, session_id).await
+    }
+
+    async fn handle_get_session_state(
+        &self,
+        owner: DID,
+        session_id: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<Option<OwnerSessionState>, RPCErrors> {
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.get_session_state_internal(owner, session_id).await
+    }
+
     async fn handle_update_record_state(
         &self,
         record_id: String,
         new_state: RecipientState,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<MailboxRecord, RPCErrors> {
-        self.update_record_state_internal(record_id, new_state)
+        let record = self.authorize_record(&ctx, &record_id, "write").await?;
+        self.update_record_state_internal(record, new_state).await
+    }
+
+    async fn handle_update_owner_ui_session_state(
+        &self,
+        owner: DID,
+        session_id: String,
+        key: String,
+        value: Value,
+        ctx: RPCContext,
+    ) -> std::result::Result<UiSessionStateEntry, RPCErrors> {
+        self.authorize_owner_write(&ctx, &owner).await?;
+        self.update_owner_ui_session_state_internal(owner, session_id, key, value)
+            .await
+    }
+
+    async fn handle_get_owner_ui_session_state(
+        &self,
+        owner: DID,
+        session_id: String,
+        key: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<Option<UiSessionStateEntry>, RPCErrors> {
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.get_owner_ui_session_state_internal(owner, session_id, key)
+            .await
+    }
+
+    async fn handle_list_owner_ui_session_state(
+        &self,
+        owner: DID,
+        session_id: String,
+        ctx: RPCContext,
+    ) -> std::result::Result<Vec<UiSessionStateEntry>, RPCErrors> {
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.list_owner_ui_session_state_internal(owner, session_id)
             .await
     }
 
@@ -2359,18 +3181,90 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         record_id: String,
         session_id: String,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<MailboxRecord, RPCErrors> {
-        self.update_record_session_internal(record_id, session_id)
+        let record = self.authorize_record(&ctx, &record_id, "write").await?;
+        if record.msg_kind == MsgObjKind::GroupMsg
+            || record.tags.iter().any(|t| t.starts_with("group:"))
+        {
+            return Err(RPCErrors::NoPermission("group-message-cannot-move".into()));
+        }
+        let mailbox = MailboxAddress::new(record.owner.clone(), Some(session_id.clone()))
+            .map_err(RPCErrors::ParseRequestError)?;
+        self.authorize_mailbox(&ctx, &mailbox, record.box_kind, "write")
+            .await?;
+        self.update_record_session_internal(record, session_id)
             .await
+    }
+
+    async fn handle_list_mailboxes(
+        &self,
+        owner: DID,
+        box_kind: MailboxKind,
+        ctx: RPCContext,
+    ) -> std::result::Result<Vec<MailboxAddress>, RPCErrors> {
+        if box_kind == MailboxKind::GroupInbox {
+            let actor = self.group_actor(&ctx).await?;
+            let sessions = self.group_sessions(&actor, &owner).await?;
+            return sessions["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| {
+                    MailboxAddress::try_from(i["session"].as_str().unwrap().to_string())
+                        .map_err(RPCErrors::ParseRequestError)
+                })
+                .collect();
+        }
+        self.authorize_owner_read(&ctx, &owner).await?;
+        self.msg_box_db.list_mailboxes(&owner, &box_kind).await
+    }
+
+    async fn handle_move_record(
+        &self,
+        record_id: String,
+        mailbox: MailboxAddress,
+        ctx: RPCContext,
+    ) -> std::result::Result<MailboxRecord, RPCErrors> {
+        let before = self.authorize_record(&ctx, &record_id, "write").await?;
+        if before.msg_kind == MsgObjKind::GroupMsg
+            || before.tags.iter().any(|t| t.starts_with("group:"))
+        {
+            return Err(RPCErrors::NoPermission("group-message-cannot-move".into()));
+        }
+        if mailbox.owner() != &before.owner {
+            return Err(RPCErrors::ParseRequestError(
+                "cannot move a record to another owner".into(),
+            ));
+        }
+        self.authorize_mailbox(&ctx, &mailbox, before.box_kind, "write")
+            .await?;
+        let mut record = before.clone();
+        record.mailbox = mailbox;
+        record.session_id = record.mailbox.session_id().map(str::to_string);
+        record.updated_at_ms = Self::now_ms().max(before.updated_at_ms + 1);
+        if !self
+            .msg_box_db
+            .compare_update_record(&before, &record)
+            .await?
+        {
+            return Err(RPCErrors::ReasonError(
+                "mailbox record changed; retry".into(),
+            ));
+        }
+        Self::publish_box_changed_event(&before, "move_out");
+        Self::publish_box_changed_event(&record, "move_in");
+        Ok(record)
     }
 
     async fn handle_report_delivery(
         &self,
         delivery_id: String,
         result_payload: DeliveryReportResult,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DeliveryRecord, RPCErrors> {
+        self.authorize_resource(&ctx, "obj://msg-center/delivery", "write")
+            .await?;
         self.report_delivery_internal(delivery_id, result_payload)
             .await
     }
@@ -2383,8 +3277,41 @@ impl MsgCenterHandler for MessageCenter {
         status: ReadReceiptState,
         reason: Option<String>,
         at_ms: Option<u64>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<MsgReceiptObj, RPCErrors> {
+        self.authorize_owner_write(&ctx, &reader_did).await?;
+        if let Some(g) = self.groups.load(&group_id).await? {
+            let actor = self.group_actor(&ctx).await?;
+            if actor.did != reader_did {
+                return Err(RPCErrors::NoPermission("reader-mismatch".into()));
+            }
+            self.authorize_group_message(&actor, &msg_id).await?;
+            let meta = g
+                .messages
+                .get(&msg_id.to_string())
+                .ok_or_else(crate::group_types::missing)?;
+            if status == ReadReceiptState::Readed {
+                let mut tx = self.groups.begin(&group_id).await?;
+                let marker = tx
+                    .state
+                    .read_markers
+                    .entry(meta.session_id.clone().unwrap_or_default())
+                    .or_default()
+                    .entry(reader_did.to_string())
+                    .or_default();
+                *marker = (*marker).max(meta.session_seq);
+                tx.commit().await?;
+            }
+            return Ok(MsgReceiptObj {
+                msg_id,
+                iss: reader_did.clone(),
+                reader: reader_did,
+                group_id: Some(group_id),
+                at_ms: Self::now_ms(),
+                status,
+                reason,
+            });
+        }
         self.set_read_state_internal(group_id, msg_id, reader_did, status, reason, at_ms)
             .await
     }
@@ -2396,8 +3323,57 @@ impl MsgCenterHandler for MessageCenter {
         reader: Option<DID>,
         limit: Option<usize>,
         offset: Option<u64>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<MsgReceiptObj>, RPCErrors> {
+        self.authorize_message(&ctx, &msg_id).await?;
+        if let Some((group, _, _)) = self.groups.object(&msg_id).await? {
+            if let Some(g) = self.groups.load(&group).await? {
+                let actor = self.group_actor(&ctx).await?;
+                let meta = g
+                    .messages
+                    .get(&msg_id.to_string())
+                    .ok_or_else(crate::group_types::missing)?;
+                let rules = g.rules(meta.session_id.as_deref())?;
+                let audience = g.audience(meta.session_id.as_deref());
+                let hidden = rules.receipts == "hidden"
+                    || audience.len() > g.config()?.limits.receipts_max_members;
+                if rules.receipts == "count" && reader.as_ref() != Some(&actor.did) {
+                    return Ok(vec![]);
+                }
+                let mut receipts = vec![];
+                for d in audience {
+                    let d = DID::from_str(&d).map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+                    if (hidden && d != actor.did)
+                        || reader.as_ref().is_some_and(|r| r != &d)
+                        || !g.visible_at(&d, meta)
+                    {
+                        continue;
+                    }
+                    let seq = g
+                        .read_markers
+                        .get(meta.session_id.as_deref().unwrap_or(""))
+                        .and_then(|markers| markers.get(&d.to_string()))
+                        .copied()
+                        .unwrap_or(0);
+                    if seq >= meta.session_seq {
+                        receipts.push(MsgReceiptObj {
+                            msg_id: msg_id.clone(),
+                            iss: d.clone(),
+                            reader: d,
+                            group_id: Some(group.clone()),
+                            at_ms: Self::now_ms(),
+                            status: ReadReceiptState::Readed,
+                            reason: None,
+                        });
+                    }
+                }
+                return Ok(receipts
+                    .into_iter()
+                    .skip(offset.unwrap_or(0) as usize)
+                    .take(limit.unwrap_or(100).min(4096))
+                    .collect());
+            }
+        }
         self.list_read_receipts_internal(msg_id, group_id, reader, limit, offset)
     }
 
@@ -2405,16 +3381,18 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         record_id: String,
         with_object: Option<bool>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<MailboxRecordWithObject>, RPCErrors> {
-        self.get_record_internal(record_id, with_object).await
+        let record = self.authorize_record(&ctx, &record_id, "read").await?;
+        Ok(Some(self.build_record_view(record, with_object).await?))
     }
 
     async fn handle_get_message(
         &self,
         msg_id: ObjId,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<MsgObject>, RPCErrors> {
+        self.authorize_message(&ctx, &msg_id).await?;
         self.get_message_internal(msg_id).await
     }
 
@@ -2423,8 +3401,15 @@ impl MsgCenterHandler for MessageCenter {
         session_id: String,
         key: String,
         value: Value,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<UiSessionStateEntry, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_update_owner_ui_session_state(owner, session_id, key, value, ctx)
+                .await;
+        }
+        self.authorize_resource(&ctx, "obj://msg-center/ui-state", "write")
+            .await?;
         self.update_ui_session_state_internal(session_id, key, value)
             .await
     }
@@ -2433,17 +3418,39 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         session_id: String,
         key: String,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<UiSessionStateEntry>, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_get_owner_ui_session_state(owner, session_id, key, ctx)
+                .await;
+        }
+        self.authorize_resource(&ctx, "obj://msg-center/ui-state", "read")
+            .await?;
         self.get_ui_session_state_internal(session_id, key).await
     }
 
     async fn handle_list_ui_session_state(
         &self,
         session_id: String,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<UiSessionStateEntry>, RPCErrors> {
+        if let Some(owner) = self.caller_ui_state_owner(&ctx).await? {
+            return self
+                .handle_list_owner_ui_session_state(owner, session_id, ctx)
+                .await;
+        }
+        self.authorize_resource(&ctx, "obj://msg-center/ui-state", "read")
+            .await?;
         self.list_ui_session_state_internal(session_id).await
+    }
+
+    async fn handle_get_delivery(
+        &self,
+        delivery_id: String,
+        _ctx: RPCContext,
+    ) -> std::result::Result<Option<DeliveryRecord>, RPCErrors> {
+        self.msg_box_db.get_delivery(&delivery_id).await
     }
 
     async fn handle_get_tunnel_cursor(
@@ -2473,8 +3480,10 @@ impl MsgCenterHandler for MessageCenter {
         account_id: String,
         profile_hint: Option<Value>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        // Routing helpers: any verified caller, no restricted session.
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_did(platform, account_id, profile_hint, contact_mgr_owner)
             .await
@@ -2487,8 +3496,9 @@ impl MsgCenterHandler for MessageCenter {
         account_type: String,
         tunnel_instance_id: String,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_endpoint_did(
                 platform,
@@ -2505,8 +3515,9 @@ impl MsgCenterHandler for MessageCenter {
         contact_did: DID,
         selector: String,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_target(contact_did, selector, contact_mgr_owner)
             .await
@@ -2516,8 +3527,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         endpoint_did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<DID>, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_contact_for_endpoint(endpoint_did, contact_mgr_owner)
             .await
@@ -2527,8 +3539,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<DID, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .resolve_canonical_did(did, contact_mgr_owner)
             .await
@@ -2538,8 +3551,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         canonical_did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .list_alias_dids(canonical_did, contact_mgr_owner)
             .await
@@ -2549,8 +3563,9 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<AccountBinding, RPCErrors> {
+        self.caller_identity(&ctx).await?;
         self.contact_mgr
             .get_preferred_binding(did, contact_mgr_owner)
             .await
@@ -2561,8 +3576,10 @@ impl MsgCenterHandler for MessageCenter {
         did: DID,
         context_id: Option<String>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<AccessDecision, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
+            .await?;
         self.contact_mgr
             .check_access_permission(did, context_id, contact_mgr_owner)
             .await
@@ -2574,8 +3591,10 @@ impl MsgCenterHandler for MessageCenter {
         context_id: String,
         duration_secs: u64,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<GrantTemporaryAccessResult, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
         self.contact_mgr
             .grant_temporary_access(dids, context_id, duration_secs, contact_mgr_owner)
             .await
@@ -2586,8 +3605,13 @@ impl MsgCenterHandler for MessageCenter {
         did: DID,
         reason: Option<String>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<(), RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
+        if let Some(owner) = contact_mgr_owner.as_ref().filter(|o| self.is_local_recipient(o)) {
+            self.settle_friendship(owner, &did, false).await?;
+        }
         self.contact_mgr
             .block_contact(did, reason, contact_mgr_owner)
             .await
@@ -2595,11 +3619,19 @@ impl MsgCenterHandler for MessageCenter {
 
     async fn handle_import_contacts(
         &self,
-        contacts: Vec<ImportContactEntry>,
+        mut contacts: Vec<ImportContactEntry>,
         upgrade_to_friend: Option<bool>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<ImportReport, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
+        // Imported groupings are user tags; system and app tags have owners.
+        for entry in contacts.iter_mut() {
+            entry.tags.retain(|tag| {
+                buckyos_api::contact_tag_kind(tag) == buckyos_api::ContactTagKind::User
+            });
+        }
         self.contact_mgr
             .import_contacts(contacts, upgrade_to_friend, contact_mgr_owner)
             .await
@@ -2610,8 +3642,10 @@ impl MsgCenterHandler for MessageCenter {
         target_did: DID,
         source_did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Contact, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
         self.contact_mgr
             .merge_contacts(target_did, source_did, contact_mgr_owner)
             .await
@@ -2622,8 +3656,15 @@ impl MsgCenterHandler for MessageCenter {
         did: DID,
         patch: ContactPatch,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Contact, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
+        if patch.access_level == Some(AccessGroupLevel::Block) {
+            if let Some(owner) = contact_mgr_owner.as_ref().filter(|o| self.is_local_recipient(o)) {
+                self.settle_friendship(owner, &did, false).await?;
+            }
+        }
         self.contact_mgr
             .update_contact(did, patch, contact_mgr_owner)
             .await
@@ -2633,20 +3674,60 @@ impl MsgCenterHandler for MessageCenter {
         &self,
         did: DID,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Option<Contact>, RPCErrors> {
-        self.contact_mgr.get_contact(did, contact_mgr_owner).await
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
+            .await?;
+        let user_reads_system = self.user_reads_system_scope(&ctx, contact_mgr_owner.as_ref()).await?;
+        let contact = self
+            .contact_mgr
+            .get_contact(did, contact_mgr_owner.clone())
+            .await?
+            .filter(|contact| {
+                self.contact_visible(contact_mgr_owner.as_ref(), contact)
+                    && !(user_reads_system && Self::is_zone_user_contact(contact))
+            });
+        Ok(match (contact, contact_mgr_owner.as_ref()) {
+            (Some(contact), Some(owner)) => Some(self.with_current_projection(owner, contact).await),
+            (contact, _) => contact,
+        })
     }
 
     async fn handle_list_contacts(
         &self,
         query: ContactQuery,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<Contact>, RPCErrors> {
-        self.contact_mgr
-            .list_contacts(query, contact_mgr_owner)
-            .await
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
+            .await?;
+        if !self.user_reads_system_scope(&ctx, contact_mgr_owner.as_ref()).await? {
+            return self
+                .contact_mgr
+                .list_contacts(query, contact_mgr_owner)
+                .await;
+        }
+        // The system scope holds every Zone account for routing; a user sees
+        // the Zone's users through its own projected address book only.
+        let offset = query.offset.unwrap_or(0) as usize;
+        let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+        let all = self
+            .contact_mgr
+            .list_contacts(
+                ContactQuery {
+                    offset: None,
+                    limit: Some(usize::MAX),
+                    ..query
+                },
+                None,
+            )
+            .await?;
+        Ok(all
+            .into_iter()
+            .filter(|contact| !Self::is_zone_user_contact(contact))
+            .skip(offset)
+            .take(limit)
+            .collect())
     }
 
     async fn handle_get_group_subscribers(
@@ -2655,8 +3736,10 @@ impl MsgCenterHandler for MessageCenter {
         limit: Option<usize>,
         offset: Option<u64>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<Vec<DID>, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), false)
+            .await?;
         self.contact_mgr
             .get_group_subscribers(group_id, limit, offset, contact_mgr_owner)
             .await
@@ -2667,174 +3750,30 @@ impl MsgCenterHandler for MessageCenter {
         group_id: DID,
         subscribers: Vec<DID>,
         contact_mgr_owner: Option<DID>,
-        _ctx: RPCContext,
+        ctx: RPCContext,
     ) -> std::result::Result<SetGroupSubscribersResult, RPCErrors> {
+        self.authorize_contact_scope(&ctx, contact_mgr_owner.as_ref(), true)
+            .await?;
         self.contact_mgr
             .set_group_subscribers(group_id, subscribers, contact_mgr_owner)
             .await
     }
 
-    // -------------------------------------------------------------------
-    // Self-host group RPC bridge — see `GroupMgr` for behaviour notes.
-    // -------------------------------------------------------------------
-
-    async fn handle_group_create(
+    async fn handle_contact_ext(
         &self,
-        req: GroupCreateReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupDoc, RPCErrors> {
-        self.group_mgr.create_group(req).await
+        method: &str,
+        params: Value,
+        ctx: RPCContext,
+    ) -> std::result::Result<Value, RPCErrors> {
+        self.contact_ext_rpc(method, params, ctx).await
     }
 
-    async fn handle_group_get_doc(
+    async fn handle_notify(
         &self,
-        req: GroupGetDocReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<Option<GroupDoc>, RPCErrors> {
-        self.group_mgr.get_group_doc(req).await
-    }
-
-    async fn handle_group_update_profile(
-        &self,
-        req: GroupUpdateProfileReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupDoc, RPCErrors> {
-        self.group_mgr.update_group_profile(req).await
-    }
-
-    async fn handle_group_invite_member(
-        &self,
-        req: GroupInviteMemberReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.invite_member(req).await
-    }
-
-    async fn handle_group_submit_member_proof(
-        &self,
-        req: GroupSubmitMemberProofReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.submit_member_proof(req).await
-    }
-
-    async fn handle_group_request_join(
-        &self,
-        req: GroupRequestJoinReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.request_join(req).await
-    }
-
-    async fn handle_group_approve_member(
-        &self,
-        req: GroupApproveMemberReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.approve_member(req).await
-    }
-
-    async fn handle_group_reject_member(
-        &self,
-        req: GroupRejectMemberReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.reject_member(req).await
-    }
-
-    async fn handle_group_remove_member(
-        &self,
-        req: GroupRemoveMemberReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.remove_member(req).await
-    }
-
-    async fn handle_group_update_member_role(
-        &self,
-        req: GroupUpdateMemberRoleReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupMemberRecord, RPCErrors> {
-        self.group_mgr.update_member_role(req).await
-    }
-
-    async fn handle_group_list_members(
-        &self,
-        req: GroupListMembersReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<Vec<GroupMemberRecord>, RPCErrors> {
-        self.group_mgr.list_members(req).await
-    }
-
-    async fn handle_group_create_subgroup(
-        &self,
-        req: GroupCreateSubgroupReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupSubgroup, RPCErrors> {
-        self.group_mgr.create_subgroup(req).await
-    }
-
-    async fn handle_group_update_subgroup(
-        &self,
-        req: GroupUpdateSubgroupReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupSubgroup, RPCErrors> {
-        self.group_mgr.update_subgroup(req).await
-    }
-
-    async fn handle_group_list_subgroups(
-        &self,
-        req: GroupListSubgroupsReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<Vec<GroupSubgroup>, RPCErrors> {
-        self.group_mgr.list_subgroups(req).await
-    }
-
-    async fn handle_group_update_collection_policy(
-        &self,
-        req: GroupUpdateCollectionPolicyReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupDoc, RPCErrors> {
-        self.group_mgr.update_collection_policy(req).await
-    }
-
-    async fn handle_group_update_attribution_policy(
-        &self,
-        req: GroupUpdateAttributionPolicyReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupDoc, RPCErrors> {
-        self.group_mgr.update_attribution_policy(req).await
-    }
-
-    async fn handle_group_expand_members(
-        &self,
-        req: GroupExpandMembersReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupExpansionSnapshot, RPCErrors> {
-        self.group_mgr.expand_group_members(req).await
-    }
-
-    async fn handle_group_list_by_member(
-        &self,
-        req: GroupListByMemberReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<Vec<GroupSummary>, RPCErrors> {
-        self.group_mgr.list_groups_by_member(req).await
-    }
-
-    async fn handle_group_list_parents(
-        &self,
-        req: GroupListParentsReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<Vec<GroupSummary>, RPCErrors> {
-        self.group_mgr.list_parent_groups(req).await
-    }
-
-    async fn handle_group_check_access(
-        &self,
-        req: GroupCheckAccessReq,
-        _ctx: RPCContext,
-    ) -> std::result::Result<GroupAccessDecision, RPCErrors> {
-        self.group_mgr.check_group_access(req).await
+        method: &str,
+        params: Value,
+        ctx: RPCContext,
+    ) -> std::result::Result<Value, RPCErrors> {
+        self.notify_rpc(method, params, ctx).await
     }
 }

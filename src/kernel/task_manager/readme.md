@@ -10,7 +10,7 @@ TaskMgr 2.0 子系统：为整个 BuckyOS 提供统一、稳定、可寻址的 `
 
 ```text
 TaskMgr 2.0 subsystem
-├── Task Core（/kapi/task-manager, RDB: task-mgr-main, schema v7）
+├── Task Core（/kapi/task-manager, RDB: task-mgr-main, schema v8）
 │   ├── server.rs      命令式状态写入、控制请求、权限计算、KEvent 发布
 │   ├── task_store.rs  CAS 事务命令层：一次性 Result、Terminal 吸收态、
 │   │                  runner epoch fencing、每次变更一条 task_event
@@ -27,11 +27,12 @@ TaskMgr 2.0 subsystem
 
 - 共享类型与客户端在 `buckyos-api`（`task_mgr.rs` / `task_dispatcher.rs`）。
 - Task ID 是 URL-safe opaque string；调用方不得解析。
+- Task 按不可变 `storage_domain` 路由到 User（`data/`）或 System（`local/`）分区；一棵树只在一个分区。
 - Input 创建后不可变；Result 一次性提交；重新执行 = 新 idempotency key 新 Task。
 - App Runner 写操作携带 `(app_instance_id, runner_epoch, expected_revision)` 双重 fencing。
 - Runner 不轮询、不 claim：Dispatcher 按注册的 RunnerFunction 主动
   `offer_task`/`activate_task`（幂等，activate 前禁止业务副作用）。
-- KEvent（`/task_mgr/{task_id}`、`/task_mgr/tree/{root_id}`）只是加速；
+- KEvent（`/obj/taskmgr/{task_id}/changed`、`/obj/taskmgr/{root_id}/tree`）只是加速；
   真相源是 RDB snapshot + `task_event`。
 
 ## 测试

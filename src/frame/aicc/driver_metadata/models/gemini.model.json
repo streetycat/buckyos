@@ -1,0 +1,618 @@
+{
+  "format": "buckyos.aicc.model-driver-catalog",
+  "schema_version": 2,
+  "schema_revision": 0,
+  "model_driver_id": "gemini",
+  "revision_seq": 6,
+  "required_features": [],
+  "models": [
+    {
+      "id": "gemini-4-argon",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-pro",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "stable",
+        "weight": 40
+      }
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "stable",
+        "weight": 38
+      }
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "stable",
+        "weight": 37
+      }
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "stable",
+        "weight": 36
+      }
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "medium",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "stable",
+        "weight": 35
+      }
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536
+      },
+      "llm": {
+        "spec": "gemini-flash-lite",
+        "effort": "high",
+        "default_effort": "minimal",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "stable",
+        "weight": 35
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash-lite",
+        "effort": "high",
+        "default_effort": "minimal",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "stable",
+        "weight": 31
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-pro",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "experimental",
+        "weight": 31
+      }
+    },
+    {
+      "id": "gemini-3-pro-preview",
+      "exclude": true,
+      "api_types": [],
+      "logical_mounts": [],
+      "capabilities": {}
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "experimental",
+        "weight": 30
+      }
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "stable",
+        "weight": 25
+      }
+    },
+    {
+      "id": "gemini-2.5-flash-lite",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-flash-lite",
+        "effort": "high",
+        "default_effort": "none",
+        "supported_efforts": ["none", "low", "medium", "high"],
+        "stability": "stable",
+        "weight": 25
+      }
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-pro",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "stable",
+        "weight": 25
+      }
+    },
+    {
+      "id": "gemini-3.1-pro-preview-customtools",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment", "audio.asr"],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "max_output_tokens": 65536,
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true
+      },
+      "llm": {
+        "spec": "gemini-pro",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["low", "medium", "high"],
+        "stability": "experimental",
+        "weight": 31
+      }
+    },
+    {
+      "id": "gemini-robotics-er-2-preview",
+      "api_types": ["llm", "vision.ocr", "vision.caption", "vision.detect", "vision.segment"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "json_schema": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 131072,
+        "max_output_tokens": 65536
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["minimal", "low", "medium", "high"],
+        "stability": "experimental",
+        "weight": 20
+      }
+    },
+    {
+      "id": "gemma-4-26b-a4b-it",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 262144,
+        "max_output_tokens": 32768
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["minimal", "high"],
+        "stability": "stable",
+        "weight": 18
+      }
+    },
+    {
+      "id": "gemma-4-31b-it",
+      "api_types": ["llm", "vision.ocr", "vision.caption"],
+      "capabilities": {
+        "streaming": true,
+        "tool_call": true,
+        "web_search": true,
+        "vision": true,
+        "reasoning": true,
+        "max_context_tokens": 262144,
+        "max_output_tokens": 32768
+      },
+      "llm": {
+        "spec": "gemini-flash",
+        "effort": "high",
+        "default_effort": "high",
+        "supported_efforts": ["minimal", "high"],
+        "stability": "stable",
+        "weight": 18
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-image",
+      "api_types": ["image.txt2img", "image.img2img"],
+      "logical_mounts": ["image.txt2img.gemini", "image.txt2img.{model}", "image.img2img.gemini", "image.img2img.{model}"],
+      "capabilities": {
+        "image_generation": true,
+        "max_context_tokens": 131072,
+        "max_output_tokens": 32768,
+        "web_search": true,
+        "reasoning": true
+      }
+    },
+    {
+      "id": "gemini-nano-banana-2.1",
+      "api_types": ["image.txt2img", "image.img2img"],
+      "logical_mounts": ["image.txt2img.gemini", "image.txt2img.{model}", "image.img2img.gemini", "image.img2img.{model}"],
+      "capabilities": {
+        "image_generation": true,
+        "max_context_tokens": 131072,
+        "max_output_tokens": 32768,
+        "web_search": true,
+        "reasoning": true
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-lite-image",
+      "api_types": ["image.txt2img", "image.img2img"],
+      "logical_mounts": ["image.txt2img.gemini", "image.txt2img.{model}", "image.img2img.gemini", "image.img2img.{model}"],
+      "capabilities": {
+        "image_generation": true,
+        "max_context_tokens": 65536,
+        "max_output_tokens": 4096,
+        "reasoning": true
+      }
+    },
+    {
+      "id": "gemini-3-pro-image",
+      "api_types": ["image.txt2img", "image.img2img"],
+      "logical_mounts": ["image.txt2img.gemini", "image.txt2img.{model}", "image.img2img.gemini", "image.img2img.{model}"],
+      "capabilities": {
+        "image_generation": true,
+        "max_context_tokens": 65536,
+        "max_output_tokens": 32768,
+        "web_search": true,
+        "reasoning": true
+      }
+    },
+    {
+      "id": "gemini-2.5-flash-image",
+      "api_types": ["image.txt2img", "image.img2img"],
+      "logical_mounts": ["image.txt2img.gemini", "image.txt2img.{model}", "image.img2img.gemini", "image.img2img.{model}"],
+      "capabilities": {
+        "image_generation": true,
+        "max_context_tokens": 65536,
+        "max_output_tokens": 32768
+      }
+    },
+    {
+      "id": "gemini-3.1-flash-tts-preview",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts.gemini", "audio.tts.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "max_output_tokens": 16384
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "gemini_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.8-flash-tts",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts.gemini", "audio.tts.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "max_output_tokens": 16384
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "gemini_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.8-flash-lite-tts",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts.gemini", "audio.tts.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "max_output_tokens": 16384
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "gemini_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-flash-preview-tts",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts.gemini", "audio.tts.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "max_output_tokens": 16384
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "gemini_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-2.5-pro-preview-tts",
+      "api_types": ["audio.tts"],
+      "logical_mounts": ["audio.tts.gemini", "audio.tts.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "max_output_tokens": 16384
+      },
+      "canonical_fields": {
+        "/voice": {
+          "converter": "gemini_tts_voice_v1",
+          "fallback": {
+            "action": "default",
+            "value": {}
+          }
+        }
+      }
+    },
+    {
+      "id": "gemini-3.5-transcribe",
+      "api_types": ["audio.asr"],
+      "logical_mounts": ["audio.asr.gemini", "audio.asr.{model}"],
+      "capabilities": {
+        "audio.max_input_duration_seconds": 3600,
+        "audio.max_input_duration_with_diarization_or_timestamps_seconds": 1800
+      }
+    },
+    {
+      "id": "gemini-omni-1.1-flash",
+      "api_types": ["video.generate", "video.edit", "video.extend"],
+      "logical_mounts": [
+        "video.generate.gemini",
+        "video.generate.{model}",
+        "video.generate.gemini_omni",
+        "video.edit.gemini",
+        "video.edit.{model}",
+        "video.extend.gemini",
+        "video.extend.{model}"
+      ],
+      "capabilities": {
+        "max_context_tokens": 1048576,
+        "video_generation": {
+          "prompt_required": true,
+          "seed": true,
+          "references": {"image": {"max": 1}},
+          "output": {
+            "durations": {"integer": false},
+            "aspect_ratios": ["16:9", "9:16"],
+            "resolutions": [{"name": "720p", "short_edge": 720}, {"name": "1080p", "short_edge": 1080}],
+            "audio": "always",
+            "media_types": ["video/mp4"]
+          }
+        }
+      }
+    },
+    {
+      "id": "lyria-3.5",
+      "api_types": ["audio.music"],
+      "logical_mounts": ["audio.music.gemini", "audio.music.{model}"],
+      "capabilities": {
+        "max_context_tokens": 131072
+      }
+    },
+    {
+      "id": "lyria-3-pro-preview",
+      "api_types": ["audio.music"],
+      "logical_mounts": ["audio.music.gemini", "audio.music.{model}"],
+      "capabilities": {
+        "max_context_tokens": 131072
+      }
+    },
+    {
+      "id": "lyria-3-clip-preview",
+      "api_types": ["audio.music"],
+      "logical_mounts": ["audio.music.gemini", "audio.music.{model}"],
+      "capabilities": {
+        "max_context_tokens": 131072
+      }
+    },
+    {
+      "id": "gemini-embedding-2",
+      "api_types": ["embedding.text", "embedding.multimodal"],
+      "logical_mounts": ["embedding.text.gemini", "embedding.text.{model}", "embedding.multimodal.gemini", "embedding.multimodal.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "embedding_dimensions_min": 128,
+        "embedding_dimensions_max": 3072
+      }
+    },
+    {
+      "id": "gemini-embedding-2-preview",
+      "api_types": ["embedding.text", "embedding.multimodal"],
+      "logical_mounts": ["embedding.text.gemini", "embedding.text.{model}", "embedding.multimodal.gemini", "embedding.multimodal.{model}"],
+      "capabilities": {
+        "max_context_tokens": 8192,
+        "embedding_dimensions_min": 128,
+        "embedding_dimensions_max": 3072
+      }
+    },
+    {
+      "id": "gemini-embedding-001",
+      "api_types": ["embedding.text"],
+      "logical_mounts": ["embedding.text.gemini", "embedding.text.{model}"],
+      "capabilities": {
+        "max_context_tokens": 2048,
+        "embedding_dimensions_min": 128,
+        "embedding_dimensions_max": 3072
+      }
+    }
+  ],
+  "patterns": [],
+  "defaults": {},
+  "specs": [
+    {
+      "id": "gemini-flash"
+    },
+    {
+      "id": "gemini-flash-lite"
+    },
+    {
+      "id": "gemini-pro"
+    }
+  ]
+}

@@ -1,4 +1,8 @@
 import { expect, test, type Locator } from '@playwright/test'
+import { openFromAllApps, pinTaskbarApps, routeAppHost } from '../fixtures/desktop'
+
+// The taskbar tests below exercise its mechanics with these pins rather than the defaults.
+const systemPins = ['settings', 'diagnostics', 'users-agents', 'my-network']
 
 function boxesOverlap(
   left: { x: number; y: number; width: number; height: number } | null,
@@ -33,6 +37,59 @@ async function getScrollMetrics(locator: Locator) {
   }))
 }
 
+test('narrow desktop keeps widgets and launcher items fully visible', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 960, height: 720 })
+  await page.goto('/?scenario=normal')
+
+  const clockTime = page
+    .getByTestId('desktop-item-Clock.widget')
+    .locator('p')
+    .first()
+  await expect(clockTime).toBeVisible()
+  await expect.poll(async () =>
+    clockTime.evaluate((element) => element.scrollWidth <= element.clientWidth),
+  ).toBe(true)
+
+  const launcherLabels = page.locator(
+    '.swiper-slide-active [data-testid^="desktop-app-"] > span:last-child',
+  )
+  await expect(launcherLabels.first()).toBeVisible()
+  expect(
+    await launcherLabels.evaluateAll((elements) =>
+      elements.every((element) => element.scrollWidth <= element.clientWidth),
+    ),
+  ).toBe(true)
+
+  await page.setViewportSize({ width: 780, height: 560 })
+
+  const activePageItems = page.locator(
+    '.swiper-slide-active [data-testid^="desktop-item-"]',
+  )
+  await expect(activePageItems.first()).toBeVisible()
+  await expect.poll(async () =>
+    activePageItems.evaluateAll((elements) =>
+      elements.every((element) => {
+        const rect = element.getBoundingClientRect()
+        return (
+          rect.left >= 0 &&
+          rect.top >= 0 &&
+          rect.right <= document.documentElement.clientWidth &&
+          rect.bottom <= document.documentElement.clientHeight
+        )
+      }),
+    ),
+  ).toBe(true)
+
+  const overflow = await page.evaluate(() => ({
+    horizontal: document.documentElement.scrollWidth > window.innerWidth,
+    vertical: document.documentElement.scrollHeight > window.innerHeight,
+  }))
+  expect(overflow.horizontal).toBeFalsy()
+  expect(overflow.vertical).toBeFalsy()
+})
+
 test('desktop flow opens settings window and supports locale switch', async ({
   page,
 }) => {
@@ -46,10 +103,10 @@ test('desktop flow opens settings window and supports locale switch', async ({
   await page.goto('/?scenario=normal')
 
   await expect(page.getByRole('button', { name: 'BuckyOS' })).toBeVisible()
-  await expect(page.getByTestId('desktop-item-widget-clock')).toBeVisible()
-  await expect(page.getByTestId('notepad-preview-widget-notepad')).toBeVisible()
-  await expect(page.getByTestId('notepad-editor-widget-notepad')).toHaveCount(0)
-  await expect(page.getByTestId('notepad-save-widget-notepad')).toHaveCount(0)
+  await expect(page.getByTestId('desktop-item-Clock.widget')).toBeVisible()
+  await expect(page.getByTestId('notepad-preview-Getting Started.widget')).toBeVisible()
+  await expect(page.getByTestId('notepad-editor-Getting Started.widget')).toHaveCount(0)
+  await expect(page.getByTestId('notepad-save-Getting Started.widget')).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Prototype Lab' })).toHaveCount(0)
   await expect(page.getByTestId('drag-settings')).toHaveCount(0)
 
@@ -64,17 +121,17 @@ test('desktop flow opens settings window and supports locale switch', async ({
   const afterDrag = await settingsIcon.boundingBox()
   expect(afterDrag?.x).not.toBe(beforeDrag?.x)
 
-  await page.getByTestId('notepad-preview-widget-notepad').click()
-  await expect(page.getByTestId('notepad-editor-widget-notepad')).toBeVisible()
-  await expect(page.getByTestId('notepad-save-widget-notepad')).toBeVisible()
-  await page.getByTestId('notepad-editor-widget-notepad').fill('Updated desktop note.')
-  await page.getByTestId('notepad-save-widget-notepad').click()
-  await expect(page.getByTestId('notepad-editor-widget-notepad')).toHaveCount(0)
-  await expect(page.getByTestId('notepad-preview-widget-notepad')).toContainText(
+  await page.getByTestId('notepad-preview-Getting Started.widget').click()
+  await expect(page.getByTestId('notepad-editor-Getting Started.widget')).toBeVisible()
+  await expect(page.getByTestId('notepad-save-Getting Started.widget')).toBeVisible()
+  await page.getByTestId('notepad-editor-Getting Started.widget').fill('Updated desktop note.')
+  await page.getByTestId('notepad-save-Getting Started.widget').click()
+  await expect(page.getByTestId('notepad-editor-Getting Started.widget')).toHaveCount(0)
+  await expect(page.getByTestId('notepad-preview-Getting Started.widget')).toContainText(
     'Updated desktop note.',
   )
 
-  const notepadWidget = page.getByTestId('desktop-item-widget-notepad')
+  const notepadWidget = page.getByTestId('desktop-item-Getting Started.widget')
   const widgetBeforeDrag = await notepadWidget.boundingBox()
   await notepadWidget.hover()
   await page.mouse.down()
@@ -82,8 +139,11 @@ test('desktop flow opens settings window and supports locale switch', async ({
     steps: 14,
   })
   await page.mouse.up()
-  const settingsAfterWidgetDrag = await page.getByTestId('desktop-app-settings').boundingBox()
-  const filesAfterWidgetDrag = await page.getByTestId('desktop-app-files').boundingBox()
+  // Compare the grid tiles (exact cell boxes), not the inner buttons: a
+  // two-line label makes the button taller than the cell, so two icons that
+  // legitimately sit in vertically adjacent cells would otherwise "overlap".
+  const settingsAfterWidgetDrag = await page.getByTestId('desktop-item-Settings.lnk').boundingBox()
+  const filesAfterWidgetDrag = await page.getByTestId('desktop-item-Files.lnk').boundingBox()
   expect(boxesOverlap(settingsAfterWidgetDrag, filesAfterWidgetDrag)).toBeFalsy()
 
   await page.getByTestId('desktop-app-settings').click()
@@ -152,6 +212,7 @@ test('desktop flow opens settings window and supports locale switch', async ({
     .boundingBox()
   expect((constrainedWindow?.x ?? 0) + (constrainedWindow?.width ?? 0)).toBeLessThanOrEqual(780)
   expect(constrainedWindow?.y ?? 0).toBeGreaterThanOrEqual(0)
+  expect((constrainedWindow?.y ?? 0) + (constrainedWindow?.height ?? 0)).toBeLessThanOrEqual(560)
   expect((closeButtonBox?.x ?? 0) + (closeButtonBox?.width ?? 0)).toBeLessThanOrEqual(780)
   expect(closeButtonBox?.y ?? 0).toBeLessThanOrEqual(560)
   const hasPageOverflow = await page.evaluate(() => ({
@@ -212,7 +273,7 @@ test('double-clicking a window title bar toggles maximize and restore', async ({
   expect(restoredBounds?.height).toBeCloseTo(windowedBounds?.height ?? 0, 0)
 })
 
-test('desktop layout restores AI Center launcher entry and opens panel content', async ({
+test('the AI Center desktop shortcut opens its panel content', async ({
   page,
 }) => {
   const consoleErrors: string[] = []
@@ -220,51 +281,6 @@ test('desktop layout restores AI Center launcher entry and opens panel content',
     if (message.type() === 'error') {
       consoleErrors.push(message.text())
     }
-  })
-
-  await page.addInitScript(() => {
-    window.localStorage.setItem(
-      'buckyos.layout.desktop.v1',
-      JSON.stringify({
-        version: 1,
-        formFactor: 'desktop',
-        deadZone: { top: 0, bottom: 8, left: 5, right: 5 },
-        pages: [
-          {
-            id: 'desktop-page-1',
-            items: [
-              { id: 'widget-clock', type: 'widget', widgetType: 'clock', x: 0, y: 0, w: 2, h: 1, config: {} },
-              { id: 'app-settings', type: 'app', appId: 'settings', x: 2, y: 0, w: 1, h: 1 },
-              { id: 'app-files', type: 'app', appId: 'files', x: 3, y: 0, w: 1, h: 1 },
-              { id: 'app-studio', type: 'app', appId: 'studio', x: 4, y: 0, w: 1, h: 1 },
-              { id: 'app-market', type: 'app', appId: 'market', x: 5, y: 0, w: 1, h: 1 },
-              { id: 'app-docs', type: 'app', appId: 'docs', x: 6, y: 0, w: 1, h: 1 },
-              { id: 'app-demos', type: 'app', appId: 'demos', x: 7, y: 0, w: 1, h: 1 },
-              { id: 'app-codeassistant', type: 'app', appId: 'codeassistant', x: 2, y: 1, w: 1, h: 1 },
-              { id: 'app-messagehub', type: 'app', appId: 'messagehub', x: 3, y: 1, w: 1, h: 1 },
-              {
-                id: 'widget-notepad',
-                type: 'widget',
-                widgetType: 'notepad',
-                x: 0,
-                y: 1,
-                w: 2,
-                h: 2,
-                config: {
-                  content: 'Review drag semantics, dead zone behavior, and window polish.',
-                },
-              },
-            ],
-          },
-          {
-            id: 'desktop-page-2',
-            items: [
-              { id: 'app-diagnostics', type: 'app', appId: 'diagnostics', x: 0, y: 0, w: 1, h: 1 },
-            ],
-          },
-        ],
-      }),
-    )
   })
 
   await page.goto('/?scenario=normal')
@@ -311,6 +327,28 @@ test('desktop layout restores AI Center launcher entry and opens panel content',
   expect(consoleErrors).toEqual([])
 })
 
+test('SN Router is shown as a system-managed provider', async ({ page }) => {
+  await page.goto('/?scenario=normal&aiccScenario=populated')
+
+  await page.getByTestId('desktop-app-ai-center').click()
+  await page.getByRole('button', { name: 'Providers', exact: true }).click()
+
+  await expect(page.getByText('SN Router', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('System managed', { exact: true }).first()).toBeVisible()
+  await page.getByRole('button', { name: 'Provider actions' }).click()
+  await expect(page.getByText('Refresh Models', { exact: true })).toBeVisible()
+  await expect(page.getByText('Update Key', { exact: true })).toHaveCount(0)
+  await expect(page.getByText('Delete', { exact: true })).toHaveCount(0)
+
+  await page.keyboard.press('Escape')
+  await page.getByRole('button', { name: 'Add Provider' }).click()
+  const snRouter = page.getByRole('button', { name: /SN Router/ })
+  await expect(snRouter).toBeEnabled()
+  await expect(snRouter).toContainText('System managed')
+  await snRouter.click()
+  await expect(page.getByRole('button', { name: 'Providers', exact: true })).toBeVisible()
+})
+
 test('systest opens its zone subdomain inside a desktop window', async ({ page }) => {
   const consoleErrors: string[] = []
   page.on('console', (message) => {
@@ -319,25 +357,24 @@ test('systest opens its zone subdomain inside a desktop window', async ({ page }
     }
   })
 
-  await page.route('http://systest.localhost:4173/**', async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/html',
-      body: '<main data-testid="systest-fixture">Systest fixture</main>',
-    })
-  })
+  const callbacks = await routeAppHost(
+    page,
+    'http://systest.localhost:4173/**',
+    '<main data-testid="systest-fixture">Systest fixture</main>',
+  )
 
   await page.goto('/?scenario=normal')
 
-  await page.getByTestId('desktop-app-systest').click()
+  await openFromAllApps(page, 'systest')
   await expect(page.getByTestId('window-systest')).toBeVisible()
   await expect(page.getByTestId('systest-frame')).toHaveAttribute(
     'src',
-    'http://systest.localhost:4173/',
+    /^http:\/\/systest\.localhost:4173\/sso_callback\?nonce=\d+&redirect_url=http%3A%2F%2Fsystest\.localhost%3A4173%2F$/,
   )
   await expect(
     page.frameLocator('[data-testid="systest-frame"]').getByTestId('systest-fixture'),
   ).toHaveText('Systest fixture')
+  expect(callbacks).toHaveLength(1)
 
   expect(consoleErrors).toEqual([])
 })
@@ -439,20 +476,12 @@ test('logout clears persisted desktop auth state before returning to login', asy
         session_token: 'session-token',
       }),
     )
-    window.localStorage.setItem(
-      'buckyos.account_info',
-      JSON.stringify({
-        user_name: 'Alice',
-        user_id: 'did:buckyos:user:alice',
-        user_type: 'owner',
-        session_token: 'legacy-session-token',
-      }),
-    )
     document.cookie = 'control-panel_token=session-token; Path=/; SameSite=Lax'
   })
 
-  await page.getByRole('button', { name: 'BuckyOS' }).click()
-  await page.getByRole('button', { name: 'Log out' }).click()
+  // Log out lives on the profile card that hovering the avatar shows.
+  await page.getByRole('button', { name: 'BuckyOS' }).hover()
+  await page.getByTestId('taskbar-profile-card').getByRole('button', { name: 'Log out' }).click()
   await page.waitForURL('**/login?**')
 
   await expect
@@ -462,7 +491,6 @@ test('logout clears persisted desktop auth state before returning to login', asy
         desktopAccountInfo: window.localStorage.getItem(
           'buckyos.account_info.control-panel',
         ),
-        legacyAccountInfo: window.localStorage.getItem('buckyos.account_info'),
         appCookie: document.cookie
           .split(';')
           .some((part) => part.trim().startsWith('control-panel_token=')),
@@ -471,7 +499,6 @@ test('logout clears persisted desktop auth state before returning to login', asy
     .toEqual({
       browserUserInfo: null,
       desktopAccountInfo: null,
-      legacyAccountInfo: null,
       appCookie: false,
     })
 })
@@ -479,7 +506,7 @@ test('logout clears persisted desktop auth state before returning to login', asy
 test('demos app renders common controls', async ({ page }) => {
   await page.goto('/?scenario=normal')
 
-  await page.getByTestId('desktop-app-demos').click()
+  await openFromAllApps(page, 'demos')
   await expect(page.getByTestId('window-demos')).toBeVisible()
   await expect(page.getByText('Control gallery', { exact: true })).toBeVisible()
 
@@ -495,29 +522,337 @@ test('demos app renders common controls', async ({ page }) => {
   await expect(page.getByText('Control coverage')).toBeVisible()
 })
 
-test('status tray tips opens from bell and closes on outside click', async ({ page }) => {
+test('desktop taskbar slides out from the avatar, pins, and leaves windows the full screen', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await pinTaskbarApps(page, systemPins)
   await page.goto('/?scenario=normal')
 
-  const tipsButton = page.getByTestId('status-tray-tips-button')
-  await expect(tipsButton).toBeVisible()
-  await tipsButton.click()
+  const avatar = page.getByRole('button', { name: 'BuckyOS' })
+  const taskbar = page.getByTestId('desktop-taskbar')
+  await expect(avatar).toBeVisible()
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'true')
+  // The desktop has no status bar: no tray, no connection label.
+  await expect(page.getByTestId('status-tray-notifications-button')).toHaveCount(0)
+  await expect(page.getByLabel('Status bar')).toHaveCount(0)
 
-  const tipsPanel = page.getByTestId('status-tips-panel')
-  await expect(tipsPanel).toBeVisible()
-  await expect(page.getByTestId('status-tip-card-recent-shell-action')).toBeVisible()
-  await expect(page.getByTestId('status-tip-card-mobile-touch-audit')).toBeVisible()
+  // Auto-hidden taskbar: a maximized window covers the whole viewport and
+  // centres its title, clear of the floating avatar.
+  await page.getByTestId('desktop-app-settings').click()
+  const settingsWindow = page.getByTestId('window-settings')
+  // A windowed window can also be dragged flush against the top edge.
+  const titleBar = await page.getByTestId('window-drag-settings').boundingBox()
+  await page.mouse.move((titleBar?.x ?? 0) + 300, (titleBar?.y ?? 0) + 16)
+  await page.mouse.down()
+  await page.mouse.move((titleBar?.x ?? 0) + 300, 0, { steps: 8 })
+  await page.mouse.up()
+  expect((await settingsWindow.boundingBox())?.y).toBe(0)
+  await page.getByTestId('window-drag-settings').dblclick()
+  await expect.poll(async () => settingsWindow.boundingBox()).toEqual({
+    x: 0,
+    y: 0,
+    width: 1280,
+    height: 800,
+  })
+  const title = await page.getByTestId('window-drag-settings').getByText('Settings', { exact: true }).boundingBox()
+  expect(Math.abs((title?.x ?? 0) + (title?.width ?? 0) / 2 - 640)).toBeLessThan(16)
 
-  const panelBox = await tipsPanel.boundingBox()
-  const viewport = page.viewportSize()
-  expect(panelBox).not.toBeNull()
-  expect(viewport).not.toBeNull()
-  expect((panelBox?.x ?? 0) + (panelBox?.width ?? 0)).toBeLessThanOrEqual(
-    (viewport?.width ?? 0) - 8,
+  // The taskbar floats over the window without a backdrop and hides on the
+  // next outside click.
+  await avatar.click()
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'false')
+  await expect.poll(async () => (await taskbar.boundingBox())?.x).toBe(0)
+  expect((await taskbar.boundingBox())?.width).toBe(60)
+  // The avatar lands centred in the taskbar's top slot.
+  const avatarBox = await avatar.boundingBox()
+  expect((avatarBox?.x ?? 0) + (avatarBox?.width ?? 0) / 2).toBeCloseTo(30, 0)
+  await page.mouse.click(900, 400)
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'true')
+
+  // Launching from the taskbar also hides it.
+  await avatar.click()
+  await taskbar.getByRole('button', { name: 'Diagnostics', exact: true }).click()
+  await expect(page.getByTestId('window-diagnostics')).toBeVisible()
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'true')
+  await page.getByTestId('window-diagnostics').getByRole('button', { name: 'Close' }).click()
+
+  // Pinned (from the taskbar's right-click menu): stays after outside
+  // clicks, survives a reload, and narrows the maximized window to the
+  // space right of it.
+  await avatar.click()
+  await taskbar.click({ button: 'right', position: { x: 30, y: 600 } })
+  const pin = page.getByTestId('taskbar-pin')
+  await expect(pin).toHaveAttribute('aria-checked', 'false')
+  await pin.click()
+  await expect(taskbar).toHaveAttribute('data-pinned', 'true')
+  await page.mouse.click(900, 400)
+  // A pinned taskbar's avatar holds the profile card instead of hiding it.
+  await avatar.click()
+  await expect(page.getByTestId('taskbar-profile-card')).toBeVisible()
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'false')
+  await expect.poll(async () => settingsWindow.boundingBox()).toEqual({
+    x: 60,
+    y: 0,
+    width: 1220,
+    height: 800,
+  })
+  await page.reload()
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'false')
+  await expect(taskbar).toHaveAttribute('data-pinned', 'true')
+
+  // Unpinning leaves it open until the next outside click.
+  await taskbar.click({ button: 'right', position: { x: 30, y: 600 } })
+  await expect(page.getByTestId('taskbar-pin')).toHaveAttribute('aria-checked', 'true')
+  await page.getByTestId('taskbar-pin').click()
+  await expect(taskbar).toHaveAttribute('data-pinned', 'false')
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'false')
+  await page.mouse.click(900, 400)
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'true')
+})
+
+test('taskbar apps launch from All apps, toggle like Windows 7, and pin from their menu', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.addInitScript(() => {
+    window.localStorage.setItem('buckyos.desktop.taskbar-pinned.v1', 'true')
+  })
+  await page.goto('/?scenario=normal')
+
+  const taskbar = page.getByTestId('desktop-taskbar')
+  await expect(taskbar).toHaveAttribute('aria-hidden', 'false')
+  await expect(page.getByTestId('taskbar-app-files')).toHaveCount(0)
+
+  // All apps: a searchable list next to the taskbar; Enter opens the first match.
+  await page.getByTestId('taskbar-all-apps').click()
+  const allApps = page.getByTestId('all-apps-panel')
+  await expect(allApps).toBeVisible()
+  await expect(page.getByTestId('all-apps-search')).toBeFocused()
+  await page.getByTestId('all-apps-search').fill('file')
+  await expect(allApps.getByRole('button', { name: /^Files/ })).toBeVisible()
+  await expect(page.getByTestId('all-apps-item-settings')).toHaveCount(0)
+  await page.keyboard.press('Enter')
+  const files = page.getByTestId('window-files')
+  await expect(files).toBeVisible()
+  await expect(allApps).toHaveCount(0)
+
+  // A running app joins the taskbar after the pinned ones.
+  const filesButton = page.getByTestId('taskbar-app-files')
+  await expect(filesButton).toBeVisible()
+  await expect(page.getByTestId('taskbar-app-running-files')).toBeVisible()
+
+  // Clicking the front app minimizes it; clicking again restores it.
+  await filesButton.click()
+  await expect(files).toBeHidden()
+  await filesButton.click()
+  await expect(files).toBeVisible()
+
+  // Pin it, then close its window: the button stays, without the running mark.
+  await filesButton.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Pin to taskbar' }).click()
+  await filesButton.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Close window' }).click()
+  await expect(files).toHaveCount(0)
+  await expect(filesButton).toBeVisible()
+  await expect(page.getByTestId('taskbar-app-running-files')).toHaveCount(0)
+
+  // The pin survives a reload; unpinning removes the button.
+  await page.reload()
+  await expect(filesButton).toBeVisible()
+  await filesButton.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Unpin from taskbar' }).click()
+  await expect(filesButton).toHaveCount(0)
+})
+
+test('taskbar app buttons reorder by dragging', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await pinTaskbarApps(page, systemPins)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('buckyos.desktop.taskbar-pinned.v1', 'true')
+  })
+  await page.goto('/?scenario=normal')
+
+  const appButtons = page.getByTestId('desktop-taskbar').getByRole('navigation').locator('[data-app-id]')
+  const order = () => appButtons.evaluateAll((buttons) => buttons.map((button) => button.getAttribute('data-app-id')))
+  const drag = async (appId: string, ontoAppId: string) => {
+    const from = await page.getByTestId(`taskbar-app-${appId}`).boundingBox()
+    const onto = await page.getByTestId(`taskbar-app-${ontoAppId}`).boundingBox()
+    if (!from || !onto) throw new Error('taskbar button missing')
+    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(onto.x + onto.width / 2, onto.y + onto.height / 2, { steps: 8 })
+    await page.mouse.up()
+  }
+  await expect.poll(order).toEqual(['settings', 'diagnostics', 'users-agents', 'my-network'])
+
+  // Dropping is not a click: the dragged app does not open.
+  await drag('settings', 'users-agents')
+  await expect.poll(order).toEqual(['diagnostics', 'users-agents', 'settings', 'my-network'])
+  await expect(page.getByTestId('window-settings')).toHaveCount(0)
+
+  // A running app that is not pinned moves too, ahead of pinned ones.
+  await page.getByTestId('taskbar-all-apps').click()
+  await page.getByTestId('all-apps-search').fill('file')
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('window-files')).toBeVisible()
+  await expect.poll(order).toEqual(['diagnostics', 'users-agents', 'settings', 'my-network', 'files'])
+  await drag('files', 'diagnostics')
+  await expect.poll(order).toEqual(['files', 'diagnostics', 'users-agents', 'settings', 'my-network'])
+
+  // A plain click still works after a drag.
+  await page.getByTestId('taskbar-app-diagnostics').click()
+  await expect(page.getByTestId('window-diagnostics')).toBeVisible()
+
+  // The pinned order survives a reload.
+  await page.reload()
+  await expect.poll(order).toEqual(['diagnostics', 'users-agents', 'settings', 'my-network'])
+})
+
+test('taskbar show desktop hides every window and brings them back', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await pinTaskbarApps(page, systemPins)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('buckyos.desktop.taskbar-pinned.v1', 'true')
+  })
+  await page.goto('/?scenario=normal')
+
+  await page.getByTestId('taskbar-app-settings').click()
+  const settings = page.getByTestId('window-settings')
+  await page.getByTestId('window-drag-settings').dblclick()
+  const maximized = await settings.boundingBox()
+  await page.getByTestId('taskbar-app-diagnostics').click()
+  const diagnostics = page.getByTestId('window-diagnostics')
+  await expect(diagnostics).toBeVisible()
+
+  const showDesktop = page.getByTestId('taskbar-show-desktop')
+  expect((await showDesktop.boundingBox())?.height).toBeLessThanOrEqual(16)
+  await showDesktop.click()
+  await expect(settings).toBeHidden()
+  await expect(diagnostics).toBeHidden()
+
+  // The second press restores them, maximized state and stacking included.
+  await showDesktop.click()
+  await expect(settings).toBeVisible()
+  await expect(diagnostics).toBeVisible()
+  expect(await settings.boundingBox()).toEqual(maximized)
+  const z = await page.evaluate(() =>
+    ['window-settings', 'window-diagnostics'].map((id) =>
+      Number((document.querySelector(`[data-testid="${id}"]`) as HTMLElement).style.zIndex),
+    ),
   )
-  expect(panelBox?.x ?? 0).toBeGreaterThanOrEqual(0)
+  expect(z[1]).toBeGreaterThan(z[0])
+})
 
-  await page.mouse.click(24, (viewport?.height ?? 0) - 24)
-  await expect(tipsPanel).toHaveCount(0)
+test('taskbar profile and system status cards open on hover and hold on click', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/?scenario=normal')
+
+  const avatar = page.getByRole('button', { name: 'BuckyOS' })
+  await avatar.hover()
+  const profile = page.getByTestId('taskbar-profile-card')
+  await expect(profile).toBeVisible()
+  await expect(profile.getByRole('button', { name: 'Log out' })).toBeVisible()
+  await page.mouse.move(900, 400)
+  await expect(profile).toHaveCount(0)
+
+  // Two lines of system status at the bottom of the taskbar.
+  await avatar.click()
+  const status = page.getByTestId('taskbar-status')
+  await expect(status).toContainText(/CPU\s*\d+%/)
+  await expect(status).toContainText(/MEM\s*\d+%/)
+
+  await status.hover()
+  const details = page.getByTestId('taskbar-status-card')
+  await expect(details).toBeVisible()
+  await expect(details).toContainText('Memory')
+  await expect(details).toContainText('Uptime')
+
+  // A click holds the card after the pointer leaves; Escape lets it go.
+  await status.click()
+  await page.mouse.move(900, 400)
+  await page.waitForTimeout(400)
+  await expect(details).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(details).toHaveCount(0)
+  await expect(page.getByTestId('desktop-taskbar')).toHaveAttribute('aria-hidden', 'false')
+})
+
+test('mobile All apps covers the screen and launches the chosen app', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/?scenario=normal')
+
+  await page.getByRole('button', { name: 'BuckyOS' }).first().click()
+  await page.getByTestId('mobile-taskbar').getByTestId('taskbar-all-apps').click()
+  const allApps = page.getByTestId('all-apps-panel')
+  await expect(allApps).toBeVisible()
+  expect(await allApps.boundingBox()).toEqual({ x: 0, y: 0, width: 390, height: 844 })
+
+  await page.getByTestId('all-apps-search').fill('sett')
+  await page.getByTestId('all-apps-item-settings').click()
+  await expect(allApps).toHaveCount(0)
+  await expect(page.getByPlaceholder('Search settings')).toBeVisible()
+})
+
+test('mobile taskbar mirrors the desktop one: profile card, pinning, status and show desktop', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await pinTaskbarApps(page, systemPins)
+  await page.goto('/?scenario=normal')
+
+  await page.getByRole('button', { name: 'BuckyOS' }).first().click()
+  const rail = page.getByTestId('mobile-taskbar')
+  await expect(rail).toHaveAttribute('data-open', 'true')
+  await expect.poll(async () => (await rail.boundingBox())?.x).toBe(0)
+  expect((await rail.boundingBox())?.width).toBe(60)
+  // A tap on an app opens it and closes the rail.
+  await rail.getByTestId('taskbar-app-settings').click()
+  await expect(rail).toHaveAttribute('data-open', 'false')
+  await expect(page.getByPlaceholder('Search settings')).toBeVisible()
+  await page.getByRole('button', { name: 'BuckyOS' }).first().click()
+
+  // The rail's avatar sits right over the status bar's and holds the profile card.
+  const avatar = page.getByTestId('mobile-taskbar-avatar')
+  const statusBarAvatar = await page.getByRole('button', { name: 'BuckyOS' }).first().boundingBox()
+  await expect.poll(() => avatar.boundingBox()).toEqual(statusBarAvatar)
+  await avatar.click()
+  const profile = page.getByTestId('taskbar-profile-card')
+  await expect(profile.getByRole('button', { name: 'Log out' })).toBeVisible()
+  await rail.getByTestId('taskbar-status').click()
+  await expect(profile).toHaveCount(0)
+  await expect(page.getByTestId('taskbar-status-card')).toBeVisible()
+  await expect(rail.getByTestId('taskbar-status')).toContainText(/CPU\s*\d+%/)
+
+  // The running app is marked; a long press opens its menu.
+  await expect(rail.getByTestId('taskbar-app-running-settings')).toBeVisible()
+  const settingsButton = rail.getByTestId('taskbar-app-settings')
+  const box = await settingsButton.boundingBox()
+  const point = { clientX: (box?.x ?? 0) + 24, clientY: (box?.y ?? 0) + 24, bubbles: true, pointerId: 7, pointerType: 'touch' }
+  await settingsButton.dispatchEvent('pointerdown', point)
+  await page.waitForTimeout(600)
+  await settingsButton.dispatchEvent('pointerup', point)
+  await page.getByRole('menuitem', { name: 'Unpin from taskbar' }).click()
+  // Still running, so it stays until its window closes.
+  await expect(settingsButton).toBeVisible()
+  await settingsButton.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Close window' }).click()
+  await expect(settingsButton).toHaveCount(0)
+  await expect(page.getByPlaceholder('Search settings')).toHaveCount(0)
+
+  // Show desktop is a full-size button at the bottom of the rail.
+  await rail.getByTestId('taskbar-app-diagnostics').click()
+  await expect(rail).toHaveAttribute('data-open', 'false')
+  await expect(page.getByText('Window system telemetry')).toBeVisible()
+  await page.getByRole('button', { name: 'BuckyOS' }).first().click()
+  const showDesktop = rail.getByTestId('taskbar-show-desktop')
+  expect((await showDesktop.boundingBox())?.height).toBe(48)
+  await showDesktop.click()
+  await expect(rail).toHaveAttribute('data-open', 'false')
+  await expect(page.getByText('Window system telemetry')).toBeHidden()
+  await expect(page.getByRole('button', { name: 'Settings' })).toBeVisible()
 })
 
 test('window modal only blocks its owner window', async ({ page }) => {
@@ -536,13 +871,27 @@ test('window modal only blocks its owner window', async ({ page }) => {
   )
   await page.mouse.up()
 
-  await page.getByTestId('desktop-app-demos').click()
+  await openFromAllApps(page, 'demos')
   await expect(page.getByTestId('window-demos')).toBeVisible()
   await page.getByRole('button', { name: 'Window modal' }).first().click()
   await expect(page.getByRole('dialog', { name: 'Scoped window modal' })).toBeVisible()
 
+  // Demos opened on top; bring Settings forward through the part of its
+  // title bar that is still uncovered (where the drag released it).
+  await page.mouse.click(1180, (settingsBeforeDrag?.y ?? 0) + 90)
+
+  // The Language select lives on the Appearance page of the (unblocked)
+  // Settings window.
+  await page
+    .getByTestId('window-settings')
+    .getByRole('button', { name: 'Appearance' })
+    .click()
   await page.getByRole('combobox', { name: 'Language' }).selectOption('ja')
-  await expect(page.getByRole('combobox', { name: 'Language' })).toHaveValue('ja')
+  // The whole shell is now in Japanese, including the select's own label.
+  await expect(page.getByRole('combobox', { name: '言語' })).toHaveValue('ja')
+  // Switch back so the remaining English locators keep working.
+  await page.getByRole('combobox', { name: '言語' }).selectOption('en')
+  await expect(page.getByRole('combobox', { name: 'Language' })).toHaveValue('en')
 
   await expect(page.getByRole('dialog', { name: 'Scoped window modal' })).toBeVisible()
   await page
@@ -561,7 +910,7 @@ test('codeassistant history does not jump back to bottom while scrolling older m
 }) => {
   await page.goto('/?scenario=normal')
 
-  await page.getByTestId('desktop-app-codeassistant').click()
+  await openFromAllApps(page, 'codeassistant')
   const historyPane = page.locator('[data-testid="window-codeassistant"] .shell-scrollbar').first()
   await expect(historyPane).toBeVisible()
 
@@ -587,4 +936,73 @@ test('codeassistant history does not jump back to bottom while scrolling older m
   await page.waitForTimeout(900)
   const settledMetrics = await getScrollMetrics(historyPane)
   expect(settledMetrics.distanceToBottom).toBeGreaterThan(600)
+})
+
+test('dragging a launcher icon keeps items that overflowed to another page', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 })
+  await page.goto('/?scenario=normal')
+  await expect(page.getByTestId('desktop-item-MessageHub.lnk')).toBeVisible()
+
+  const noteText = 'Overflow note keeps its content.'
+  await page.getByTestId('notepad-preview-Getting Started.widget').click()
+  await page.getByTestId('notepad-editor-Getting Started.widget').fill(noteText)
+  await page.getByTestId('notepad-save-Getting Started.widget').click()
+  await expect(page.getByTestId('notepad-preview-Getting Started.widget')).toContainText(noteText)
+
+  const tileIds = () =>
+    page
+      .locator('[data-testid^="desktop-item-"]')
+      .evaluateAll((elements) => elements.map((el) => el.getAttribute('data-testid')).sort())
+  const allIds = await tileIds()
+  expect(allIds.length).toBeGreaterThan(0)
+
+  // Move the (three rows tall) notepad three rows down so a short viewport can no longer fit it.
+  // MessageHub and AI Center sit in one column, a row apart.
+  const messageHubBox = (await page.getByTestId('desktop-item-MessageHub.lnk').boundingBox())!
+  const aiCenterBox = (await page.getByTestId('desktop-item-AI Center.lnk').boundingBox())!
+  const cellHeight = aiCenterBox.y - messageHubBox.y
+  const notepad = page.getByTestId('desktop-item-Getting Started.widget')
+  const notepadBox = (await notepad.boundingBox())!
+  await notepad.hover()
+  await page.mouse.down()
+  await page.mouse.move(
+    notepadBox.x + notepadBox.width / 2,
+    notepadBox.y + notepadBox.height / 2 + cellHeight * 3,
+    { steps: 14 },
+  )
+  await page.mouse.up()
+  await expect
+    .poll(async () => (await notepad.boundingBox())?.y ?? 0)
+    .toBeGreaterThan(notepadBox.y + cellHeight * 2)
+
+  // A 7×3 grid: the notepad (and the rightmost icons) overflow onto page 2.
+  await page.setViewportSize({ width: 780, height: 400 })
+  await expect.poll(async () => (await notepad.boundingBox())?.x ?? 0).toBeGreaterThanOrEqual(780)
+  expect(await tileIds()).toEqual(allIds)
+
+  // Drag a page-1 icon one cell down.
+  const messageHub = page.getByTestId('desktop-item-MessageHub.lnk')
+  const before = (await messageHub.boundingBox())!
+  const cellHeightSmall =
+    (await page.getByTestId('desktop-item-AI Center.lnk').boundingBox())!.y - before.y
+  await messageHub.hover()
+  await page.mouse.down()
+  await page.mouse.move(
+    before.x + before.width / 2,
+    before.y + before.height / 2 + cellHeightSmall,
+    { steps: 12 },
+  )
+  await page.mouse.up()
+  await expect
+    .poll(async () => (await messageHub.boundingBox())?.y ?? 0)
+    .toBeGreaterThan(before.y + cellHeightSmall / 2)
+
+  // Nothing that lived on page 2 may disappear, before or after a reload.
+  expect(await tileIds()).toEqual(allIds)
+  await expect(page.getByTestId('notepad-preview-Getting Started.widget')).toContainText(noteText)
+
+  await page.reload()
+  await expect(page.getByTestId('desktop-item-MessageHub.lnk')).toBeVisible()
+  expect(await tileIds()).toEqual(allIds)
+  await expect(page.getByTestId('notepad-preview-Getting Started.widget')).toContainText(noteText)
 })

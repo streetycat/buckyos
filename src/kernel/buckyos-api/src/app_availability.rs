@@ -1,55 +1,81 @@
 use crate::{
-    AppDoc, AppServiceSpec, AppType, ServiceSpecConfig, ServiceState, SystemConfigClient,
-    SystemConfigError, UserSettings, UserState, UserType,
+    AppId, AppInstanceId, AppServiceSpec, AuthTarget, SystemConfigClient, SystemConfigError,
+    SystemServiceId, UserSettings, UserType,
 };
 use ::kRPC::{RPCErrors, RPCSessionToken};
-use name_lib::DID;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 pub const APP_AVAILABILITY_SCHEMA_VERSION: u32 = 1;
 pub const APP_AVAILABILITY_POLICY_PREFIX: &str = "services/control_panel/app_availability/policies";
 pub const APP_AVAILABILITY_AUDIT_PREFIX: &str = "services/control_panel/app_availability/audit";
-pub const ZONE_APP_PREFIX: &str = "zone/apps";
-pub const SYSTEM_APP_OWNER_ID: &str = "system";
 pub const APP_INSTANCE_ID_CLAIM: &str = "app_instance_id";
 pub const APP_OWNER_USER_ID_CLAIM: &str = "app_owner_user_id";
 pub const TOKEN_PRINCIPAL_KIND_CLAIM: &str = "principal_kind";
+pub const TOKEN_TARGET_KIND_CLAIM: &str = "target_kind";
+pub const TOKEN_USE_CLAIM: &str = "token_use";
+pub const VERIFY_HUB_TOKEN_ISSUER: &str = "verify-hub";
 pub const TOKEN_PRINCIPAL_KIND_USER: &str = "user";
 pub const TOKEN_PRINCIPAL_KIND_DEVICE: &str = "device";
-pub const TOKEN_PRINCIPAL_KIND_SERVICE: &str = "service";
-
-const SYSTEM_LOGIN_TARGETS: &[&str] = &["control-panel", "kernel", "system-config"];
-
-const SYSTEM_APP_AUTHOR: &str = "did:bns:buckyos";
+pub const TOKEN_PRINCIPAL_KIND_APP: &str = "app";
+pub const TOKEN_PRINCIPAL_KIND_SYSTEM: &str = "system";
+pub const TOKEN_PRINCIPAL_KIND_AGENT: &str = "agent";
+/// Marks a `user` token whose subject is a DID without an account record in
+/// this Zone (External). The principal kind stays `user`, so a service that
+/// does not know External looks the account up, finds none and refuses.
+pub const TOKEN_EXTERNAL_CLAIM: &str = "external";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum AppClass {
-    SystemBuiltin,
-    UserInstalled,
-    ZoneInstalled,
+pub enum TokenPrincipalKind {
+    User,
+    Device,
+    App,
+    System,
+    Agent,
 }
 
-impl Default for AppClass {
-    fn default() -> Self {
-        Self::UserInstalled
-    }
-}
-
-impl TryFrom<&str> for AppClass {
-    type Error = &'static str;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        match value {
-            "system_builtin" => Ok(Self::SystemBuiltin),
-            "user_installed" => Ok(Self::UserInstalled),
-            "zone_installed" => Ok(Self::ZoneInstalled),
-            _ => Err("invalid app class"),
+impl TokenPrincipalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => TOKEN_PRINCIPAL_KIND_USER,
+            Self::Device => TOKEN_PRINCIPAL_KIND_DEVICE,
+            Self::App => TOKEN_PRINCIPAL_KIND_APP,
+            Self::System => TOKEN_PRINCIPAL_KIND_SYSTEM,
+            Self::Agent => TOKEN_PRINCIPAL_KIND_AGENT,
         }
     }
 }
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUse {
+    Session,
+    Refresh,
+}
+
+impl TokenUse {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Refresh => "refresh",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedTokenClaims {
+    pub principal_kind: TokenPrincipalKind,
+    pub token_use: TokenUse,
+    pub target: AuthTarget,
+}
+
+const SYSTEM_LOGIN_TARGETS: &[&str] = &["control-panel", "kernel", "system-config", "aiworkspace"];
+/// System services a Control Panel user session may be delegated to without a password (the Desktop opening a
+/// page on the service's own origin): AI Workspace pages live on `aiws-<id>.<zone>` (内核架构改进 D21).
+const SYSTEM_DELEGATION_TARGETS: &[&str] = &["aiworkspace"];
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -59,21 +85,24 @@ pub enum AvailabilityEffect {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppAvailabilityGroupRule {
     pub group_id: String,
     pub effect: AvailabilityEffect,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppAvailabilityUserRule {
     pub user_id: String,
     pub effect: AvailabilityEffect,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppAvailabilityPolicy {
     pub schema_version: u32,
-    pub app_instance_id: String,
+    pub app_instance_id: AppInstanceId,
     pub default_effect: AvailabilityEffect,
     pub group_rules: Vec<AppAvailabilityGroupRule>,
     pub user_rules: Vec<AppAvailabilityUserRule>,
@@ -83,10 +112,10 @@ pub struct AppAvailabilityPolicy {
 }
 
 impl AppAvailabilityPolicy {
-    pub fn owner_default(app_instance_id: impl Into<String>) -> Self {
+    pub fn owner_default(app_instance_id: AppInstanceId) -> Self {
         Self {
             schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: app_instance_id.into(),
+            app_instance_id,
             default_effect: AvailabilityEffect::Deny,
             group_rules: Vec::new(),
             user_rules: Vec::new(),
@@ -100,7 +129,6 @@ impl AppAvailabilityPolicy {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AvailabilityMatchType {
-    SystemBuiltin,
     Owner,
     ZoneAllUsers,
     Group,
@@ -108,6 +136,7 @@ pub enum AvailabilityMatchType {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AvailabilityMatch {
     #[serde(rename = "type")]
     pub match_type: AvailabilityMatchType,
@@ -115,21 +144,12 @@ pub struct AvailabilityMatch {
     pub subject: Option<String>,
 }
 
-impl AvailabilityMatch {
-    fn new(match_type: AvailabilityMatchType, subject: Option<String>) -> Self {
-        Self {
-            match_type,
-            subject,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppAvailabilityDecision {
     pub allowed: bool,
-    pub app_id: String,
-    pub app_instance_id: String,
-    pub app_class: AppClass,
+    pub app_id: AppId,
+    pub app_instance_id: AppInstanceId,
     pub owner_user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub availability_match: Option<AvailabilityMatch>,
@@ -144,166 +164,290 @@ pub struct ResolvedAppInstallation {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SystemBuiltinAppDescriptor {
-    pub app_id: &'static str,
+    pub service_id: &'static str,
     pub show_name: &'static str,
     pub icon_url: &'static str,
     pub description: &'static str,
-    pub app_index: u16,
 }
 
 pub const SYSTEM_BUILTIN_APPS: &[SystemBuiltinAppDescriptor] = &[
     SystemBuiltinAppDescriptor {
-        app_id: "messagehub",
+        service_id: "messagehub",
         show_name: "Message Hub",
         icon_url: "res/messagehub/appicon.png",
         description: "BuckyOS 内置的统一消息中心",
-        app_index: 100,
     },
     SystemBuiltinAppDescriptor {
-        app_id: "homestation",
+        service_id: "homestation",
         show_name: "Home Station",
         icon_url: "res/homestation/appicon.png",
         description: "BuckyOS 内置的家庭门户",
-        app_index: 101,
     },
     SystemBuiltinAppDescriptor {
-        app_id: "content-store",
+        service_id: "content-store",
         show_name: "Content Store",
         icon_url: "res/content-store/appicon.png",
         description: "BuckyOS 内置的内容仓库",
-        app_index: 102,
     },
 ];
 
-pub fn find_system_builtin_app(app_id: &str) -> Option<&'static SystemBuiltinAppDescriptor> {
-    SYSTEM_BUILTIN_APPS.iter().find(|app| app.app_id == app_id)
+pub fn find_system_builtin_app(service_id: &str) -> Option<&'static SystemBuiltinAppDescriptor> {
+    SYSTEM_BUILTIN_APPS
+        .iter()
+        .find(|app| app.service_id == service_id)
 }
 
-pub fn is_system_login_target(app_id: &str) -> bool {
-    SYSTEM_LOGIN_TARGETS.contains(&app_id) || find_system_builtin_app(app_id).is_some()
+pub fn is_system_login_target(service_id: &str) -> bool {
+    SYSTEM_LOGIN_TARGETS.contains(&service_id) || find_system_builtin_app(service_id).is_some()
 }
 
-pub fn bind_token_app_instance(
-    token: &mut RPCSessionToken,
-    app_instance_id: &str,
-    owner_user_id: Option<&str>,
-) {
+/// Whether `delegate_user_session` may issue a `System(service_id)` session from a Control Panel user session.
+pub fn is_system_delegation_target(service_id: &str) -> bool {
+    SYSTEM_DELEGATION_TARGETS.contains(&service_id)
+}
+
+pub fn bind_token_principal_kind(token: &mut RPCSessionToken, principal_kind: TokenPrincipalKind) {
     token.extra.insert(
-        APP_INSTANCE_ID_CLAIM.to_string(),
-        serde_json::Value::String(app_instance_id.to_string()),
+        TOKEN_PRINCIPAL_KIND_CLAIM.to_string(),
+        serde_json::Value::String(principal_kind.as_str().to_string()),
     );
-    if let Some(owner_user_id) = owner_user_id {
-        token.extra.insert(
-            APP_OWNER_USER_ID_CLAIM.to_string(),
-            serde_json::Value::String(owner_user_id.to_string()),
-        );
+}
+
+pub fn token_principal_kind(token: &RPCSessionToken) -> Result<TokenPrincipalKind, RPCErrors> {
+    match token
+        .extra
+        .get(TOKEN_PRINCIPAL_KIND_CLAIM)
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(TOKEN_PRINCIPAL_KIND_USER) => Ok(TokenPrincipalKind::User),
+        Some(TOKEN_PRINCIPAL_KIND_DEVICE) => Ok(TokenPrincipalKind::Device),
+        Some(TOKEN_PRINCIPAL_KIND_APP) => Ok(TokenPrincipalKind::App),
+        Some(TOKEN_PRINCIPAL_KIND_SYSTEM) => Ok(TokenPrincipalKind::System),
+        Some(TOKEN_PRINCIPAL_KIND_AGENT) => Ok(TokenPrincipalKind::Agent),
+        _ => Err(RPCErrors::InvalidToken(
+            "missing or invalid principal_kind claim".to_string(),
+        )),
     }
 }
 
-pub fn token_app_instance_id(token: &RPCSessionToken) -> Result<&str, RPCErrors> {
-    token
-        .extra
-        .get(APP_INSTANCE_ID_CLAIM)
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| RPCErrors::InvalidToken("missing app_instance_id claim".to_string()))
+pub fn bind_token_external(token: &mut RPCSessionToken) {
+    bind_token_principal_kind(token, TokenPrincipalKind::User);
+    token.extra.insert(
+        TOKEN_EXTERNAL_CLAIM.to_string(),
+        serde_json::Value::Bool(true),
+    );
 }
 
-pub fn build_system_builtin_app_spec(
-    app_id: &str,
-    version: &str,
-) -> Result<AppServiceSpec, RPCErrors> {
-    let descriptor = find_system_builtin_app(app_id)
-        .ok_or_else(|| RPCErrors::ReasonError(format!("unknown system built-in app `{app_id}`")))?;
-    let owner = DID::from_str(SYSTEM_APP_AUTHOR).map_err(|error| {
-        RPCErrors::ReasonError(format!("failed to build system owner DID: {error}"))
-    })?;
-    let app_doc = AppDoc::builder(
-        AppType::Service,
-        descriptor.app_id,
-        version,
-        SYSTEM_APP_AUTHOR,
-        &owner,
-    )
-    .show_name(descriptor.show_name)
-    .app_icon_url(descriptor.icon_url)
-    .description_detail(descriptor.description)
-    .build()
-    .map_err(|error| {
-        RPCErrors::ReasonError(format!(
-            "failed to build system app doc `{app_id}`: {error}"
-        ))
-    })?;
+pub fn token_is_external(token: &RPCSessionToken) -> bool {
+    token
+        .extra
+        .get(TOKEN_EXTERNAL_CLAIM)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
 
-    Ok(AppServiceSpec {
-        permission: app_doc.permissions.clone(),
-        app_doc,
-        app_index: descriptor.app_index,
-        user_id: SYSTEM_APP_OWNER_ID.to_string(),
-        app_class: AppClass::SystemBuiltin,
-        enable: true,
-        expected_instance_count: 1,
-        state: ServiceState::Running,
-        spec_config: ServiceSpecConfig::default(),
+pub fn bind_token_target(
+    token: &mut RPCSessionToken,
+    target: &AuthTarget,
+    token_use: TokenUse,
+) -> Result<(), RPCErrors> {
+    if token_use == TokenUse::Refresh && token.sudo {
+        return Err(RPCErrors::InvalidToken(
+            "refresh token cannot be a sudo token".to_string(),
+        ));
+    }
+
+    token.appid = Some(target.appid_claim().to_string());
+    token.extra.remove(APP_INSTANCE_ID_CLAIM);
+    token.extra.remove(APP_OWNER_USER_ID_CLAIM);
+    token.extra.insert(
+        TOKEN_USE_CLAIM.to_string(),
+        serde_json::Value::String(token_use.as_str().to_string()),
+    );
+    match target {
+        AuthTarget::App { app_instance_id } => {
+            token.extra.insert(
+                TOKEN_TARGET_KIND_CLAIM.to_string(),
+                serde_json::Value::String("app".to_string()),
+            );
+            token.extra.insert(
+                APP_INSTANCE_ID_CLAIM.to_string(),
+                serde_json::Value::String(app_instance_id.to_string()),
+            );
+            token.extra.insert(
+                APP_OWNER_USER_ID_CLAIM.to_string(),
+                serde_json::Value::String(app_instance_id.owner_user_id().to_string()),
+            );
+        }
+        AuthTarget::System { .. } => {
+            token.extra.insert(
+                TOKEN_TARGET_KIND_CLAIM.to_string(),
+                serde_json::Value::String("system".to_string()),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn token_use(token: &RPCSessionToken) -> Result<TokenUse, RPCErrors> {
+    let value = token
+        .extra
+        .get(TOKEN_USE_CLAIM)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RPCErrors::InvalidToken("missing token_use claim".to_string()))?;
+    let token_use = match value {
+        "session" => TokenUse::Session,
+        "refresh" => TokenUse::Refresh,
+        _ => {
+            return Err(RPCErrors::InvalidToken(
+                "invalid token_use claim".to_string(),
+            ));
+        }
+    };
+    if token_use == TokenUse::Refresh && token.sudo {
+        return Err(RPCErrors::InvalidToken(
+            "refresh token cannot be a sudo token".to_string(),
+        ));
+    }
+    Ok(token_use)
+}
+
+pub fn token_auth_target(token: &RPCSessionToken) -> Result<AuthTarget, RPCErrors> {
+    let appid = token
+        .appid
+        .as_deref()
+        .ok_or_else(|| RPCErrors::InvalidToken("missing appid claim".to_string()))?;
+    let target_kind = token
+        .extra
+        .get(TOKEN_TARGET_KIND_CLAIM)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| RPCErrors::InvalidToken("missing target_kind claim".to_string()))?;
+    match target_kind {
+        "app" => {
+            let instance_value = token
+                .extra
+                .get(APP_INSTANCE_ID_CLAIM)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RPCErrors::InvalidToken("missing app_instance_id claim".to_string())
+                })?;
+            let app_instance_id = AppInstanceId::from_str(instance_value).map_err(|error| {
+                RPCErrors::InvalidToken(format!("invalid app_instance_id claim: {error}"))
+            })?;
+            if app_instance_id.app_id().as_str() != appid {
+                return Err(RPCErrors::InvalidToken(
+                    "appid and app_instance_id claims do not match".to_string(),
+                ));
+            }
+            let owner = token
+                .extra
+                .get(APP_OWNER_USER_ID_CLAIM)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    RPCErrors::InvalidToken("missing app_owner_user_id claim".to_string())
+                })?;
+            if owner != app_instance_id.owner_user_id() {
+                return Err(RPCErrors::InvalidToken(
+                    "app_owner_user_id and app_instance_id claims do not match".to_string(),
+                ));
+            }
+            Ok(AuthTarget::app(app_instance_id))
+        }
+        "system" => {
+            if token.extra.contains_key(APP_INSTANCE_ID_CLAIM)
+                || token.extra.contains_key(APP_OWNER_USER_ID_CLAIM)
+            {
+                return Err(RPCErrors::InvalidToken(
+                    "system target cannot contain app instance claims".to_string(),
+                ));
+            }
+            let service_id = SystemServiceId::parse(appid).map_err(|error| {
+                RPCErrors::InvalidToken(format!("invalid system service target: {error}"))
+            })?;
+            Ok(AuthTarget::system(service_id))
+        }
+        _ => Err(RPCErrors::InvalidToken(
+            "invalid target_kind claim".to_string(),
+        )),
+    }
+}
+
+pub fn validate_token_claims(
+    token: &RPCSessionToken,
+    expected_use: TokenUse,
+) -> Result<ValidatedTokenClaims, RPCErrors> {
+    let actual_use = token_use(token)?;
+    if actual_use != expected_use {
+        return Err(RPCErrors::InvalidToken(format!(
+            "token_use mismatch: expected {}, got {}",
+            expected_use.as_str(),
+            actual_use.as_str()
+        )));
+    }
+    Ok(ValidatedTokenClaims {
+        principal_kind: token_principal_kind(token)?,
+        token_use: actual_use,
+        target: token_auth_target(token)?,
     })
 }
 
-pub fn app_instance_id(app_id: &str, owner_user_id: &str) -> String {
-    format!("{app_id}@{owner_user_id}")
-}
-
-pub fn parse_app_instance_id(value: &str) -> Result<(String, String), RPCErrors> {
-    let value = value.trim();
-    let (app_id, owner_user_id) = value.rsplit_once('@').ok_or_else(|| {
-        RPCErrors::ParseRequestError("app_instance_id must be `<app_id>@<owner_user_id>`".into())
-    })?;
-    if app_id.is_empty() || owner_user_id.is_empty() {
-        return Err(RPCErrors::ParseRequestError(
-            "app_instance_id must contain non-empty app and owner ids".into(),
+pub fn validate_verify_hub_token_claims(
+    token: &RPCSessionToken,
+    expected_use: TokenUse,
+) -> Result<ValidatedTokenClaims, RPCErrors> {
+    if token.iss.as_deref() != Some(VERIFY_HUB_TOKEN_ISSUER) {
+        return Err(RPCErrors::InvalidToken(
+            "ordinary session tokens must be issued by verify-hub".to_string(),
         ));
     }
-    let valid_component = |component: &str, max_len: usize| {
-        component.len() <= max_len
-            && component
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    };
-    if !valid_component(app_id, 128) || !valid_component(owner_user_id, 64) {
-        return Err(RPCErrors::ParseRequestError(
-            "app_instance_id contains invalid app or owner characters".into(),
-        ));
-    }
-    Ok((app_id.to_string(), owner_user_id.to_string()))
+    validate_token_claims(token, expected_use)
 }
 
-pub fn user_app_spec_key(owner_user_id: &str, app_id: &str) -> String {
+pub fn token_app_instance_id(token: &RPCSessionToken) -> Result<AppInstanceId, RPCErrors> {
+    match token_auth_target(token)? {
+        AuthTarget::App { app_instance_id } => Ok(app_instance_id),
+        AuthTarget::System { .. } => Err(RPCErrors::InvalidToken(
+            "system target has no app_instance_id".to_string(),
+        )),
+    }
+}
+
+pub fn parse_app_instance_id(value: &str) -> Result<(AppId, String), RPCErrors> {
+    let instance_id = AppInstanceId::from_str(value).map_err(RPCErrors::ParseRequestError)?;
+    Ok((
+        instance_id.app_id().clone(),
+        instance_id.owner_user_id().to_string(),
+    ))
+}
+
+pub fn user_app_spec_key(owner_user_id: &str, app_id: &AppId) -> String {
     format!("users/{owner_user_id}/apps/{app_id}/spec")
 }
 
-pub fn zone_app_spec_key(app_id: &str) -> String {
-    format!("{ZONE_APP_PREFIX}/{app_id}/spec")
-}
-
-pub fn app_availability_policy_key(app_instance_id: &str) -> String {
+pub fn app_availability_policy_key(app_instance_id: &AppInstanceId) -> String {
     format!("{APP_AVAILABILITY_POLICY_PREFIX}/{app_instance_id}")
 }
 
-pub fn app_availability_audit_key(app_instance_id: &str, revision: u64) -> String {
+pub fn app_availability_audit_key(app_instance_id: &AppInstanceId, revision: u64) -> String {
     format!("{APP_AVAILABILITY_AUDIT_PREFIX}/{app_instance_id}/{revision}")
 }
 
-pub fn system_group_for_user_type(user_type: &UserType) -> Option<&'static str> {
+/// App availability group of a UserType. `guest` is reserved for anonymous
+/// requests (no account record) and `group:<id>` names a system user group.
+pub fn system_group_for_user_type(user_type: UserType) -> Option<&'static str> {
     match user_type {
         UserType::Admin => Some("admins"),
         UserType::User => Some("users"),
         UserType::Limited => Some("limited"),
-        UserType::Guest => Some("guest"),
         UserType::Root => None,
     }
 }
 
+pub const ANONYMOUS_AVAILABILITY_GROUP: &str = "guest";
+const USER_TYPE_AVAILABILITY_GROUPS: [&str; 3] = ["admins", "users", "limited"];
+
 pub fn user_is_active(settings: &UserSettings) -> bool {
-    matches!(settings.state, UserState::Active)
-        && !matches!(settings.user_type, UserType::Root | UserType::Guest)
+    settings.is_active()
 }
 
 pub fn evaluate_app_availability(
@@ -314,164 +458,152 @@ pub fn evaluate_app_availability(
     policy: Option<&AppAvailabilityPolicy>,
 ) -> AppAvailabilityDecision {
     let spec = &installation.spec;
-    let app_id = spec.app_id().to_string();
-    let app_instance_id = spec.app_instance_id();
     let denied = |reason: &str| AppAvailabilityDecision {
         allowed: false,
-        app_id: app_id.clone(),
-        app_instance_id: app_instance_id.clone(),
-        app_class: spec.app_class,
-        owner_user_id: spec.user_id.clone(),
+        app_id: spec.app_id().clone(),
+        app_instance_id: spec.app_instance_id.clone(),
+        owner_user_id: spec.owner_user_id.clone(),
         availability_match: None,
         reason: reason.to_string(),
     };
     let allowed = |match_type, subject, reason: &str| AppAvailabilityDecision {
         allowed: true,
-        app_id: app_id.clone(),
-        app_instance_id: app_instance_id.clone(),
-        app_class: spec.app_class,
-        owner_user_id: spec.user_id.clone(),
-        availability_match: Some(AvailabilityMatch::new(match_type, subject)),
+        app_id: spec.app_id().clone(),
+        app_instance_id: spec.app_instance_id.clone(),
+        owner_user_id: spec.owner_user_id.clone(),
+        availability_match: Some(AvailabilityMatch {
+            match_type,
+            subject,
+        }),
         reason: reason.to_string(),
     };
 
-    if matches!(spec.state, ServiceState::Deleted) {
+    if !spec.is_installed() {
         return denied("app_deleted");
     }
-
+    if !owner_settings.map(user_is_active).unwrap_or(false) {
+        return denied("owner_not_active");
+    }
     let is_guest = target_user_id == "guest" && target_user.is_none();
     if !is_guest && !target_user.map(user_is_active).unwrap_or(false) {
         return denied("user_not_active");
     }
+    if !is_guest && target_user_id == spec.owner_user_id {
+        return allowed(
+            AvailabilityMatchType::Owner,
+            Some(target_user_id.to_string()),
+            "owner",
+        );
+    }
 
-    match spec.app_class {
-        AppClass::SystemBuiltin => {
-            if is_guest {
-                denied("guest_not_declared_public")
-            } else {
-                allowed(AvailabilityMatchType::SystemBuiltin, None, "system_builtin")
-            }
-        }
-        AppClass::ZoneInstalled => {
-            if is_guest {
-                denied("zone_app_requires_login")
-            } else {
-                allowed(AvailabilityMatchType::ZoneAllUsers, None, "zone_all_users")
-            }
-        }
-        AppClass::UserInstalled => {
-            if !owner_settings.map(user_is_active).unwrap_or(false) {
-                return denied("owner_not_active");
-            }
-            if !is_guest && target_user_id == spec.user_id {
-                return allowed(
-                    AvailabilityMatchType::Owner,
+    let Some(policy) = policy else {
+        return denied("default_deny");
+    };
+    if policy.schema_version != APP_AVAILABILITY_SCHEMA_VERSION
+        || policy.app_instance_id != spec.app_instance_id
+        || validate_availability_rules(&policy.group_rules, &policy.user_rules).is_err()
+    {
+        return denied("invalid_policy");
+    }
+    if !is_guest {
+        if let Some(rule) = policy
+            .user_rules
+            .iter()
+            .find(|rule| rule.user_id == target_user_id)
+        {
+            return match rule.effect {
+                AvailabilityEffect::Allow => allowed(
+                    AvailabilityMatchType::ExactUser,
                     Some(target_user_id.to_string()),
-                    "owner",
-                );
-            }
-            if let Some(policy) = policy {
-                if policy.schema_version != APP_AVAILABILITY_SCHEMA_VERSION
-                    || policy.app_instance_id != app_instance_id
-                    || policy.default_effect != AvailabilityEffect::Deny
-                    || validate_availability_rules(&policy.group_rules, &policy.user_rules).is_err()
-                {
-                    return denied("invalid_policy");
-                }
-                if !is_guest {
-                    if let Some(rule) = policy
-                        .user_rules
-                        .iter()
-                        .find(|rule| rule.user_id == target_user_id)
-                    {
-                        return match rule.effect {
-                            AvailabilityEffect::Allow => allowed(
-                                AvailabilityMatchType::ExactUser,
-                                Some(target_user_id.to_string()),
-                                "exact_user_allow",
-                            ),
-                            AvailabilityEffect::Deny => denied("exact_user_deny"),
-                        };
-                    }
-                }
-            }
-
-            let group_id = if is_guest {
-                Some("guest")
-            } else {
-                target_user.and_then(|settings| system_group_for_user_type(&settings.user_type))
+                    "exact_user_allow",
+                ),
+                AvailabilityEffect::Deny => denied("exact_user_deny"),
             };
-            if let (Some(policy), Some(group_id)) = (policy, group_id) {
-                let matching = policy
-                    .group_rules
-                    .iter()
-                    .filter(|rule| rule.group_id == group_id)
-                    .collect::<Vec<_>>();
-                if matching
-                    .iter()
-                    .any(|rule| rule.effect == AvailabilityEffect::Deny)
-                {
-                    return denied("group_deny");
-                }
-                if matching
-                    .iter()
-                    .any(|rule| rule.effect == AvailabilityEffect::Allow)
-                {
-                    return allowed(
-                        AvailabilityMatchType::Group,
-                        Some(group_id.to_string()),
-                        "group_allow",
-                    );
-                }
-            }
-
-            if matches!(group_id, Some("admins" | "users")) {
-                return allowed(
-                    AvailabilityMatchType::Group,
-                    group_id.map(str::to_string),
-                    "default_group_allow",
-                );
-            }
-
-            match policy.map(|policy| policy.default_effect) {
-                Some(AvailabilityEffect::Allow) => denied("invalid_default_effect"),
-                Some(AvailabilityEffect::Deny) | None => denied("default_deny"),
-            }
         }
     }
+
+    if let Some((effect, group_id)) =
+        match_availability_group_rule(&policy.group_rules, target_user.filter(|_| !is_guest))
+    {
+        return match effect {
+            AvailabilityEffect::Allow => {
+                allowed(AvailabilityMatchType::Group, Some(group_id), "group_allow")
+            }
+            AvailabilityEffect::Deny => denied("group_deny"),
+        };
+    }
+    match policy.default_effect {
+        AvailabilityEffect::Allow => allowed(
+            AvailabilityMatchType::ZoneAllUsers,
+            None,
+            "policy_default_allow",
+        ),
+        AvailabilityEffect::Deny => denied("default_deny"),
+    }
+}
+
+/// The group rule that decides for a user (`None` = anonymous request). System
+/// user group rules come before the UserType group rule, and among the system
+/// groups of one user an allow wins.
+pub fn match_availability_group_rule(
+    group_rules: &[AppAvailabilityGroupRule],
+    target_user: Option<&UserSettings>,
+) -> Option<(AvailabilityEffect, String)> {
+    let Some(settings) = target_user else {
+        return group_rules
+            .iter()
+            .find(|rule| rule.group_id == ANONYMOUS_AVAILABILITY_GROUP)
+            .map(|rule| (rule.effect, rule.group_id.clone()));
+    };
+    let system_rules: Vec<&AppAvailabilityGroupRule> = group_rules
+        .iter()
+        .filter(|rule| {
+            rule.group_id
+                .strip_prefix(crate::USER_GROUP_REF_PREFIX)
+                .is_some_and(|group_id| settings.groups.iter().any(|g| g == group_id))
+        })
+        .collect();
+    if let Some(rule) = system_rules
+        .iter()
+        .find(|rule| rule.effect == AvailabilityEffect::Allow)
+        .or_else(|| system_rules.first())
+    {
+        return Some((rule.effect, rule.group_id.clone()));
+    }
+    let type_group = system_group_for_user_type(settings.user_type)?;
+    group_rules
+        .iter()
+        .find(|rule| rule.group_id == type_group)
+        .map(|rule| (rule.effect, rule.group_id.clone()))
 }
 
 pub fn validate_availability_rules(
     group_rules: &[AppAvailabilityGroupRule],
     user_rules: &[AppAvailabilityUserRule],
 ) -> Result<(), RPCErrors> {
-    const GROUPS: [&str; 4] = ["admins", "users", "limited", "guest"];
     let mut seen_groups = HashSet::new();
     for rule in group_rules {
-        if !GROUPS.contains(&rule.group_id.as_str()) {
+        let known = USER_TYPE_AVAILABILITY_GROUPS.contains(&rule.group_id.as_str())
+            || rule.group_id == ANONYMOUS_AVAILABILITY_GROUP
+            || rule
+                .group_id
+                .strip_prefix(crate::USER_GROUP_REF_PREFIX)
+                .is_some_and(|group_id| crate::validate_user_group_id(group_id).is_ok());
+        if !known || !seen_groups.insert(&rule.group_id) {
             return Err(RPCErrors::ParseRequestError(format!(
-                "unknown availability group `{}`",
-                rule.group_id
-            )));
-        }
-        if !seen_groups.insert(rule.group_id.as_str()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "duplicate availability group rule `{}`",
+                "invalid or duplicate availability group `{}`",
                 rule.group_id
             )));
         }
     }
     let mut seen_users = HashSet::new();
     for rule in user_rules {
-        if rule.user_id.trim().is_empty() || rule.user_id == "guest" || rule.user_id == "root" {
+        if rule.user_id.trim().is_empty()
+            || matches!(rule.user_id.as_str(), "guest" | "root")
+            || !seen_users.insert(&rule.user_id)
+        {
             return Err(RPCErrors::ParseRequestError(format!(
-                "invalid availability user `{}`",
-                rule.user_id
-            )));
-        }
-        if !seen_users.insert(rule.user_id.as_str()) {
-            return Err(RPCErrors::ParseRequestError(format!(
-                "duplicate availability user rule `{}`",
+                "invalid or duplicate availability user `{}`",
                 rule.user_id
             )));
         }
@@ -482,21 +614,20 @@ pub fn validate_availability_rules(
 #[derive(Clone)]
 pub struct AppAvailabilityResolver {
     client: Arc<SystemConfigClient>,
-    system_version: String,
 }
 
 impl AppAvailabilityResolver {
-    pub fn new(client: Arc<SystemConfigClient>, system_version: impl Into<String>) -> Self {
-        Self {
-            client,
-            system_version: system_version.into(),
-        }
+    pub fn new(client: Arc<SystemConfigClient>) -> Self {
+        Self { client }
     }
 
     pub async fn get_user_settings(&self, user_id: &str) -> Result<UserSettings, RPCErrors> {
         let key = format!("users/{user_id}/settings");
-        let value = self.client.get(&key).await.map_err(|error| {
-            RPCErrors::ReasonError(format!("user `{user_id}` not found: {error}"))
+        let value = self.client.get(&key).await.map_err(|error| match error {
+            SystemConfigError::KeyNotFound(_) => {
+                RPCErrors::KeyNotExist(format!("user `{user_id}` not found: {error}"))
+            }
+            error => RPCErrors::ReasonError(format!("read user `{user_id}` failed: {error}")),
         })?;
         let settings: UserSettings = serde_json::from_str(&value.value).map_err(|error| {
             RPCErrors::ReasonError(format!("invalid user settings for `{user_id}`: {error}"))
@@ -509,49 +640,48 @@ impl AppAvailabilityResolver {
         Ok(settings)
     }
 
+    async fn get_owner_settings(
+        &self,
+        owner_user_id: &str,
+    ) -> Result<Option<UserSettings>, RPCErrors> {
+        match self.get_user_settings(owner_user_id).await {
+            Ok(settings) => Ok(Some(settings)),
+            Err(RPCErrors::KeyNotExist(_) | RPCErrors::NoPermission(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn resolve_installation(
         &self,
-        app_instance_id: &str,
+        app_instance_id: &AppInstanceId,
     ) -> Result<ResolvedAppInstallation, RPCErrors> {
-        let (app_id, owner_user_id) = parse_app_instance_id(app_instance_id)?;
-        if owner_user_id == SYSTEM_APP_OWNER_ID {
-            if find_system_builtin_app(&app_id).is_some() {
-                return Ok(ResolvedAppInstallation {
-                    spec: build_system_builtin_app_spec(&app_id, &self.system_version)?,
-                    spec_path: format!("system/apps/{app_id}/spec"),
-                });
-            }
-            let spec_path = zone_app_spec_key(&app_id);
-            let value = self.client.get(&spec_path).await.map_err(|error| {
-                RPCErrors::ReasonError(format!(
+        let spec_path =
+            user_app_spec_key(app_instance_id.owner_user_id(), app_instance_id.app_id());
+        let value = self
+            .client
+            .get(&spec_path)
+            .await
+            .map_err(|error| match error {
+                SystemConfigError::KeyNotFound(_) => RPCErrors::KeyNotExist(format!(
                     "app instance `{app_instance_id}` not found: {error}"
-                ))
+                )),
+                error => RPCErrors::ReasonError(format!(
+                    "read app instance `{app_instance_id}` failed: {error}"
+                )),
             })?;
-            let spec: AppServiceSpec = serde_json::from_str(&value.value).map_err(|error| {
-                RPCErrors::ReasonError(format!("invalid app spec `{spec_path}`: {error}"))
-            })?;
-            if spec.app_class != AppClass::ZoneInstalled
-                || spec.app_instance_id() != app_instance_id
-            {
-                return Err(RPCErrors::ReasonError(format!(
-                    "zone app spec does not match `{app_instance_id}`"
-                )));
-            }
-            return Ok(ResolvedAppInstallation { spec, spec_path });
-        }
-
-        let spec_path = user_app_spec_key(&owner_user_id, &app_id);
-        let value = self.client.get(&spec_path).await.map_err(|error| {
-            RPCErrors::ReasonError(format!(
-                "app instance `{app_instance_id}` not found: {error}"
-            ))
-        })?;
         let spec: AppServiceSpec = serde_json::from_str(&value.value).map_err(|error| {
             RPCErrors::ReasonError(format!("invalid app spec `{spec_path}`: {error}"))
         })?;
-        if spec.app_class != AppClass::UserInstalled || spec.app_instance_id() != app_instance_id {
+        if spec.app_instance_id != *app_instance_id
+            || spec.owner_user_id != app_instance_id.owner_user_id()
+        {
             return Err(RPCErrors::ReasonError(format!(
-                "user app spec does not match `{app_instance_id}`"
+                "app spec does not match `{app_instance_id}`"
+            )));
+        }
+        if !spec.is_installed() {
+            return Err(RPCErrors::KeyNotExist(format!(
+                "APP_NOT_INSTALLED: app instance `{app_instance_id}` has been deleted"
             )));
         }
         Ok(ResolvedAppInstallation { spec, spec_path })
@@ -559,7 +689,7 @@ impl AppAvailabilityResolver {
 
     pub async fn load_policy(
         &self,
-        app_instance_id: &str,
+        app_instance_id: &AppInstanceId,
     ) -> Result<Option<(AppAvailabilityPolicy, u64)>, RPCErrors> {
         let key = app_availability_policy_key(app_instance_id);
         match self.client.get(&key).await {
@@ -571,8 +701,7 @@ impl AppAvailabilityResolver {
                         ))
                     })?;
                 if policy.schema_version != APP_AVAILABILITY_SCHEMA_VERSION
-                    || policy.app_instance_id != app_instance_id
-                    || policy.default_effect != AvailabilityEffect::Deny
+                    || policy.app_instance_id != *app_instance_id
                     || validate_availability_rules(&policy.group_rules, &policy.user_rules).is_err()
                 {
                     return Err(RPCErrors::ReasonError(format!(
@@ -589,21 +718,17 @@ impl AppAvailabilityResolver {
     pub async fn check_user(
         &self,
         user_id: &str,
-        app_instance_id: &str,
+        app_instance_id: &AppInstanceId,
     ) -> Result<AppAvailabilityDecision, RPCErrors> {
         let target_user = self.get_user_settings(user_id).await?;
         let installation = self.resolve_installation(app_instance_id).await?;
-        let owner_settings = if installation.spec.app_class == AppClass::UserInstalled {
-            self.get_user_settings(&installation.spec.user_id)
-                .await
-                .ok()
-        } else {
-            None
-        };
+        let owner_settings = self
+            .get_owner_settings(&installation.spec.owner_user_id)
+            .await?;
         let policy = self
             .load_policy(app_instance_id)
             .await?
-            .map(|(policy, _)| policy);
+            .map(|value| value.0);
         Ok(evaluate_app_availability(
             Some(&target_user),
             user_id,
@@ -615,20 +740,16 @@ impl AppAvailabilityResolver {
 
     pub async fn check_guest(
         &self,
-        app_instance_id: &str,
+        app_instance_id: &AppInstanceId,
     ) -> Result<AppAvailabilityDecision, RPCErrors> {
         let installation = self.resolve_installation(app_instance_id).await?;
-        let owner_settings = if installation.spec.app_class == AppClass::UserInstalled {
-            self.get_user_settings(&installation.spec.user_id)
-                .await
-                .ok()
-        } else {
-            None
-        };
+        let owner_settings = self
+            .get_owner_settings(&installation.spec.owner_user_id)
+            .await?;
         let policy = self
             .load_policy(app_instance_id)
             .await?
-            .map(|(policy, _)| policy);
+            .map(|value| value.0);
         Ok(evaluate_app_availability(
             None,
             "guest",
@@ -643,30 +764,18 @@ impl AppAvailabilityResolver {
         user_id: &str,
     ) -> Result<Vec<(ResolvedAppInstallation, AppAvailabilityDecision)>, RPCErrors> {
         let target_user = self.get_user_settings(user_id).await?;
-        let mut candidates = BTreeMap::<String, ResolvedAppInstallation>::new();
-
-        for descriptor in SYSTEM_BUILTIN_APPS {
-            let spec = build_system_builtin_app_spec(descriptor.app_id, &self.system_version)?;
-            candidates.insert(
-                spec.app_instance_id(),
-                ResolvedAppInstallation {
-                    spec,
-                    spec_path: format!("system/apps/{}/spec", descriptor.app_id),
-                },
-            );
-        }
-
-        for app_id in list_children_or_empty(&self.client, ZONE_APP_PREFIX).await? {
-            let instance_id = app_instance_id(&app_id, SYSTEM_APP_OWNER_ID);
-            if let Ok(installation) = self.resolve_installation(&instance_id).await {
-                candidates.insert(instance_id, installation);
-            }
-        }
-
+        let mut candidates = BTreeMap::<AppInstanceId, ResolvedAppInstallation>::new();
         for owner_user_id in list_children_or_empty(&self.client, "users").await? {
-            let app_root = format!("users/{owner_user_id}/apps");
-            for app_id in list_children_or_empty(&self.client, &app_root).await? {
-                let instance_id = app_instance_id(&app_id, &owner_user_id);
+            let root = format!("users/{owner_user_id}/apps");
+            for raw_app_id in list_children_or_empty(&self.client, &root).await? {
+                let app_id = match AppId::parse(&raw_app_id) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let instance_id = match AppInstanceId::new(app_id, owner_user_id.clone()) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
                 if let Ok(installation) = self.resolve_installation(&instance_id).await {
                     candidates.insert(instance_id, installation);
                 }
@@ -675,20 +784,11 @@ impl AppAvailabilityResolver {
 
         let mut result = Vec::new();
         for (instance_id, installation) in candidates {
-            if installation.spec.app_doc.get_app_type() == AppType::Agent {
-                continue;
-            }
-            let owner_settings = if installation.spec.app_class == AppClass::UserInstalled {
-                self.get_user_settings(&installation.spec.user_id)
-                    .await
-                    .ok()
-            } else {
-                None
-            };
-            let policy = self
-                .load_policy(&instance_id)
-                .await?
-                .map(|(policy, _)| policy);
+            let owner_settings = self
+                .get_user_settings(&installation.spec.owner_user_id)
+                .await
+                .ok();
+            let policy = self.load_policy(&instance_id).await?.map(|value| value.0);
             let decision = evaluate_app_availability(
                 Some(&target_user),
                 user_id,
@@ -709,7 +809,7 @@ async fn list_children_or_empty(
     key: &str,
 ) -> Result<Vec<String>, RPCErrors> {
     match client.list(key).await {
-        Ok(items) => Ok(items),
+        Ok(values) => Ok(values),
         Err(SystemConfigError::KeyNotFound(_)) => Ok(Vec::new()),
         Err(error) => Err(RPCErrors::ReasonError(error.to_string())),
     }
@@ -718,193 +818,42 @@ async fn list_children_or_empty(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserState;
 
-    fn settings(user_id: &str, user_type: UserType, state: UserState) -> UserSettings {
-        UserSettings {
-            user_id: user_id.to_string(),
-            user_type,
-            password: String::new(),
-            state,
-            res_pool_id: "default".to_string(),
-            is_local: true,
-            allow_password_change: Some(true),
-        }
-    }
-
-    fn installation(owner: &str) -> ResolvedAppInstallation {
-        let owner_did = DID::new("bns", owner);
-        let app_doc = AppDoc::builder(AppType::Service, "notes", "1.0.0", owner, &owner_did)
-            .build()
-            .unwrap();
-        ResolvedAppInstallation {
-            spec: AppServiceSpec {
-                permission: Vec::new(),
-                app_doc,
-                app_index: 1,
-                user_id: owner.to_string(),
-                app_class: AppClass::UserInstalled,
-                enable: true,
-                expected_instance_count: 1,
-                state: ServiceState::Running,
-                spec_config: ServiceSpecConfig::default(),
-            },
-            spec_path: user_app_spec_key(owner, "notes"),
+    fn token() -> RPCSessionToken {
+        RPCSessionToken {
+            token_type: ::kRPC::RPCSessionTokenType::JWT,
+            token: None,
+            aud: None,
+            exp: Some(u64::MAX),
+            iss: Some(VERIFY_HUB_TOKEN_ISSUER.to_string()),
+            jti: Some("1".to_string()),
+            sub: Some("alice".to_string()),
+            appid: None,
+            sudo: false,
+            extra: std::collections::HashMap::new(),
         }
     }
 
     #[test]
-    fn exact_user_rule_overrides_group_rule() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let bob = settings("bob", UserType::User, UserState::Active);
-        let app = installation("alice");
-        let policy = AppAvailabilityPolicy {
-            schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: "notes@alice".to_string(),
-            default_effect: AvailabilityEffect::Deny,
-            group_rules: vec![AppAvailabilityGroupRule {
-                group_id: "users".to_string(),
+    fn parse_app_instance_selector_rejects_noncanonical_values() {
+        let parsed = parse_app_instance_id("notes.example.com@alice").unwrap();
+        assert_eq!(parsed.0.as_str(), "notes.example.com");
+        assert_eq!(parsed.1, "alice");
+        assert!(parse_app_instance_id("Notes@alice").is_err());
+        assert!(parse_app_instance_id("../../spec@alice").is_err());
+    }
+
+    #[test]
+    fn availability_rules_are_explicit() {
+        assert!(validate_availability_rules(
+            &[AppAvailabilityGroupRule {
+                group_id: "users".into(),
                 effect: AvailabilityEffect::Allow,
             }],
-            user_rules: vec![AppAvailabilityUserRule {
-                user_id: "bob".to_string(),
-                effect: AvailabilityEffect::Deny,
-            }],
-            revision: 1,
-            updated_by: "alice".to_string(),
-            updated_at: 1,
-        };
-        let decision =
-            evaluate_app_availability(Some(&bob), "bob", Some(&owner), &app, Some(&policy));
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "exact_user_deny");
-
-        let mut allow_exact = policy.clone();
-        allow_exact.group_rules[0].effect = AvailabilityEffect::Deny;
-        allow_exact.user_rules[0].effect = AvailabilityEffect::Allow;
-        let decision =
-            evaluate_app_availability(Some(&bob), "bob", Some(&owner), &app, Some(&allow_exact));
-        assert!(decision.allowed);
-        assert_eq!(
-            decision.availability_match.unwrap().match_type,
-            AvailabilityMatchType::ExactUser
-        );
-    }
-
-    #[test]
-    fn owner_is_always_allowed_but_inactive_owner_blocks_shares() {
-        let active_owner = settings("alice", UserType::User, UserState::Active);
-        let bob = settings("bob", UserType::User, UserState::Active);
-        let app = installation("alice");
-        let owner_decision = evaluate_app_availability(
-            Some(&active_owner),
-            "alice",
-            Some(&active_owner),
-            &app,
-            None,
-        );
-        assert!(owner_decision.allowed);
-
-        let banned_owner = settings(
-            "alice",
-            UserType::User,
-            UserState::Banned("test".to_string()),
-        );
-        let policy = AppAvailabilityPolicy {
-            schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: "notes@alice".to_string(),
-            default_effect: AvailabilityEffect::Deny,
-            group_rules: vec![AppAvailabilityGroupRule {
-                group_id: "users".to_string(),
-                effect: AvailabilityEffect::Allow,
-            }],
-            user_rules: Vec::new(),
-            revision: 1,
-            updated_by: "alice".to_string(),
-            updated_at: 1,
-        };
-        let shared_decision =
-            evaluate_app_availability(Some(&bob), "bob", Some(&banned_owner), &app, Some(&policy));
-        assert!(!shared_decision.allowed);
-        assert_eq!(shared_decision.reason, "owner_not_active");
-    }
-
-    #[test]
-    fn admin_and_user_are_allowed_user_apps_by_default() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let app = installation("alice");
-
-        for (user_id, user_type, group_id) in [
-            ("admin", UserType::Admin, "admins"),
-            ("bob", UserType::User, "users"),
-        ] {
-            let target = settings(user_id, user_type, UserState::Active);
-            let decision =
-                evaluate_app_availability(Some(&target), user_id, Some(&owner), &app, None);
-            assert!(decision.allowed);
-            assert_eq!(decision.reason, "default_group_allow");
-            assert_eq!(
-                decision.availability_match.unwrap(),
-                AvailabilityMatch::new(AvailabilityMatchType::Group, Some(group_id.to_string()))
-            );
-        }
-    }
-
-    #[test]
-    fn limited_user_requires_explicit_allow() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let limited = settings("bob", UserType::Limited, UserState::Active);
-        let app = installation("alice");
-
-        let decision = evaluate_app_availability(Some(&limited), "bob", Some(&owner), &app, None);
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "default_deny");
-
-        let policy = AppAvailabilityPolicy {
-            schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: "notes@alice".to_string(),
-            default_effect: AvailabilityEffect::Deny,
-            group_rules: vec![AppAvailabilityGroupRule {
-                group_id: "limited".to_string(),
-                effect: AvailabilityEffect::Allow,
-            }],
-            user_rules: Vec::new(),
-            revision: 1,
-            updated_by: "alice".to_string(),
-            updated_at: 1,
-        };
-        let decision =
-            evaluate_app_availability(Some(&limited), "bob", Some(&owner), &app, Some(&policy));
-        assert!(decision.allowed);
-        assert_eq!(decision.reason, "group_allow");
-    }
-
-    #[test]
-    fn explicit_deny_overrides_default_group_allow() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let bob = settings("bob", UserType::User, UserState::Active);
-        let app = installation("alice");
-        let policy = AppAvailabilityPolicy {
-            schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: "notes@alice".to_string(),
-            default_effect: AvailabilityEffect::Deny,
-            group_rules: vec![AppAvailabilityGroupRule {
-                group_id: "users".to_string(),
-                effect: AvailabilityEffect::Deny,
-            }],
-            user_rules: Vec::new(),
-            revision: 1,
-            updated_by: "alice".to_string(),
-            updated_at: 1,
-        };
-
-        let decision =
-            evaluate_app_availability(Some(&bob), "bob", Some(&owner), &app, Some(&policy));
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "group_deny");
-    }
-
-    #[test]
-    fn duplicate_or_untrusted_rules_are_rejected() {
+            &[],
+        )
+        .is_ok());
         assert!(validate_availability_rules(
             &[
                 AppAvailabilityGroupRule {
@@ -919,94 +868,145 @@ mod tests {
             &[],
         )
         .is_err());
-        assert!(validate_availability_rules(
-            &[AppAvailabilityGroupRule {
-                group_id: "profile-admins".into(),
-                effect: AvailabilityEffect::Allow,
-            }],
-            &[],
-        )
-        .is_err());
     }
 
     #[test]
-    fn app_instance_id_rejects_path_components() {
-        assert_eq!(
-            parse_app_instance_id("demo-app@alice").unwrap(),
-            ("demo-app".to_string(), "alice".to_string())
-        );
-        assert!(parse_app_instance_id("../../spec@alice").is_err());
-        assert!(parse_app_instance_id("demo@app/owner").is_err());
-    }
-
-    #[test]
-    fn system_and_zone_apps_allow_active_users_but_not_guest() {
-        let bob = settings("bob", UserType::User, UserState::Active);
-        let system = ResolvedAppInstallation {
-            spec: build_system_builtin_app_spec("messagehub", "1.0.0").unwrap(),
-            spec_path: "system/apps/messagehub/spec".to_string(),
+    fn system_group_rules_open_apps_to_limited_accounts() {
+        let rule = |group_id: &str, effect| AppAvailabilityGroupRule {
+            group_id: group_id.into(),
+            effect,
         };
-        let system_decision = evaluate_app_availability(Some(&bob), "bob", None, &system, None);
-        assert!(system_decision.allowed);
-        assert_eq!(
-            system_decision.availability_match.unwrap().match_type,
-            AvailabilityMatchType::SystemBuiltin
+        let rules = vec![
+            rule("limited", AvailabilityEffect::Deny),
+            rule("group:customer", AvailabilityEffect::Allow),
+            rule("group:minors", AvailabilityEffect::Deny),
+            rule("guest", AvailabilityEffect::Allow),
+        ];
+        assert!(validate_availability_rules(&rules, &[]).is_ok());
+        assert!(
+            validate_availability_rules(&[rule("group:Bad", AvailabilityEffect::Allow)], &[])
+                .is_err()
         );
-        assert!(!evaluate_app_availability(None, "guest", None, &system, None).allowed);
-
-        let mut zone = installation(SYSTEM_APP_OWNER_ID);
-        zone.spec.app_class = AppClass::ZoneInstalled;
-        let zone_decision = evaluate_app_availability(Some(&bob), "bob", None, &zone, None);
-        assert!(zone_decision.allowed);
-        assert_eq!(
-            zone_decision.availability_match.unwrap().match_type,
-            AvailabilityMatchType::ZoneAllUsers
-        );
-    }
-
-    #[test]
-    fn guest_access_is_driven_only_by_guest_policy() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let app = installation("alice");
-        let policy = AppAvailabilityPolicy {
-            schema_version: APP_AVAILABILITY_SCHEMA_VERSION,
-            app_instance_id: "notes@alice".to_string(),
-            default_effect: AvailabilityEffect::Deny,
-            group_rules: vec![AppAvailabilityGroupRule {
-                group_id: "guest".to_string(),
-                effect: AvailabilityEffect::Allow,
-            }],
-            user_rules: Vec::new(),
-            revision: 1,
-            updated_by: "alice".to_string(),
-            updated_at: 1,
+        let mut carol = UserSettings {
+            user_id: "carol".into(),
+            user_type: UserType::Limited,
+            password: String::new(),
+            state: UserState::Active,
+            res_pool_id: "default".into(),
+            is_local: true,
+            allow_password_change: None,
+            allow_contact_edit: None,
+            groups: Vec::new(),
+            password_state: crate::PasswordState::Set,
         };
-        let decision = evaluate_app_availability(None, "guest", Some(&owner), &app, Some(&policy));
-        assert!(decision.allowed);
+        let decide =
+            |settings: Option<&UserSettings>| match_availability_group_rule(&rules, settings);
         assert_eq!(
-            decision.availability_match.unwrap(),
-            AvailabilityMatch::new(AvailabilityMatchType::Group, Some("guest".to_string()))
+            decide(Some(&carol)),
+            Some((AvailabilityEffect::Deny, "limited".into()))
+        );
+        carol.groups = vec!["customer".into(), "minors".into()];
+        assert_eq!(
+            decide(Some(&carol)),
+            Some((AvailabilityEffect::Allow, "group:customer".into()))
+        );
+        carol.groups = vec!["minors".into()];
+        assert_eq!(
+            decide(Some(&carol)),
+            Some((AvailabilityEffect::Deny, "group:minors".into()))
+        );
+        carol.user_type = UserType::User;
+        carol.groups.clear();
+        assert_eq!(decide(Some(&carol)), None);
+        assert_eq!(
+            decide(None),
+            Some((AvailabilityEffect::Allow, "guest".into()))
         );
     }
 
     #[test]
-    fn deleted_apps_and_inactive_users_are_denied() {
-        let owner = settings("alice", UserType::User, UserState::Active);
-        let banned = settings("bob", UserType::User, UserState::Banned("test".to_string()));
-        let guest_account = settings("guest", UserType::Guest, UserState::Active);
-        let mut app = installation("alice");
-        let decision = evaluate_app_availability(Some(&banned), "bob", Some(&owner), &app, None);
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "user_not_active");
+    fn token_target_bind_and_parse_round_trip() {
+        let targets = [
+            AuthTarget::app("notes.example.com@alice".parse().unwrap()),
+            AuthTarget::system("control-panel".parse().unwrap()),
+        ];
+        for target in targets {
+            let mut token = token();
+            bind_token_principal_kind(&mut token, TokenPrincipalKind::User);
+            bind_token_target(&mut token, &target, TokenUse::Session).unwrap();
+            let validated = validate_verify_hub_token_claims(&token, TokenUse::Session).unwrap();
+            assert_eq!(validated.principal_kind, TokenPrincipalKind::User);
+            assert_eq!(validated.target, target);
+        }
+    }
 
-        let decision =
-            evaluate_app_availability(Some(&guest_account), "guest", Some(&owner), &app, None);
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "user_not_active");
+    #[test]
+    fn token_claim_validation_fails_closed() {
+        let app_target = AuthTarget::app("notes.example.com@alice".parse().unwrap());
+        let mut valid = token();
+        bind_token_principal_kind(&mut valid, TokenPrincipalKind::User);
+        bind_token_target(&mut valid, &app_target, TokenUse::Session).unwrap();
 
-        app.spec.state = ServiceState::Deleted;
-        let decision = evaluate_app_availability(Some(&owner), "alice", Some(&owner), &app, None);
-        assert!(!decision.allowed);
-        assert_eq!(decision.reason, "app_deleted");
+        let mut cases = Vec::new();
+        let mut missing_kind = valid.clone();
+        missing_kind.extra.remove(TOKEN_TARGET_KIND_CLAIM);
+        cases.push(missing_kind);
+        let mut missing_use = valid.clone();
+        missing_use.extra.remove(TOKEN_USE_CLAIM);
+        cases.push(missing_use);
+        let mut bad_instance = valid.clone();
+        bad_instance.extra.insert(
+            APP_INSTANCE_ID_CLAIM.to_string(),
+            serde_json::Value::String("other.example.com@alice".to_string()),
+        );
+        cases.push(bad_instance);
+        let mut bad_owner = valid.clone();
+        bad_owner.extra.insert(
+            APP_OWNER_USER_ID_CLAIM.to_string(),
+            serde_json::Value::String("bob".to_string()),
+        );
+        cases.push(bad_owner);
+        let mut wrong_issuer = valid.clone();
+        wrong_issuer.iss = Some("alice".to_string());
+        cases.push(wrong_issuer);
+
+        for token in cases {
+            assert!(validate_verify_hub_token_claims(&token, TokenUse::Session).is_err());
+        }
+
+        assert!(validate_verify_hub_token_claims(&valid, TokenUse::Refresh).is_err());
+    }
+
+    #[test]
+    fn token_use_and_sudo_combinations_are_strict() {
+        let target = AuthTarget::system("control-panel".parse().unwrap());
+        for (token_use, sudo, expected_ok) in [
+            (TokenUse::Session, false, true),
+            (TokenUse::Session, true, true),
+            (TokenUse::Refresh, false, true),
+            (TokenUse::Refresh, true, false),
+        ] {
+            let mut token = token();
+            token.sudo = sudo;
+            bind_token_principal_kind(&mut token, TokenPrincipalKind::User);
+            let result = bind_token_target(&mut token, &target, token_use);
+            assert_eq!(result.is_ok(), expected_ok);
+            if expected_ok {
+                assert!(validate_token_claims(&token, token_use).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn system_target_rejects_app_claims() {
+        let target = AuthTarget::system("control-panel".parse().unwrap());
+        let mut token = token();
+        bind_token_principal_kind(&mut token, TokenPrincipalKind::User);
+        bind_token_target(&mut token, &target, TokenUse::Session).unwrap();
+        token.extra.insert(
+            APP_INSTANCE_ID_CLAIM.to_string(),
+            serde_json::Value::String("control-panel.example@alice".to_string()),
+        );
+        assert!(token_auth_target(&token).is_err());
     }
 }

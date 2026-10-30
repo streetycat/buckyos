@@ -43,8 +43,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { Buffer } from "node:buffer";
-import { createPrivateKey, sign } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";
 import { parseArgs } from "node:util";
+import { fileURLToPath } from "node:url";
 import {
   assertProvisionRuntime,
   createIdentityCertFromCa,
@@ -52,6 +53,8 @@ import {
   createUserEnv,
   deviceIdentityPathsForRoots,
   ensureCa,
+  getDevTestKeyPairById,
+  hashAdminPassword,
   IdentityRoots,
   loadLocalNodeIdentityConfig,
 } from "buckyos/provision";
@@ -85,9 +88,7 @@ export function getBuckyosRoot(): string {
     return fromEnv;
   }
   if (IS_WINDOWS) {
-    const appData = Deno.env.get("APPDATA") ?? Deno.env.get("USERPROFILE") ??
-      ".";
-    return path.join(appData, "buckyos");
+    return "C:\\buckyos";
   }
   return "/opt/buckyos/";
 }
@@ -311,6 +312,7 @@ export async function buildUserEnv(
   keyPairs: BuildUserEnvKeyPairs = {},
 ): Promise<string> {
   const userDir = ensureDir(path.join(envRoot, params.zone_id));
+  removeIfExists(path.join(userDir, params.node_name, "sn_seed_identity.json"));
   const oodNameForZone = params.netid !== "lan"
     ? `${params.node_name}@${params.netid}`
     : params.node_name;
@@ -325,6 +327,11 @@ export async function buildUserEnv(
     ownerKeyPair: keyPairs.ownerKeyPair,
     deviceKeyPair: keyPairs.deviceKeyPair,
   });
+  const ownerPath = path.join(userDir, "user_config.json");
+  const zonePath = path.join(userDir, "zone_config.json");
+  const zoneDocument = readJsonObject(zonePath);
+  zoneDocument.iat = requireNumber(readJsonObject(ownerPath), "iat", ownerPath);
+  writeJson(zonePath, zoneDocument);
   await createNodeConfigs({
     deviceName: params.node_name,
     netId: params.netid,
@@ -407,11 +414,7 @@ function normalizeOwnerDocument(
   const ownerPath = path.join(userDir, "user_config.json");
   const ownerDocument = structuredClone(readJsonObject(ownerPath));
   const ownerDid = requireString(ownerDocument, "id", ownerPath);
-  const displayName = typeof ownerDocument.display_name === "string"
-    ? ownerDocument.display_name
-    : requireString(ownerDocument, "full_name", ownerPath);
-  ownerDocument.display_name = displayName;
-  delete ownerDocument.full_name;
+  requireString(ownerDocument, "display_name", ownerPath);
 
   if (ownerDid !== zoneDid) {
     const boundZones = Array.isArray(ownerDocument.binded_zone_list)
@@ -469,7 +472,7 @@ function makeSnApiUrl(params: OODGroupParams): string | undefined {
 function writeLocalDeviceIdentityFiles(
   userDir: string,
   nodeDir: string,
-  targetDir: string,
+  targetDir: string | undefined,
   params: OODGroupParams,
 ): LocalDeviceIdentityFiles {
   const nodeIdentityPath = path.join(nodeDir, "node_identity.json");
@@ -506,6 +509,10 @@ function writeLocalDeviceIdentityFiles(
     sourcePaths.authenticationPrivateKey,
     "utf8",
   );
+  const devicePublicKey = createPublicKey(createPrivateKey(devicePrivateKeyPem)).export({ format: "jwk" });
+  if (devicePublicKey.x !== defaultPublicJwk(deviceConfig, sourcePaths.didJson).x) {
+    throw new Error(`${sourcePaths.authenticationPrivateKey} differs from device document key`);
+  }
   const ownerPublicKeyFromDocument = defaultPublicJwk(
     ownerDocument,
     path.join(userDir, "user_config.json"),
@@ -520,16 +527,15 @@ function writeLocalDeviceIdentityFiles(
 
   const documentIat = requireNumber(zoneConfig, "iat", zoneConfigPath);
   const documentExp = requireNumber(bootDocument, "exp", bootSeedPath);
-  const usesSnRelay = params.netid !== "wan";
+  const usesSnDdns = params.netid !== "wan";
+  const usesSnRelay = usesSnDdns && params.netid !== "wan_dyn";
   const snApiUrl = makeSnApiUrl(params);
-  if (usesSnRelay && !snApiUrl) {
+  if (usesSnDdns && !snApiUrl) {
     throw new Error(
-      `group ${params.username} needs SN relay but has no SN base host`,
+      `group ${params.username} needs SN DDNS but has no SN base host`,
     );
   }
   bootDocument.id = zoneDid;
-  delete bootDocument.owner;
-  delete bootDocument.owner_key;
   delete bootDocument.iat;
   if (usesSnRelay) {
     bootDocument.sn = `sn.${params.sn_base_host.trim()}`;
@@ -540,14 +546,19 @@ function writeLocalDeviceIdentityFiles(
 
   deviceConfig.owner = ownerDid;
   deviceConfig.zone_did = zoneDid;
+  // support_container is serialized only when false (serde default true).
+  if (params.support_container === false) {
+    deviceConfig.support_container = false;
+  } else {
+    delete deviceConfig.support_container;
+  }
   deviceConfig.net_id = params.netid === "lan" ? "nat" : params.netid;
   deviceConfig.rtcp_port = params.rtcp_port;
-  delete deviceConfig.support_container;
   delete deviceConfig.device_mini_document_jwt;
   deviceConfig.iat = documentIat;
   deviceConfig.exp = documentExp;
   deviceConfig.version_seq = 0;
-  if (usesSnRelay) {
+  if (usesSnDdns) {
     deviceConfig.ddns_sn_url = snApiUrl;
   } else {
     delete deviceConfig.ddns_sn_url;
@@ -591,6 +602,34 @@ function writeLocalDeviceIdentityFiles(
     );
   }
 
+  const localIdentity = {
+    ownerDocument,
+    bootDocument,
+    bootDocumentJwt,
+    deviceDocJwt,
+    deviceMiniDocJwt,
+    deviceDid,
+    zoneDid,
+    zoneDocument,
+    zoneDocumentJwt,
+  };
+  if (params.sn_base_host.trim()) {
+    const bundlePath = path.join(nodeDir, "sn_seed_identity.json");
+    const bundle = seedIdentityBundle(userDir, nodeDir, params, localIdentity);
+    if (fs.existsSync(bundlePath)) {
+      const existing = readJsonObject(bundlePath);
+      if (Object.keys(existing).length !== Object.keys(bundle).length ||
+          Object.entries(bundle).some(([field, value]) => existing[field] !== value)) {
+        throw new Error(`${bundlePath} differs from finalized identity; use a new --env_root and regenerate OOD and SN together`);
+      }
+    } else {
+      writeJson(bundlePath, bundle);
+    }
+  }
+  if (targetDir === undefined) {
+    return localIdentity;
+  }
+
   const roots = new IdentityRoots(
     path.join(targetDir, "local", "identity"),
     path.join(targetDir, "security"),
@@ -623,6 +662,7 @@ function writeLocalDeviceIdentityFiles(
   writeJson(path.join(etcDir, "node_gateway_params.json"), {
     params: {
       device_did: deviceDid,
+      rtcp_port: String(params.rtcp_port),
     },
   });
   writeJson(didJsonPath, deviceConfig);
@@ -641,17 +681,92 @@ function writeLocalDeviceIdentityFiles(
     privateKeyPath,
   ]);
 
+  return localIdentity;
+}
+
+function seedIdentitySourceHash(
+  userDir: string,
+  nodeDir: string,
+  params: OODGroupParams,
+): string {
+  const nodeIdentity = loadLocalNodeIdentityConfig(path.join(nodeDir, "node_identity.json"));
+  const sourcePaths = deviceIdentityPathsForRoots(
+    new IdentityRoots(path.join(nodeDir, "local", "identity"), path.join(nodeDir, "security")),
+    nodeIdentity.device_did,
+  );
+  const sourceFiles = [
+    path.join(userDir, "user_config.json"),
+    path.join(userDir, "zone_config.json"),
+    path.join(userDir, `${params.zone_id}.zone.json`),
+    path.join(nodeDir, "node_identity.json"),
+    sourcePaths.didJson,
+  ];
+  return createHash("sha256")
+    .update(JSON.stringify(sourceFiles.map((file) => fs.readFileSync(file, "utf8"))))
+    .digest("hex");
+}
+
+function seedIdentityBundle(
+  userDir: string,
+  nodeDir: string,
+  params: OODGroupParams,
+  identity: LocalDeviceIdentityFiles,
+): Record<string, unknown> {
+  const now = Math.floor(Date.now() / 1000);
+  for (const document of [identity.ownerDocument, identity.zoneDocument]) {
+    const iat = requireNumber(document, "iat", userDir);
+    const exp = requireNumber(document, "exp", userDir);
+    if (iat > now || exp <= now || iat > exp) {
+      throw new Error(`${userDir} has invalid document validity times; use a new --env_root`);
+    }
+  }
   return {
-    ownerDocument,
-    bootDocument,
-    bootDocumentJwt,
-    deviceDocJwt,
-    deviceMiniDocJwt,
-    deviceDid,
-    zoneDid,
-    zoneDocument,
-    zoneDocumentJwt,
+    schema: "buckyos.sn_seed_identity.v1",
+    source_sha256: seedIdentitySourceHash(userDir, nodeDir, params),
+    owner_document_jwt: signJwtEdDSA(
+      identity.ownerDocument,
+      fs.readFileSync(path.join(userDir, "user_private_key.pem"), "utf8"),
+    ),
+    zone_document_jwt: identity.zoneDocumentJwt,
+    boot_config_jwt: identity.bootDocumentJwt,
+    device_doc_jwt: identity.deviceDocJwt,
+    device_mini_doc_jwt: identity.deviceMiniDocJwt,
   };
+}
+
+export async function prepareSeedIdentity(
+  groupName: string,
+  envRoot: string = ENV_ROOT_DIR,
+): Promise<void> {
+  await prepareSeedIdentityForParams(getParamsFromGroupName(groupName), envRoot);
+}
+
+async function prepareSeedIdentityForParams(
+  params: OODGroupParams,
+  envRoot: string,
+): Promise<void> {
+  if (!params.sn_base_host.trim() || params.preseed_identity === false) {
+    throw new Error(`${params.zone_id} does not publish a devtest seed identity`);
+  }
+  const userDir = ensureDir(path.join(envRoot, params.zone_id));
+  const nodeDir = path.join(userDir, params.node_name);
+  const bundlePath = path.join(nodeDir, "sn_seed_identity.json");
+  const lockPath = path.join(userDir, ".sn_seed_identity.lock");
+  const lock = fs.openSync(lockPath, "wx");
+  try {
+    if (fs.existsSync(bundlePath)) {
+      const bundle = readJsonObject(bundlePath);
+      if (bundle.source_sha256 !== seedIdentitySourceHash(userDir, nodeDir, params)) {
+        throw new Error(`${bundlePath} is stale; use a new --env_root and regenerate OOD and SN together`);
+      }
+    } else {
+      await buildUserEnv(params, envRoot);
+    }
+    writeLocalDeviceIdentityFiles(userDir, nodeDir, undefined, params);
+  } finally {
+    fs.closeSync(lock);
+    fs.unlinkSync(lockPath);
+  }
 }
 
 export function copyIdentityOutputs(
@@ -660,6 +775,13 @@ export function copyIdentityOutputs(
   targetDir: string,
   params: OODGroupParams,
 ): LocalDeviceIdentityFiles {
+  const startConfigPath = path.join(nodeDir, "start_config.json");
+  const startConfig = readJsonObject(startConfigPath);
+  if (startConfig.admin_password_hash !== hashAdminPassword(params.username, "bucky2025")) {
+    throw new Error(
+      `${startConfigPath} has a stale admin_password_hash for ${params.username}; use a new --env_root and regenerate OOD and SN together`,
+    );
+  }
   const etcDir = ensureDir(path.join(targetDir, "etc"));
 
   const localIdentity = writeLocalDeviceIdentityFiles(
@@ -669,8 +791,6 @@ export function copyIdentityOutputs(
     params,
   );
 
-  const startConfigPath = path.join(nodeDir, "start_config.json");
-  const startConfig = readJsonObject(startConfigPath);
   startConfig.owner_document = localIdentity.ownerDocument;
   startConfig.zone_name = localIdentity.zoneDid;
   startConfig.access_hostname = makeAccessHostname(params);
@@ -681,21 +801,26 @@ export function copyIdentityOutputs(
   startConfig.ood_jwt = localIdentity.deviceDocJwt;
   startConfig.enabled_features ??= {};
   startConfig.ai_provider_config ??= {};
-  startConfig.jarvis_msg_tunnel_config ??= {};
   delete startConfig.BUCKYOS_ROOT;
   delete startConfig.gateway_type;
   delete startConfig.private_key;
   delete startConfig.public_key;
   delete startConfig.device_private_key;
   delete startConfig.device_public_key;
-  writeJson(path.join(etcDir, "start_config.json"), startConfig);
+  const runtimeStartConfigPath = path.join(targetDir, "security", "start_config.json");
+  writeJson(runtimeStartConfigPath, startConfig);
+  fs.chmodSync(runtimeStartConfigPath, 0o600);
   writeText(
     path.join(etcDir, ZONE_DOCUMENT_JWT_FILE_NAME),
     localIdentity.zoneDocumentJwt,
   );
-  removeIfExists(path.join(etcDir, "node_private_key.pem"));
-  removeIfExists(path.join(etcDir, "node_device_config.json"));
-  removeIfExists(path.join(etcDir, `${params.zone_id}.zone.json`));
+  writeJson(
+    path.join(
+      etcDir,
+      `${didRawHostName(localIdentity.zoneDid)}.zone.json`,
+    ),
+    localIdentity.bootDocument,
+  );
 
   const buckycliDir = ensureDir(path.join(etcDir, ".buckycli"));
   writeJson(
@@ -706,7 +831,6 @@ export function copyIdentityOutputs(
     path.join(buckycliDir, "zone_config.json"),
     localIdentity.zoneDocument,
   );
-  removeIfExists(path.join(buckycliDir, "user_private_key.pem"));
   console.log(
     `device identity ${localIdentity.deviceDid} copied to local identity roots`,
   );
@@ -716,14 +840,13 @@ export function copyIdentityOutputs(
 function makeUnactivatedIdentityConfig(targetDir: string): void {
   const etcDir = ensureDir(path.join(targetDir, "etc"));
   removeIfExists(path.join(etcDir, "node_identity.json"));
-  removeIfExists(path.join(etcDir, "start_config.json"));
+  removeIfExists(path.join(targetDir, "security", "start_config.json"));
   removeIfExists(path.join(etcDir, ZONE_DOCUMENT_JWT_FILE_NAME));
-  removeIfExists(path.join(etcDir, "node_private_key.pem"));
-  removeIfExists(path.join(etcDir, "node_device_config.json"));
   removeTreeIfExists(path.join(etcDir, ".buckycli"));
   writeJson(path.join(etcDir, "node_gateway_params.json"), {
     params: {
       device_did: "did:bns:unactivated.local",
+      rtcp_port: "2980",
     },
   });
 }
@@ -784,8 +907,9 @@ async function generateTls(
   );
   copyIfExists(
     path.join(caDir, `${caName}_ca_key.pem`),
-    path.join(etcDir, "ca_key.pem"),
+    path.join(securityRoot, "ca_key.pem"),
   );
+  fs.chmodSync(path.join(securityRoot, "ca_key.pem"), 0o600);
   console.log(`tls identity certs generated under ${publicRoot}`);
 
   if (!writePostGateway) {
@@ -822,8 +946,11 @@ async function makeIdentityFiles(
   targetDir: string,
   params: OODGroupParams,
   caDir: string,
+  envRoot: string,
 ): Promise<void> {
-  const userDir = await buildUserEnv(params, ENV_ROOT_DIR);
+  const userDir = params.sn_base_host.trim()
+    ? path.join(envRoot, params.zone_id)
+    : await buildUserEnv(params, envRoot);
   const nodeDir = path.join(userDir, params.node_name);
   copyIdentityOutputs(userDir, nodeDir, targetDir, params);
 
@@ -849,7 +976,7 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function applyDevBootTemplateOverride(
+function applyDevBootTemplate(
   targetDir: string,
   groupName: string,
 ): void {
@@ -857,44 +984,106 @@ function applyDevBootTemplateOverride(
     return;
   }
 
+  const identity = loadLocalNodeIdentityConfig(
+    path.join(targetDir, "etc", "node_identity.json"),
+  );
+  const zoneDid = identity.zone_did;
+  const zone = parseDid(zoneDid);
+  const now = Math.floor(Date.now() / 1000);
+  const entries: Array<[string, string]> = [];
+  for (const username of ["bob", "alice"]) {
+    const userDid = `did:${zone.method}:${username}.${zone.id}`;
+    const keyPair = getDevTestKeyPairById(username);
+    const userEntries: Record<string, unknown> = {
+      [`users/${username}/settings`]: {
+        user_id: username,
+        type: "user",
+        password: createHash("sha256").update(`buckyos2026${username}.buckyos`)
+          .digest("base64"),
+        state: "active",
+        res_pool_id: "default",
+        is_local: true,
+        allow_password_change: true,
+      },
+      [`users/${username}/doc`]: {
+        "@context": [
+          "https://www.w3.org/ns/did/v1",
+          "https://buckyos.org/ns/owner/v1",
+        ],
+        id: userDid,
+        name: username,
+        display_name: username,
+        verificationMethod: [{
+          id: "#main_key",
+          type: "Ed25519VerificationKey2020",
+          controller: userDid,
+          publicKeyJwk: { kty: "OKP", crv: "Ed25519", x: keyPair.publicKeyX },
+        }],
+        authentication: ["#main_key"],
+        assertion_method: ["#main_key"],
+        capabilityInvocation: ["#main_key"],
+        iat: now,
+        exp: now + 3600 * 24 * 365 * 10,
+        version_seq: 0,
+        zone_binding_model_version: 2,
+        binded_zone_list: [zoneDid],
+        service: [{
+          id: `${userDid}#lastDoc`,
+          type: "DIDDoc",
+          serviceEndpoint: `https://${
+            didRawHostName(zoneDid)
+          }/resolve/${userDid}`,
+        }],
+      },
+      [`users/${username}/profile`]: {
+        did: userDid,
+        name: username,
+        display_name: username,
+        private_extra: {
+          system_contact: { did: userDid, groups: ["users"] },
+        },
+      },
+      [`security/${username}/key`]: keyPair.privateKeyPem,
+    };
+    for (const [key, value] of Object.entries(userEntries)) {
+      const content = typeof value === "string"
+        ? value
+        : JSON.stringify(value, null, 2);
+      entries.push([key, `"${key}" = """\n${content}\n"""`]);
+    }
+  }
+
   const localBootToml = path.join(
     os.homedir(),
     ".buckycli",
     "buckyos_boot.toml",
   );
-  if (!fs.existsSync(localBootToml)) {
+  if (fs.existsSync(localBootToml)) {
+    const srcText = fs.readFileSync(localBootToml, "utf8");
+    for (const match of srcText.matchAll(BOOT_ENTRY_PATTERN)) {
+      const key = match[1];
+      console.log(`load ${key} from .buckycli/boot_template`);
+      entries.push([key, `"${key}" = """\n${match[2]}\n"""`]);
+    }
+  } else {
     console.log(`skip missing dev boot override: ${localBootToml}`);
-    return;
   }
 
-  const dstBootTemplate = path.join(
+  const baseBootTemplate = path.join(
     targetDir,
     "etc",
     "scheduler",
     "boot.template.toml",
   );
-  const srcText = fs.readFileSync(localBootToml, "utf8");
-  const entries: Array<[string, string]> = [];
-  for (const match of srcText.matchAll(BOOT_ENTRY_PATTERN)) {
-    const key = match[1];
-    console.log(`load ${key} from .buckycli/boot_template`);
-    entries.push([key, `"${key}" = """\n${match[2]}\n"""`]);
-  }
-
-  if (entries.length === 0) {
-    console.log(
-      `skip invalid dev boot override (no key/value found): ${localBootToml}`,
-    );
-    return;
-  }
-
-  if (!fs.existsSync(dstBootTemplate)) {
-    writeText(dstBootTemplate, srcText);
-    console.log(`create boot template from local override: ${dstBootTemplate}`);
-    return;
-  }
-
-  let merged = fs.readFileSync(dstBootTemplate, "utf8");
+  const dstBootTemplate = path.join(
+    targetDir,
+    "security",
+    "scheduler",
+    "boot.template.toml",
+  );
+  let merged = fs.existsSync(baseBootTemplate)
+    ? fs.readFileSync(baseBootTemplate, "utf8")
+    : "";
   let replaced = 0;
   let added = 0;
   for (const [key, block] of entries) {
@@ -920,9 +1109,43 @@ function applyDevBootTemplateOverride(
     added += 1;
   }
 
+  const params = getParamsFromGroupName(groupName);
+  const nodeSettingsKey = `nodes/${params.node_name}/settings`;
+  if (Deno.build.os === "linux" &&
+    ![...merged.matchAll(BOOT_ENTRY_PATTERN)].some((match) => match[1] === nodeSettingsKey)) {
+    const user = os.userInfo();
+    const runAs = user.uid === 0
+      ? { uid: 65534, gid: 65534 }
+      : { uid: user.uid, gid: user.gid };
+    const workspace = path.resolve(targetDir, "data", "home", params.username, "host-runtime");
+    ensureDir(path.dirname(workspace));
+    if (!fs.existsSync(workspace)) {
+      fs.mkdirSync(workspace, { mode: 0o750 });
+      if (user.uid === 0) fs.chownSync(workspace, runAs.uid, runAs.gid);
+    }
+    const workspaceInfo = fs.lstatSync(workspace);
+    if (!workspaceInfo.isDirectory() || workspaceInfo.uid !== runAs.uid || workspaceInfo.gid !== runAs.gid) {
+      throw new Error(`dev host runtime workspace must be a directory owned by ${runAs.uid}:${runAs.gid}: ${workspace}`);
+    }
+    const settings = {
+      executor: {
+        enabled: true,
+        owner_agents: {
+          enabled: true,
+          workdir_roots: [workspace],
+          computer: "none",
+          run_as: runAs,
+        },
+      },
+    };
+    merged += `\n"${nodeSettingsKey}" = """\n${JSON.stringify(settings, null, 2)}\n"""\n`;
+    added += 1;
+  }
+
   writeText(dstBootTemplate, merged);
+  fs.chmodSync(dstBootTemplate, 0o600);
   console.log(
-    `merge dev boot override into template: ${dstBootTemplate} (replaced=${replaced}, added=${added})`,
+    `merge dev boot entries into template: ${dstBootTemplate} (replaced=${replaced}, added=${added})`,
   );
 }
 
@@ -931,7 +1154,7 @@ function applyDevBootTemplateOverride(
 // ============================================================================
 
 function printUsage(log: (message?: unknown) => void = console.error): void {
-  log("usage: make_config.ts <group> [--rootfs <dir>] [--ca <dir>]");
+  log("usage: make_config.ts <group> [--rootfs <dir>] [--ca <dir>] [--env_root <dir>] [--edition full|lite]");
   log(
     `groups: ${[...Object.keys(OOD_GROUPS), "nightly", "release"].join(" | ")}`,
   );
@@ -943,10 +1166,29 @@ function printUsage(log: (message?: unknown) => void = console.error): void {
   );
 }
 
+export type ProductEdition = "full" | "lite";
+
+/**
+ * The product edition the installation is shipped as: `etc/product.json`
+ * from the version-managed manifest in `src/product/` (node_daemon,
+ * scheduler, control-panel and Desktop all read it from there).
+ */
+export function writeProductProfile(targetDir: string, edition: ProductEdition): void {
+  const source = fileURLToPath(new URL(`./product/${edition}.json`, import.meta.url));
+  const profile = JSON.parse(fs.readFileSync(source, "utf8"));
+  if (profile.edition !== edition) {
+    throw new Error(`${source} is not the ${edition} edition`);
+  }
+  writeJson(path.join(ensureDir(path.join(targetDir, "etc")), "product.json"), profile);
+  console.log(`product edition: ${edition}`);
+}
+
 export async function makeConfigByGroupName(
   groupName: string,
   targetRoot: string | undefined,
   caDir: string | undefined,
+  envRoot: string = ENV_ROOT_DIR,
+  edition: ProductEdition = "full",
 ): Promise<void> {
   if (groupName === "sn" || groupName === "sn_server") {
     throw new Error(
@@ -968,6 +1210,7 @@ export async function makeConfigByGroupName(
         bnsHost: "bns.buckyos.ai",
       };
     console.log(`${groupName} mode, write basic configs to ${targetDir}`);
+    writeProductProfile(targetDir, edition);
     makeGlobalEnvConfig(
       targetDir,
       envHosts.web3BridgeHost,
@@ -979,9 +1222,13 @@ export async function makeConfigByGroupName(
     return;
   }
 
-  const params = getParamsFromGroupName(groupName);
+  const params = {
+    ...getParamsFromGroupName(groupName),
+    ...(edition === "lite" ? { support_container: false } : {}),
+  };
   const targetDir = targetRoot ?? getBuckyosRoot();
-  const resolvedCaDir = caDir ?? ensureDir(path.join(ENV_ROOT_DIR, "ca"));
+  const resolvedCaDir = caDir ?? ensureDir(path.join(envRoot, "ca"));
+  writeProductProfile(targetDir, edition);
 
   console.log(
     `############ make config for group name: ${groupName} #########################`,
@@ -992,6 +1239,10 @@ export async function makeConfigByGroupName(
   console.log(`zone       : ${params.zone_id}`);
   console.log(`node       : ${params.node_name}`);
   console.log(`web3_bridge: ${params.web3_bridge}`);
+
+  if (params.sn_base_host.trim() && params.preseed_identity !== false) {
+    await prepareSeedIdentityForParams(params, envRoot);
+  }
 
   makeGlobalEnvConfig(
     targetDir,
@@ -1004,15 +1255,22 @@ export async function makeConfigByGroupName(
   if (params.preseed_identity === false) {
     makeUnactivatedIdentityConfig(targetDir);
   } else {
-    await makeIdentityFiles(targetDir, params, resolvedCaDir);
+    await makeIdentityFiles(targetDir, params, resolvedCaDir, envRoot);
   }
-  applyDevBootTemplateOverride(targetDir, groupName);
+  applyDevBootTemplate(targetDir, groupName);
 
   console.log(`config ${groupName} generation finished.`);
 }
 
 async function main(): Promise<void> {
-  let values: { rootfs?: string; ca?: string; sn_ip?: string; help?: boolean };
+  let values: {
+    rootfs?: string;
+    ca?: string;
+    env_root?: string;
+    sn_ip?: string;
+    edition?: string;
+    help?: boolean;
+  };
   let positionals: string[];
   try {
     const parsed = parseArgs({
@@ -1020,12 +1278,14 @@ async function main(): Promise<void> {
       options: {
         rootfs: { type: "string" },
         ca: { type: "string" },
+        env_root: { type: "string" },
         sn_ip: { type: "string" },
+        edition: { type: "string" },
         help: { type: "boolean", short: "h" },
       },
       allowPositionals: true,
     }) as {
-      values: { rootfs?: string; ca?: string; sn_ip?: string; help?: boolean };
+      values: typeof values;
       positionals: string[];
     };
     values = parsed.values;
@@ -1070,8 +1330,21 @@ async function main(): Promise<void> {
     Deno.exit(1);
   }
 
+  const edition = values.edition ?? "full";
+  if (edition !== "full" && edition !== "lite") {
+    console.error(`argument error: --edition takes full | lite, got ${edition}`);
+    printUsage();
+    Deno.exit(1);
+  }
+
   try {
-    await makeConfigByGroupName(groupName, values.rootfs, values.ca);
+    await makeConfigByGroupName(
+      groupName,
+      values.rootfs,
+      values.ca,
+      values.env_root,
+      edition,
+    );
   } catch (e) {
     console.error(
       `config generation failed: ${e instanceof Error ? e.message : e}`,

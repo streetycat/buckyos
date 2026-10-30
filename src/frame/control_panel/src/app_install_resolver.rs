@@ -6,10 +6,12 @@
 //! 这里不复制第二套验签，只做协议状态映射与硬约束复查。
 
 use async_trait::async_trait;
+#[cfg(test)]
+use buckyos_api::AppDoc;
 use buckyos_api::{
-    AppDoc, AppDocType, DidCacheStatus, DidEvidenceLevel, DidResolutionSnapshot,
-    DidVerificationStatus, DocumentStatus, InstallError, InstallErrorCode, InstallPolicy,
-    InstallStage, InstallUserAction, OBJ_TYPE_APP_DOC,
+    AppDocType, DidCacheStatus, DidEvidenceLevel, DidResolutionSnapshot, DidVerificationStatus,
+    DocumentStatus, InstallError, InstallErrorCode, InstallPolicy, InstallStage, InstallUserAction,
+    OBJ_TYPE_APP_DOC,
 };
 use buckyos_kit::buckyos_get_unix_timestamp;
 use log::warn;
@@ -31,6 +33,8 @@ pub enum NormalizedIdentifier {
     ObjectId(ObjId),
     /// App Document / pikg URL：同上。
     Url(String),
+    /// 权威域名别名。必须经 name-client 查询 TXT 后才能得到 App DID。
+    DomainAlias(String),
 }
 
 fn is_key_class_did(did: &DID) -> bool {
@@ -72,13 +76,67 @@ pub fn normalize_identifier(raw: &str) -> Result<NormalizedIdentifier, InstallEr
         return Ok(NormalizedIdentifier::ObjectId(obj_id));
     }
 
-    // 裸名视为 BNS 名称。
+    // 含点裸名是权威域名别名，不能直接拼成 did:bns:*。
     if raw.contains('/') || raw.contains('\\') || raw.contains(char::is_whitespace) {
         return Err(invalid_request(format!(
             "identifier `{raw}` is not a did/name/objid/url"
         )));
     }
+    if raw.contains('.') {
+        return Ok(NormalizedIdentifier::DomainAlias(raw.to_ascii_lowercase()));
+    }
+    // 无点短名才按 BNS short name 处理。
     Ok(NormalizedIdentifier::AppDid(DID::new("bns", raw)))
+}
+
+fn app_did_from_alias_txt(value: &str) -> Option<DID> {
+    let value = value.trim().trim_matches('"');
+    let raw = value
+        .strip_prefix("buckyos-app-did=")
+        .or_else(|| value.strip_prefix("app-did="))
+        .unwrap_or(value)
+        .trim();
+    if !raw.starts_with("did:") {
+        return None;
+    }
+    DID::from_str(raw).ok().filter(|did| !is_key_class_did(did))
+}
+
+pub async fn resolve_domain_alias(alias: &str) -> Result<DID, InstallError> {
+    let invalid = |message: String| {
+        InstallError::new(
+            InstallStage::Resolve,
+            InstallErrorCode::InvalidRequest,
+            false,
+            message,
+        )
+    };
+    let answer = name_client::resolve(alias, Some(name_client::RecordType::TXT))
+        .await
+        .map_err(|error| {
+            invalid(format!(
+                "authoritative domain alias `{alias}` could not be resolved: {error}"
+            ))
+        })?;
+    let mut dids = answer
+        .txt
+        .iter()
+        .filter_map(|value| app_did_from_alias_txt(value))
+        .collect::<Vec<_>>();
+    dids.sort_by_key(DID::to_string);
+    dids.dedup();
+    match dids.len() {
+        1 => Ok(dids.remove(0)),
+        0 => Err(invalid(format!(
+            "authoritative domain alias `{alias}` has no buckyos-app-did TXT record"
+        ))),
+        _ => Err(InstallError::new(
+            InstallStage::Resolve,
+            InstallErrorCode::AmbiguousAppTarget,
+            false,
+            format!("authoritative domain alias `{alias}` names multiple App DIDs"),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -92,25 +150,6 @@ pub struct ResolvedApp {
     /// resolver 验证管线给出的 body（Anchored 或验证通过的 NeedProof）。
     /// `Missing/Unknown/Revoked` 等无 body 场景为 None。
     pub document_value: Option<Value>,
-}
-
-impl ResolvedApp {
-    pub fn document(&self) -> Result<Option<AppDoc>, InstallError> {
-        match self.document_value.as_ref() {
-            None => Ok(None),
-            Some(value) => {
-                let doc: AppDoc = serde_json::from_value(value.clone()).map_err(|err| {
-                    InstallError::new(
-                        InstallStage::Resolve,
-                        InstallErrorCode::VerificationFailed,
-                        false,
-                        format!("resolved app document schema invalid: {err}"),
-                    )
-                })?;
-                Ok(Some(doc))
-            }
-        }
-    }
 }
 
 /// 内部 resolver 抽象：生产实现包 name-client；单元测试使用 fake，
@@ -181,33 +220,18 @@ pub fn enforce_resolution_invariants(
     Ok(())
 }
 
-/// 终止状态立即产生不可重试错误；清除/屏蔽正候选由调用方（引擎）负责。
-pub fn reject_terminal_status(
-    app_did: &DID,
-    snapshot: &DidResolutionSnapshot,
-) -> Result<(), InstallError> {
-    if snapshot.document_status.is_terminal() {
-        return Err(InstallError::from_document_status(
-            InstallStage::Resolve,
-            snapshot.document_status,
-            app_did,
-        ));
-    }
-    Ok(())
-}
-
 /// candidate body（来自 pikg/URL/ObjectId）与权威解析结果的绑定检查。
 ///
 /// - `document.did == app_did` 永远强制；
 /// - candidate 自声明 owner 只用于一致性检查：expected_owner 已知且不一致
 ///   必须拒绝并记录高风险（实现规则 4）；
-/// - 权威给出 body 时，candidate 是否等于该 body 只影响"能否把 candidate
-///   当作当前发布文档"，不影响 candidate 作为内容载体（内容按 digest 复用）。
+/// - 返回 candidate 的 canonical Object ID；它是否为当前发布文档由调用方
+///   根据权威解析结果决定，不影响 candidate 作为内容载体复用。
 pub fn bind_candidate_document(
     app_did: &DID,
     snapshot: &DidResolutionSnapshot,
     candidate_value: &Value,
-) -> Result<CandidateBinding, InstallError> {
+) -> Result<ObjId, InstallError> {
     let candidate_did = candidate_value
         .get("did")
         .and_then(|v| v.as_str())
@@ -249,24 +273,7 @@ pub fn bind_candidate_document(
         }
     }
 
-    let (candidate_obj_id, _) = build_named_object_by_json(OBJ_TYPE_APP_DOC, candidate_value);
-    let matches_published = snapshot
-        .app_doc_object_id
-        .as_ref()
-        .map(|published| *published == candidate_obj_id)
-        .unwrap_or(false);
-
-    Ok(CandidateBinding {
-        candidate_obj_id,
-        matches_published,
-    })
-}
-
-#[derive(Debug, Clone)]
-pub struct CandidateBinding {
-    pub candidate_obj_id: ObjId,
-    /// candidate 是否就是权威当前发布的 body。
-    pub matches_published: bool,
+    Ok(build_named_object_by_json(OBJ_TYPE_APP_DOC, candidate_value).0)
 }
 
 // ---------------------------------------------------------------------------
@@ -280,71 +287,70 @@ impl NameClientAppResolver {
         Self
     }
 
-    fn resolve_policy_for(policy: InstallPolicy) -> name_client::ResolvePolicy {
-        let mut resolve_policy = name_client::ResolvePolicy::default();
-        match policy {
-            InstallPolicy::StrictPublic => {
-                resolve_policy.allow_stale_cache = false;
-                resolve_policy.allow_unverified_cache_when_unavailable = false;
-                resolve_policy.allow_self_signed_when_missing = false;
-            }
-            InstallPolicy::Normal | InstallPolicy::SystemInternal => {}
-            InstallPolicy::TrustedShare => {
-                resolve_policy.allow_unverified_cache_when_unavailable = true;
-            }
-            InstallPolicy::LocalDeveloper => {
-                resolve_policy.allow_unverified_cache_when_unavailable = true;
-                resolve_policy.allow_self_signed_when_missing = true;
+    /// 重构后的 resolver 不再提供"未验证兜底 / Missing 自签名入场"开关:resolve
+    /// 永远只返回验证通过的文档。TrustedShare / LocalDeveloper 场景下本机安装的
+    /// App Document 由 `app_installer` 写入本机 locker(hosts 语义),因此这里对所有
+    /// 策略使用同一套默认选项。
+    fn resolve_opts_for(_policy: InstallPolicy) -> name_client::ResolveOpts {
+        name_client::ResolveOpts::default()
+    }
+
+    /// AppDIDs under the current Zone (the App each Agent is built into shares
+    /// the AgentDID) are only known through the local locker; the Zone locker
+    /// would answer them Missing before the local locker is read.
+    fn is_current_zone_subname(app_did: &DID) -> bool {
+        buckyos_api::get_buckyos_api_runtime()
+            .ok()
+            .is_some_and(|runtime| app_did.upper_did().as_ref() == Some(&runtime.zone_id))
+    }
+
+    /// DID 级 / 类型级状态 → 协议状态。`invalid`(权威确定性校验拒绝)对安装器
+    /// 等同 Missing。
+    fn map_result_status(result: &name_client::DocResult) -> DocumentStatus {
+        match result.did_state.as_ref() {
+            Some(name_client::DidState::Tombstoned) => return DocumentStatus::Tombstoned,
+            Some(name_client::DidState::Migrated { .. }) => return DocumentStatus::Migrated,
+            _ => {}
+        }
+        match result.type_state.as_ref() {
+            Some(name_client::TypeState::Revoked) => DocumentStatus::Revoked,
+            Some(name_client::TypeState::Missing)
+            | Some(name_client::TypeState::Invalid { .. }) => DocumentStatus::Missing,
+            Some(name_client::TypeState::Expired) => DocumentStatus::Expired,
+            Some(name_client::TypeState::Active) => DocumentStatus::Active,
+            // 没有权威回答 != Missing(实现规则 5):有验证通过的选择即 Active。
+            None => {
+                if result.select(&name_client::Revision::current()).is_some() {
+                    DocumentStatus::Active
+                } else {
+                    DocumentStatus::Unknown
+                }
             }
         }
-        resolve_policy
     }
 
-    fn map_document_status(status: Option<&name_client::DocumentStatus>) -> DocumentStatus {
-        match status {
-            Some(name_client::DocumentStatus::Active) => DocumentStatus::Active,
-            Some(name_client::DocumentStatus::Missing) => DocumentStatus::Missing,
-            Some(name_client::DocumentStatus::Expired) => DocumentStatus::Expired,
-            Some(name_client::DocumentStatus::Revoked) => DocumentStatus::Revoked,
-            Some(name_client::DocumentStatus::Tombstoned) => DocumentStatus::Tombstoned,
-            Some(name_client::DocumentStatus::Migrated) => DocumentStatus::Migrated,
-            // 没有权威回答 != Missing（实现规则 5）。
-            None => DocumentStatus::Unknown,
+    fn map_evidence(choice: &name_client::Choice) -> DidEvidenceLevel {
+        if choice.report.is_published || choice.source.tier == name_client::SourceTier::Authority {
+            DidEvidenceLevel::Anchored
+        } else {
+            DidEvidenceLevel::NeedProof
         }
     }
 
-    fn map_evidence(evidence: Option<name_client::BodyEvidence>) -> Option<DidEvidenceLevel> {
-        evidence.map(|value| match value {
-            name_client::BodyEvidence::Anchored => DidEvidenceLevel::Anchored,
-            name_client::BodyEvidence::NeedProof => DidEvidenceLevel::NeedProof,
-            name_client::BodyEvidence::UnproofInfo => DidEvidenceLevel::UnproofInfo,
-        })
+    fn map_verification(choice: &name_client::Choice) -> DidVerificationStatus {
+        if choice.report.is_signed || choice.source.tier != name_client::SourceTier::Normal {
+            DidVerificationStatus::Passed
+        } else {
+            DidVerificationStatus::NotAttempted
+        }
     }
 
-    fn map_verification(
-        status: Option<name_client::VerificationStatus>,
-    ) -> Option<DidVerificationStatus> {
-        status.map(|value| match value {
-            name_client::VerificationStatus::Passed => DidVerificationStatus::Passed,
-            name_client::VerificationStatus::Failed => DidVerificationStatus::Failed,
-            name_client::VerificationStatus::Unavailable => DidVerificationStatus::Unavailable,
-            name_client::VerificationStatus::NotAttempted => DidVerificationStatus::NotAttempted,
-        })
-    }
-
-    fn map_cache_status(status: Option<name_client::CacheStatus>) -> Option<DidCacheStatus> {
-        status.map(|value| match value {
-            name_client::CacheStatus::Disabled => DidCacheStatus::Disabled,
-            name_client::CacheStatus::Miss => DidCacheStatus::Miss,
-            name_client::CacheStatus::Hit => DidCacheStatus::Hit,
-            name_client::CacheStatus::Refresh => DidCacheStatus::Refresh,
-            name_client::CacheStatus::Fallback => DidCacheStatus::Fallback,
-            name_client::CacheStatus::UnauthenticatedInfoHit => {
-                DidCacheStatus::UnauthenticatedInfoHit
-            }
-            name_client::CacheStatus::ZoneHit => DidCacheStatus::ZoneHit,
-            name_client::CacheStatus::ObservedFallback => DidCacheStatus::ObservedFallback,
-        })
+    fn map_resolve_error_status(error: &name_lib::NSError) -> DocumentStatus {
+        match error {
+            name_lib::NSError::NotFound(_) => DocumentStatus::Missing,
+            name_lib::NSError::Disabled(_) => DocumentStatus::Revoked,
+            _ => DocumentStatus::Unknown,
+        }
     }
 }
 
@@ -355,18 +361,28 @@ impl AppDidResolver for NameClientAppResolver {
         app_did: &DID,
         policy: InstallPolicy,
     ) -> Result<ResolvedApp, InstallError> {
-        let resolve_policy = Self::resolve_policy_for(policy);
+        let mut resolve_opts = Self::resolve_opts_for(policy);
+        if Self::is_current_zone_subname(app_did) {
+            resolve_opts = resolve_opts.without_zone_lock();
+        }
         let doc_type = name_client::DidDocType::Custom(APP_DID_DOC_TYPE.to_string());
 
-        let result = name_client::resolve_did_ex(app_did, Some(doc_type), resolve_policy).await;
+        let result = name_client::resolve_did_ex(
+            app_did,
+            Some(doc_type),
+            name_client::Revision::current(),
+            resolve_opts,
+        )
+        .await;
 
         let resolved = match result {
             Ok(resolved) => resolved,
             Err(err) => {
-                // 解析器没有回答：Unknown（不是 Missing）。
+                let document_status = Self::map_resolve_error_status(&err);
                 warn!(
-                    "resolve_did_ex for `{}` (app) got no answer: {}",
+                    "resolve_did_ex for `{}` (app) returned {:?}: {}",
                     app_did.to_string(),
+                    document_status,
                     err
                 );
                 return Ok(ResolvedApp {
@@ -374,8 +390,9 @@ impl AppDidResolver for NameClientAppResolver {
                         app_did: app_did.clone(),
                         doc_type: AppDocType,
                         app_doc_object_id: None,
+                        local_authority_app_doc_object_id: None,
                         resolver_id: None,
-                        document_status: DocumentStatus::Unknown,
+                        document_status,
                         document_version: None,
                         authority_seq: None,
                         effective_owner: None,
@@ -393,23 +410,27 @@ impl AppDidResolver for NameClientAppResolver {
             }
         };
 
-        let buckyos_meta = &resolved.document_metadata.buckyos;
-        let document_status = Self::map_document_status(buckyos_meta.document_status.as_ref());
+        let warnings: Vec<String> = resolved.reasons.clone();
+        let document_status = Self::map_result_status(&resolved);
+        let choice = resolved.select(&name_client::Revision::current()).cloned();
 
         let document_value = if matches!(
             document_status,
             DocumentStatus::Active | DocumentStatus::Expired
         ) {
-            match resolved.document.clone().to_json_value() {
-                Ok(value) => Some(value),
-                Err(err) => {
-                    return Err(InstallError::new(
-                        InstallStage::Resolve,
-                        InstallErrorCode::VerificationFailed,
-                        false,
-                        format!("decode resolved app document failed: {err}"),
-                    ))
-                }
+            match choice.as_ref() {
+                Some(choice) => match choice.doc.clone().to_json_value() {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        return Err(InstallError::new(
+                            InstallStage::Resolve,
+                            InstallErrorCode::VerificationFailed,
+                            false,
+                            format!("decode resolved app document failed: {err}"),
+                        ))
+                    }
+                },
+                None => None,
             }
         } else {
             None
@@ -419,50 +440,34 @@ impl AppDidResolver for NameClientAppResolver {
             .as_ref()
             .map(|value| build_named_object_by_json(OBJ_TYPE_APP_DOC, value).0);
 
-        let warnings: Vec<String> = resolved
-            .resolution_metadata
-            .warnings
-            .iter()
-            .map(|warning| format!("{warning:?}"))
-            .collect();
+        let migration_target = resolved.migration_target();
 
-        // migration_target：name-client 元数据未直接暴露，Migrated 时从 body 提取。
-        let migration_target = if matches!(document_status, DocumentStatus::Migrated) {
-            resolved
-                .document
-                .clone()
-                .to_json_value()
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("migration_target")
-                        .and_then(|v| v.as_str())
-                        .and_then(|raw| DID::from_str(raw).ok())
-                })
-        } else {
-            None
-        };
-
-        // expected_owner：权威绑定优先，否则名字结构确定性上级；
-        // 绝不读 candidate 自声明。
-        let expected_owner = app_did.upper_did();
+        // expected_owner:权威绑定优先,否则名字结构确定性上级;绝不读 candidate 自声明。
+        let expected_owner = resolved
+            .owner_binding
+            .clone()
+            .or_else(|| app_did.upper_did());
 
         let snapshot = DidResolutionSnapshot {
             app_did: app_did.clone(),
             doc_type: AppDocType,
             app_doc_object_id,
-            resolver_id: resolved.resolution_metadata.resolver_id.clone(),
+            local_authority_app_doc_object_id: None,
+            resolver_id: choice.as_ref().map(|c| c.source.id.clone()),
             document_status,
-            document_version: buckyos_meta.document_version,
-            authority_seq: buckyos_meta.authority_seq,
-            effective_owner: None,
+            document_version: choice.as_ref().map(|c| c.revision.iat),
+            authority_seq: None,
+            effective_owner: resolved.owner_binding.clone(),
             expected_owner,
-            evidence: Self::map_evidence(resolved.resolution_metadata.evidence),
-            verification_status: Self::map_verification(
-                resolved.resolution_metadata.verification_status,
-            ),
-            cache_status: Self::map_cache_status(resolved.resolution_metadata.cache_status),
-            doc_hash: None,
+            evidence: choice.as_ref().map(Self::map_evidence),
+            verification_status: choice.as_ref().map(Self::map_verification),
+            // 本机 locker 回答(原 LocalAuthorityOverride)按本机命中标记;其余不区分。
+            cache_status: if resolved.locked {
+                Some(DidCacheStatus::Hit)
+            } else {
+                None
+            },
+            doc_hash: choice.as_ref().map(|c| c.revision.hash.clone()),
             warnings,
             migration_target,
             resolved_at: Some(buckyos_get_unix_timestamp()),
@@ -481,7 +486,7 @@ impl AppDidResolver for NameClientAppResolver {
 // 测试 fake
 // ---------------------------------------------------------------------------
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub mod fake {
     use super::*;
     use std::collections::HashMap;
@@ -530,6 +535,7 @@ pub mod fake {
                     app_did: app_did.clone(),
                     doc_type: AppDocType,
                     app_doc_object_id: None,
+                    local_authority_app_doc_object_id: None,
                     resolver_id: Some("fake".to_string()),
                     document_status: DocumentStatus::Unknown,
                     document_version: None,
@@ -559,6 +565,7 @@ pub mod fake {
                 app_did: app_did.clone(),
                 doc_type: AppDocType,
                 app_doc_object_id: Some(obj_id),
+                local_authority_app_doc_object_id: None,
                 resolver_id: Some("fake".to_string()),
                 document_status: DocumentStatus::Active,
                 document_version: Some(version),
@@ -587,6 +594,7 @@ pub mod fake {
                 app_did: app_did.clone(),
                 doc_type: AppDocType,
                 app_doc_object_id: None,
+                local_authority_app_doc_object_id: None,
                 resolver_id: Some("fake".to_string()),
                 document_status: status,
                 document_version: None,
@@ -609,13 +617,18 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buckyos_api::{AppType, SubPkgDesc};
+    use buckyos_api::{AppId, AppType, SubPkgDesc};
 
     fn demo_doc_value(app_did: &str, owner: &str) -> Value {
         let owner_did = DID::from_str(owner).unwrap();
-        let doc = AppDoc::builder(AppType::Web, "demo_web", "0.1.0", "tester", &owner_did)
-            .app_did(DID::from_str(app_did).unwrap())
-            .web_pkg(SubPkgDesc::new("demo_web-web#0.1.0"))
+        let app_did = DID::from_str(app_did).unwrap();
+        let app_id = AppId::from_app_did(&app_did).unwrap();
+        let doc = AppDoc::builder(AppType::Web, "demo-web", "0.1.0", "tester", &owner_did)
+            .app_did(app_did)
+            .web_pkg(
+                SubPkgDesc::new(format!("web.{app_id}#0.1.0"))
+                    .package_meta_object_id(ObjId::new_by_raw("pkg".to_string(), vec![1u8; 32])),
+            )
             .build()
             .unwrap();
         serde_json::to_value(&doc).unwrap()
@@ -629,6 +642,10 @@ mod tests {
         ));
         assert!(matches!(
             normalize_identifier("filebrowser.buckyos").unwrap(),
+            NormalizedIdentifier::DomainAlias(alias) if alias == "filebrowser.buckyos"
+        ));
+        assert!(matches!(
+            normalize_identifier("filebrowser").unwrap(),
             NormalizedIdentifier::AppDid(did) if did.method == "bns"
         ));
         assert!(matches!(
@@ -649,14 +666,33 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_alias_txt_only_accepts_app_dids() {
+        assert_eq!(
+            app_did_from_alias_txt("buckyos-app-did=did:bns:demo")
+                .unwrap()
+                .to_string(),
+            "did:bns:demo"
+        );
+        assert_eq!(
+            app_did_from_alias_txt("\"app-did=did:web:demo.example.com\"")
+                .unwrap()
+                .to_string(),
+            "did:web:demo.example.com"
+        );
+        assert!(app_did_from_alias_txt("https://example.com").is_none());
+        assert!(app_did_from_alias_txt("did:key:z6Mk").is_none());
+        assert!(app_did_from_alias_txt("did:dev:device").is_none());
+    }
+
+    #[test]
     fn candidate_binding_enforces_did_and_owner() {
-        let app_did = DID::from_str("did:bns:demo_web.tester").unwrap();
-        let doc_value = demo_doc_value("did:bns:demo_web.tester", "did:bns:tester");
+        let app_did = DID::from_str("did:bns:demo-web.tester").unwrap();
+        let doc_value = demo_doc_value("did:bns:demo-web.tester", "did:bns:tester");
         let snapshot = fake::active_answer(&app_did, doc_value.clone(), 1).snapshot;
 
         // 一致：绑定成功且命中已发布 body。
-        let binding = bind_candidate_document(&app_did, &snapshot, &doc_value).unwrap();
-        assert!(binding.matches_published);
+        let candidate_id = bind_candidate_document(&app_did, &snapshot, &doc_value).unwrap();
+        assert_eq!(snapshot.app_doc_object_id.as_ref(), Some(&candidate_id));
 
         // document.did 不一致必须拒绝。
         let mut wrong_did = doc_value.clone();
@@ -671,24 +707,27 @@ mod tests {
         assert_eq!(err.code, InstallErrorCode::VerificationFailed);
         assert!(err.message.contains("expected owner"));
 
-        // 权威 body 不同（旧版本 candidate）：可绑定但 matches_published=false。
+        // 权威 body 不同（旧版本 candidate）：仍可绑定，但 Object ID 不同。
         let mut older = doc_value.clone();
         older["version"] = Value::String("0.0.9".to_string());
-        let binding = bind_candidate_document(&app_did, &snapshot, &older).unwrap();
-        assert!(!binding.matches_published);
+        let older_id = bind_candidate_document(&app_did, &snapshot, &older).unwrap();
+        assert_ne!(snapshot.app_doc_object_id.as_ref(), Some(&older_id));
     }
 
     #[test]
-    fn terminal_status_is_not_retryable() {
-        let app_did = DID::from_str("did:bns:demo_web.tester").unwrap();
-        let revoked = fake::status_answer(&app_did, DocumentStatus::Revoked);
-        let err = reject_terminal_status(&app_did, &revoked.snapshot).unwrap_err();
-        assert_eq!(err.code, InstallErrorCode::IdentityRevoked);
-        assert!(!err.retryable);
-
-        let tombstoned = fake::status_answer(&app_did, DocumentStatus::Tombstoned);
-        let err = reject_terminal_status(&app_did, &tombstoned.snapshot).unwrap_err();
-        assert_eq!(err.code, InstallErrorCode::IdentityRevoked);
+    fn resolver_error_preserves_authoritative_missing() {
+        assert_eq!(
+            NameClientAppResolver::map_resolve_error_status(&name_lib::NSError::NotFound(
+                "app document".to_string(),
+            )),
+            DocumentStatus::Missing
+        );
+        assert_eq!(
+            NameClientAppResolver::map_resolve_error_status(&name_lib::NSError::Failed(
+                "network unavailable".to_string(),
+            )),
+            DocumentStatus::Unknown
+        );
     }
 
     #[tokio::test]
@@ -749,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn fake_resolver_rejects_mismatched_document() {
         let resolver = fake::FakeAppResolver::new();
-        let app_did = DID::from_str("did:bns:demo_web.tester").unwrap();
+        let app_did = DID::from_str("did:bns:demo-web.tester").unwrap();
         // body 的 did 指向别的 DID：契约检查必须拒绝。
         let bad_value = demo_doc_value("did:bns:other.tester", "did:bns:tester");
         let mut answer = fake::active_answer(&app_did, bad_value, 1);

@@ -7,14 +7,13 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use log::warn;
 use serde_json::{Map, Value as Json};
 use tokio::fs;
-use tokio::process::Command;
-use tokio::time::timeout;
 use upon::Engine;
 
 const ESCAPED_OPEN_SENTINEL: &str = "\u{001f}ESCAPED_OPEN_BRACE\u{001f}";
@@ -76,6 +75,26 @@ impl ValueLoader for NullValueLoader {
 }
 
 #[derive(Clone, Debug)]
+pub struct PromptExecRequest {
+    pub command: String,
+    pub timeout: Duration,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PromptExecOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
+#[async_trait]
+pub trait PromptExec: Send + Sync + std::fmt::Debug {
+    async fn exec(&self, request: PromptExecRequest) -> Result<PromptExecOutput, String>;
+}
+
+#[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Per-`__INCLUDE__` byte cap. Default 64 KiB.
     pub max_include_bytes: usize,
@@ -85,6 +104,7 @@ pub struct EngineConfig {
     pub exec_timeout: Duration,
     /// `__EXEC__` master gate. Default `false` (sandbox-friendly).
     pub allow_exec: bool,
+    pub executor: Option<Arc<dyn PromptExec>>,
     /// Virtual root for `__INCLUDE__` paths that start with `/`.
     /// When set, `/foo.md` resolves to `<include_root>/foo.md`.
     pub include_root: Option<PathBuf>,
@@ -96,6 +116,8 @@ pub struct EngineConfig {
     pub include_roots: Vec<PathBuf>,
     /// Max recursion depth for `__INCLUDE__`-nested templates. Default 8.
     pub max_recursion_depth: u8,
+    /// Host-registered named formats (`render_format`) and extra filters.
+    pub extensions: RenderExtensions,
 }
 
 impl Default for EngineConfig {
@@ -105,11 +127,221 @@ impl Default for EngineConfig {
             max_total_bytes: 256 * 1024,
             exec_timeout: Duration::from_secs(10),
             allow_exec: false,
+            executor: None,
             include_root: None,
             template_dir: None,
             include_roots: Vec::new(),
             max_recursion_depth: 8,
+            extensions: RenderExtensions::default(),
         }
+    }
+}
+
+/// A pure function over a template value: no queue, network or state access.
+pub type RenderValueFn = Arc<dyn Fn(&Json) -> Result<String, String> + Send + Sync>;
+
+/// What a host adds to the template engine: named formats used through
+/// `{{ value | render_format: "name" }}` and extra one-argument filters
+/// (`{{ value | name }}`). The engine itself registers `render_format` and
+/// the generic filters (`xml`, `attr`, `json`, `truncate`, `oneline`,
+/// `default`, `join`, `quote`, `time`) and knows no host vocabulary.
+#[derive(Clone, Default)]
+pub struct RenderExtensions {
+    formats: HashMap<String, RenderValueFn>,
+    filters: HashMap<String, RenderValueFn>,
+}
+
+impl std::fmt::Debug for RenderExtensions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut formats: Vec<&String> = self.formats.keys().collect();
+        formats.sort();
+        let mut filters: Vec<&String> = self.filters.keys().collect();
+        filters.sort();
+        f.debug_struct("RenderExtensions")
+            .field("formats", &formats)
+            .field("filters", &filters)
+            .finish()
+    }
+}
+
+impl RenderExtensions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a named format. The name is a stable identifier, not a path.
+    pub fn with_format<F>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(&Json) -> Result<String, String> + Send + Sync + 'static,
+    {
+        self.formats.insert(name.into(), Arc::new(f));
+        self
+    }
+
+    /// Register an extra filter taking the piped value only.
+    pub fn with_filter<F>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(&Json) -> Result<String, String> + Send + Sync + 'static,
+    {
+        self.filters.insert(name.into(), Arc::new(f));
+        self
+    }
+
+    pub fn format(&self, name: &str) -> Option<&RenderValueFn> {
+        self.formats.get(name)
+    }
+
+    /// Render `value` with the named format (what `render_format` does).
+    pub fn render_format(&self, value: &Json, name: &str) -> Result<String, String> {
+        match self.formats.get(name) {
+            Some(f) => f(value).map_err(|e| format!("render_format `{name}`: {e}")),
+            None => Err(format!("render_format: unknown format `{name}`")),
+        }
+    }
+}
+
+/// Escape `& < >` (element text).
+pub fn escape_xml_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escape `& < > "` (attribute value).
+pub fn escape_xml_attr(s: &str) -> String {
+    escape_xml_text(s).replace('"', "&quot;")
+}
+
+fn upon_to_json(v: &upon::Value) -> Json {
+    match v {
+        upon::Value::None => Json::Null,
+        upon::Value::Bool(b) => Json::Bool(*b),
+        upon::Value::Integer(i) => Json::from(*i),
+        upon::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
+        upon::Value::String(s) => Json::String(s.clone()),
+        upon::Value::List(l) => Json::Array(l.iter().map(upon_to_json).collect()),
+        upon::Value::Map(m) => Json::Object(
+            m.iter()
+                .map(|(k, v)| (k.clone(), upon_to_json(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Text of a template value: strings as they are, `None` as the empty
+/// string, anything else as compact JSON.
+fn upon_text(v: &upon::Value) -> String {
+    match v {
+        upon::Value::None => String::new(),
+        upon::Value::String(s) => s.clone(),
+        upon::Value::Bool(b) => b.to_string(),
+        upon::Value::Integer(i) => i.to_string(),
+        upon::Value::Float(f) => f.to_string(),
+        other => upon_to_json(other).to_string(),
+    }
+}
+
+fn upon_is_empty(v: &upon::Value) -> bool {
+    match v {
+        upon::Value::None => true,
+        upon::Value::String(s) => s.is_empty(),
+        upon::Value::List(l) => l.is_empty(),
+        _ => false,
+    }
+}
+
+/// Format an RFC 3339 string or an epoch-ms number in UTC.
+fn format_time_utc(v: &upon::Value, fmt: &str) -> Result<String, String> {
+    use chrono::format::{Item, StrftimeItems};
+    let t = match v {
+        upon::Value::None => return Ok(String::new()),
+        upon::Value::String(s) if s.trim().is_empty() => return Ok(String::new()),
+        upon::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s.trim())
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .map_err(|e| format!("time: `{s}` is not RFC 3339: {e}"))?,
+        upon::Value::Integer(ms) => chrono::DateTime::from_timestamp_millis(*ms)
+            .ok_or_else(|| format!("time: `{ms}` is out of range"))?,
+        other => {
+            return Err(format!(
+                "time: expected an RFC 3339 string or epoch ms, got {}",
+                upon_to_json(other)
+            ))
+        }
+    };
+    let items: Vec<Item> = StrftimeItems::new(fmt).collect();
+    if items.iter().any(|i| matches!(i, Item::Error)) {
+        return Err(format!("time: invalid format `{fmt}`"));
+    }
+    Ok(t.format_with_items(items.iter()).to_string())
+}
+
+fn register_filters(engine: &mut Engine<'_>, ext: &RenderExtensions) {
+    engine.add_function("xml", |v: upon::Value| escape_xml_text(&upon_text(&v)));
+    engine.add_function("attr", |v: upon::Value| escape_xml_attr(&upon_text(&v)));
+    engine.add_function("json", |v: upon::Value| upon_to_json(&v).to_string());
+    engine.add_function(
+        "truncate",
+        |v: upon::Value, n: i64| -> Result<String, String> {
+            if n < 0 {
+                return Err("truncate: length must not be negative".to_string());
+            }
+            let text = upon_text(&v);
+            let n = n as usize;
+            if text.chars().count() <= n {
+                return Ok(text);
+            }
+            let mut out: String = text.chars().take(n.saturating_sub(1)).collect();
+            out.push('…');
+            Ok(out)
+        },
+    );
+    engine.add_function("oneline", |v: upon::Value| {
+        upon_text(&v).split_whitespace().collect::<Vec<_>>().join(" ")
+    });
+    engine.add_function("default", |v: upon::Value, d: upon::Value| {
+        if upon_is_empty(&v) {
+            d
+        } else {
+            v
+        }
+    });
+    engine.add_function(
+        "join",
+        |v: upon::Value, sep: String| -> Result<String, String> {
+            match v {
+                upon::Value::None => Ok(String::new()),
+                upon::Value::List(l) => Ok(l.iter().map(upon_text).collect::<Vec<_>>().join(&sep)),
+                other => Err(format!(
+                    "join: expected a list, got {}",
+                    upon_to_json(&other)
+                )),
+            }
+        },
+    );
+    engine.add_function("quote", |v: upon::Value| {
+        upon_text(&v)
+            .lines()
+            .map(|l| if l.is_empty() { ">".to_string() } else { format!("> {l}") })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    engine.add_function(
+        "time",
+        |v: upon::Value, fmt: String| -> Result<String, String> { format_time_utc(&v, &fmt) },
+    );
+    let formats = ext.clone();
+    engine.add_function(
+        "render_format",
+        move |v: upon::Value, name: String| -> Result<String, String> {
+            formats.render_format(&upon_to_json(&v), &name)
+        },
+    );
+    for (name, f) in &ext.filters {
+        let f = f.clone();
+        engine.add_function(
+            name.clone(),
+            move |v: upon::Value| -> Result<String, String> { f(&upon_to_json(&v)) },
+        );
     }
 }
 
@@ -204,6 +436,7 @@ impl PromptRenderEngine {
 
         let escaped = escape_template_literals(&preprocessed);
         let mut engine = Engine::new();
+        register_filters(&mut engine, &self.config.extensions);
         engine
             .add_template("text_template", &escaped)
             .map_err(|err| RenderError::Syntax(format!("add text template failed: {err}")))?;
@@ -375,6 +608,11 @@ impl PromptRenderEngine {
                         stats.exec_failed = stats.exec_failed.saturating_add(1);
                         output.push_str(&failed_marker("exec", "disabled by config"));
                     } else {
+                        if self.config.executor.is_none() {
+                            return Err(RenderError::Loader(
+                                "__EXEC__ enabled without an executor".into(),
+                            ));
+                        }
                         match self.run_exec(raw_arg, vars, loader).await {
                             Ok(text) => {
                                 stats.exec_run = stats.exec_run.saturating_add(1);
@@ -515,38 +753,31 @@ impl PromptRenderEngine {
         let expanded = expand_exec_command_dynamic_values(command, vars, loader)
             .await
             .map_err(|err| format!("expand $expr failed: {err}"))?;
-        let result = timeout(
-            self.config.exec_timeout,
-            Command::new("sh")
-                .arg("-lc")
-                .arg(expanded.as_str())
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out after {}ms: `{}`",
-                self.config.exec_timeout.as_millis(),
-                truncate_chars(expanded.as_str(), 160)
-            )
-        })?
-        .map_err(|err| format!("spawn failed: {err}"))?;
-
-        if !result.status.success() {
-            let stderr = String::from_utf8_lossy(&result.stderr);
-            let stderr = truncate_chars(stderr.trim(), 200);
-            let exit_code = result.status.code().unwrap_or_default();
+        let result = self
+            .config
+            .executor
+            .as_ref()
+            .ok_or_else(|| "__EXEC__ enabled without an executor".to_string())?
+            .exec(PromptExecRequest {
+                command: expanded,
+                timeout: self.config.exec_timeout,
+                max_output_bytes: self.config.max_total_bytes,
+            })
+            .await?;
+        if result.timed_out {
             return Err(format!(
-                "exit_code={} stderr={}",
-                exit_code,
-                if stderr.is_empty() {
-                    "<empty>"
-                } else {
-                    stderr.as_str()
-                }
+                "timed out after {}ms",
+                self.config.exec_timeout.as_millis()
             ));
         }
-        let stdout = String::from_utf8_lossy(&result.stdout);
+        if result.exit_code != 0 {
+            return Err(format!(
+                "exit_code={} stderr={}",
+                result.exit_code,
+                truncate_chars(result.stderr.trim(), 200)
+            ));
+        }
+        let stdout = result.stdout;
         Ok(truncate_utf8(
             stdout.as_ref(),
             self.config.max_include_bytes,
@@ -744,7 +975,7 @@ fn resolve_include_path(
     current_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     let requested = PathBuf::from(path);
-    if requested.is_absolute() {
+    if requested.has_root() {
         if let Some(root) = include_root {
             return Ok(root.join(strip_virtual_root(&requested)?));
         }
@@ -1043,6 +1274,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_filters() {
+        let engine = PromptRenderEngine::with_defaults();
+        let vars = RenderVars::new()
+            .with_var("t", "a <b> & \"c\"\n  next")
+            .with_var("empty", "")
+            .with_var("list", json!(["x", "y"]))
+            .with_var("obj", json!({"k": 1}))
+            .with_var("at", "2026-10-02T08:05:00+08:00")
+            .with_var("ms", 1_790_899_200_000u64);
+        let r = |tpl: &'static str| {
+            let engine = &engine;
+            let vars = &vars;
+            async move {
+                engine
+                    .render(tpl, vars, &NullValueLoader)
+                    .await
+                    .map(|r| r.rendered)
+            }
+        };
+        assert_eq!(r("{{ t | xml }}").await.unwrap(), "a &lt;b&gt; &amp; \"c\"\n  next");
+        assert_eq!(
+            r("{{ t | attr }}").await.unwrap(),
+            "a &lt;b&gt; &amp; &quot;c&quot;\n  next"
+        );
+        assert_eq!(r("{{ t | oneline }}").await.unwrap(), "a <b> & \"c\" next");
+        assert_eq!(r("{{ t | truncate: 3 }}").await.unwrap(), "a …");
+        assert_eq!(r("{{ t | quote }}").await.unwrap(), "> a <b> & \"c\"\n>   next");
+        assert_eq!(r("{{ empty | default: \"unknown\" }}").await.unwrap(), "unknown");
+        assert_eq!(r("{{ list | join: \", \" }}").await.unwrap(), "x, y");
+        assert_eq!(r("{{ obj | json }}").await.unwrap(), "{\"k\":1}");
+        assert_eq!(r("{{ at | time: \"%H:%M\" }}").await.unwrap(), "00:05");
+        assert_eq!(r("{{ ms | time: \"%Y-%m-%d\" }}").await.unwrap(), "2026-10-02");
+        assert_eq!(r("{{ empty | time: \"%H\" }}").await.unwrap(), "");
+        assert!(r("{{ t | time: \"%H\" }}").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn render_format_uses_host_formats_only() {
+        let ext = RenderExtensions::new()
+            .with_format("todo.summary_xml", |v| match v {
+                Json::Null => Ok(String::new()),
+                Json::Object(m) => Ok(format!(
+                    "<todo>{}</todo>",
+                    escape_xml_text(m.get("title").and_then(Json::as_str).unwrap_or_default())
+                )),
+                _ => Err("expected a todo object".to_string()),
+            })
+            .with_filter("shout", |v| Ok(v.as_str().unwrap_or_default().to_uppercase()));
+        let engine = PromptRenderEngine::new(EngineConfig {
+            extensions: ext,
+            ..EngineConfig::default()
+        });
+        let vars = RenderVars::new()
+            .with_var("todo", json!({"title": "fix <it>"}))
+            .with_var("none", Json::Null)
+            .with_var("s", "x");
+        let ok = engine
+            .render(
+                "{{ todo | render_format: \"todo.summary_xml\" }}|{{ none | render_format: \"todo.summary_xml\" }}|{{ s | shout }}",
+                &vars,
+                &NullValueLoader,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.rendered, "<todo>fix &lt;it&gt;</todo>||X");
+        // unknown format / wrong shape are template errors
+        assert!(engine
+            .render("{{ todo | render_format: \"nope\" }}", &vars, &NullValueLoader)
+            .await
+            .is_err());
+        assert!(engine
+            .render("{{ s | render_format: \"todo.summary_xml\" }}", &vars, &NullValueLoader)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn renders_plain_placeholder() {
         let engine = PromptRenderEngine::with_defaults();
         let mut vars = RenderVars::new();
@@ -1334,10 +1642,43 @@ mod tests {
         assert!(result.rendered.contains("disabled by config"));
     }
 
+    #[derive(Debug)]
+    struct TestExecutor;
+    #[async_trait]
+    impl PromptExec for TestExecutor {
+        async fn exec(&self, req: PromptExecRequest) -> Result<PromptExecOutput, String> {
+            Ok(PromptExecOutput {
+                exit_code: 0,
+                stdout: if req.command == "printf hi" {
+                    "hi".into()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+                timed_out: req.command == "sleep 1",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_requires_injected_executor() {
+        let engine = PromptRenderEngine::new(EngineConfig {
+            allow_exec: true,
+            ..Default::default()
+        });
+        assert!(engine
+            .render("__EXEC(echo hi)__", &RenderVars::new(), &NullValueLoader)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("without an executor"));
+    }
+
     #[tokio::test]
     async fn exec_runs_when_enabled() {
         let cfg = EngineConfig {
             allow_exec: true,
+            executor: Some(Arc::new(TestExecutor)),
             ..EngineConfig::default()
         };
         let engine = PromptRenderEngine::new(cfg);
@@ -1358,6 +1699,7 @@ mod tests {
         let cfg = EngineConfig {
             allow_exec: true,
             exec_timeout: Duration::from_millis(50),
+            executor: Some(Arc::new(TestExecutor)),
             ..EngineConfig::default()
         };
         let engine = PromptRenderEngine::new(cfg);

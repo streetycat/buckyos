@@ -1,18 +1,38 @@
-// Input resource resolution + output artifact persistence.
+// Input resource resolution + output artifact delivery.
 //
 // Input rules:
 //   - "named_object:<obj_id>"          → ResourceRef::NamedObject
+//   - "obj://bucket/<bucket_id>/<key>" → ResourceRef::NamedObject of what it binds
 //   - "http(s)://..." / "data:..."     → ResourceRef::Url
-//   - any local path                   → ResourceRef::Base64 (small/MVP) or
-//                                        — when caller passes uploadNamed=true —
-//                                        wrapped as a NamedObject via NDM.
+//   - any local path                   → ResourceRef::Base64 (small/MVP)
 //
-// Output rules:
-//   - artifact.resource.named_object   → download via ndm_proxy.openReader
-//   - artifact.resource.url            → fetch
-//   - artifact.resource.base64         → decode
+// Output rules (deliverArtifact): every result goes into this Agent's
+// `artifacts` bucket and is named by its `obj://bucket/...`:
+//   - stored by AICC (its `outputs` bucket) → bucket.copy, no bytes move
+//   - otherwise the bytes are read and uploaded (lib/bucket.ts uploadNamed):
+//       named_object → ndm_proxy.openReader; a message attachment the store
+//                      refuses → msg-center's object route
+//       url          → AICC Provider reader, then public fetch fallback
+//       base64       → decode
+// A local file is written only when the caller gives a path (the explicit
+// fallback for tools that need one; `materialize_resource` does the same later).
 
-import { AiArtifact, AiResponse, ResourceRef, aiResponseArtifacts } from "./types.ts";
+import { buckyos, ndm_proxy } from "buckyos";
+
+import {
+  boundObjectId,
+  copyToArtifacts,
+  parseBucketObjUrl,
+  readBucketObject,
+  uploadNamed,
+} from "./bucket.ts";
+import type { AiccRuntime } from "./runtime.ts";
+import {
+  AiArtifact,
+  AiccInferenceResponse,
+  aiResponseArtifacts,
+  ResourceRef,
+} from "./types.ts";
 
 const MIME_BY_EXT: Record<string, string> = {
   png: "image/png",
@@ -65,17 +85,64 @@ export function extFromMime(mime: string | undefined | null): string | null {
   return EXT_BY_MIME[k] ?? k.split("/").at(-1) ?? null;
 }
 
+function isRawPcm(mime: string | null | undefined): boolean {
+  const type = (mime ?? "").split(";")[0].trim().toLowerCase();
+  return type === "audio/l16" || type === "audio/pcm";
+}
+
+// Raw 16-bit PCM (`audio/l16`, `audio/pcm`; Gemini TTS sends little-endian
+// samples, 24 kHz mono) plays nowhere: wrap it in a WAV header. Rate and
+// channels come from the mime parameters when present.
+export function wrapRawPcm(
+  bytes: Uint8Array,
+  mime: string | undefined,
+): Uint8Array | null {
+  if (!isRawPcm(mime)) return null;
+  const params = (mime ?? "").split(";").slice(1).map((p) => p.trim().toLowerCase());
+  const param = (name: string) =>
+    Number(params.find((p) => p.startsWith(`${name}=`))?.split("=")[1]);
+  const rate = param("rate") || 24000;
+  const channels = param("channels") || 1;
+  const out = new Uint8Array(44 + bytes.byteLength);
+  const v = new DataView(out.buffer);
+  const ascii = (at: number, s: string) => {
+    for (let i = 0; i < s.length; i += 1) out[at + i] = s.charCodeAt(i);
+  };
+  ascii(0, "RIFF");
+  v.setUint32(4, 36 + bytes.byteLength, true);
+  ascii(8, "WAVE");
+  ascii(12, "fmt ");
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true);
+  v.setUint16(22, channels, true);
+  v.setUint32(24, rate, true);
+  v.setUint32(28, rate * channels * 2, true);
+  v.setUint16(32, channels * 2, true);
+  v.setUint16(34, 16, true);
+  ascii(36, "data");
+  v.setUint32(40, bytes.byteLength, true);
+  out.set(bytes, 44);
+  return out;
+}
+
 export function isUrl(value: string): boolean {
   return /^(https?|data):/i.test(value);
 }
 
 export function isNamedObjectRef(value: string): boolean {
-  return value.startsWith("named_object:") || value.startsWith("chunk:");
+  return value.startsWith("named_object:") || value.startsWith("cyfile:") ||
+    value.startsWith("chunk:");
+}
+
+export function isBucketObjectRef(value: string): boolean {
+  return parseBucketObjUrl(value) !== null;
 }
 
 function base64FromBytes(bytes: Uint8Array): string {
   let binary = "";
-  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
   return btoa(binary);
 }
 
@@ -96,13 +163,19 @@ export async function resolveInputResource(
       : value;
     return { kind: "named_object", obj_id: objId };
   }
+  if (isBucketObjectRef(value)) {
+    return { kind: "named_object", obj_id: await boundObjectId(value) };
+  }
   if (isUrl(value)) {
     return { kind: "url", url: value, mime_hint: mimeHint };
   }
   // Local path → base64. Caller is responsible for choosing this path only for
   // files small enough to fit in the request envelope.
   const bytes = await Deno.readFile(value);
-  const mime = mimeHint ?? mimeFromPath(value);
+  const inferredMime = mimeFromPath(value);
+  const mime = mimeHint?.endsWith("/*")
+    ? inferredMime
+    : mimeHint ?? inferredMime;
   return { kind: "base64", mime, data_base64: base64FromBytes(bytes) };
 }
 
@@ -111,6 +184,13 @@ export interface SavedOutput {
   bytes: number;
   mime?: string;
   source_kind: string;
+  // The typed object id (e.g. `cyfile:…`) when the resource is a named object:
+  // pass it on as `named_object:<id>` or list it as a report artifact.
+  obj_id?: string;
+}
+
+export interface SaveResourceOptions {
+  overwrite?: boolean;
 }
 
 async function ensureParentDir(path: string): Promise<void> {
@@ -130,10 +210,85 @@ async function readNamedObject(
   ndmProxy: NdmProxyClient,
   objId: string,
 ): Promise<{ bytes: Uint8Array; mime?: string }> {
-  const opened = await ndmProxy.openReader({ obj_id: objId });
+  let opened;
+  try {
+    opened = await ndmProxy.openReader({ obj_id: objId });
+  } catch (error) {
+    // The store refuses this identity a message attachment: msg-center reads
+    // it when a message of the caller's own mailboxes references it.
+    if (error instanceof ndm_proxy.NdmProxyApiError && error.status === 403) {
+      return await readMessageAttachment(objId);
+    }
+    throw error;
+  }
   const bytes = new Uint8Array(await opened.response.arrayBuffer());
   const mime = opened.response.headers.get("content-type") ?? undefined;
   return { bytes, mime };
+}
+
+async function readMessageAttachment(
+  objId: string,
+): Promise<{ bytes: Uint8Array; mime?: string }> {
+  const serviceUrl = buckyos.getZoneServiceURL("msg-center").replace(/\/$/, "");
+  const token = buckyos.getServiceRpcClient("msg-center").getSessionToken();
+  if (!token) throw new Error("msg-center session token is unavailable");
+  const response = await fetch(
+    `${serviceUrl}/objects/${encodeURIComponent(objId)}/content`,
+    { headers: { authorization: `Bearer ${token}` } },
+  );
+  if (!response.ok) {
+    const detail = (await response.text()).trim().slice(0, 4096);
+    throw new Error(
+      `${objId} is not readable here: the object store refuses this identity and msg-center answered ${response.status}${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+  }
+  return {
+    bytes: new Uint8Array(await response.arrayBuffer()),
+    mime: response.headers.get("content-type") ?? undefined,
+  };
+}
+
+async function readUrlArtifact(
+  url: string,
+): Promise<{ bytes: Uint8Array; mime?: string }> {
+  const serviceUrl = buckyos.getZoneServiceURL("aicc").replace(/\/$/, "");
+  const rpcClient = buckyos.getServiceRpcClient("aicc");
+  const token = rpcClient.getSessionToken();
+  if (!token) throw new Error("AICC session token is unavailable");
+  const aiccResponse = await fetch(`${serviceUrl}/artifact/open`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Auth": token,
+    },
+    body: JSON.stringify({ url }),
+  });
+  if (aiccResponse.ok) {
+    return {
+      bytes: new Uint8Array(await aiccResponse.arrayBuffer()),
+      mime: aiccResponse.headers.get("content-type") ?? undefined,
+    };
+  }
+  if (aiccResponse.status !== 404) {
+    const detail = (await aiccResponse.text()).trim().slice(0, 4096);
+    throw new Error(
+      `AICC failed to open Provider artifact: ${aiccResponse.status} ${aiccResponse.statusText}${
+        detail ? `: ${detail}` : ""
+      }`,
+    );
+  }
+  const publicResponse = await fetch(url);
+  if (!publicResponse.ok) {
+    throw new Error(
+      `failed to download public artifact: ${publicResponse.status} ${publicResponse.statusText}`,
+    );
+  }
+  return {
+    bytes: new Uint8Array(await publicResponse.arrayBuffer()),
+    mime: publicResponse.headers.get("content-type") ?? undefined,
+  };
 }
 
 export async function saveArtifactToPath(
@@ -141,38 +296,201 @@ export async function saveArtifactToPath(
   destPath: string,
   ndmProxy: NdmProxyClient,
 ): Promise<SavedOutput> {
-  const sourceKind = artifact.resource?.kind ?? "unknown";
-  let bytes: Uint8Array;
-  let mime = artifactMime(artifact);
+  return saveResourceToPath(artifact.resource, destPath, ndmProxy, {
+    overwrite: true,
+  }, artifactMime(artifact));
+}
 
-  if (sourceKind === "named_object" && artifact.resource.obj_id) {
-    const r = await readNamedObject(ndmProxy, artifact.resource.obj_id);
-    bytes = r.bytes;
-    mime = r.mime ?? mime;
-  } else if (sourceKind === "url" && artifact.resource.url) {
-    const resp = await fetch(artifact.resource.url);
-    if (!resp.ok) {
-      throw new Error(
-        `failed to download artifact from ${artifact.resource.url}: ${resp.status} ${resp.statusText}`,
-      );
-    }
-    mime = resp.headers.get("content-type") ?? mime;
-    bytes = new Uint8Array(await resp.arrayBuffer());
-  } else if (sourceKind === "base64" && artifact.resource.data_base64) {
-    bytes = bytesFromBase64(artifact.resource.data_base64);
-  } else {
-    throw new Error(`unsupported artifact resource kind: ${sourceKind}`);
+// The bytes of a resource (and its mime, when the source says it).
+export async function readResource(
+  resource: ResourceRef,
+  ndmProxy: NdmProxyClient,
+  mimeHint?: string,
+): Promise<{ bytes: Uint8Array; mime?: string }> {
+  const mime = mimeHint ?? resource.mime ?? resource.mime_hint ?? undefined;
+  if (resource.kind === "named_object") {
+    const r = await readNamedObject(ndmProxy, resource.obj_id);
+    return { bytes: r.bytes, mime: mime ?? r.mime };
   }
+  if (resource.kind === "url") {
+    const r = await readUrlArtifact(resource.url);
+    return { bytes: r.bytes, mime: r.mime ?? mime };
+  }
+  if (resource.kind === "base64") {
+    return { bytes: bytesFromBase64(resource.data_base64), mime };
+  }
+  throw new Error(`unsupported artifact resource kind: ${(resource as ResourceRef).kind}`);
+}
 
+function wavPath(path: string): string {
+  return `${path.replace(/\.[a-z0-9]{1,8}$/i, "")}.wav`;
+}
+
+export async function saveResourceToPath(
+  resource: ResourceRef,
+  destPath: string,
+  ndmProxy: NdmProxyClient,
+  options: SaveResourceOptions = {},
+  mimeHint?: string,
+): Promise<SavedOutput> {
+  let { bytes, mime } = await readResource(resource, ndmProxy, mimeHint);
+  const wav = wrapRawPcm(bytes, mime);
+  if (wav) {
+    bytes = wav;
+    mime = "audio/wav";
+    destPath = wavPath(destPath);
+  }
+  await writeBytesToPath(destPath, bytes, options);
+  return {
+    path: destPath,
+    bytes: bytes.byteLength,
+    mime,
+    source_kind: resource.kind,
+    ...(resource.kind === "named_object" ? { obj_id: resource.obj_id } : {}),
+  };
+}
+
+// A bucket object (`obj://bucket/...`) saved as a local file.
+export async function saveBucketObjectToPath(
+  url: string,
+  destPath: string,
+  options: SaveResourceOptions = {},
+): Promise<SavedOutput> {
+  const { bytes, mime } = await readBucketObject(url);
+  await writeBytesToPath(destPath, bytes, options);
+  return { path: destPath, bytes: bytes.byteLength, mime, source_kind: "bucket", obj_id: await boundObjectId(url) };
+}
+
+export async function writeBytesToPath(
+  destPath: string,
+  bytes: Uint8Array,
+  options: SaveResourceOptions = {},
+): Promise<void> {
   await ensureParentDir(destPath);
-  await Deno.writeFile(destPath, bytes);
-  return { path: destPath, bytes: bytes.byteLength, mime, source_kind: sourceKind };
+  const exclusive = options.overwrite === false;
+  let file: Deno.FsFile | undefined;
+  try {
+    file = await Deno.open(destPath, {
+      write: true,
+      create: !exclusive,
+      createNew: exclusive,
+      truncate: !exclusive,
+    });
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const written = await file.write(bytes.subarray(offset));
+      if (written === 0) throw new Error("resource write made no progress");
+      offset += written;
+    }
+  } catch (err) {
+    if (file && exclusive) {
+      try {
+        await Deno.remove(destPath);
+      } catch {
+      }
+    }
+    throw err;
+  } finally {
+    file?.close();
+  }
+}
+
+// What AICC says about a result it stored (`extra.materialized_artifacts`):
+// its name, mime and the `obj://bucket/...` binding in AICC's `outputs`.
+export function aiccStoredArtifact(
+  response: AiccInferenceResponse,
+  objId: string,
+): { bucket_ref?: string; mime?: string; name?: string } | undefined {
+  const extra = (response as unknown as { extra?: { materialized_artifacts?: unknown } }).extra;
+  const list = Array.isArray(extra?.materialized_artifacts) ? extra.materialized_artifacts : [];
+  const entry = list.find((e) =>
+    e && typeof e === "object" && (e as Record<string, unknown>).obj_id === objId
+  ) as Record<string, unknown> | undefined;
+  if (!entry) return undefined;
+  const text = (v: unknown) => typeof v === "string" && v ? v : undefined;
+  return { bucket_ref: text(entry.bucket_ref), mime: text(entry.mime), name: text(entry.name) };
+}
+
+export type DeliveredOutput = {
+  // `obj://bucket/<this Agent's artifacts>/<key>`: hand this over.
+  url: string;
+  obj_id: string;
+  // The local copy, written only when a path was given.
+  path: string | null;
+  bytes: number | null;
+  mime: string | null;
+  source_kind: string;
+};
+
+export function deliveredSummary(tool: string, files: DeliveredOutput[]): string {
+  const written = files.flatMap((f) => f.path ? [f.path] : []);
+  return `${tool} kept ${files.map((f) => f.url).join(", ")}${
+    written.length ? `; wrote ${written.join(", ")}` : ""
+  }`;
+}
+
+function deliveryName(tool: string, artifact: AiArtifact, mime: string | null): string {
+  const base = `${tool}-${artifact.name || "result"}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return suffixPathByMime(base, mime ?? undefined);
+}
+
+// deliverArtifact: keep an AICC result in this Agent's `artifacts` bucket and
+// optionally write a local copy at `path` (an extension is added from the
+// mime when it has none; raw PCM becomes WAV). An AICC-stored result is
+// copied from AICC's `outputs` without moving bytes; anything else is
+// uploaded once.
+export async function deliverArtifact(
+  runtime: AiccRuntime,
+  response: AiccInferenceResponse,
+  artifact: AiArtifact,
+  ndmProxy: NdmProxyClient,
+  options: { tool: string; path?: string; defaultMime?: string },
+): Promise<DeliveredOutput> {
+  const stored = artifact.resource.kind === "named_object"
+    ? aiccStoredArtifact(response, artifact.resource.obj_id)
+    : undefined;
+  let mime = artifactMime(artifact) ?? stored?.mime ?? null;
+  let dest = options.path
+    ? suffixPathByMime(options.path, mime ?? options.defaultMime)
+    : undefined;
+  let bytes: Uint8Array | undefined;
+  let kept;
+  if (stored?.bucket_ref && !isRawPcm(mime)) {
+    const name = dest ? dest.split("/").at(-1)! : deliveryName(options.tool, artifact, mime ?? options.defaultMime ?? null);
+    kept = await copyToArtifacts(runtime, stored.bucket_ref, name);
+  } else {
+    const read = stored?.bucket_ref
+      ? await readBucketObject(stored.bucket_ref)
+      : await readResource(artifact.resource, ndmProxy, mime ?? undefined);
+    bytes = read.bytes;
+    mime = mime ?? read.mime ?? null;
+    const wav = wrapRawPcm(bytes, mime ?? undefined);
+    if (wav) {
+      bytes = wav;
+      mime = "audio/wav";
+      dest = dest ? wavPath(dest) : undefined;
+    }
+    const name = dest ? dest.split("/").at(-1)! : deliveryName(options.tool, artifact, mime ?? options.defaultMime ?? null);
+    kept = await uploadNamed(runtime, bytes, name, mime ? { mime } : {});
+  }
+  if (dest) {
+    bytes = bytes ?? (await readBucketObject(kept.url)).bytes;
+    await writeBytesToPath(dest, bytes, { overwrite: true });
+  }
+  return {
+    url: kept.url,
+    obj_id: kept.obj_id,
+    path: dest ?? null,
+    bytes: kept.bytes ?? bytes?.byteLength ?? null,
+    mime: mime ?? kept.mime,
+    source_kind: artifact.resource.kind,
+  };
 }
 
 // Pick the first artifact whose mime matches the desired top-level family
 // ("image" / "audio" / "video"). Falls back to first artifact when no match.
 export function pickArtifact(
-  response: AiResponse,
+  response: AiccInferenceResponse,
   family?: "image" | "audio" | "video",
 ): AiArtifact | null {
   const arts = aiResponseArtifacts(response);
@@ -188,7 +506,10 @@ export function pickArtifact(
 // Append an extension to `path` (chosen by `mime`) if the path has none.
 // Used by single-file output commands so `gen_image foo bar` still produces
 // `bar.png` rather than an extension-less blob.
-export function suffixPathByMime(path: string, mime: string | undefined): string {
+export function suffixPathByMime(
+  path: string,
+  mime: string | undefined,
+): string {
   if (/\.[a-z0-9]{1,8}$/i.test(path)) return path;
   const ext = extFromMime(mime ?? "");
   return ext ? `${path}.${ext}` : path;

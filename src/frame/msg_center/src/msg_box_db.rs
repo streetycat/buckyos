@@ -17,9 +17,9 @@
  */
 
 use buckyos_api::{
-    get_rdb_instance, msg_center_default_rdb_instance_config, DeliveryEnvelope, DeliveryError,
+    get_rdb_instance_in, msg_center_default_rdb_instance_config, DeliveryEnvelope, DeliveryError,
     DeliveryRecord, DeliveryState, IngressContext, MailboxKind, MailboxRecord, RdbBackend,
-    RecipientState, UiSessionStateEntry, MSG_CENTER_RDB_INSTANCE_ID,
+    RdbPartition, RecipientState, UiSessionStateEntry, MSG_CENTER_RDB_INSTANCE_ID,
     MSG_CENTER_RDB_SCHEMA_POSTGRES, MSG_CENTER_RDB_SCHEMA_SQLITE, MSG_CENTER_SERVICE_NAME,
 };
 use kRPC::RPCErrors;
@@ -69,7 +69,7 @@ struct MsgBoxDbInner {
     backend: RdbBackend,
 }
 
-const MAILBOX_COLUMNS: &str = r#"
+pub(crate) const MAILBOX_COLUMNS: &str = r#"
     owner,
     record_id,
     box_kind,
@@ -103,9 +103,8 @@ const DELIVERY_COLUMNS: &str = r#"
 "#;
 
 impl MsgBoxDbMgr {
-    /// Open a pool against `connection`. `schema` is the DDL to apply (usually
-    /// what the service spec carried for the chosen backend); an empty / None
-    /// value means "use the compile-time default for `backend`".
+    /// Open a pool against `connection`, applying the service spec's DDL and
+    /// the required schema compiled into this version of the service.
     pub async fn open(
         connection: &str,
         backend: RdbBackend,
@@ -137,11 +136,16 @@ impl MsgBoxDbMgr {
     /// Resolve the msg-center rdb instance from the service spec and open a
     /// pool against it. This is the production entry point.
     pub async fn open_from_service_spec() -> std::result::Result<Self, RPCErrors> {
-        let instance = get_rdb_instance(MSG_CENTER_SERVICE_NAME, None, MSG_CENTER_RDB_INSTANCE_ID)
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!("resolve msg-center rdb instance failed: {}", error))
-            })?;
+        let instance = get_rdb_instance_in(
+            MSG_CENTER_SERVICE_NAME,
+            None,
+            MSG_CENTER_RDB_INSTANCE_ID,
+            RdbPartition::UserData,
+        )
+        .await
+        .map_err(|error| {
+            RPCErrors::ReasonError(format!("resolve msg-center rdb instance failed: {}", error))
+        })?;
         info!("msg_box_db.open {}", instance.connection);
         Self::open(
             &instance.connection,
@@ -170,23 +174,23 @@ impl MsgBoxDbMgr {
     }
 
     async fn apply_schema(&self, override_ddl: Option<&str>) -> std::result::Result<(), RPCErrors> {
-        let ddl: &str =
-            override_ddl
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(match self.backend() {
-                    RdbBackend::Sqlite => MSG_CENTER_RDB_SCHEMA_SQLITE,
-                    RdbBackend::Postgres => MSG_CENTER_RDB_SCHEMA_POSTGRES,
-                });
-        for statement in split_sql_statements(ddl) {
-            self.pool().execute(statement.as_str()).await.map_err(|e| {
-                RPCErrors::ReasonError(format!("apply msg-center schema failed: {}", e))
-            })?;
+        let required_ddl = match self.backend() {
+            RdbBackend::Sqlite => MSG_CENTER_RDB_SCHEMA_SQLITE,
+            RdbBackend::Postgres => MSG_CENTER_RDB_SCHEMA_POSTGRES,
+        };
+        let override_ddl = override_ddl.filter(|ddl| !ddl.trim().is_empty() && *ddl != required_ddl);
+        for ddl in override_ddl.into_iter().chain(std::iter::once(required_ddl)) {
+            for statement in split_sql_statements(ddl) {
+                self.pool().execute(statement.as_str()).await.map_err(|e| {
+                    RPCErrors::ReasonError(format!("apply msg-center schema failed: {}", e))
+                })?;
+            }
         }
         Ok(())
     }
 
     /// Translate `?` placeholders into `$N` form for postgres.
-    fn render_sql(&self, sql: &str) -> String {
+    pub(crate) fn render_sql(&self, sql: &str) -> String {
         match self.backend() {
             RdbBackend::Postgres => rewrite_placeholders_to_dollar(sql),
             RdbBackend::Sqlite => sql.to_string(),
@@ -224,8 +228,7 @@ impl MsgBoxDbMgr {
 INSERT INTO mailbox_records ({MAILBOX_COLUMNS})
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(owner, record_id) DO UPDATE SET
-    msg_kind = COALESCE(excluded.msg_kind, mailbox_records.msg_kind),
-    session_id = COALESCE(mailbox_records.session_id, excluded.session_id)
+    msg_kind = COALESCE(excluded.msg_kind, mailbox_records.msg_kind)
 "#
         ));
 
@@ -282,7 +285,7 @@ ON CONFLICT(owner, record_id) DO UPDATE SET
         Ok(())
     }
 
-    async fn upsert_record_with_msg_tx(
+    pub(crate) async fn upsert_record_with_msg_tx(
         &self,
         tx: &mut Transaction<'_, Any>,
         record: &MailboxRecord,
@@ -293,7 +296,7 @@ ON CONFLICT(owner, record_id) DO UPDATE SET
             .await
     }
 
-    async fn create_delivery_if_absent_tx(
+    pub(crate) async fn create_delivery_if_absent_tx(
         &self,
         tx: &mut Transaction<'_, Any>,
         record: &DeliveryRecord,
@@ -538,7 +541,7 @@ ON CONFLICT(owner, record_id) DO UPDATE SET
     msg_from = COALESCE(excluded.msg_from, mailbox_records.msg_from),
     msg_to = COALESCE(excluded.msg_to, mailbox_records.msg_to),
     state = excluded.state,
-    session_id = COALESCE(excluded.session_id, mailbox_records.session_id),
+    session_id = excluded.session_id,
     sort_key = excluded.sort_key,
     tags_json = excluded.tags_json,
     ingress_json = COALESCE(excluded.ingress_json, mailbox_records.ingress_json),
@@ -597,9 +600,68 @@ ON CONFLICT(owner, record_id) DO UPDATE SET
         row.as_ref().map(row_to_mailbox_record).transpose()
     }
 
-    pub async fn list_records(
+    pub async fn list_message_records(
+        &self,
+        msg_id: &ObjId,
+    ) -> std::result::Result<Vec<MailboxRecord>, RPCErrors> {
+        let sql = self.render_sql(&format!(
+            "SELECT {MAILBOX_COLUMNS} FROM mailbox_records WHERE msg_id = ?"
+        ));
+        let rows = sqlx::query(&sql)
+            .bind(msg_id.to_string())
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        rows.iter().map(row_to_mailbox_record).collect()
+    }
+
+    pub async fn compare_update_record(
+        &self,
+        before: &MailboxRecord,
+        after: &MailboxRecord,
+    ) -> std::result::Result<bool, RPCErrors> {
+        let sql = self.render_sql("UPDATE mailbox_records SET state = ?, session_id = ?, updated_at_ms = ? WHERE owner = ? AND record_id = ? AND COALESCE(session_id, '') = ? AND state = ? AND updated_at_ms = ?");
+        let result = sqlx::query(&sql)
+            .bind(recipient_state_name(&after.state))
+            .bind(after.session_id.clone())
+            .bind(to_sql_i64(after.updated_at_ms))
+            .bind(before.owner.to_string())
+            .bind(before.record_id.clone())
+            .bind(before.session_id.as_deref().unwrap_or(""))
+            .bind(recipient_state_name(&before.state))
+            .bind(to_sql_i64(before.updated_at_ms))
+            .execute(self.pool())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_mailboxes(
         &self,
         owner: &DID,
+        box_kind: &MailboxKind,
+    ) -> std::result::Result<Vec<buckyos_api::MailboxAddress>, RPCErrors> {
+        let sql = self.render_sql("SELECT DISTINCT session_id FROM mailbox_records WHERE owner = ? AND box_kind = ? AND state = 'UNREAD' ORDER BY session_id");
+        let rows = sqlx::query(&sql)
+            .bind(owner.to_string())
+            .bind(mailbox_kind_name(box_kind))
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+        rows.iter()
+            .map(|row| {
+                let session = row
+                    .try_get::<Option<String>, _>("session_id")
+                    .map_err(|e| decode_err("session_id", &e))?;
+                buckyos_api::MailboxAddress::new(owner.clone(), session)
+                    .map_err(RPCErrors::ReasonError)
+            })
+            .collect()
+    }
+
+    pub async fn list_records(
+        &self,
+        mailbox: &buckyos_api::MailboxAddress,
         box_kind: &MailboxKind,
         state_filter: Option<&[RecipientState]>,
         descending: bool,
@@ -609,12 +671,19 @@ ON CONFLICT(owner, record_id) DO UPDATE SET
         } else {
             "ORDER BY sort_key ASC, record_id ASC"
         };
+        let session_clause = if mailbox.session_id().is_some() {
+            "session_id = ?"
+        } else {
+            "session_id IS NULL"
+        };
         let sql = self.render_sql(&format!(
-            "SELECT {MAILBOX_COLUMNS} FROM mailbox_records WHERE owner = ? AND box_kind = ? {order_clause}"
+            "SELECT {MAILBOX_COLUMNS} FROM mailbox_records WHERE owner = ? AND {session_clause} AND box_kind = ? {order_clause}"
         ));
-
-        let rows = sqlx::query(&sql)
-            .bind(owner.to_string())
+        let mut query = sqlx::query(&sql).bind(mailbox.owner().to_string());
+        if let Some(session) = mailbox.session_id() {
+            query = query.bind(session);
+        }
+        let rows = query
             .bind(mailbox_kind_name(box_kind).to_string())
             .fetch_all(self.pool())
             .await
@@ -791,6 +860,7 @@ ON CONFLICT(delivery_id) DO UPDATE SET
     delivered_at_ms = excluded.delivered_at_ms,
     last_error_json = excluded.last_error_json,
     updated_at_ms = excluded.updated_at_ms
+WHERE delivery_records.state <> 'SENT' OR excluded.state = 'SENT'
 "#
         ));
 
@@ -1440,6 +1510,60 @@ LIMIT 1
         Ok(row.is_some())
     }
 
+    /// Keep the JWT original of a MsgObject received in signed form (CYFS 标准对象
+    /// §16.5) in `msg_jwt_originals`. The named store holds the canonical JSON,
+    /// which has the same ObjId; the JWT is kept for later readers and replayed
+    /// on native dispatch. The first stored JWT wins.
+    pub async fn put_msg_jwt(
+        &self,
+        msg_id: &ObjId,
+        jwt: &str,
+        created_at_ms: u64,
+    ) -> std::result::Result<(), RPCErrors> {
+        let sql = self.render_sql(
+            "INSERT INTO msg_jwt_originals(msg_id, jwt, created_at_ms)
+             VALUES(?, ?, ?)
+             ON CONFLICT(msg_id) DO NOTHING",
+        );
+        sqlx::query(&sql)
+            .bind(msg_id.to_string())
+            .bind(jwt.to_string())
+            .bind(to_sql_i64(created_at_ms))
+            .execute(self.pool())
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!(
+                    "failed to store jwt original of message {}: {}",
+                    msg_id.to_string(),
+                    error
+                ))
+            })?;
+        Ok(())
+    }
+
+    pub async fn get_msg_jwt(
+        &self,
+        msg_id: &ObjId,
+    ) -> std::result::Result<Option<String>, RPCErrors> {
+        let sql = self.render_sql("SELECT jwt FROM msg_jwt_originals WHERE msg_id = ?");
+        let row = sqlx::query(&sql)
+            .bind(msg_id.to_string())
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!(
+                    "failed to query jwt original of message {}: {}",
+                    msg_id.to_string(),
+                    error
+                ))
+            })?;
+        row.map(|row| {
+            row.try_get("jwt")
+                .map_err(|error| decode_err("jwt", &error))
+        })
+        .transpose()
+    }
+
     pub async fn upsert_tunnel_cursor(
         &self,
         tunnel_key: &str,
@@ -1619,11 +1743,11 @@ ORDER BY state_key ASC
     }
 }
 
-fn decode_err(field: &str, err: &sqlx::Error) -> RPCErrors {
+pub(crate) fn decode_err(field: &str, err: &sqlx::Error) -> RPCErrors {
     RPCErrors::ReasonError(format!("failed to decode column {}: {}", field, err))
 }
 
-fn decode_ui_session_state_row(
+pub(crate) fn decode_ui_session_state_row(
     row: &AnyRow,
 ) -> std::result::Result<UiSessionStateEntry, RPCErrors> {
     let session_id: String = row
@@ -1654,7 +1778,7 @@ fn decode_ui_session_state_row(
     })
 }
 
-fn row_to_mailbox_record(row: &AnyRow) -> std::result::Result<MailboxRecord, RPCErrors> {
+pub(crate) fn row_to_mailbox_record(row: &AnyRow) -> std::result::Result<MailboxRecord, RPCErrors> {
     let record_id: String = row
         .try_get("record_id")
         .map_err(|e| decode_err("record_id", &e))?;
@@ -1715,6 +1839,8 @@ fn row_to_mailbox_record(row: &AnyRow) -> std::result::Result<MailboxRecord, RPC
         parse_optional_json(ingress_json.as_deref(), &record_id, "ingress_json")?;
 
     Ok(MailboxRecord {
+        mailbox: buckyos_api::MailboxAddress::new(owner.clone(), session_id.clone())
+            .map_err(RPCErrors::ReasonError)?,
         record_id: record_id.clone(),
         owner,
         box_kind,
@@ -1968,7 +2094,7 @@ fn recipient_state_matches(filter: Option<&[RecipientState]>, state: &RecipientS
     }
 }
 
-fn to_sql_i64(value: u64) -> i64 {
+pub(crate) fn to_sql_i64(value: u64) -> i64 {
     value.min(i64::MAX as u64) as i64
 }
 
@@ -2075,6 +2201,8 @@ mod tests {
             suffix
         );
         MailboxRecord {
+            mailbox: buckyos_api::MailboxAddress::new(owner.clone(), Some("topic-1".into()))
+                .unwrap(),
             record_id,
             owner: owner.clone(),
             box_kind,
@@ -2134,6 +2262,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn stale_service_schema_adds_friend_requests_and_preserves_existing_data() {
+        let (mgr, tmp) = setup_test_mgr().await;
+        let owner = sample_owner();
+        let record = sample_record(&owner, MailboxKind::Inbox, "before-upgrade");
+        mgr.upsert_record(&record).await.unwrap();
+        mgr.pool().execute("DROP TABLE friend_requests").await.unwrap();
+        mgr.pool().close().await;
+
+        let stale_ddl = MSG_CENTER_RDB_SCHEMA_SQLITE
+            .split_once("CREATE TABLE IF NOT EXISTS friend_requests")
+            .unwrap()
+            .0;
+        let stale_ddl = format!(
+            "{stale_ddl}\nCREATE TABLE IF NOT EXISTS deployment_metadata (name TEXT PRIMARY KEY);"
+        );
+        let conn = format!("sqlite://{}?mode=rwc", tmp.path().join("msg-box.db").display());
+        let mgr = MsgBoxDbMgr::open(&conn, RdbBackend::Sqlite, Some(&stale_ddl))
+            .await
+            .unwrap();
+        let restored = mgr
+            .get_record(&owner, &record.record_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+        mgr.pool()
+            .execute("INSERT INTO deployment_metadata(name) VALUES ('retained')")
+            .await
+            .unwrap();
+        let indexes = sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'friend_requests'",
+        )
+        .fetch_all(mgr.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+        assert!(indexes.iter().any(|name| name == "idx_friend_requests_owner"));
+        assert!(indexes.iter().any(|name| name == "idx_friend_requests_expire"));
+        mgr.pool()
+            .execute(
+                "INSERT INTO friend_requests (owner_key, request_id, peer_did, direction, state,
+                    created_at_ms, expires_at_ms, updated_at_ms)
+                 VALUES ('did:bns:alice', 'request-1', 'did:bns:bob', 'outgoing', 'pending', 1, 2, 1)",
+            )
+            .await
+            .unwrap();
+        mgr.pool().close().await;
+
+        let mgr = MsgBoxDbMgr::open(&conn, RdbBackend::Sqlite, Some(&stale_ddl))
+            .await
+            .unwrap();
+        for table in ["mailbox_records", "friend_requests", "deployment_metadata"] {
+            let count: i64 = sqlx::query(&format!("SELECT COUNT(*) AS count FROM {table}"))
+                .fetch_one(mgr.pool())
+                .await
+                .unwrap()
+                .get("count");
+            assert_eq!(count, 1, "{table}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn list_records_and_state_filter() {
         let (mgr, _tmp) = setup_test_mgr().await;
         let owner = sample_owner();
@@ -2143,13 +2338,18 @@ mod tests {
         mgr.upsert_record(&r1).await.unwrap();
         mgr.upsert_record(&r2).await.unwrap();
         let all = mgr
-            .list_records(&owner, &MailboxKind::Inbox, None, true)
+            .list_records(
+                &buckyos_api::MailboxAddress::new(owner.clone(), Some("topic-1".into())).unwrap(),
+                &MailboxKind::Inbox,
+                None,
+                true,
+            )
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
         let unread = mgr
             .list_records(
-                &owner,
+                &buckyos_api::MailboxAddress::new(owner.clone(), Some("topic-1".into())).unwrap(),
                 &MailboxKind::Inbox,
                 Some(&[RecipientState::Unread]),
                 true,

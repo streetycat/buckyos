@@ -1,91 +1,72 @@
 # Overview of the `dev_configs` Directory
 
-Each typical environment is a directory that holds all information and configuration needed for a typical "distributed test environment".
-- `nodes.json` defines how many VMs exist in this environment. Format: `vm_name -> vm_config`. A `vm_config` can reference a VM template (Multipass format).
-- `apps` directory (important): contains `$appname.json` files that define basic behavior for a set of apps.
-- `$vm_template.yaml` is the template used for initialization.
+This directory holds the VM-based distributed test environments driven by `buckyos-devtest` (from `buckyos-devkit`). The full workflow, troubleshooting notes and test cases are in [doc/CI/基于VM的开发环境构造.md](../../doc/CI/基于VM的开发环境构造.md).
+
+- `<group>.json`: one workspace group (a typical topology). `nodes` maps node id -> VM config (template, disk, init/instance commands, apps and their params); `app_configs` can pull app definitions from sibling repos.
+- `apps/<app>.json`: how an app is built on the host, pushed, installed, started and stopped on a node.
+- `templates/<vm_template>.yaml`: Multipass cloud-init templates.
+- `aicc.json`, `msg_center.json`: service configuration samples, not devtest groups.
+
+Groups:
+
+- `sntest`: the most commonly used environment, 2 VMs: SN (`web3-gateway` from the sibling `cyfs-gateway` repo) + `alice-ood1` (OOD behind a simulated NAT, reached through the SN relay).
+- `full`: SN + `web` + `alice-ood1` + `bob-ood1` + `charlie-ood1`.
+- `ssotest`: SN + three Zones for cross-Zone tests such as DID federation: `alice-ood1` (`alice.web3.devtests.org`, NAT, reached only through the SN relay), `bob-ood1` (`bob.web3.devtests.org`, `wan_dyn`, DNS points to its reported address) and `charlie-ood1` (`charlie.me`, portmap with RTCP on 2981, DNS points to its reported address). OODs get 2 CPU / 4G / 16G. The PVE backend defaults to a 900 s guest-agent timeout; the group needs no override. Owners sign in with `bucky2025`. Materialization rejects an old seed's `admin_password_hash` if it does not match that owner and password: generate OOD and SN together with a fresh `--env_root`. Tests: `test/test_hybrid_sso/test_hybrid_sso_federation_dv.ts` (backend) and `src/frame/desktop/tests/dv/hybrid-sso-federation.spec.ts` (browser); run commands are in their headers.
+
+On a PVE host select the backend first; the image is the Ubuntu cloud image and VMs bridge to `vmbr0`:
+
+```
+export BUCKYOS_VM_BACKEND=pve
+export BUCKYOS_PVE_VM_PARAMS='{"image": "/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img", "storage": "local-lvm"}'
+```
+
+The host does not use the SN for DNS: point clients at the SN (`dig @<sn ip> <host>`, Node `dns.Resolver`) or map hosts to IPs (Chromium `--host-resolver-rules`). To exercise relay paths, explicitly map Alice and Charlie to the SN IP; normal Bob/Charlie DNS answers exercise direct access. Trust the development CA for browser tests: certificate-error retries can greatly increase the number of TLS connections and trigger RTCP admission limits. RTCP retries temporary admission failures within the stream-open deadline.
+
 Note: the current development machine is `ood1@test.buckyos.io`, and it always acts as a WAN node without SN.
 
-- `2zone_sn`: the most commonly used environment, with 3 VM nodes: SN + Alice.ood1 (port mapping) + bob.ood1 (LAN)
+## Dev Loop
 
-## VM Environment
-
-### Hardware environment config (usually multiple sets can exist)
-- `vm_config.json` (VM environment config)
-- `vm_init.yaml`
-
-### Base software environment
-- Some configs depend on IPs of already-created VMs, so you must wait until VM node instances start and get IPs before continuing
-- Build iptables rules
-- Pre-installed CA certificates (can also be generated)
-
-## Deploy Software (dev-environment related)
-### Understanding `app_list.json`
-
-### Step1. Build
-### Step2. Build config (rootfs) based on node-name
-### Step3. Push to the target node
-
-Environment setup is complete; you now have a set of running VMs (in Init state).
+Run from `buckyos/src`. Snapshots keep VM IPs; recreating VMs changes them, so reinstall after `create_vms`.
 
 ```
-main.py $group_name clean_vms
-main.py $group_name create_vms
-```
+uv run buckyos-devtest $group_name clean_vms
+uv run buckyos-devtest $group_name create_vms
+uv run buckyos-devtest $group_name snapshot init
 
+uv run ./build_for_vm_test.py
+uv run buckyos-devtest $group_name install
+uv run buckyos-devtest $group_name snapshot installed
 
------------------ Dev Loop ----------------
-`Use VM snapshots to speed up development`
-
-1. Create a snapshot before software is deployed: `init`
-```
-main.py $group_name snapshot init
-```
-
-2. Deploy the latest software, test cases, and config: `installed`
-```
-main.py $group_name install --all
-main.py $group_name snapshot installed
-```
-3. Start software as needed for tests: `started`
-```
-main.py $group_name start --all
-main.py $group_name snapshot started
+uv run buckyos-devtest $group_name start
 ```
 
 loop:
 ```
-    4.1 Restore to the `started` snapshot
-    main.py $group_name restore started
-    4.2 Run test cases
-    main.py #groupname run $node_id /opt/testcases/xxx.py
+uv run buckyos-devtest $group_name restore installed
+uv run buckyos-devtest $group_name start
+uv run buckyos-devtest $group_name run $node_id "<command>"
 ```
 
-
-### Update software
+Update software after `uv run ./build_for_vm_test.py`:
 ```
-main.py $group_name update --all
-```
-
-### Update config (reinstall)
-```
-main.py $group_name restore init
-main.py $group_name install --all
-main.py $group_name snapshot installed
+uv run buckyos-devtest $group_name update
 ```
 
-
-## Build and Run Test Cases
-- Different test cases have different base software requirements
-
-## Collect Logs
+Update config (reinstall):
 ```
-main.py #$group_name clog
+uv run buckyos-devtest $group_name restore init
+uv run buckyos-devtest $group_name install
+uv run buckyos-devtest $group_name snapshot installed
 ```
 
-## Check App Status
+Collect logs into `/tmp/clogs/<node_id>/`:
 ```
-main.py $group_name info
+uv run buckyos-devtest $group_name clog
+```
+
+Show VM IPs:
+```
+uv run buckyos-devtest $group_name info_vms
 ```
 
 
@@ -121,9 +102,9 @@ main.py $group_name info
 - Requires SN
 
 ### ood1@charlie.me (owner did:bns:charlie)
-- Uses a custom domain and custom port mapping on 2981 (D-DNS; RTCP traffic is not forwarded, other traffic is)
+- Uses a custom domain with mapped HTTP/HTTPS ports and RTCP on 2981 (D-DNS)
 - Configures `sn: sn.devtests.org` in `zone_boot`
-- Sets `rtcp_port` to 2981 in `device_mini_config`
+- Sets `rtcp_port` to 2981 in the device document and mini document; the local gateway listens on the same port
 - ood1's netid is `portmap`
 - Requires SN
 
@@ -134,13 +115,13 @@ Just call `register_device_to_sn` / `update_device_info_to_sn` at the appropriat
 ## Zone Access Logic
 ### Access via HTTPS
 - DNS resolution: decide based on whether the domain's NS records point to SN (if it is a `*.web` second-level domain, it always goes through SN)
-- SN decides whether this zone needs HTTP traffic relay (`net_id` is `wan` → return device IP; otherwise return SN IP)
+- SN uses the explicit network type: `wan`, `wan_dyn`, and `portmap` return the reported device IP when available; NAT, unknown network types and missing addresses return the SN IP
 - If DNS returns an SN address, traffic is relayed; otherwise it is a public IP or port mapping
 
-### Access via RTCP (not implemented yet)
+### Access via RTCP
 - `resolve_did` to get `zone_boot_config`
-- When OOD `net_id` is `wan` or `portmap`, connect directly: `(rtcp://device_did/xxxx)`
-- When OOD `net_id` is not `wan` and SN exists, relay: `(rtcp://sn/device_did/xxxx)`
+- Direct candidates use the device DID and its declared `rtcp_port` (`2980` if omitted).
+- `wan_dyn` uses SN for DDNS only and omits `sn` from its boot and Zone documents. NAT and `portmap` retain an explicit SN relay candidate; the SN derives the device identity from the Zone's own DID, including `did:web` custom domains.
 
 ### Access any node in the zone via RTCP (not implemented yet)
 

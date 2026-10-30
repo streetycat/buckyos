@@ -1,0 +1,1119 @@
+use super::*;
+use crate::catalog::{CatalogBuildOptions, CatalogDocuments, ModelDriverCatalog};
+use serde_json::json;
+
+pub(crate) fn openai_document() -> Value {
+    serde_json::from_slice(include_bytes!(
+        "../../driver_metadata/models/openai.model.json"
+    ))
+    .unwrap()
+}
+
+pub(crate) fn documents() -> Vec<ModelDriverCatalog> {
+    std::fs::read_dir(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/driver_metadata/models"
+    ))
+    .unwrap()
+    .map(|entry| serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap())
+    .collect()
+}
+
+pub(crate) fn compile(
+    documents: Vec<ModelDriverCatalog>,
+) -> Result<CatalogSnapshot, crate::error::CatalogBuildError> {
+    CatalogSnapshot::build(
+        100,
+        CatalogDocuments {
+            model_drivers: documents,
+            provider_rules: vec![],
+            known_providers: vec![],
+        },
+        &CatalogBuildOptions::default(),
+    )
+}
+
+pub(crate) fn builtin_catalog() -> CatalogSnapshot {
+    compile(documents()).unwrap()
+}
+
+#[test]
+fn builtin_llm_token_limits_are_positive_and_missing_limits_are_documented() {
+    let catalog = builtin_catalog();
+    let mut missing = BTreeSet::new();
+    for driver in catalog.model_drivers() {
+        for model in &driver.models {
+            let semantics = catalog
+                .resolve_model(&driver.model_driver_id, &model.id)
+                .unwrap()
+                .semantics;
+            if semantics.exclude == Some(true)
+                || !semantics
+                    .api_types
+                    .as_ref()
+                    .is_some_and(|types| types.contains("llm"))
+            {
+                continue;
+            }
+            let caps = semantics.capabilities.unwrap_or_default();
+            for key in ["max_context_tokens", "max_output_tokens"] {
+                if let Some(value) = caps.get(key) {
+                    assert!(
+                        value.as_u64().is_some_and(|tokens| tokens > 0),
+                        "{} / {}: {key} must be a positive integer",
+                        driver.model_driver_id,
+                        model.id
+                    );
+                } else {
+                    missing.insert((driver.model_driver_id.clone(), model.id.clone(), key));
+                }
+            }
+            if let (Some(context), Some(output)) = (
+                caps.get("max_context_tokens").and_then(Value::as_u64),
+                caps.get("max_output_tokens").and_then(Value::as_u64),
+            ) {
+                assert!(output <= context, "{}: output exceeds context", model.id);
+            }
+        }
+    }
+    let documented = [
+        ("glm", "charglm-4", "max_context_tokens"),
+        ("glm", "charglm-4", "max_output_tokens"),
+        ("glm", "emohaa", "max_context_tokens"),
+        ("glm", "emohaa", "max_output_tokens"),
+        ("glm", "glm-4-32b-0414-128k", "max_output_tokens"),
+        ("kimi", "kimi-k2.6", "max_output_tokens"),
+        ("kimi", "kimi-k2.7-code", "max_output_tokens"),
+        ("kimi", "kimi-k2.7-code-highspeed", "max_output_tokens"),
+        ("kimi", "kimi-k2.8-preview", "max_output_tokens"),
+        ("mistral", "voxtral-small-24b-2507", "max_output_tokens"),
+        ("qwen", "qwen2-5-72b-20240919", "max_context_tokens"),
+        ("qwen", "qwen2-5-72b-20240919", "max_output_tokens"),
+        ("qwen", "qwen3-0-6b-20250429", "max_context_tokens"),
+        ("qwen", "qwen3-0-6b-20250429", "max_output_tokens"),
+        ("qwen", "qwen3-8b-20250429", "max_context_tokens"),
+        ("qwen", "qwen3-8b-20250429", "max_output_tokens"),
+        ("qwen", "qwen3-14b-20250429", "max_context_tokens"),
+        ("qwen", "qwen3-14b-20250429", "max_output_tokens"),
+        ("qwen", "qwen3-32b-20250429", "max_context_tokens"),
+        ("qwen", "qwen3-32b-20250429", "max_output_tokens"),
+    ]
+    .into_iter()
+    .map(|(driver, model, field)| (driver.to_owned(), model.to_owned(), field))
+    .collect();
+    assert_eq!(
+        missing, documented,
+        "Check official model limits and doc/aicc/driver_metadata_review_20260926.md"
+    );
+}
+
+#[test]
+fn reviewed_vendor_token_limits_match_official_hard_limits() {
+    let catalog = builtin_catalog();
+    let expected = [
+        ("gemini", "gemma-4-26b-a4b-it", 262_144, 32_768),
+        ("gemini", "gemma-4-31b-it", 262_144, 32_768),
+        ("qwen", "qwen3.8-27b", 1_000_000, 131_072),
+        ("qwen", "qwen3.6-35b-a3b", 262_144, 65_536),
+        ("kimi", "kimi-k3", 1_048_576, 1_048_576),
+        ("minimax", "MiniMax-M3", 1_000_000, 524_288),
+        ("doubao", "doubao-seed-2.1-lite", 1_048_576, 262_144),
+        ("doubao", "doubao-seed-2.1-turbo", 262_144, 262_144),
+        ("doubao", "doubao-seed-2.1-pro", 1_048_576, 262_144),
+        ("doubao", "doubao-seed-evolving", 1_048_576, 262_144),
+        ("doubao", "doubao-seed-2-1-turbo-260628", 262_144, 262_144),
+        ("doubao", "doubao-seed-character", 128_000, 32_000),
+        ("doubao", "doubao-seed-translation", 4_000, 3_000),
+        ("doubao", "doubao-seed-2.0-code-preview", 256_000, 128_000),
+    ];
+    for (driver, model, context, output) in expected {
+        let capabilities = catalog
+            .resolve_model(driver, model)
+            .unwrap()
+            .semantics
+            .capabilities
+            .unwrap();
+        assert_eq!(
+            capabilities["max_context_tokens"], context,
+            "{driver}/{model} context"
+        );
+        assert_eq!(
+            capabilities["max_output_tokens"], output,
+            "{driver}/{model} output"
+        );
+    }
+}
+
+pub(crate) fn definition(path: &str) -> LogicalModelDefinition {
+    LogicalModelDefinition {
+        path: path.into(),
+        api_type: ApiType::Llm,
+        min_line: ModelRequirement::default(),
+        disable_line: ModelDisable::default(),
+        default_options: BTreeMap::new(),
+        mount_mode: MountMode::Manual,
+        scheduler_profile: AiccSchedulerProfile::Balanced,
+        fallback: None,
+        route_policy: AiccPolicyConfig::default(),
+        user_visible_tier: None,
+    }
+}
+
+pub(crate) fn gpt_overlay() -> AiccRouteOverlay {
+    let items = ["nano", "mini", "standard", "pro", "max", "codex"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, spec)| LogicalItem::new(spec, format!("llm.gpt-{spec}"), index as f64 + 1.0))
+        .collect();
+    AiccRouteOverlay {
+        logical_tree: BTreeMap::from([(
+            "llm.chat".into(),
+            AiccLogicalNodeOverlay {
+                items: Some(items),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    }
+}
+
+pub(crate) fn gpt_registry(inventories: &[ProviderInventory]) -> ModelRegistry {
+    let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
+    ModelRegistry::build(
+        &catalog,
+        inventories,
+        vec![
+            definition("llm"),
+            definition("llm.chat"),
+            definition("llm.plan"),
+        ],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+pub(crate) fn inventory(
+    driver: &str,
+    origin: &str,
+    channel: &str,
+    instance: &str,
+    efforts: &[&str],
+) -> ProviderInventory {
+    let catalog = builtin_catalog();
+    let semantics = catalog.resolve_model(driver, origin).unwrap().semantics;
+    ProviderInventory {
+        provider_instance_name: instance.into(),
+        provider_profile_id: "synthetic".into(),
+        protocol_adapter_id: "synthetic".into(),
+        inventory_revision: "1".into(),
+        models: vec![InventoryModel {
+            provider_model_id: channel.into(),
+            model_driver_id: driver.into(),
+            origin_model_id: origin.into(),
+            api_types: vec![ApiType::Llm],
+            logical_mounts: vec!["llm.plan".into()],
+            variants: efforts
+                .iter()
+                .map(|effort| InventoryModelVariant {
+                    name: format!("reasoning-{effort}"),
+                    logical_mounts: vec!["llm.plan.high".into()],
+                })
+                .collect(),
+            capabilities: semantics.capabilities.unwrap_or_default(),
+            canonical_fields: semantics.canonical_fields.unwrap_or_default(),
+            attributes: BTreeMap::new(),
+            operations: BTreeMap::from([("llm".into(), "responses.create".into())]),
+        }],
+    }
+}
+
+#[test]
+fn z01_z02_real_openai_catalog_and_empty_specifications_need_no_provider() {
+    let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
+    assert!(catalog.provider_rules("openai").is_none());
+    assert!(catalog.known_provider("openai").is_none());
+    assert_eq!(catalog.model_driver("openai").unwrap().specs.len(), 6);
+    let model = catalog.llm_model("openai", "gpt-5.6-sol").unwrap();
+    assert_eq!(model.family, "llm.gpt-5-6-sol");
+    assert_eq!(model.semantics.weight, 56.0);
+    assert_eq!(
+        model.semantics.effort.variant().as_deref(),
+        Some("reasoning-high")
+    );
+    let registry = gpt_registry(&[]);
+    assert!(registry.model_views().is_empty());
+    let views = registry.logical_model_views();
+    assert!(!views.iter().any(|node| node.path == model.family));
+    for spec in &catalog.model_driver("openai").unwrap().specs {
+        let path = format!("llm.{}", spec.id);
+        assert!(views
+            .iter()
+            .any(|node| node.path == path && node.items.is_empty()));
+        assert!(registry
+            .resolve_candidates(&path, ApiType::Llm)
+            .unwrap()
+            .candidates
+            .is_empty());
+    }
+    let chat = views.iter().find(|node| node.path == "llm.chat").unwrap();
+    assert_eq!(chat.items.len(), 6);
+    assert!(chat
+        .items
+        .iter()
+        .any(|item| item.target == "llm.gpt-pro" && item.weight == 4.0));
+    for path in ["llm", "llm.plan", "llm.chat", "llm.missing"] {
+        let result = registry.resolve_candidates(path, ApiType::Llm).unwrap();
+        assert!(result.candidates.is_empty());
+        assert!(result.fallback_chain.is_empty());
+    }
+}
+
+#[test]
+fn z06_z08_invalid_catalogs_fail_without_inventory() {
+    for (name, edit) in [
+        ("duplicate spec", 0),
+        ("unknown spec", 1),
+        ("missing llm", 2),
+        ("invalid effort", 3),
+        ("duplicate effort", 4),
+        ("family collision", 5),
+        ("model_pricing", 6),
+        ("pricing", 7),
+        ("variants", 8),
+        ("version_order", 9),
+        ("v1", 10),
+        ("version_rules", 11),
+        ("missing weight", 12),
+        ("negative weight", 13),
+    ] {
+        let mut value = openai_document();
+        match edit {
+            0 => {
+                let spec = value["specs"][0].clone();
+                value["specs"].as_array_mut().unwrap().push(spec);
+            }
+            1 => value["models"][0]["llm"]["spec"] = json!("missing"),
+            2 => {
+                value["models"][0].as_object_mut().unwrap().remove("llm");
+            }
+            3 => value["models"][0]["llm"]["effort"] = json!("invalid"),
+            4 => value["models"][0]["llm"]["supported_efforts"] = json!(["none", "none"]),
+            5 => value["models"][0]["llm"]["family_id"] = json!("gpt-5-6-sol"),
+            6 => value["model_pricing"] = json!([]),
+            7 => value["models"][0]["pricing"] = json!({"currency":"USD","amount":0}),
+            8 => value["variants"] = json!([]),
+            9 => value["models"][0]["llm"]["version_order"] = json!(900),
+            10 => value["schema_version"] = json!(1),
+            11 => value["version_rules"] = json!([]),
+            12 => {
+                value["models"][0]["llm"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("weight");
+            }
+            _ => value["models"][0]["llm"]["weight"] = json!(-1),
+        }
+        let result = serde_json::from_value(value)
+            .map_err(|error| error.to_string())
+            .and_then(|document| compile(vec![document]).map_err(|error| error.to_string()));
+        assert!(result.is_err(), "{name}");
+        let error = result.unwrap_err();
+        assert!(!error.is_empty(), "{name}");
+        if edit <= 5 && edit != 3 {
+            assert!(error.contains("openai"), "{name}: {error}");
+        }
+    }
+}
+
+#[test]
+fn additional_spec_bindings_validate_revision_membership_effort_and_weight() {
+    for (name, edit) in [
+        ("revision zero", 0),
+        ("duplicate primary spec", 1),
+        ("duplicate additional spec", 2),
+        ("unknown spec", 3),
+        ("unsupported effort", 4),
+        ("negative weight", 5),
+        ("missing weight", 6),
+    ] {
+        let mut value = openai_document();
+        let llm = &mut value["models"][0]["llm"];
+        match edit {
+            0 => value["schema_revision"] = json!(0),
+            1 => llm["additional_specs"][0]["spec"] = llm["spec"].clone(),
+            2 => {
+                let binding = llm["additional_specs"][0].clone();
+                llm["additional_specs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(binding);
+            }
+            3 => llm["additional_specs"][0]["spec"] = json!("missing"),
+            4 => llm["additional_specs"][0]["effort"] = json!("native"),
+            5 => llm["additional_specs"][0]["weight"] = json!(-1),
+            _ => {
+                llm["additional_specs"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("weight");
+            }
+        }
+        let result = serde_json::from_value(value)
+            .map_err(|error| error.to_string())
+            .and_then(|document| compile(vec![document]).map_err(|error| error.to_string()));
+        assert!(result.is_err(), "{name}");
+    }
+}
+
+#[test]
+fn additional_spec_bindings_preserve_family_defaults_and_require_exact_efforts() {
+    let sol = inventory("openai", "gpt-6-sol", "sol", "a", &["medium", "high"]);
+    let luna = inventory("openai", "gpt-6-luna", "luna", "b", &["none"]);
+    let registry = gpt_registry(&[sol.clone(), luna.clone()]);
+    for (path, exact) in [
+        ("llm.gpt-6-sol", "sol:reasoning-medium@a"),
+        ("llm.gpt-standard", "sol:reasoning-medium@a"),
+        ("llm.gpt-pro", "sol:reasoning-high@a"),
+        ("llm.gpt-nano", "luna:reasoning-none@b"),
+    ] {
+        let result = registry.resolve_candidates(path, ApiType::Llm).unwrap();
+        assert_eq!(result.candidates.len(), 1, "{path}");
+        assert_eq!(result.candidates[0].model.exact_model.to_string(), exact);
+    }
+    for path in ["llm.gpt-mini", "llm.gpt-codex"] {
+        assert!(registry
+            .resolve_candidates(path, ApiType::Llm)
+            .unwrap()
+            .candidates
+            .is_empty());
+    }
+    let views = registry.logical_model_views();
+    assert_eq!(
+        views
+            .iter()
+            .filter(|node| node.path == "llm.gpt-6-sol")
+            .count(),
+        1
+    );
+    for spec in ["gpt-standard", "gpt-pro", "gpt-codex"] {
+        let node = views
+            .iter()
+            .find(|node| node.path == format!("llm.{spec}"))
+            .unwrap();
+        assert_eq!(node.items.len(), 1);
+        assert_eq!(node.items[0].default_weight, 60.0);
+    }
+    let legacy_codex = inventory("openai", "gpt-5.3-codex", "codex", "c", &["high"]);
+    let with_legacy = gpt_registry(&[sol, luna, legacy_codex]);
+    let codex = with_legacy
+        .resolve_candidates("llm.gpt-codex", ApiType::Llm)
+        .unwrap();
+    assert_eq!(codex.candidates.len(), 1);
+    assert_eq!(
+        codex.candidates[0].model.identity.origin_model_id,
+        "gpt-5.3-codex"
+    );
+    let empty = gpt_registry(&[]);
+    assert!(!empty
+        .logical_model_views()
+        .iter()
+        .any(|node| node.path == "llm.gpt-6-sol"));
+    for spec in ["gpt-standard", "gpt-pro", "gpt-codex"] {
+        assert!(empty
+            .logical_model_views()
+            .iter()
+            .find(|node| node.path == format!("llm.{spec}"))
+            .unwrap()
+            .items
+            .is_empty());
+    }
+}
+
+#[test]
+fn additional_spec_binding_weights_are_independent() {
+    let mut value = openai_document();
+    let sol = value["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["id"] == "gpt-6-sol")
+        .unwrap();
+    sol["llm"]["additional_specs"][0]["weight"] = json!(1);
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    let stocks = [
+        inventory(
+            "openai",
+            "gpt-6-sol",
+            "sol",
+            "a",
+            &["medium", "high", "xhigh"],
+        ),
+        inventory("openai", "gpt-5.5", "standard", "b", &["medium"]),
+    ];
+    let registry = ModelRegistry::build(
+        &catalog,
+        &stocks,
+        vec![definition("llm.chat")],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (spec, origin) in [
+        ("gpt-standard", "gpt-5.5"),
+        ("gpt-pro", "gpt-6-sol"),
+        ("gpt-codex", "gpt-6-sol"),
+    ] {
+        let result = registry
+            .resolve_candidates(&format!("llm.{spec}"), ApiType::Llm)
+            .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].model.identity.origin_model_id, origin);
+    }
+}
+
+#[test]
+fn additional_direct_only_spec_cannot_be_bypassed_by_fallback() {
+    let mut value = openai_document();
+    value["specs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|spec| spec["id"] == "gpt-mini")
+        .unwrap()["direct_only"] = json!(true);
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    let stock = inventory("openai", "gpt-6-luna", "luna", "a", &["none", "low"]);
+    let mut overlay = gpt_overlay();
+    overlay
+        .logical_tree
+        .get_mut("llm.chat")
+        .unwrap()
+        .items
+        .as_mut()
+        .unwrap()
+        .retain(|item| item.target != "llm.gpt-mini");
+    ModelRegistry::build(
+        &catalog,
+        std::slice::from_ref(&stock),
+        vec![definition("llm.chat")],
+        RegistryLayers {
+            factory: Some(&overlay),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (mode, target) in [
+        (AiccFallbackMode::TargetLogical, "llm.gpt-6-luna:low"),
+        (AiccFallbackMode::TargetExact, "luna:reasoning-low@a"),
+    ] {
+        let mut task = definition("llm.plan");
+        task.fallback = Some(AiccFallbackRule {
+            mode,
+            target: Some(target.into()),
+        });
+        let error = ModelRegistry::build(
+            &catalog,
+            std::slice::from_ref(&stock),
+            vec![definition("llm.chat"), task],
+            RegistryLayers {
+                factory: Some(&overlay),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("fallback bypasses direct_only"));
+    }
+}
+
+#[test]
+fn z07_specs_require_explicit_admission_and_direct_only_cannot_be_bypassed() {
+    let mut value = openai_document();
+    let document = serde_json::from_value(value.clone()).unwrap();
+    let catalog = compile(vec![document]).unwrap();
+    assert!(ModelRegistry::build(&catalog, &[], vec![], RegistryLayers::default()).is_err());
+    for spec in value["specs"].as_array_mut().unwrap() {
+        spec["direct_only"] = json!(true);
+    }
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    ModelRegistry::build(&catalog, &[], vec![], RegistryLayers::default()).unwrap();
+    assert!(ModelRegistry::build(
+        &catalog,
+        &[],
+        vec![definition("llm.chat")],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        }
+    )
+    .is_err());
+    let mut task = definition("llm.plan");
+    task.fallback = Some(AiccFallbackRule {
+        mode: AiccFallbackMode::TargetLogical,
+        target: Some("llm.gpt-pro".into()),
+    });
+    assert!(ModelRegistry::build(&catalog, &[], vec![task], RegistryLayers::default()).is_err());
+    let mut value = openai_document();
+    value["models"][0]["llm"]["family_id"] = json!("plan");
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    assert!(ModelRegistry::build(
+        &catalog,
+        &[],
+        vec![definition("llm.plan")],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        }
+    )
+    .is_err());
+    let registry = gpt_registry(&[]);
+    let cycle: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree": {"llm.plan":{"fallback":{"mode":"target_logical","target":"llm.chat"}},"llm.chat":{"fallback":{"mode":"target_logical","target":"llm.plan"}}}})).unwrap();
+    assert!(registry.with_session_overlay(&cycle).is_err());
+}
+
+#[test]
+fn d01_d02_d03_d10_families_share_instances_and_disappear_only_after_last_inventory() {
+    let a = inventory("openai", "gpt-5.6-sol", "channel/A", "official", &["high"]);
+    let b = inventory(
+        "openai",
+        "gpt-5.6-sol",
+        "vendor/model-alias",
+        "third-party",
+        &["high"],
+    );
+    for stock in [vec![], vec![a.clone(), b.clone()], vec![b], vec![]] {
+        let registry = gpt_registry(&stock);
+        let views = registry.logical_model_views();
+        let spec = views
+            .iter()
+            .find(|node| node.path == "llm.gpt-pro")
+            .unwrap();
+        assert_eq!(spec.items.len(), usize::from(!stock.is_empty()));
+        assert_eq!(
+            views.iter().any(|node| node.path == "llm.gpt-5-6-sol"),
+            !stock.is_empty()
+        );
+        assert!(!views.iter().any(|node| node.path.ends_with(".high")));
+        let candidates = registry
+            .resolve_candidates("llm.gpt-pro", ApiType::Llm)
+            .unwrap()
+            .candidates;
+        assert_eq!(candidates.len(), stock.len());
+        for candidate in candidates {
+            assert_eq!(
+                candidate.model.exact_model.variant(),
+                Some("reasoning-high")
+            );
+        }
+        assert!(registry
+            .resolve_candidates("llm.openai.gpt-5-6-sol", ApiType::Llm)
+            .unwrap()
+            .candidates
+            .is_empty());
+        let again = gpt_registry(&stock);
+        assert_eq!(registry.logical_model_views(), again.logical_model_views());
+    }
+    let registry = gpt_registry(&[a]);
+    let fixed = registry
+        .resolve_candidates("llm.gpt-5-6-sol:high", ApiType::Llm)
+        .unwrap();
+    assert_eq!(
+        fixed.candidates[0].model.exact_model.as_str(),
+        "channel/A:reasoning-high@official"
+    );
+}
+
+#[test]
+fn d07_d08_efforts_never_fabricate_channel_support_or_bypass_task_membership() {
+    let model = inventory("openai", "gpt-5.6-sol", "sol", "a", &["low"]);
+    let registry = gpt_registry(&[model.clone()]);
+    assert!(registry
+        .resolve_candidates("llm.gpt-pro", ApiType::Llm)
+        .unwrap()
+        .candidates
+        .is_empty());
+    assert_eq!(
+        registry
+            .resolve_candidates("llm.gpt-5-6-sol:low", ApiType::Llm)
+            .unwrap()
+            .candidates
+            .len(),
+        1
+    );
+    assert!(registry
+        .resolve_candidates("llm.plan", ApiType::Llm)
+        .unwrap()
+        .candidates
+        .is_empty());
+    let bypass: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{"llm.plan":{"items":[{"name":"bypass","target":"sol:reasoning-low@a","weight":100}]}}})).unwrap();
+    assert!(registry.with_session_overlay(&bypass).is_err());
+    for mode in [MountMode::Auto, MountMode::Hybrid] {
+        let mut task = definition("llm.chat");
+        task.mount_mode = mode;
+        let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
+        assert!(ModelRegistry::build(
+            &catalog,
+            &[model.clone()],
+            vec![task],
+            RegistryLayers {
+                factory: Some(&gpt_overlay()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+    }
+    let mut value = openai_document();
+    value["models"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|model| model["id"] == "gpt-5.6-sol")
+        .unwrap()["llm"]["default_effort"] = json!("low");
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    let registry = ModelRegistry::build(
+        &catalog,
+        &[inventory(
+            "openai",
+            "gpt-5.6-sol",
+            "sol",
+            "a",
+            &["low", "high"],
+        )],
+        vec![definition("llm.chat")],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        registry
+            .resolve_candidates("llm.gpt-5-6-sol", ApiType::Llm)
+            .unwrap()
+            .candidates[0]
+            .model
+            .exact_model
+            .variant(),
+        Some("reasoning-low")
+    );
+    assert_eq!(
+        registry
+            .resolve_candidates("llm.gpt-pro", ApiType::Llm)
+            .unwrap()
+            .candidates[0]
+            .model
+            .exact_model
+            .variant(),
+        Some("reasoning-high")
+    );
+}
+
+#[test]
+fn d04_metadata_weights_select_families_without_parsing_model_names() {
+    let mut value = openai_document();
+    let template = value["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "gpt-5.6-sol")
+        .unwrap()
+        .clone();
+    let models = [
+        ("gpt-5.5", 55.0),
+        ("gpt-5.6", 56.0),
+        ("gpt-unknown", 56.0),
+        ("gpt-6", 1.0),
+    ];
+    value["models"] = Value::Array(
+        models
+            .iter()
+            .map(|(id, weight)| {
+                let mut model = template.clone();
+                model["id"] = json!(id);
+                model["llm"]["weight"] = json!(weight);
+                model
+            })
+            .collect(),
+    );
+    value["specs"] = json!([{"id":"gpt-pro","direct_only":true}]);
+    let base = inventory("openai", "gpt-5.6-sol", "x", "a", &["high"]);
+    let stocks: Vec<_> = models
+        .iter()
+        .map(|(id, _)| {
+            let mut stock = base.clone();
+            stock.provider_instance_name = (*id).replace('.', "-");
+            stock.models[0].origin_model_id = (*id).into();
+            stock
+        })
+        .collect();
+    let catalog = compile(vec![serde_json::from_value(value.clone()).unwrap()]).unwrap();
+    let first = ModelRegistry::build(&catalog, &stocks, vec![], RegistryLayers::default()).unwrap();
+    let spec = first
+        .logical_model_views()
+        .into_iter()
+        .find(|view| view.path == "llm.gpt-pro")
+        .unwrap();
+    assert_eq!(
+        spec.items
+            .iter()
+            .map(|item| (item.name.as_str(), item.default_weight))
+            .collect::<Vec<_>>(),
+        [
+            ("llm.gpt-5-5", 55.0),
+            ("llm.gpt-5-6", 56.0),
+            ("llm.gpt-6", 1.0),
+            ("llm.gpt-unknown", 56.0),
+        ]
+    );
+    let origins = |registry: &ModelRegistry| {
+        registry
+            .resolve_candidates("llm.gpt-pro", ApiType::Llm)
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|candidate| candidate.model.identity.origin_model_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(origins(&first), ["gpt-5.6", "gpt-unknown"]);
+
+    value["models"].as_array_mut().unwrap().reverse();
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    let mut reversed = stocks.clone();
+    reversed.reverse();
+    let second =
+        ModelRegistry::build(&catalog, &reversed, vec![], RegistryLayers::default()).unwrap();
+    assert_eq!(first.logical_model_views(), second.logical_model_views());
+
+    let overlay: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{"llm.gpt-pro":{"item_overrides":{"llm.gpt-5-5":{"weight":60},"llm.gpt-6":{"weight":0}}}}})).unwrap();
+    let overridden = first.with_session_overlay(&overlay).unwrap();
+    assert_eq!(origins(&overridden), ["gpt-5.5"]);
+    let item = overridden
+        .logical_model_views()
+        .into_iter()
+        .find(|view| view.path == "llm.gpt-pro")
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|item| item.name == "llm.gpt-5-5")
+        .unwrap();
+    assert_eq!(
+        (item.weight, item.default_weight, item.weight_source),
+        (60.0, 55.0, LogicalItemSource::SessionOverlay)
+    );
+    let overlay: AiccRouteOverlay = serde_json::from_value(
+        json!({"logical_tree":{"llm.gpt-pro":{"item_overrides":{"llm.gpt-5-5":{"weight":56}}}}}),
+    )
+    .unwrap();
+    assert_eq!(
+        origins(&first.with_session_overlay(&overlay).unwrap()),
+        ["gpt-5.5", "gpt-5.6", "gpt-unknown"]
+    );
+}
+
+#[test]
+fn family_instance_weights_accept_overrides_but_not_new_members() {
+    let a = inventory("openai", "gpt-5.6-sol", "sol", "a", &["high"]);
+    let b = inventory("openai", "gpt-5.6-sol", "sol", "b", &["high"]);
+    let registry = gpt_registry(&[a, b]);
+    let overlay: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{"llm.gpt-5-6-sol":{"item_overrides":{"sol:reasoning-high@b":{"weight":2}}}}})).unwrap();
+    let candidates = registry
+        .with_session_overlay(&overlay)
+        .unwrap()
+        .resolve_candidates("llm.gpt-pro", ApiType::Llm)
+        .unwrap()
+        .candidates;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].model.exact_model.as_str(),
+        "sol:reasoning-high@b"
+    );
+    let retarget: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{"llm.gpt-5-6-sol":{"item_overrides":{"sol:reasoning-high@b":{"target":"sol:reasoning-high@a"}}}}})).unwrap();
+    assert!(registry.with_session_overlay(&retarget).is_err());
+
+    let persisted: AiccRouteOverlay = serde_json::from_value(json!({"logical_tree":{
+        "llm.gpt-5-6-sol":{"item_overrides":{"sol:reasoning-high@b":{"weight":2}}},
+        "llm.gpt-pro":{"item_overrides":{"llm.gpt-5-6-sol":{"weight":70}}}
+    }}))
+    .unwrap();
+    let empty = ModelRegistry::build(
+        &compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap(),
+        &[],
+        vec![definition("llm.chat")],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            user: Some(&persisted),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(!empty
+        .logical_model_views()
+        .iter()
+        .any(|view| view.path == "llm.gpt-5-6-sol"));
+}
+
+#[test]
+fn finite_llm_patterns_preserve_exact_and_first_match_precedence() {
+    let mut value = openai_document();
+    let exact = value["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "gpt-5.6-sol")
+        .unwrap()
+        .clone();
+    let id = exact["id"].as_str().unwrap().to_owned();
+    let mut pattern = exact.clone();
+    pattern.as_object_mut().unwrap().remove("id");
+    pattern["match"] = json!({"origin_model_id": [id, "gpt-5.5-pattern"]});
+    pattern["llm"]["spec"] = json!("gpt-standard");
+    value["models"] = json!([exact]);
+    value["patterns"] = json!([pattern.clone(), pattern]);
+    value["patterns"][1]["llm"]["spec"] = json!("gpt-max");
+    let catalog = compile(vec![serde_json::from_value(value.clone()).unwrap()]).unwrap();
+    assert_eq!(
+        catalog.llm_model("openai", &id).unwrap().semantics.spec,
+        "gpt-pro"
+    );
+    let pattern_model = catalog.llm_model("openai", "gpt-5.5-pattern").unwrap();
+    assert_eq!(pattern_model.semantics.spec, "gpt-standard");
+    let resolved = catalog.resolve_model("openai", "gpt-5.5-pattern").unwrap();
+    assert_eq!(
+        resolved.semantics.llm.as_ref().unwrap(),
+        &pattern_model.semantics
+    );
+    let serialized = serde_json::to_value(resolved.semantics).unwrap();
+    assert!(serialized.get("pricing").is_none());
+    value["patterns"][0]["match"] = json!("gpt-*");
+    assert!(compile(vec![serde_json::from_value(value).unwrap()]).is_err());
+}
+
+#[test]
+fn d08_native_uses_base_and_thinking_is_not_medium() {
+    let mut docs = documents();
+    for doc in &mut docs {
+        for spec in &mut doc.specs {
+            spec.direct_only = true;
+        }
+    }
+    let catalog = compile(docs).unwrap();
+    assert_eq!(
+        catalog
+            .llm_model("qwen", "qwen3.8-2.4t-a95b")
+            .unwrap()
+            .semantics
+            .supported_efforts,
+        vec![
+            crate::catalog::Effort::Low,
+            crate::catalog::Effort::Medium,
+            crate::catalog::Effort::Xhigh
+        ]
+    );
+    let native = inventory("minimax", "MiniMax-M2.7", "native-channel", "a", &[]);
+    let thinking = inventory(
+        "qwen",
+        "qwen3.6-35b-a3b",
+        "thinking-channel",
+        "b",
+        &["thinking"],
+    );
+    let registry = ModelRegistry::build(
+        &catalog,
+        &[native, thinking],
+        vec![],
+        RegistryLayers::default(),
+    )
+    .unwrap();
+    for path in [
+        "llm.minimax-m2-7",
+        "llm.minimax-m2-7:native",
+        "llm.minimax-standard",
+    ] {
+        let candidates = registry
+            .resolve_candidates(path, ApiType::Llm)
+            .unwrap()
+            .candidates;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].model.exact_model.as_str(), "native-channel@a");
+        assert!(candidates[0].model.exact_model.variant().is_none());
+    }
+    assert!(registry
+        .resolve_candidates("llm.minimax-m2-7:high", ApiType::Llm)
+        .unwrap()
+        .candidates
+        .is_empty());
+    let candidates = registry
+        .resolve_candidates("llm.qwen3-6-35b-a3b:thinking", ApiType::Llm)
+        .unwrap()
+        .candidates;
+    assert_eq!(
+        candidates[0].model.exact_model.as_str(),
+        "thinking-channel:reasoning-thinking@b"
+    );
+    assert!(registry
+        .resolve_candidates("llm.qwen3-6-35b-a3b:medium", ApiType::Llm)
+        .unwrap()
+        .candidates
+        .is_empty());
+}
+
+#[test]
+fn direct_only_exact_fallback_cannot_bypass_a_missing_effort() {
+    let mut value = openai_document();
+    for spec in value["specs"].as_array_mut().unwrap() {
+        spec["direct_only"] = json!(true);
+    }
+    let catalog = compile(vec![serde_json::from_value(value).unwrap()]).unwrap();
+    let stock = inventory("openai", "gpt-5.6-sol", "base", "a", &[]);
+    let mut task = definition("llm.plan");
+    task.fallback = Some(AiccFallbackRule {
+        mode: AiccFallbackMode::TargetExact,
+        target: Some("base@a".into()),
+    });
+    assert!(
+        ModelRegistry::build(&catalog, &[stock], vec![task], RegistryLayers::default()).is_err()
+    );
+}
+
+#[test]
+fn d09_explicit_fallback_chain_retains_each_task_requirement() {
+    let catalog = compile(vec![serde_json::from_value(openai_document()).unwrap()]).unwrap();
+    let mut stock = inventory("openai", "gpt-5.6-sol", "weak", "a", &["high"]);
+    stock.models[0].capabilities.remove("tool_call");
+    let mut plan = definition("llm.plan");
+    plan.fallback = Some(AiccFallbackRule {
+        mode: AiccFallbackMode::TargetLogical,
+        target: Some("llm.guard".into()),
+    });
+    let mut guard = definition("llm.guard");
+    guard.min_line.tool_call = true;
+    guard.fallback = Some(AiccFallbackRule {
+        mode: AiccFallbackMode::TargetExact,
+        target: Some("weak:reasoning-high@a".into()),
+    });
+    let registry = ModelRegistry::build(
+        &catalog,
+        &[stock],
+        vec![definition("llm.chat"), plan, guard],
+        RegistryLayers {
+            factory: Some(&gpt_overlay()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let result = registry
+        .resolve_candidates("llm.plan", ApiType::Llm)
+        .unwrap();
+    assert_eq!(result.fallback_chain.len(), 2);
+    assert!(result.candidates.is_empty());
+}
+
+#[test]
+fn routing_commands_scale_and_pin_item_weights_after_every_rebuild() {
+    let anthropic: ModelDriverCatalog = serde_json::from_slice(include_bytes!(
+        "../../driver_metadata/models/anthropic.model.json"
+    ))
+    .unwrap();
+    let catalog = compile(vec![
+        serde_json::from_value(openai_document()).unwrap(),
+        anthropic,
+    ])
+    .unwrap();
+    let stocks = [
+        inventory("openai", "gpt-5.6-sol", "sol", "oa", &["high"]),
+        inventory("claude", "claude-opus-5-5", "opus", "an", &["high"]),
+    ];
+    let mut items = vec![
+        json!({"name":"pro","target":"llm.gpt-pro","weight":2.0}),
+        json!({"name":"opus","target":"llm.claude-opus","weight":2.0}),
+    ];
+    for spec in [
+        "gpt-nano",
+        "gpt-mini",
+        "gpt-standard",
+        "gpt-max",
+        "gpt-codex",
+        "claude-fable",
+        "claude-haiku",
+        "claude-sonnet",
+    ] {
+        items.push(json!({"name":spec,"target":format!("llm.{spec}"),"weight":0.0}));
+    }
+    let tree: AiccRouteOverlay =
+        serde_json::from_value(json!({"logical_tree":{"llm.chat":{"items":items}}})).unwrap();
+    let build = |commands: Value| {
+        let mut user = AiccRouteOverlay::default();
+        user.routing_commands = serde_json::from_value(commands).unwrap();
+        ModelRegistry::build(
+            &catalog,
+            &stocks,
+            vec![definition("llm"), definition("llm.chat")],
+            RegistryLayers {
+                factory: Some(&tree),
+                user: Some(&user),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let drivers = |registry: &ModelRegistry| {
+        registry
+            .resolve_candidates("llm.chat", ApiType::Llm)
+            .unwrap()
+            .candidates
+            .iter()
+            .map(|candidate| candidate.model.identity.model_driver_id.clone())
+            .collect::<Vec<_>>()
+    };
+    let chat_item = |registry: &ModelRegistry, name: &str| {
+        registry
+            .logical_model_views()
+            .into_iter()
+            .find(|view| view.path == "llm.chat")
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.name == name)
+            .unwrap()
+    };
+
+    assert_eq!(drivers(&build(json!([]))), ["openai", "claude"]);
+
+    let vendor = build(json!([{"kind":"vendor_factor","vendor":"claude","factor":1.5}]));
+    assert_eq!(drivers(&vendor), ["claude"]);
+    let opus = chat_item(&vendor, "opus");
+    assert_eq!(
+        (opus.weight, opus.default_weight, opus.weight_source),
+        (3.0, 2.0, LogicalItemSource::RoutingCommand)
+    );
+    assert!(vendor.routing_command_status()[0].stale_reason.is_none());
+
+    let model = build(json!([
+        {"kind":"vendor_factor","vendor":"claude","factor":1.5},
+        {"kind":"model_factor","vendor":"openai","model":"gpt-5.6-sol","factor":2.0}
+    ]));
+    assert_eq!(drivers(&model), ["openai"]);
+    assert_eq!(chat_item(&model, "pro").weight, 4.0);
+
+    let pinned = build(json!([
+        {"kind":"item_weight","path":"llm.chat","item":"opus","weight":9.0},
+        {"kind":"spec_factor","spec":"llm.claude-opus","factor":0.1}
+    ]));
+    assert_eq!(chat_item(&pinned, "opus").weight, 9.0);
+    assert_eq!(drivers(&pinned), ["claude"]);
+
+    let stale = build(json!([
+        {"kind":"spec_factor","spec":"llm.gone","factor":2.0},
+        {"kind":"item_weight","path":"llm.chat","item":"missing","weight":1.0},
+        {"kind":"model_factor","vendor":"openai","model":"nope","factor":2.0},
+        {"kind":"vendor_factor","vendor":"nope","factor":2.0}
+    ]));
+    assert_eq!(drivers(&stale), ["openai", "claude"]);
+    assert!(stale
+        .routing_command_status()
+        .iter()
+        .all(|status| status.stale_reason.is_some() && status.matched_items == 0));
+}

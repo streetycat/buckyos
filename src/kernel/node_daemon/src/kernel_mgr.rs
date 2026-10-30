@@ -26,11 +26,12 @@ impl KernelServiceRunItem {
     pub fn new(app_id: &str, kernel_config: &KernelServiceInstanceConfig) -> Self {
         let service_doc = &kernel_config.service_sepc.service_doc;
         let pkg_desc = current_platform_service_pkg_desc(service_doc)
-            .unwrap_or_else(|| SubPkgDesc::new(service_doc.get_package_id().to_string()));
+            .unwrap_or_else(|| SubPkgDesc::new(app_id.to_string()));
         let pkg_id = pkg_desc
             .get_pkg_id_with_objid()
             .unwrap_or_else(|| pkg_desc.pkg_id.clone());
-        let service_pkg = ServicePkg::new(pkg_id.clone(), get_buckyos_system_bin_dir());
+        let mut service_pkg = ServicePkg::new(pkg_id.clone(), get_buckyos_system_bin_dir());
+        service_pkg.service_identity = app_id.to_string();
         Self {
             service_name: app_id.to_string(),
             pkg_desc,
@@ -70,7 +71,7 @@ impl KernelServiceRunItem {
                 ),
             )
         })?;
-        let store_mgr = runtime.get_named_store().await.map_err(|error| {
+        let store_mgr = runtime.get_local_named_store().await.map_err(|error| {
             ControlRuntItemErrors::ExecuteError(
                 "index_pkg_meta".to_string(),
                 format!(
@@ -205,7 +206,7 @@ impl RunItemControl for KernelServiceRunItem {
         let runtime = get_buckyos_api_runtime().unwrap();
         let device_doc = runtime.device_config.as_ref().unwrap();
         let device_private_key = runtime.device_private_key.as_ref().unwrap();
-        let (device_session_token_jwt, _) = generate_service_login_jwt(
+        let (_, mut login_assertion) = generate_service_login_assertion(
             device_doc.name.as_str(),
             app_id.as_str(),
             device_doc.name.as_str(),
@@ -219,8 +220,15 @@ impl RunItemControl for KernelServiceRunItem {
             );
             return ControlRuntItemErrors::ExecuteError("start".to_string(), err.to_string());
         })?;
+        login_assertion.aud = Some(SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE.to_string());
+        login_assertion.token = None;
+        let device_session_token_jwt = login_assertion
+            .generate_jwt(Some(device_doc.name.clone()), device_private_key)
+            .map_err(|err| {
+                ControlRuntItemErrors::ExecuteError("start".to_string(), err.to_string())
+            })?;
 
-        let env_key = get_session_token_env_key(&self.service_name, false);
+        let env_key = get_service_session_token_env_key(&self.service_name);
         unsafe {
             std::env::set_var(env_key.as_str(), device_session_token_jwt);
         }

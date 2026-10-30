@@ -1,9 +1,10 @@
+use crate::redaction::redact_text;
 use crate::{external_command, ControlPanelServer};
 use ::kRPC::{RPCErrors, RPCRequest, RPCResponse, RPCResult};
 use base64::{engine::general_purpose, Engine as _};
 use buckyos_http_server::*;
 use bytes::Bytes;
-use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDateTime, TimeZone, Utc};
 use http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -18,7 +19,7 @@ use zip::CompressionMethod;
 pub(crate) const LOG_ROOT_DIR: &str = "/opt/buckyos/logs";
 pub(crate) const LOG_DOWNLOAD_TTL_SECS: u64 = 600;
 const DEFAULT_LOG_LIMIT: usize = 200;
-const MAX_LOG_LIMIT: usize = 1000;
+const MAX_LOG_LIMIT: usize = 500;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct LogQueryCursor {
@@ -26,6 +27,168 @@ struct LogQueryCursor {
     file: String,
     line_index: u64,
     direction: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_file_selector_rejects_host_paths() {
+        assert!(ControlPanelServer::validate_log_file_name(Some("scheduler.log")).is_ok());
+        assert!(ControlPanelServer::validate_log_file_name(Some("../scheduler.log")).is_err());
+        assert!(ControlPanelServer::validate_log_file_name(Some("/etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn log_line_matches_current_logger_format() {
+        for (level, expected_level) in [
+            ("INFO", "info"),
+            ("WARN", "warning"),
+            ("ERROR", "error"),
+            ("DEBUG", "debug"),
+            ("TRACE", "trace"),
+        ] {
+            let line = format!("01-15 12:00:00.123 {level:<5} [main.rs:42] 日志 [details]");
+            let (timestamp, parsed_level, message) = ControlPanelServer::split_log_line(&line);
+            assert_eq!(timestamp, "01-15 12:00:00.123");
+            assert_eq!(parsed_level, expected_level);
+            assert_eq!(message, "[main.rs:42] 日志 [details]");
+            assert!(ControlPanelServer::parse_log_timestamp(&timestamp).is_some());
+        }
+    }
+
+    #[test]
+    fn log_continuations_do_not_replace_header_context() {
+        let context = ("01-15 12:00:00.123".to_string(), "error".to_string());
+        for line in [
+            "  请求失败 [details]",
+            "  {\"items\": [1, 2]}",
+            "99-99 99:99:99.999 INFO [invalid timestamp]",
+        ] {
+            let (timestamp, level, _, next_context) =
+                ControlPanelServer::extract_log_entry(line, Some(&context)).unwrap();
+            assert_eq!(timestamp, context.0);
+            assert_eq!(level, context.1);
+            assert!(next_context.is_none());
+        }
+    }
+
+    #[test]
+    fn log_timestamp_and_query_key_use_service_local_time() {
+        let local = Local
+            .with_ymd_and_hms(Local::now().year(), 1, 15, 12, 0, 0)
+            .single()
+            .unwrap();
+        let utc = local.with_timezone(&Utc);
+        assert_eq!(
+            ControlPanelServer::parse_log_timestamp("01-15 12:00:00.000"),
+            Some(utc)
+        );
+        assert_eq!(
+            ControlPanelServer::format_log_filter_key(&utc),
+            "01-15 12:00:00.000"
+        );
+        assert_eq!(
+            ControlPanelServer::parse_filter_time(&utc.to_rfc3339()),
+            Some(utc)
+        );
+    }
+
+    #[test]
+    fn filtered_download_keeps_matching_records_and_continuations() {
+        let input = concat!(
+            "orphan continuation\n",
+            "01-15 11:59:59.999 INFO  [main.rs:1] too early\n",
+            "  excluded earlier detail\n",
+            "01-15 12:00:00.000 INFO  [main.rs:2] first\n",
+            "  请求内容 [1, 2]\n",
+            "01-15 12:01:00.000 WARN  [main.rs:3] last\n",
+            "  last detail\n",
+            "01-15 12:01:00.001 ERROR [main.rs:4] too late\n",
+            "  excluded later detail\n",
+        );
+        let since = Local
+            .with_ymd_and_hms(Local::now().year(), 1, 15, 12, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let until = since + chrono::Duration::minutes(1);
+        let output = ControlPanelServer::filter_log_lines(
+            input.as_bytes(),
+            None,
+            None,
+            Some(&since),
+            Some(&until),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            concat!(
+                "01-15 12:00:00.000 INFO  [main.rs:2] first\n",
+                "  请求内容 [1, 2]\n",
+                "01-15 12:01:00.000 WARN  [main.rs:3] last\n",
+                "  last detail\n",
+            )
+        );
+        assert!(ControlPanelServer::filter_log_lines(
+            input.as_bytes(),
+            None,
+            None,
+            Some(&(until + chrono::Duration::hours(1))),
+            None,
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn filtered_download_applies_level_keyword_and_redaction() {
+        let input = concat!(
+            "01-15 12:00:00.000 WARN  [main.rs:1] warning\n",
+            "  MATCH password=hidden-value\n",
+            "01-15 12:00:00.001 INFO  [main.rs:2] other\n",
+            "  MATCH excluded\n",
+        );
+        let output = ControlPanelServer::filter_log_lines(
+            input.as_bytes(),
+            Some("warning"),
+            Some("match"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(output.starts_with("  MATCH password="));
+        assert!(output.contains("REDACTED"));
+        assert!(!output.contains("hidden-value"));
+        assert!(!output.contains("excluded"));
+    }
+
+    #[test]
+    fn filtered_download_reports_read_errors() {
+        let input = b"01-15 12:00:00.000 INFO  [main.rs:1] first\n\xff\n";
+        assert!(ControlPanelServer::filter_log_lines(&input[..], None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn filtered_download_redacts_multiline_secrets_before_keyword_filtering() {
+        let input = concat!(
+            "01-15 12:00:00.000 INFO  [main.rs:1] key:\n",
+            "-----BEGIN PRIVATE KEY-----\n",
+            "sensitive-key-material\n",
+            "-----END PRIVATE KEY-----\n",
+            "  sensitive operation completed\n",
+        );
+        let output = ControlPanelServer::filter_log_lines(
+            input.as_bytes(),
+            None,
+            Some("sensitive"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, "  sensitive operation completed\n");
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -72,16 +235,17 @@ impl ControlPanelServer {
 
     pub(crate) fn split_log_line(line: &str) -> (String, String, String) {
         let trimmed = line.trim_start().trim_end();
-        if let Some(bracket_start) = trimmed.find('[') {
-            if let Some(bracket_end) = trimmed[bracket_start + 1..].find(']') {
-                let ts_candidate = trimmed[..bracket_start].trim_end();
-                let level = trimmed[bracket_start + 1..bracket_start + 1 + bracket_end].trim();
-                let message = trimmed[bracket_start + 1 + bracket_end + 1..].trim_start();
-                if !ts_candidate.is_empty() {
+        let mut parts = trimmed.splitn(3, ' ');
+        if let (Some(date), Some(time), Some(rest)) = (parts.next(), parts.next(), parts.next()) {
+            if let Some((level, message)) = rest.trim_start().split_once(char::is_whitespace) {
+                let timestamp = format!("{} {}", date, time);
+                if matches!(level, "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE")
+                    && Self::parse_log_timestamp(&timestamp).is_some()
+                {
                     return (
-                        ts_candidate.to_string(),
+                        timestamp,
                         Self::normalize_log_level(level),
-                        message.to_string(),
+                        message.trim_start().to_string(),
                     );
                 }
             }
@@ -128,13 +292,16 @@ impl ControlPanelServer {
         if value.is_empty() {
             return None;
         }
-        let year = Utc::now().year();
+        let year = Local::now().year();
         let with_year = format!("{}-{}", year, value);
         let parsed = NaiveDateTime::parse_from_str(&with_year, "%Y-%m-%d %H:%M:%S%.3f").ok()?;
-        Some(Utc.from_utc_datetime(&parsed))
+        Local
+            .from_local_datetime(&parsed)
+            .earliest()
+            .map(|timestamp| timestamp.with_timezone(&Utc))
     }
 
-    fn parse_filter_time(value: &str) -> Option<DateTime<Utc>> {
+    pub(crate) fn parse_filter_time(value: &str) -> Option<DateTime<Utc>> {
         if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
             return Some(parsed.with_timezone(&Utc));
         }
@@ -153,8 +320,76 @@ impl ControlPanelServer {
         None
     }
 
+    fn parse_request_filter_time(
+        req: &RPCRequest,
+        name: &str,
+    ) -> Result<Option<DateTime<Utc>>, RPCErrors> {
+        Self::param_str(req, name)
+            .map(|value| {
+                Self::parse_filter_time(&value).ok_or_else(|| {
+                    RPCErrors::ParseRequestError(format!("{} must be RFC 3339", name))
+                })
+            })
+            .transpose()
+    }
+
     fn format_log_filter_key(value: &DateTime<Utc>) -> String {
-        value.format("%m-%d %H:%M:%S%.3f").to_string()
+        value
+            .with_timezone(&Local)
+            .format("%m-%d %H:%M:%S%.3f")
+            .to_string()
+    }
+
+    fn filter_log_lines(
+        reader: impl BufRead,
+        level_filter: Option<&str>,
+        keyword_filter: Option<&str>,
+        since_filter: Option<&DateTime<Utc>>,
+        until_filter: Option<&DateTime<Utc>>,
+    ) -> Result<String, RPCErrors> {
+        let mut filtered = String::new();
+        let mut context = None;
+        for line in reader.lines() {
+            let line = line.map_err(|err| {
+                RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
+            })?;
+            let Some((timestamp, level, _, next_context)) =
+                Self::extract_log_entry(&line, context.as_ref())
+            else {
+                continue;
+            };
+            if let Some(next_context) = next_context {
+                context = Some(next_context);
+            }
+            if level_filter.is_some_and(|filter| level != filter) {
+                continue;
+            }
+            if since_filter.is_some() || until_filter.is_some() {
+                let Some(timestamp) = Self::parse_log_timestamp(&timestamp) else {
+                    continue;
+                };
+                if since_filter.is_some_and(|start| &timestamp < start)
+                    || until_filter.is_some_and(|end| &timestamp > end)
+                {
+                    continue;
+                }
+            }
+            filtered.push_str(&line);
+            filtered.push('\n');
+        }
+        let redacted = redact_text(&filtered);
+        if let Some(keyword) = keyword_filter {
+            filtered.clear();
+            for line in redacted.lines() {
+                if line.to_lowercase().contains(keyword) {
+                    filtered.push_str(line);
+                    filtered.push('\n');
+                }
+            }
+            Ok(filtered)
+        } else {
+            Ok(redacted)
+        }
     }
 
     fn rg_available() -> bool {
@@ -280,6 +515,19 @@ impl ControlPanelServer {
         Ok(files)
     }
 
+    fn validate_log_file_name(value: Option<&str>) -> Result<(), RPCErrors> {
+        if let Some(value) = value {
+            let valid = !matches!(value, "." | "..")
+                && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value);
+            if !valid {
+                return Err(RPCErrors::ParseRequestError(
+                    "log file must be an exact filename".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn cleanup_log_downloads(&self) {
         let mut downloads = self.log_downloads.lock().await;
         let now = std::time::SystemTime::now();
@@ -308,7 +556,6 @@ impl ControlPanelServer {
                 json!({
                     "id": service,
                     "label": Self::format_log_service_label(service),
-                    "path": format!("{}/{}", LOG_ROOT_DIR, service),
                 })
             })
             .collect();
@@ -354,19 +601,19 @@ impl ControlPanelServer {
         }
 
         let file_filter = Self::param_str(&req, "file");
+        Self::validate_log_file_name(file_filter.as_deref())?;
         let direction = Self::param_str(&req, "direction").unwrap_or_else(|| "forward".to_string());
         let direction = if direction == "backward" {
             "backward".to_string()
         } else {
             "forward".to_string()
         };
-        let level_filter = Self::param_str(&req, "level").map(|value| value.to_lowercase());
+        let level_filter =
+            Self::param_str(&req, "level").map(|value| Self::normalize_log_level(&value));
         let keyword_raw = Self::param_str(&req, "keyword");
         let keyword_filter = keyword_raw.as_ref().map(|value| value.to_lowercase());
-        let since_filter =
-            Self::param_str(&req, "since").and_then(|value| Self::parse_filter_time(&value));
-        let until_filter =
-            Self::param_str(&req, "until").and_then(|value| Self::parse_filter_time(&value));
+        let since_filter = Self::parse_request_filter_time(&req, "since")?;
+        let until_filter = Self::parse_request_filter_time(&req, "until")?;
         let since_key = since_filter.as_ref().map(Self::format_log_filter_key);
         let until_key = until_filter.as_ref().map(Self::format_log_filter_key);
         let limit = req
@@ -521,8 +768,8 @@ impl ControlPanelServer {
                     collected.push(json!({
                         "timestamp": ts,
                         "level": level,
-                        "message": message,
-                        "raw": raw,
+                        "message": redact_text(&message),
+                        "raw": redact_text(&raw),
                         "service": file.service.clone(),
                         "file": file.name.clone(),
                         "line": line_index,
@@ -612,8 +859,8 @@ impl ControlPanelServer {
                                 entries.push(json!({
                                     "timestamp": ts,
                                     "level": level,
-                                    "message": message,
-                                    "raw": raw,
+                                    "message": redact_text(&message),
+                                    "raw": redact_text(&raw),
                                     "service": file.service.clone(),
                                     "file": file.name.clone(),
                                     "line": line_index,
@@ -704,8 +951,8 @@ impl ControlPanelServer {
                         entries.push(json!({
                             "timestamp": ts,
                             "level": level,
-                            "message": message,
-                            "raw": raw_line,
+                            "message": redact_text(&message),
+                            "raw": redact_text(&raw_line),
                             "service": file.service.clone(),
                             "file": file.name.clone(),
                             "line": line_index,
@@ -783,8 +1030,12 @@ impl ControlPanelServer {
         }
 
         let file_param = Self::param_str(&req, "file");
-        let level_filter = Self::param_str(&req, "level").map(|value| value.to_lowercase());
+        Self::validate_log_file_name(file_param.as_deref())?;
+        let level_filter =
+            Self::param_str(&req, "level").map(|value| Self::normalize_log_level(&value));
         let keyword_filter = Self::param_str(&req, "keyword").map(|value| value.to_lowercase());
+        let since_filter = Self::parse_request_filter_time(&req, "since")?;
+        let until_filter = Self::parse_request_filter_time(&req, "until")?;
         let limit = req
             .params
             .get("limit")
@@ -826,12 +1077,7 @@ impl ControlPanelServer {
             })?;
             let file_len = metadata.len();
             if read_from_end {
-                let mut buffer = String::new();
-                file.read_to_string(&mut buffer).map_err(|err| {
-                    RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
-                })?;
-                let lines = buffer.lines().map(|line| line.to_string()).collect();
-                return Ok((lines, file_len));
+                return Ok((Vec::new(), file_len));
             }
             let offset = start_offset.min(file_len);
             file.seek(SeekFrom::Start(offset)).map_err(|err| {
@@ -876,11 +1122,24 @@ impl ControlPanelServer {
                     continue;
                 }
             }
+            if since_filter.is_some() || until_filter.is_some() {
+                let timestamp = match Self::parse_log_timestamp(&ts) {
+                    Some(timestamp) => timestamp,
+                    None => continue,
+                };
+                if since_filter
+                    .as_ref()
+                    .is_some_and(|start| &timestamp < start)
+                    || until_filter.as_ref().is_some_and(|end| &timestamp > end)
+                {
+                    continue;
+                }
+            }
             entries.push(json!({
                 "timestamp": ts,
                 "level": level,
-                "message": message,
-                "raw": raw_line,
+                "message": redact_text(&message),
+                "raw": redact_text(&raw_line),
                 "service": service.clone(),
                 "file": file_name.clone(),
             }));
@@ -934,12 +1193,21 @@ impl ControlPanelServer {
         }
 
         let mode = Self::param_str(&req, "mode").unwrap_or_else(|| "filtered".to_string());
-        let level_filter = Self::param_str(&req, "level").map(|value| value.to_lowercase());
+        if mode != "filtered" {
+            return Err(RPCErrors::ParseRequestError(
+                "only filtered log downloads are supported".to_string(),
+            ));
+        }
+        let level_filter =
+            Self::param_str(&req, "level").map(|value| Self::normalize_log_level(&value));
         let keyword_filter = Self::param_str(&req, "keyword").map(|value| value.to_lowercase());
-        let since_filter =
-            Self::param_str(&req, "since").and_then(|value| Self::parse_filter_time(&value));
-        let until_filter =
-            Self::param_str(&req, "until").and_then(|value| Self::parse_filter_time(&value));
+        let since_filter = Self::parse_request_filter_time(&req, "since")?;
+        let until_filter = Self::parse_request_filter_time(&req, "until")?;
+        if since_filter.is_none() && until_filter.is_none() {
+            return Err(RPCErrors::ParseRequestError(
+                "log download requires since or until".to_string(),
+            ));
+        }
 
         let token = Uuid::new_v4().to_string();
         let file_name = format!("buckyos-logs-{}.zip", token);
@@ -947,8 +1215,8 @@ impl ControlPanelServer {
         let zip_path_clone = zip_path.clone();
 
         let services_clone = services.clone();
-        let mode_clone = mode.clone();
         let file_filter = Self::param_str(&req, "file");
+        Self::validate_log_file_name(file_filter.as_deref())?;
 
         task::spawn_blocking(move || -> Result<(), RPCErrors> {
             let file = std::fs::File::create(&zip_path_clone)
@@ -959,110 +1227,39 @@ impl ControlPanelServer {
 
             for service in services_clone.iter() {
                 let dir_path = Path::new(LOG_ROOT_DIR).join(service);
-                if mode_clone == "full" {
-                    let entries = std::fs::read_dir(&dir_path).map_err(|err| {
-                        RPCErrors::ReasonError(format!(
-                            "Failed to read log dir {}: {}",
-                            service, err
-                        ))
-                    })?;
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        let name = match path.file_name().and_then(|value| value.to_str()) {
-                            Some(name) => name.to_string(),
-                            None => continue,
-                        };
-                        if let Some(filter) = file_filter.as_deref() {
-                            if name != filter {
-                                continue;
-                            }
-                        }
-                        let entry_name = format!("{}/{}", service, name);
-                        zip.start_file(entry_name, options)
-                            .map_err(|err| RPCErrors::ReasonError(format!("Zip error: {}", err)))?;
-                        let mut file_reader = std::fs::File::open(&path).map_err(|err| {
-                            RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
-                        })?;
-                        let mut buffer = Vec::new();
-                        file_reader.read_to_end(&mut buffer).map_err(|err| {
-                            RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
-                        })?;
-                        zip.write_all(&buffer).map_err(|err| {
-                            RPCErrors::ReasonError(format!("Failed to write zip: {}", err))
-                        })?;
+                let mut filtered = String::new();
+                let entries = std::fs::read_dir(&dir_path).map_err(|err| {
+                    RPCErrors::ReasonError(format!("Failed to read log dir {}: {}", service, err))
+                })?;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
                     }
-                } else {
-                    let mut filtered = String::new();
-                    let entries = std::fs::read_dir(&dir_path).map_err(|err| {
-                        RPCErrors::ReasonError(format!(
-                            "Failed to read log dir {}: {}",
-                            service, err
-                        ))
-                    })?;
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if !path.is_file() {
-                            continue;
-                        }
-                        let name = match path.file_name().and_then(|value| value.to_str()) {
-                            Some(name) => name.to_string(),
-                            None => continue,
-                        };
-                        if let Some(filter) = file_filter.as_deref() {
-                            if name != filter {
-                                continue;
-                            }
-                        }
-                        let file_handle = std::fs::File::open(&path).map_err(|err| {
-                            RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
-                        })?;
-                        let reader = BufReader::new(file_handle);
-                        for line in reader.lines().map_while(Result::ok) {
-                            let (ts, level, message) = ControlPanelServer::split_log_line(&line);
-                            if let Some(filter) = level_filter.as_ref() {
-                                if &level != filter {
-                                    continue;
-                                }
-                            }
-                            if let Some(filter) = keyword_filter.as_ref() {
-                                if !line.to_lowercase().contains(filter) {
-                                    continue;
-                                }
-                            }
-                            if since_filter.is_some() || until_filter.is_some() {
-                                let ts_value = match ControlPanelServer::parse_log_timestamp(&ts) {
-                                    Some(value) => value,
-                                    None => continue,
-                                };
-                                if let Some(since) = since_filter.as_ref() {
-                                    if &ts_value < since {
-                                        continue;
-                                    }
-                                }
-                                if let Some(until) = until_filter.as_ref() {
-                                    if &ts_value > until {
-                                        continue;
-                                    }
-                                }
-                            }
-                            filtered.push_str(&format!(
-                                "{} {} {}\n",
-                                ts,
-                                level.to_uppercase(),
-                                message
-                            ));
-                        }
+                    let name = match path.file_name().and_then(|value| value.to_str()) {
+                        Some(name) => name,
+                        None => continue,
+                    };
+                    if file_filter.as_deref().is_some_and(|filter| name != filter) {
+                        continue;
                     }
-                    let entry_name = format!("{}/filtered.log", service);
-                    zip.start_file(entry_name, options)
-                        .map_err(|err| RPCErrors::ReasonError(format!("Zip error: {}", err)))?;
-                    zip.write_all(filtered.as_bytes()).map_err(|err| {
-                        RPCErrors::ReasonError(format!("Failed to write zip: {}", err))
+                    let file_handle = std::fs::File::open(&path).map_err(|err| {
+                        RPCErrors::ReasonError(format!("Failed to read log file: {}", err))
                     })?;
+                    filtered.push_str(&ControlPanelServer::filter_log_lines(
+                        BufReader::new(file_handle),
+                        level_filter.as_deref(),
+                        keyword_filter.as_deref(),
+                        since_filter.as_ref(),
+                        until_filter.as_ref(),
+                    )?);
                 }
+                let entry_name = format!("{}/filtered.log", service);
+                zip.start_file(entry_name, options)
+                    .map_err(|err| RPCErrors::ReasonError(format!("Zip error: {}", err)))?;
+                zip.write_all(filtered.as_bytes()).map_err(|err| {
+                    RPCErrors::ReasonError(format!("Failed to write zip: {}", err))
+                })?;
             }
 
             zip.finish()

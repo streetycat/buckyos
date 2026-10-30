@@ -8,8 +8,11 @@ import { displayPath } from './data/urls'
 interface StatusBarProps {
   /** Canonical location url. */
   currentUrl: string
-  /** Undefined while the first page is in flight — renders as "…". */
+  /** Undefined while the first page is in flight or for cursor-backed listings. */
   totalCount: number | undefined
+  /** Loaded window size — shown as "N+" when the total is unknown (§5.1). */
+  loadedCount?: number
+  hasMore?: boolean
   /** Captured selection — details for one item, a count for many. */
   selectedItems: FileItem[]
   onCopy: (text: string) => void
@@ -20,6 +23,8 @@ interface StatusBarProps {
 export function StatusBar({
   currentUrl,
   totalCount,
+  loadedCount,
+  hasMore,
   selectedItems,
   onCopy,
   onExpandSidebar,
@@ -42,11 +47,17 @@ export function StatusBar({
     : null
 
   return (
-    <div className="flex flex-wrap items-center gap-3 border-t border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_90%,transparent)] px-3 py-1.5 text-[11px] text-[color:var(--cp-muted)]">
+    <div className="flex min-w-0 items-center gap-2 overflow-hidden border-t border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] bg-[color:color-mix(in_srgb,var(--cp-surface)_90%,transparent)] px-3 py-1.5 text-[11px] text-[color:var(--cp-muted)]">
       <span>
-        {totalCount === undefined
-          ? t('filebrowser.status.itemsUnknown', '… items')
-          : t('filebrowser.status.items', '{{count}} items', { count: totalCount })}
+        {totalCount !== undefined
+          ? t('filebrowser.status.items', '{{count}} items', { count: totalCount })
+          : loadedCount
+            ? hasMore
+              ? t('filebrowser.status.itemsLoaded', '{{count}}+ items', {
+                  count: loadedCount,
+                })
+              : t('filebrowser.status.items', '{{count}} items', { count: loadedCount })
+            : t('filebrowser.status.itemsUnknown', '… items')}
       </span>
       {multiSelection ? (
         <>
@@ -61,17 +72,17 @@ export function StatusBar({
                   count: multiSelection.length,
                 })}
           </span>
-          {multiBytes > 0 ? (
+          {multiSelection.length > 0 ? (
             <>
               <span className="opacity-60">·</span>
-              <span>{formatBytes(multiBytes)}</span>
+              <span className="shrink-0">{formatBytes(multiBytes)} · {t('filebrowser.meta.knownSize', 'Known size ({{count}}/{{total}} items)', { count: multiSelection.filter((item) => item.entry.sizeBytes !== undefined).length, total: multiSelection.length })}</span>
             </>
           ) : null}
         </>
       ) : selection && entry ? (
         <>
           <span className="opacity-60">·</span>
-          <span className="truncate">
+          <span className="min-w-0 truncate">
             {t('filebrowser.status.selected', 'Selected')}: {entry.name}
           </span>
           <span className="opacity-60">·</span>
@@ -81,7 +92,7 @@ export function StatusBar({
             <button
               type="button"
               onClick={() => onCopy(entry.path)}
-              className="inline-flex items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-2 py-0.5 font-mono text-[10px] hover:border-[color:var(--cp-accent)] hover:text-[color:var(--cp-accent)]"
+              className="hidden min-w-0 max-w-48 truncate items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-2 py-0.5 font-mono text-[10px] hover:border-[color:var(--cp-accent)] hover:text-[color:var(--cp-accent)]"
             >
               <Copy size={10} /> {displayPath(entry.path)}
             </button>
@@ -91,7 +102,7 @@ export function StatusBar({
               <button
                 type="button"
                 onClick={() => onCopy(originalHint)}
-                className="inline-flex items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-2 py-0.5 font-mono text-[10px] hover:border-[color:var(--cp-accent)] hover:text-[color:var(--cp-accent)]"
+                className="hidden min-w-0 max-w-48 truncate items-center gap-1 rounded-full border border-[color:color-mix(in_srgb,var(--cp-border)_60%,transparent)] px-2 py-0.5 font-mono text-[10px] hover:border-[color:var(--cp-accent)] hover:text-[color:var(--cp-accent)]"
               >
                 <CornerUpRight size={10} /> {originalHint}
               </button>

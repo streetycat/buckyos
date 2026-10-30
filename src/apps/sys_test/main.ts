@@ -9,7 +9,7 @@
  *      execute the cases on the server side ("Run tests on backend service").
  *
  * Phase 1 (initBuckyOS as AppService) is done up front. If the required
- * environment (`app_instance_config` + the `<OWNER>_<APP>_TOKEN`) is missing
+ * environment (`app_instance_config` + fixed `BUCKYOS_APP_*` variables) is missing
  * — for example when this binary is run standalone for development — the
  * static server still works and the selftest endpoints respond with a clear
  * "AppService not initialized" error so the frontend can render it.
@@ -18,17 +18,12 @@
  * ../../../buckyos-websdk, which is the canonical reference for driving the
  * AppService runtime from a Deno process.
  */
-import { serveDir } from "jsr:@std/http/file-server";
+import { fromFileUrl, join, toFileUrl } from "jsr:@std/path@^1";
+import { runXllmIdentitySelftest } from "./xllm_selftest.ts";
+import { handleSupportRoute, type SupportContext } from "./support_group.ts";
+import { serveSystestStatic } from "./static_web.ts";
 
 type NodeSdkModule = typeof import("@sys-test/websdk-node-types");
-type NdmModule = NodeSdkModule["ndm"];
-type QueryObjectByIdResponse = Awaited<
-  ReturnType<NdmModule["queryObjectById"]>
->;
-type QueryChunkStateResponse = Awaited<
-  ReturnType<NdmModule["queryChunkState"]>
->;
-
 type AppInstanceIdentity = {
   appId: string;
   ownerUserId: string;
@@ -44,6 +39,7 @@ type SelftestCaseResult = {
 
 type GroupId =
   | "runtime"
+  | "xllm"
   | "system_config"
   | "app_settings"
   | "task_manager"
@@ -51,24 +47,29 @@ type GroupId =
   | "kevent"
   | "service_clients"
   | "sdk_utilities"
+  | "bucket"
   | "ndm_proxy";
-
-type ContentAvailabilityState =
-  | {
-    kind: "chunk";
-    state: QueryChunkStateResponse | { state: "error"; error: string };
-  }
-  | {
-    kind: "object";
-    state: QueryObjectByIdResponse | { state: "error"; error: string };
-  };
 
 type BootstrapState =
   | { kind: "ready"; identity: AppInstanceIdentity; sdk: NodeSdkModule }
   | { kind: "missing-env"; reason: string }
   | { kind: "failed"; reason: string };
 
-const port = Number.parseInt(Deno.env.get("PORT") ?? "3000", 10);
+/**
+ * Where to listen: every interface, on the port node-daemon's app loader
+ * hands over in `BUCKYOS_SERVICE_PORT` (the AppDoc inner port in a
+ * container, the instance port when the node runs the app natively).
+ */
+function listenAddress(): { hostname: string; port: number } {
+  const raw = Deno.env.get("BUCKYOS_SERVICE_PORT") ?? Deno.env.get("PORT") ?? "3000";
+  const port = Number.parseInt(raw, 10);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error(`invalid service port ${raw}`);
+  }
+  return { hostname: "0.0.0.0", port };
+}
+
+const { hostname: listenHostname, port } = listenAddress();
 const sdkRoutePrefix = "/sdk/appservice";
 const bootstrapRetryDelaysMs = [250, 500, 1_000, 2_000, 5_000, 10_000, 30_000];
 
@@ -92,10 +93,10 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function resolveStaticRoot(): Promise<string> {
   const candidates = [
-    new URL("./web/dist", import.meta.url).pathname,
-    new URL("./web", import.meta.url).pathname,
-    new URL("./dist/web", import.meta.url).pathname,
-    new URL("./dist", import.meta.url).pathname,
+    fromFileUrl(new URL("./web/dist", import.meta.url)),
+    fromFileUrl(new URL("./web", import.meta.url)),
+    fromFileUrl(new URL("./dist/web", import.meta.url)),
+    fromFileUrl(new URL("./dist", import.meta.url)),
   ];
 
   for (const candidate of candidates) {
@@ -112,40 +113,37 @@ async function resolveStaticRoot(): Promise<string> {
 function parseAppInstanceIdentity(
   appInstanceConfig: string,
 ): AppInstanceIdentity {
+  const appId = getEnv("BUCKYOS_APP_ID") ?? "";
+  const ownerUserId = getEnv("BUCKYOS_OWNER_USER_ID") ?? "";
+  const appInstanceId = getEnv("BUCKYOS_APP_INSTANCE_ID") ?? "";
+  if (!appId || !ownerUserId || appInstanceId !== `${appId}@${ownerUserId}`) {
+    throw new Error(
+      "fixed BuckyOS app identity environment is missing or inconsistent",
+    );
+  }
   const parsed = JSON.parse(appInstanceConfig) as {
-    app_spec?: {
-      user_id?: unknown;
-      app_doc?: { name?: unknown };
+    node_execution_spec?: {
+      app_instance_id?: unknown;
     };
   };
-  const appId = typeof parsed.app_spec?.app_doc?.name === "string"
-    ? parsed.app_spec.app_doc.name.trim()
-    : "";
-  const ownerUserId = typeof parsed.app_spec?.user_id === "string"
-    ? parsed.app_spec.user_id.trim()
-    : "";
-  if (!appId || !ownerUserId) {
+  const configuredInstanceId =
+    typeof parsed.node_execution_spec?.app_instance_id === "string"
+      ? parsed.node_execution_spec.app_instance_id.trim()
+      : "";
+  if (configuredInstanceId !== appInstanceId) {
     throw new Error(
-      "app_instance_config is missing app_spec.user_id or app_spec.app_doc.name",
+      "app_instance_config AppInstanceId does not match the fixed environment",
     );
   }
   return { appId, ownerUserId };
-}
-
-function getRustStyleAppServiceTokenEnvKey(
-  identity: AppInstanceIdentity,
-): string {
-  return `${identity.ownerUserId}-${identity.appId}`
-    .toUpperCase()
-    .replaceAll("-", "_") + "_TOKEN";
 }
 
 async function resolveWebSdkRoot(): Promise<string> {
   const explicit = getEnv("BUCKYOS_WEBSDK_ROOT");
   const candidates = [
     explicit,
-    new URL("./node_modules/buckyos", import.meta.url).pathname,
-    new URL("./dist/node_modules/buckyos", import.meta.url).pathname,
+    fromFileUrl(new URL("./node_modules/buckyos", import.meta.url)),
+    fromFileUrl(new URL("./dist/node_modules/buckyos", import.meta.url)),
   ].filter((value): value is string =>
     typeof value === "string" && value.trim().length > 0
   );
@@ -162,7 +160,7 @@ async function resolveWebSdkRoot(): Promise<string> {
 
 async function loadSdkModule(): Promise<NodeSdkModule> {
   const sdkRoot = await resolveWebSdkRoot();
-  const moduleUrl = new URL(`file://${sdkRoot}/dist/node.mjs`);
+  const moduleUrl = toFileUrl(join(sdkRoot, "dist", "node.mjs"));
   return await import(moduleUrl.href) as NodeSdkModule;
 }
 
@@ -186,22 +184,56 @@ async function bootstrapSdk(): Promise<BootstrapState> {
     };
   }
 
-  const expectedTokenKey = getRustStyleAppServiceTokenEnvKey(identity);
-  if (!getEnv(expectedTokenKey)) {
+  const appToken = getEnv("BUCKYOS_APP_TOKEN");
+  if (!appToken) {
     return {
       kind: "missing-env",
-      reason: `missing ${expectedTokenKey}; service_debug.tsx should inject it`,
+      reason: "missing BUCKYOS_APP_TOKEN; service_debug.tsx should inject it",
     };
   }
 
   try {
     const sdk = await loadSdkModule();
-    await sdk.buckyos.initBuckyOS("", {
-      appId: "",
+    let zoneHost = getEnv("BUCKYOS_ZONE_HOST") ?? "";
+    const zoneConfig = getEnv("BUCKYOS_ZONE_CONFIG");
+    if (!zoneHost && zoneConfig) {
+      const config: unknown = JSON.parse(zoneConfig);
+      if (!sdk.isBuckyOSZoneConfig(config)) {
+        throw new Error("BUCKYOS_ZONE_CONFIG must contain zone_document");
+      }
+      const zone = sdk.namelib.parseDidDoc(config.zone_document);
+      if (zone.docType !== "zone") {
+        throw new Error("BUCKYOS_ZONE_CONFIG does not contain a Zone document");
+      }
+      zoneHost = zone.doc.hostname;
+    }
+    let sessionToken = appToken;
+    let refreshToken: string | undefined;
+    if (sdk.parseSessionTokenClaims(appToken)?.iss !== "verify-hub") {
+      const gateway = getEnv("BUCKYOS_HOST_GATEWAY") ?? "host.docker.internal";
+      const verifyHub = new sdk.VerifyHubClient(
+        new sdk.buckyos.kRPCClient(
+          `http://${gateway}:3180/kapi/verify-hub`,
+        ),
+      );
+      const pair = await verifyHub.loginByJwt({
+        jwt: appToken,
+        target: {
+          kind: "app",
+          app_instance_id: `${identity.appId}@${identity.ownerUserId}`,
+        },
+      });
+      sessionToken = pair.session_token;
+      refreshToken = pair.refresh_token;
+    }
+    await sdk.buckyos.initBuckyOS(identity.appId, {
+      appId: identity.appId,
       ownerUserId: identity.ownerUserId,
       runtimeType: sdk.RuntimeType.AppService,
-      zoneHost: getEnv("BUCKYOS_ZONE_HOST") ?? "",
+      zoneHost,
       defaultProtocol: "https://",
+      sessionToken,
+      refreshToken,
     });
     await sdk.buckyos.login();
     return { kind: "ready", identity, sdk };
@@ -304,10 +336,18 @@ async function publishKEvent(
   eventid: string,
   data: Record<string, unknown>,
 ): Promise<void> {
+  const account = await sdk.buckyos.getAccountInfo();
+  if (!account?.session_token) {
+    throw new Error("KEvent publish requires an AppService session");
+  }
   const response = await fetch(getKEventRequestUrl(sdk, "publish"), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${account.session_token}`,
+    },
     body: JSON.stringify({ eventid, data }),
+    signal: AbortSignal.timeout(5_000),
   });
   const payload = await readJsonResponse(response);
   if (!response.ok || payload.status !== "ok") {
@@ -339,8 +379,14 @@ function buildGroupRunners(
               `expected appId ${identity.appId}, got ${actualAppId ?? "null"}`,
             );
           }
-          if (!zoneHost) {
-            throw new Error("getZoneHostName() returned an empty value");
+          const appInstanceId = sdk.buckyos.getAppInstanceId();
+          if (
+            sdk.buckyos.getRuntimeType() !== sdk.RuntimeType.AppService ||
+            appInstanceId !== `${identity.appId}@${identity.ownerUserId}`
+          ) {
+            throw new Error(
+              "AppService runtime identity does not match the app instance",
+            );
           }
           const services = [
             "system-config",
@@ -357,9 +403,20 @@ function buildGroupRunners(
               sdk.buckyos.getZoneServiceURL(name),
             ]),
           );
+          const gateway = getEnv("BUCKYOS_HOST_GATEWAY") ??
+            "host.docker.internal";
+          for (const [name, address] of Object.entries(serviceUrls)) {
+            const url = new URL(address);
+            if (url.hostname !== gateway || url.port !== "3180") {
+              throw new Error(
+                `${name} does not resolve through the node gateway: ${address}`,
+              );
+            }
+          }
           return {
             runtimeType: sdk.buckyos.getRuntimeType(),
             appId: actualAppId,
+            appInstanceId,
             zoneHost,
             serviceUrls,
           };
@@ -415,30 +472,31 @@ function buildGroupRunners(
       await runSelftestCase(
         "getAppSetting/setAppSetting round trip on namespaced key",
         async () => {
-          const settingPath = `test_settings.websdk_${Date.now()}`;
+          const client = sdk.buckyos.getSystemConfigClient();
+          const settingsPath = getSettingsPath(identity);
+          let previous: string | null = null;
           try {
-            await sdk.buckyos.setAppSetting(settingPath, '"roundtrip"');
+            previous = (await client.get(settingsPath)).value;
           } catch (error) {
             if (!isMissingSettingsError(error)) throw error;
-            // First-time settings write: synthesize the full settings tree at
-            // the app-level key so subsequent setAppSetting calls succeed.
-            const settingsPath = getSettingsPath(identity);
-            const segments = settingPath.split(/[./]/).filter(Boolean);
-            const rootSettings = segments.reduceRight<unknown>(
-              (acc, segment) => ({ [segment]: acc }),
-              "roundtrip",
-            );
-            await sdk.buckyos
-              .getSystemConfigClient()
-              .set(settingsPath, JSON.stringify(rootSettings));
           }
-          const read = await sdk.buckyos.getAppSetting(settingPath);
-          if (read !== "roundtrip") {
-            throw new Error(
-              `settings round trip mismatch, got ${JSON.stringify(read)}`,
-            );
+          const settingPath = `websdk_${
+            crypto.randomUUID().replaceAll("-", "")
+          }`;
+          if (previous === null) await client.set(settingsPath, "{}");
+          try {
+            await sdk.buckyos.setAppSetting(settingPath, '"roundtrip"');
+            const read = await sdk.buckyos.getAppSetting(settingPath);
+            if (read !== "roundtrip") {
+              throw new Error(
+                `settings round trip mismatch, got ${JSON.stringify(read)}`,
+              );
+            }
+            return { settingPath };
+          } finally {
+            if (previous === null) await client.delete(settingsPath);
+            else await client.set(settingsPath, previous);
           }
-          return { settingPath };
         },
       ),
     ];
@@ -447,36 +505,46 @@ function buildGroupRunners(
   const taskManagerGroup = async (): Promise<SelftestCaseResult[]> => {
     return [
       await runSelftestCase(
-        "TaskManagerClient creates/updates/queries/deletes a namespaced task",
+        "TaskManagerClient creates/runs/queries/archives a namespaced task",
         async () => {
           const client = sdk.buckyos.getTaskManagerClient();
           const name = `test-websdk-${Date.now()}`;
           const created = await client.createTask({
             name,
-            taskType: "test",
-            data: { createdBy: "sys-test-backend" },
-            userId: identity.ownerUserId,
-            appId: identity.appId,
+            schema_id: "raw/v1",
+            input: { createdBy: "sys-test-backend" },
+            executor: { kind: "SelfApp" },
+            idempotency_key: `sys-test-${crypto.randomUUID()}`,
           });
+          const taskId = created.task_id;
           try {
-            await client.updateTaskProgress(created.id, 1, 2);
-            await client.completeTask(created.id);
-            const fetched = await client.getTask(created.id);
-            if (fetched.status !== "Completed") {
+            await client.runnerStart(taskId);
+            await client.runnerProgress(taskId, { completed: 1, total: 2 });
+            await client.runnerComplete(taskId, { ok: true });
+            const fetched = await client.getTask(taskId);
+            if (
+              fetched.phase !== "Terminal" || fetched.outcome !== "Succeeded"
+            ) {
               throw new Error(
-                `expected task ${created.id} to be Completed, got ${fetched.status}`,
+                `expected task ${taskId} to succeed, got ${fetched.phase}/${fetched.outcome}`,
               );
             }
-            const filtered = await client.listTasks({
-              filter: { root_id: String(created.id) },
-            });
-            if (!filtered.some((task) => task.id === created.id)) {
-              throw new Error(`task ${created.id} missing from filtered list`);
+            const page = await client.listTasks({ root_id: created.root_id });
+            if (!page.tasks.some((task) => task.task_id === taskId)) {
+              throw new Error(`task ${taskId} missing from filtered list`);
             }
-            return { taskId: created.id };
+            return { taskId };
           } finally {
             try {
-              await client.deleteTask(created.id);
+              const latest = await client.getTask(taskId);
+              if (
+                latest.phase === "Terminal" && latest.archived_at === undefined
+              ) {
+                await client.archiveTask({
+                  task_id: taskId,
+                  expected_revision: latest.revision,
+                });
+              }
             } catch {
               // best-effort cleanup, ignore
             }
@@ -522,8 +590,15 @@ function buildGroupRunners(
               crypto.randomUUID().replaceAll("-", "").slice(0, 8)
             }`;
           const marker = `app_service_${Date.now()}`;
-          const reader = await sdk.buckyos.createEventReader(eventid, {
+          const client = new sdk.KEventClient({
+            mode: "browser",
+            streamUrl: sdk.buckyos.getZoneServiceURL("kevent"),
+            sessionTokenProvider: async () =>
+              (await sdk.buckyos.getAccountInfo())?.session_token,
+          });
+          const reader = await client.createEventReader(eventid, {
             keepaliveMs: 1_000,
+            signal: AbortSignal.timeout(10_000),
           });
           try {
             await publishKEvent(sdk, eventid, {
@@ -579,21 +654,39 @@ function buildGroupRunners(
         return { definitions: definitions.length };
       }),
       await runSelftestCase("AiccClient.queryQuota", async () => {
-        const { quota } = await sdk.buckyos.getAiccClient().queryQuota({});
-        if (typeof quota.state !== "string" || quota.state.length === 0) {
-          throw new Error("quota.query returned an invalid state");
+        const quota = await sdk.buckyos.getAiccClient().queryQuota({});
+        if (typeof quota.user_id !== "string" || !Array.isArray(quota.rules)) {
+          throw new Error("quota.query returned no user or rule list");
         }
-        return { quota };
+        return { user_id: quota.user_id, rules: quota.rules.length };
       }),
-      await runSelftestCase("MsgCenterClient.peekBox", async () => {
-        const records = await sdk.buckyos.getMsgCenterClient().peekBox({
-          owner,
-          box_kind: "INBOX",
-          limit: 1,
-          with_object: false,
-        });
-        return { owner, records: records.length };
-      }),
+      await runSelftestCase(
+        "MsgCenterClient rejects an ungranted owner inbox read",
+        async () => {
+          const mailbox = sdk.mailboxAddress(owner);
+          const resource = sdk.mailboxResource(mailbox, "INBOX");
+          try {
+            await sdk.buckyos.getMsgCenterClient().peekBox({
+              mailbox,
+              box_kind: "INBOX",
+              limit: 1,
+              with_object: false,
+            });
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.startsWith("RPC call error: No permission:") &&
+              error.message.includes(`resource:${resource},action:read`)
+            ) {
+              return { mailbox, resource, access: "denied" };
+            }
+            throw error;
+          }
+          throw new Error(
+            "sys_test has no MsgCenter grant but could read the owner inbox",
+          );
+        },
+      ),
       await runSelftestCase("RepoClient.stat", async () => {
         const stat = await sdk.buckyos.getRepoClient().stat();
         return { stat };
@@ -661,20 +754,117 @@ function buildGroupRunners(
     ];
   };
 
+  const bucketGroup = async (): Promise<SelftestCaseResult[]> => {
+    return [
+      await runSelftestCase(
+        "putBytes → fetchObject → bucket.delete in the app's smoke bucket",
+        async () => {
+          const client = sdk.buckyos.getBucketClient();
+          const bucketId = sdk.bucket.userBucketId(identity.appId, identity.ownerUserId, "smoke");
+          const key = `service/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
+          const body = `sys_test service putBytes ${key}`;
+          const put = await client.putBytes(bucketId, key, body, { contentType: "text/plain", if_none_match: "*" });
+          try {
+            const text = await (await client.fetchObject(bucketId, key)).text();
+            if (text !== body) {
+              throw new Error(`fetchObject returned ${JSON.stringify(text.slice(0, 80))}`);
+            }
+            const deleted = await client.delete(bucketId, key);
+            try {
+              await client.fetchObject(bucketId, key);
+            } catch (error) {
+              if (error instanceof sdk.bucket.BucketError && error.code === "no_such_key") {
+                return { bucketId, key, objId: put.obj_id, version: put.version, deleted: deleted.deleted };
+              }
+              throw error;
+            }
+            throw new Error(`${key} is still readable after bucket.delete`);
+          } catch (error) {
+            await client.delete(bucketId, key).catch(() => undefined);
+            throw error;
+          }
+        },
+      ),
+    ];
+  };
+
   const ndmProxyGroup = async (): Promise<SelftestCaseResult[]> => {
     return [
-      await runSelftestCase("ndm_proxy.outboxCount", async () => {
-        const result = await sdk.ndm_proxy.outboxCount();
-        if (!Number.isInteger(result.count) || result.count < 0) {
-          throw new Error(`invalid outbox count: ${result.count}`);
-        }
-        return { count: result.count };
-      }),
+      await runSelftestCase(
+        "ndm_proxy writes, registers and reads back its own object",
+        async () => {
+          const data = new TextEncoder().encode(`systest ndm_proxy ${Date.now()}`);
+          const chunkId = sdk.ndn.ChunkId.fromMix256Result(
+            data.length,
+            sdk.ndn.sha256Bytes(data),
+          ).toString();
+          await sdk.ndm_proxy.putChunk(chunkId, data);
+          const [objId, objData] = new sdk.ndn.FileObject(
+            "systest-ndm-proxy.txt",
+            data.length,
+            chunkId,
+          ).genObjId();
+          await sdk.ndm_proxy.putObject({ obj_id: objId.toString(), obj_data: objData });
+          const result = await sdk.ndm_proxy.queryObjectById({ obj_id: objId.toString() });
+          if (result.state !== "object") {
+            throw new Error(`expected the registered object, got ${result.state}`);
+          }
+          return { objId: objId.toString(), state: result.state };
+        },
+      ),
+      await runSelftestCase(
+        "ndm_proxy denies reading an object this app does not hold",
+        async () => {
+          const objId = new sdk.ndn.ObjId(
+            sdk.ndn.OBJ_TYPE_FILE,
+            crypto.getRandomValues(new Uint8Array(32)),
+          ).toString();
+          try {
+            await sdk.ndm_proxy.queryObjectById({ obj_id: objId });
+          } catch (error) {
+            if (
+              error instanceof sdk.ndm_proxy.NdmProxyApiError &&
+              error.status === 403 &&
+              error.errorCode === "permission_denied"
+            ) {
+              return { access: "denied", status: error.status };
+            }
+            throw error;
+          }
+          throw new Error("app read an object it never uploaded or registered");
+        },
+      ),
+      await runSelftestCase(
+        "ndm_proxy rejects restricted outboxCount for apps",
+        async () => {
+          try {
+            await sdk.ndm_proxy.outboxCount();
+          } catch (error) {
+            if (
+              error instanceof sdk.ndm_proxy.NdmProxyApiError &&
+              error.status === 403 &&
+              error.errorCode === "permission_denied"
+            ) {
+              return { access: "denied", status: error.status };
+            }
+            throw error;
+          }
+          throw new Error(
+            "app gateway unexpectedly allowed restricted outboxCount",
+          );
+        },
+      ),
     ];
   };
 
   return {
     runtime: runtimeGroup,
+    xllm: async () => [
+      await runSelftestCase(
+        "bash → xllm preserves AppService identity with inherited OOD environment (#640)",
+        () => runXllmIdentitySelftest(sdk, identity),
+      ),
+    ],
     system_config: systemConfigGroup,
     app_settings: appSettingsGroup,
     task_manager: taskManagerGroup,
@@ -682,6 +872,7 @@ function buildGroupRunners(
     kevent: keventGroup,
     service_clients: serviceClientsGroup,
     sdk_utilities: sdkUtilitiesGroup,
+    bucket: bucketGroup,
     ndm_proxy: ndmProxyGroup,
   };
 }
@@ -691,6 +882,21 @@ const staticRoot = await resolveStaticRoot();
 let groupRunners = bootstrapState.kind === "ready"
   ? buildGroupRunners(bootstrapState)
   : null;
+
+// The customer-service example (support_group.ts) needs the App service session
+// and the owner identity; both come from the bootstrap state.
+function supportContext(): SupportContext | null {
+  if (bootstrapState.kind !== "ready") return null;
+  const { sdk, identity } = bootstrapState;
+  return {
+    ownerUserId: identity.ownerUserId,
+    appInstanceId: `${identity.appId}@${identity.ownerUserId}`,
+    zoneHost: sdk.buckyos.getZoneHostName() ?? "",
+    serviceClient: (service) => sdk.buckyos.getServiceRpcClient(service),
+    clientWithToken: (service, token) =>
+      new sdk.buckyos.kRPCClient(sdk.buckyos.getZoneServiceURL(service), token),
+  };
+}
 
 let bootstrapRetryAttempt = 0;
 
@@ -738,7 +944,7 @@ if (bootstrapState.kind === "ready") {
   void retryBootstrapUntilReady();
 }
 
-console.log(`[sys_test] serving ${staticRoot} on http://0.0.0.0:${port}`);
+console.log(`[sys_test] serving ${staticRoot} on http://${listenHostname}:${port}`);
 // Log static root contents for debugging
 try {
   const entries: string[] = [];
@@ -764,7 +970,7 @@ function appServiceUnavailableResponse(): Response {
       ok: false,
       error: `AppService not initialized: ${reason}`,
       hint:
-        "start sys_test through buckyos node-daemon, or via tests/scripts/debug_systest.sh-style harness, so that app_instance_config and the <OWNER>_<APP>_TOKEN env are present",
+        "start sys_test through buckyos node-daemon, or via tests/scripts/debug_systest.sh-style harness, so that app_instance_config and fixed BUCKYOS_APP_* variables are present",
     },
     503,
   );
@@ -792,47 +998,11 @@ function summarizeHeaders(req: Request): Record<string, string> {
   return out;
 }
 
-function isChunkListContentId(contentId: string): boolean {
-  return contentId.startsWith("clist:") || contentId.startsWith("chunklist:");
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) &&
-    value.every((item) => typeof item === "string" && item.length > 0);
-}
-
-function extractChunkIdsFromChunkListObjectData(
-  objData: string,
-): string[] | null {
-  try {
-    const parsed = JSON.parse(objData) as unknown;
-    return isStringArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function queryContentAvailabilityState(
-  ndm: NdmModule,
-  contentId: string,
-): Promise<ContentAvailabilityState> {
-  if (
-    contentId.startsWith("chunk:") || contentId.startsWith("mix256:") ||
-    contentId.startsWith("sha256:")
-  ) {
-    const state = await ndm.queryChunkState({ chunk_id: contentId });
-    return { kind: "chunk", state };
-  }
-
-  const state = await ndm.queryObjectById({ obj_id: contentId });
-  return { kind: "object", state };
-}
-
 let requestSeq = 0;
 
 Deno.serve({
   port,
-  hostname: "0.0.0.0",
+  hostname: listenHostname,
   onListen: ({ hostname, port }) => {
     console.log(`[sys_test] listening on http://${hostname}:${port}`);
     console.log(`[sys_test] mounted routes:`);
@@ -849,10 +1019,11 @@ Deno.serve({
     console.log(`  POST ${sdkRoutePrefix}/selftest/kevent`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/service_clients`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/sdk_utilities`);
+    console.log(`  POST ${sdkRoutePrefix}/selftest/bucket`);
     console.log(`  POST ${sdkRoutePrefix}/selftest/ndm_proxy`);
-    console.log(
-      `  POST ${sdkRoutePrefix}/ndm_query             (query FileObjId status)`,
-    );
+    console.log(`  GET  /support/panel                           (customer-service example panel)`);
+    console.log(`  GET  ${sdkRoutePrefix}/support/summary`);
+    console.log(`  POST ${sdkRoutePrefix}/support/customer_link`);
     console.log(
       `  GET  *                                       (static dist/)`,
     );
@@ -891,6 +1062,9 @@ Deno.serve({
   };
 
   try {
+    const support = await handleSupportRoute(req, url, sdkRoutePrefix, supportContext());
+    if (support) return tap(url.pathname, support);
+
     if (req.method === "GET" && url.pathname === `${sdkRoutePrefix}/healthz`) {
       return tap(
         "healthz",
@@ -916,10 +1090,11 @@ Deno.serve({
           ok: true,
           mode: "app-service",
           appId: identity.appId,
+          appInstanceId: sdk.buckyos.getAppInstanceId(),
           ownerUserId: identity.ownerUserId,
-          zoneHost: sdk.buckyos.getZoneHostName(),
+          zoneHost: sdk.buckyos.getZoneHostName() ?? "",
           hostGateway: getEnv("BUCKYOS_HOST_GATEWAY"),
-          expectedTokenEnvKey: getRustStyleAppServiceTokenEnvKey(identity),
+          expectedTokenEnvKey: "BUCKYOS_APP_TOKEN",
           serviceUrls: {
             verifyHub: sdk.buckyos.getZoneServiceURL("verify-hub"),
             taskManager: sdk.buckyos.getZoneServiceURL("task-manager"),
@@ -944,309 +1119,6 @@ Deno.serve({
       );
     }
 
-    // NDM query endpoint: receives FileObjId + FileObject + chunkList + qcid from the
-    // frontend after upload, then uses ndm store APIs to:
-    //   1. putObject — store chunklist/FileObject metadata so NDM knows about it
-    //   2. queryObjectById — query the object state
-    //   3. isObjectStored/queryChunkState — query content + qcid state
-    // The qcid is stored alongside the FileObject so that future uploads
-    // of the same file content can be resolved instantly (instant upload).
-    if (
-      req.method === "POST" && url.pathname === `${sdkRoutePrefix}/ndm_query`
-    ) {
-      if (bootstrapState.kind !== "ready") {
-        return tap("ndm_query[unavail]", appServiceUnavailableResponse());
-      }
-      try {
-        const body = await readJsonBody(req);
-        const fileObjId = body.fileObjId as string | undefined;
-        const fileObject = body.fileObject as
-          | Record<string, unknown>
-          | undefined;
-        const qcid = body.qcid as string | undefined;
-        const chunkList = body.chunkList;
-        const preUploadState = body.preUploadState as
-          | Record<string, unknown>
-          | undefined;
-
-        if (typeof fileObjId !== "string" || !fileObjId) {
-          return tap(
-            "ndm_query[bad-req]",
-            jsonResponse({ ok: false, error: "fileObjId is required" }, 400),
-          );
-        }
-
-        console.log(
-          `[sys_test] ndm_query: fileObjId=${fileObjId}, qcid=${qcid ?? "N/A"}`,
-        );
-
-        const { ndm } = bootstrapState.sdk;
-        const contentId = typeof fileObject?.content === "string" &&
-            fileObject.content.length > 0
-          ? fileObject.content
-          : null;
-        const isChunkListContent = contentId
-          ? isChunkListContentId(contentId)
-          : false;
-
-        let putChunkListResult: { ok: boolean; error?: string } | null = null;
-        if (contentId && isChunkListContent) {
-          if (!isStringArray(chunkList)) {
-            putChunkListResult = {
-              ok: false,
-              error:
-                "chunkList is required when fileObject.content is a chunklist id",
-            };
-            console.warn(
-              `[sys_test] ndm_query: missing chunkList for ${contentId}`,
-            );
-          } else {
-            try {
-              await ndm.putObject({
-                obj_id: contentId,
-                obj_data: JSON.stringify(chunkList),
-              });
-              console.log(
-                `[sys_test] ndm_query: putObject OK for chunklist ${contentId}`,
-              );
-              putChunkListResult = { ok: true };
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: put chunklist failed: ${msg}`,
-              );
-              putChunkListResult = { ok: false, error: msg };
-            }
-          }
-        }
-
-        let putObjectResult: { ok: boolean; error?: string } = { ok: true };
-        if (fileObject) {
-          const objDataToStore = qcid
-            ? { ...fileObject, _qcid: qcid }
-            : fileObject;
-          try {
-            await ndm.putObject({
-              obj_id: fileObjId,
-              obj_data: JSON.stringify(objDataToStore),
-            });
-            console.log(`[sys_test] ndm_query: putObject OK for ${fileObjId}`);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(`[sys_test] ndm_query: putObject failed: ${msg}`);
-            putObjectResult = { ok: false, error: msg };
-          }
-        }
-
-        let objectState: QueryObjectByIdResponse | {
-          state: "error";
-          error: string;
-        };
-        try {
-          objectState = await ndm.queryObjectById({ obj_id: fileObjId });
-          console.log(
-            `[sys_test] ndm_query: queryObjectById state=${objectState.state}`,
-          );
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          console.warn(`[sys_test] ndm_query: queryObjectById failed: ${msg}`);
-          objectState = { state: "error", error: msg };
-        }
-
-        let contentState:
-          | { contentId: string; state: ContentAvailabilityState }
-          | null = null;
-        if (contentId) {
-          try {
-            const availabilityState = await queryContentAvailabilityState(
-              ndm,
-              contentId,
-            );
-            console.log(
-              `[sys_test] ndm_query: content availability for ${contentId} queried`,
-            );
-            contentState = { contentId, state: availabilityState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: content availability query failed for ${contentId}: ${msg}`,
-            );
-            contentState = {
-              contentId,
-              state: { kind: "object", state: { state: "error", error: msg } },
-            };
-          }
-        }
-
-        let contentStoredState:
-          | {
-            contentId: string;
-            state: { stored: boolean } | { state: "error"; error: string };
-          }
-          | null = null;
-        if (contentId) {
-          try {
-            const storedState = await ndm.isObjectStored({ obj_id: contentId });
-            console.log(
-              `[sys_test] ndm_query: isObjectStored(${contentId}) = ${storedState.stored}`,
-            );
-            contentStoredState = { contentId, state: storedState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: isObjectStored(${contentId}) failed: ${msg}`,
-            );
-            contentStoredState = {
-              contentId,
-              state: { state: "error", error: msg },
-            };
-          }
-        }
-
-        let contentChunkStates: Array<{
-          chunkId: string;
-          state: QueryChunkStateResponse | { state: "error"; error: string };
-        }> = [];
-        if (contentId && isChunkListContent) {
-          const chunkIds = isStringArray(chunkList)
-            ? chunkList
-            : contentState?.state.kind === "object" &&
-                contentState.state.state.state === "object"
-            ? extractChunkIdsFromChunkListObjectData(
-              contentState.state.state.obj_data,
-            ) ?? []
-            : [];
-
-          for (const chunkId of chunkIds) {
-            try {
-              const chunkState = await ndm.queryChunkState({
-                chunk_id: chunkId,
-              });
-              console.log(
-                `[sys_test] ndm_query: queryChunkState(${chunkId}) = ${chunkState.state}`,
-              );
-              contentChunkStates.push({ chunkId, state: chunkState });
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: queryChunkState(${chunkId}) failed: ${msg}`,
-              );
-              contentChunkStates.push({
-                chunkId,
-                state: { state: "error", error: msg },
-              });
-            }
-          }
-        }
-
-        let addSameAsResult:
-          | { ok: boolean; skipped?: boolean; error?: string }
-          | null = null;
-        if (qcid && contentId && isChunkListContent) {
-          const fileSize = typeof fileObject?.size === "number" &&
-              Number.isFinite(fileObject.size)
-            ? fileObject.size
-            : null;
-          const contentFullyStored = contentStoredState?.state &&
-            "stored" in contentStoredState.state &&
-            contentStoredState.state.stored === true;
-
-          if (fileSize === null) {
-            addSameAsResult = {
-              ok: false,
-              error:
-                "fileObject.size is required when adding qcid same_as mapping",
-            };
-          } else if (!contentFullyStored) {
-            addSameAsResult = {
-              ok: false,
-              error:
-                `skip addChunkBySameAs because content ${contentId} is not fully stored yet`,
-            };
-            console.warn(
-              `[sys_test] ndm_query: skip addChunkBySameAs for ${qcid} because ${contentId} is not fully stored`,
-            );
-          } else {
-            try {
-              await ndm.addChunkBySameAs({
-                big_chunk_id: qcid,
-                chunk_list_id: contentId,
-                big_chunk_size: fileSize,
-              });
-              console.log(
-                `[sys_test] ndm_query: addChunkBySameAs OK for ${qcid} -> ${contentId}`,
-              );
-              addSameAsResult = { ok: true };
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              console.warn(
-                `[sys_test] ndm_query: addChunkBySameAs failed: ${msg}`,
-              );
-              addSameAsResult = { ok: false, error: msg };
-            }
-          }
-        } else if (qcid) {
-          addSameAsResult = { ok: true, skipped: true };
-        }
-
-        let qcidState:
-          | {
-            chunkId: string;
-            state: QueryChunkStateResponse | { state: "error"; error: string };
-          }
-          | null = null;
-        if (qcid) {
-          try {
-            const chunkState = await ndm.queryChunkState({
-              chunk_id: qcid,
-            });
-            console.log(
-              `[sys_test] ndm_query: queryChunkState(${qcid}) = ${chunkState.state}`,
-            );
-            qcidState = { chunkId: qcid, state: chunkState };
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            console.warn(
-              `[sys_test] ndm_query: queryChunkState(${qcid}) failed: ${msg}`,
-            );
-            qcidState = {
-              chunkId: qcid,
-              state: { state: "error", error: msg },
-            };
-          }
-        }
-
-        return tap(
-          "ndm_query",
-          jsonResponse({
-            ok: true,
-            fileObjId,
-            qcid: qcid ?? null,
-            preUploadState: preUploadState ?? null,
-            putChunkList: putChunkListResult,
-            putObject: putObjectResult,
-            addSameAs: addSameAsResult,
-            objectState,
-            contentState,
-            contentStoredState,
-            contentChunkStates,
-            qcidState,
-          }),
-        );
-      } catch (error) {
-        return tap(
-          "ndm_query[error]",
-          jsonResponse(
-            {
-              ok: false,
-              error: error instanceof Error ? error.message : String(error),
-            },
-            500,
-          ),
-        );
-      }
-    }
-
     // Per-group selftest endpoint, e.g.
     //   POST /sdk/appservice/selftest/system_config
     //   POST /sdk/appservice/selftest/app_settings
@@ -1267,7 +1139,9 @@ Deno.serve({
       const groupId = url.pathname.slice(
         `${sdkRoutePrefix}/selftest/`.length,
       ) as GroupId;
-      const runner = groupRunners[groupId];
+      const runner = Object.hasOwn(groupRunners, groupId)
+        ? groupRunners[groupId]
+        : null;
       if (!runner) {
         return tap(
           `selftest/${groupId}[unknown]`,
@@ -1330,27 +1204,7 @@ Deno.serve({
       );
     }
 
-    const staticResponse = await serveDir(req, {
-      fsRoot: staticRoot,
-      quiet: true,
-      showIndex: true,
-    });
-    // Fallback: if the static file is not found and the request is a
-    // navigation (not an asset), serve index.html so the SPA can handle
-    // client-side routing.
-    if (staticResponse.status === 404) {
-      const accept = req.headers.get("accept") ?? "";
-      if (accept.includes("text/html")) {
-        const fallback = await serveDir(
-          new Request(new URL("/index.html", req.url), req),
-          { fsRoot: staticRoot, quiet: true, showIndex: true },
-        );
-        if (fallback.status === 200) {
-          return tap("static[fallback]", fallback);
-        }
-      }
-    }
-    return tap("static", staticResponse);
+    return tap("static", await serveSystestStatic(req, staticRoot));
   } catch (error) {
     console.error(
       `[sys_test][req#${reqId}] !! handler threw: ${

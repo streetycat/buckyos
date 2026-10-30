@@ -2,34 +2,32 @@
 
 import { useMemo, useState } from 'react'
 import { Bot, Search, UserPlus } from 'lucide-react'
-import { Chip, IconButton, Tooltip } from '@mui/material'
+import { Button, Chip, IconButton, Tooltip } from '@mui/material'
 import { EntityCard } from '../cards/EntityCard'
+import { UserGroupsNavItem } from '../groups/UserGroupsNavItem'
+import { ExclusiveInvitesNavItem } from '../invites/ExclusiveInvitesNavItem'
 import { SearchFilterBar } from '../shared/SearchFilterBar'
-import { filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
+import { entityFilterOptions, filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
 import {
   useSelf,
   useAgents,
   useLocalUsers,
   useEntityGroups,
+  useViewerIsAdmin,
 } from '../../hooks/use-users-agents-store'
 import type { SidebarSelection } from '../../datamodel/types'
+import { useI18n } from '../../../../i18n/provider'
 
 interface SidebarProps {
   selection: SidebarSelection | null
   onSelect: (sel: SidebarSelection) => void
   onAddUser?: () => void
   onAddAgent?: () => void
+  canCreateAgents?: boolean
 }
 
-const filters: Array<{ value: InternalEntityFilter; label: string }> = [
-  { value: 'all', label: 'All' },
-  { value: 'users', label: 'User' },
-  { value: 'agents', label: 'Agent' },
-  { value: 'groups', label: 'Group' },
-  { value: 'online', label: 'Online' },
-]
-
-export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarProps) {
+export function Sidebar({ selection, onSelect, onAddUser, onAddAgent, canCreateAgents = true }: SidebarProps) {
+  const { t } = useI18n()
   const [showSearch, setShowSearch] = useState(false)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<InternalEntityFilter>('all')
@@ -37,9 +35,10 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
   const agents = useAgents()
   const localUsers = useLocalUsers()
   const entityGroups = useEntityGroups()
+  const isAdmin = useViewerIsAdmin()
 
   const isEntityActive = (id: string) =>
-    selection?.kind === 'entity' && selection.entityId === id
+    selection?.kind === 'entity' ? selection.entityId === id : selection?.kind === 'self' && id === self.id
 
   const entities = useMemo(
     () => filterInternalEntities(getInternalEntities(self, agents, localUsers, entityGroups), query, filter),
@@ -59,24 +58,31 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
             className="text-[11px] font-semibold uppercase tracking-[0.18em]"
             style={{ color: 'var(--cp-muted)' }}
           >
-            Internal Entities
+            {t('usersAgents.internalEntities')}
           </span>
           <div className="flex items-center gap-1">
-            <Tooltip title="Search or filter">
-              <IconButton size="small" onClick={() => setShowSearch((value) => !value)} aria-label="Search or filter">
+            <Tooltip title={t('usersAgents.searchOrFilter')}>
+              <IconButton size="small" onClick={() => setShowSearch((value) => !value)} aria-label={t('usersAgents.searchOrFilter')}>
                 <Search size={14} />
               </IconButton>
             </Tooltip>
             {onAddAgent && (
-              <Tooltip title="Add Agent">
-                <IconButton size="small" onClick={onAddAgent} aria-label="Add Agent">
+              <Tooltip title={canCreateAgents ? t('usersAgents.addAgent') : t('usersAgents.addAgent.limited')}>
+                <IconButton
+                  size="small"
+                  onClick={onAddAgent}
+                  aria-label={t('usersAgents.addAgent')}
+                  aria-disabled={!canCreateAgents || undefined}
+                  data-testid="users-agents-add-agent"
+                  style={canCreateAgents ? undefined : { opacity: 0.45 }}
+                >
                   <Bot size={14} />
                 </IconButton>
               </Tooltip>
             )}
             {onAddUser && (
-              <Tooltip title="Add User">
-                <IconButton size="small" onClick={onAddUser} aria-label="Add User">
+              <Tooltip title={t('usersAgents.addUser')}>
+                <IconButton size="small" onClick={onAddUser} aria-label={t('usersAgents.addUser')}>
                   <UserPlus size={14} />
                 </IconButton>
               </Tooltip>
@@ -84,18 +90,18 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
           </div>
         </div>
 
-        {(showSearch || query) && (
+        {(showSearch || query || filter !== 'all') && (
           <>
             <SearchFilterBar
               query={query}
               onQueryChange={setQuery}
-              placeholder="Search name, DID, role, tag, status..."
+              placeholder={t('usersAgents.searchPlaceholder')}
             />
             <div className="mx-2 mb-2 mt-1 flex flex-wrap gap-1">
-              {filters.map((item) => (
+              {entityFilterOptions.map((item) => (
                 <Chip
                   key={item.value}
-                  label={item.label}
+                  label={t(item.labelKey)}
                   size="small"
                   variant={filter === item.value ? 'filled' : 'outlined'}
                   onClick={() => setFilter(item.value)}
@@ -108,7 +114,7 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
         <div className="space-y-0.5">
           {entities.length === 0 && (
             <div className="px-3 py-8 text-center text-sm" style={{ color: 'var(--cp-muted)' }}>
-              No internal entities match.
+              {t('usersAgents.noMatch')}
             </div>
           )}
 
@@ -121,6 +127,22 @@ export function Sidebar({ selection, onSelect, onAddUser, onAddAgent }: SidebarP
             />
           ))}
         </div>
+
+        {isAdmin ? <Button
+          fullWidth
+          size="small"
+          data-testid="users-agents-deleted-users"
+          aria-current={selection?.kind === 'deleted-users' ? 'page' : undefined}
+          onClick={() => onSelect({ kind: 'deleted-users' })}
+        >{t('usersAgents.deleted.title')}</Button> : null}
+        <UserGroupsNavItem
+          isActive={selection?.kind === 'user-groups'}
+          onClick={() => onSelect({ kind: 'user-groups' })}
+        />
+        <ExclusiveInvitesNavItem
+          isActive={selection?.kind === 'exclusive-invites'}
+          onClick={() => onSelect({ kind: 'exclusive-invites' })}
+        />
       </div>
     </div>
   )

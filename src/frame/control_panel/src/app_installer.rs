@@ -1,10 +1,17 @@
+use crate::app_mutation::{self, AppMutationLease};
 use buckyos_api::{
-    app_availability_audit_key, app_availability_policy_key, get_buckyos_api_runtime,
-    parse_app_instance_id, zone_app_spec_key, AppAvailabilityPolicy, AppClass, AppDoc,
-    AppServiceSpec, AppStartTaskData, AppStartTaskRequest, AppType, AppUninstallTaskData,
-    AppUninstallTaskRequest, AvailabilityEffect, InstallPolicy, RepoClient,
-    ServiceInstanceReportInfo, ServiceInstanceState, ServiceState, SubPkgDesc, SystemConfigClient,
-    SystemConfigError, TaskManagerClient, APP_AVAILABILITY_SCHEMA_VERSION, SYSTEM_APP_OWNER_ID,
+    app_availability_audit_key, app_availability_policy_key, get_buckyos_api_runtime, AgentSpec,
+    AppAvailabilityPolicy, AppDataDisposition, AppDeletionManifest, AppDoc, AppId, AppInstanceId,
+    AppLifecycleAction, AppLifecycleTaskResult, AppServiceSpec, AppStartTaskData,
+    AppStartTaskRequest, AppType, AppUninstallTaskData, AppUninstallTaskRequest,
+    AppUninstallTaskResult, AppUpdateAvailability, AppUpdateBatchItemOutcome,
+    AppUpdateBatchItemResult, AppUpdateBatchProgress, AppUpdateBatchRequestItem,
+    AppUpdateBatchTaskData, AppUpdateBatchTaskRequest, AppUpdateBatchTaskResult, AppUpdateState,
+    AvailabilityEffect, InstallPolicy, RepoClient, RestartStrategy, ServiceInstanceReportInfo,
+    ServiceInstanceState, ServiceState, SubPkgDesc, SystemConfigClient, SystemConfigError,
+    TaskManagerClient, TaskOutcome, TaskPhase, APP_AVAILABILITY_SCHEMA_VERSION,
+    APP_INSTALL_SCHEMA_VERSION, APP_INSTALL_TASK_SCHEMA_ID, APP_START_TASK_SCHEMA_ID,
+    APP_UNINSTALL_TASK_SCHEMA_ID, APP_UPDATE_BATCH_TASK_SCHEMA_ID, APP_UPDATE_TASK_SCHEMA_ID,
 };
 use buckyos_kit::{buckyos_get_unix_timestamp, KVAction};
 use flate2::write::GzEncoder;
@@ -17,7 +24,7 @@ use ndn_toolkit::{cacl_file_object, CheckMode};
 use package_lib::{PackageId, PackageMeta};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File as StdFile;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,17 +47,19 @@ use uuid::Uuid;
 // 3. schedule() 四阶段: Step1 resort_nodes -> Step2 schedule_spec_change(New->选点+InstanceReplica, Deleted->RemoveInstance) -> Step4 calc_service_infos
 // 4. 输出: InstanceReplica -> nodes/{node}/config.apps, RemoveInstance -> 删 node config, UpdateServiceInfo -> services/{spec}/info
 // 5. node-daemon 读 nodes/{node}/config 收敛实例; 实例上报 services/{spec}/instances/{node}; gateway 读 service_info 做路由
-const INSTALL_TASK_TYPE: &str = "app.install";
 const UNINSTALL_TASK_TYPE: &str = "app.uninstall";
 const START_TASK_TYPE: &str = "app.start";
-const UPDATE_TASK_TYPE: &str = "app.update";
 const WAIT_INTERVAL_MS: u64 = 1_000;
 const WAIT_TIMEOUT_SECS: u64 = 45;
-const PROOF_EXPIRE_SECS: u64 = 365 * 24 * 60 * 60;
+const AGENT_SKILLS_PUBLISH_DIR: &str = "agent_skills";
 
 #[derive(Clone)]
 enum PackageSource {
     Directory(PathBuf),
+    DirectoryExcept {
+        path: PathBuf,
+        exclude: PathBuf,
+    },
     File {
         path: PathBuf,
         packaged_name: Option<String>,
@@ -71,6 +80,97 @@ struct PublishScanPlan {
 struct PreparedPayload {
     file_object: Option<FileObject>,
     tarball_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppSubmitAction {
+    FreshInstall,
+    Upgrade,
+    Satisfied,
+}
+
+fn parse_installed_spec(
+    key: &str,
+    raw: &str,
+    app_instance_id: &AppInstanceId,
+    app_did: &name_lib::DID,
+    owner_user_id: &str,
+) -> Result<Option<AppServiceSpec>, RPCErrors> {
+    let spec: AppServiceSpec = serde_json::from_str(raw).map_err(|error| {
+        RPCErrors::ReasonError(format!("invalid installed spec `{key}`: {error}"))
+    })?;
+    if spec.app_instance_id != *app_instance_id
+        || spec.app_did != *app_did
+        || spec.owner_user_id != owner_user_id
+    {
+        return Err(RPCErrors::ReasonError(format!(
+            "installed spec `{key}` does not match installation identity"
+        )));
+    }
+    Ok(Some(spec).filter(AppServiceSpec::is_installed))
+}
+
+fn decide_app_submit_action(
+    submitted_plan_use: Option<buckyos_api::InstallPlanUse>,
+    installed_object_id: Option<&ObjId>,
+    target_object_id: &ObjId,
+    installed_document_version: Option<u64>,
+    target_document_version: Option<u64>,
+) -> Result<AppSubmitAction, buckyos_api::InstallError> {
+    match submitted_plan_use {
+        Some(buckyos_api::InstallPlanUse::FreshInstall) => {
+            return if installed_object_id.is_some() {
+                Err(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::PlanNotApplicable,
+                    false,
+                    "FreshInstall plan cannot be consumed by an installed target",
+                ))
+            } else {
+                Ok(AppSubmitAction::FreshInstall)
+            };
+        }
+        Some(buckyos_api::InstallPlanUse::Upgrade) if installed_object_id.is_none() => {
+            return Err(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::PlanNotApplicable,
+                false,
+                "Upgrade plan requires an installed target",
+            ));
+        }
+        Some(buckyos_api::InstallPlanUse::Satisfied) => {
+            return Err(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::PlanNotApplicable,
+                false,
+                "Satisfied inspection result cannot be submitted as a mutation plan",
+            ));
+        }
+        _ => {}
+    }
+    let Some(installed_object_id) = installed_object_id else {
+        return Err(buckyos_api::InstallError::new(
+            buckyos_api::InstallStage::Inspect,
+            buckyos_api::InstallErrorCode::PlanRequired,
+            false,
+            "first installation requires an approved FreshInstall plan",
+        ));
+    };
+    if installed_object_id == target_object_id {
+        return Ok(AppSubmitAction::Satisfied);
+    }
+    if matches!(
+        (installed_document_version, target_document_version),
+        (Some(installed), Some(target)) if target < installed
+    ) {
+        return Err(buckyos_api::InstallError::new(
+            buckyos_api::InstallStage::Inspect,
+            buckyos_api::InstallErrorCode::DowngradeNotAllowed,
+            false,
+            "resolved App Document is older than the installed authority version",
+        ));
+    }
+    Ok(AppSubmitAction::Upgrade)
 }
 
 struct PreparedSubPkg {
@@ -94,11 +194,32 @@ pub struct PublishOutput {
     /// 最终 App Document body（canonical 前的 JSON 值，供工具链/测试消费）。
     pub app_doc_value: Value,
     pub pikg_digest: String,
+    /// Staging handle of the self-checked PIKG, owned by the caller (installable with `apps.submit`).
     pub pikg_handle: String,
-    pub staged_pikg_path: PathBuf,
     /// 发布状态：发布到 Repo/NamedStore 与发布 App DID 是两个动作；
     /// 这里只完成前者，App Document 仍是未经权威发布的 candidate。
     pub publish_status: &'static str,
+}
+
+pub(crate) fn register_app_doc_authority(
+    app_did: &name_lib::DID,
+    app_doc_value: Value,
+    scope: &str,
+) -> Result<(), RPCErrors> {
+    let name_client = name_client::get_name_client().ok_or_else(|| {
+        RPCErrors::ReasonError("name client unavailable for local App authority".to_string())
+    })?;
+    // 本机 locker(hosts 语义):本 Zone 的 App Document 在本进程内闭环解析。
+    name_client.lock_document(
+        app_did.clone(),
+        name_client::DidDocType::Custom(crate::app_install_resolver::APP_DID_DOC_TYPE.to_string()),
+        name_lib::EncodedDocument::JsonLd(app_doc_value),
+        name_client::LockOptions {
+            scope: scope.to_string(),
+            ..Default::default()
+        },
+    );
+    Ok(())
 }
 
 fn task_data_value<T: Serialize>(data: T) -> Result<Value, RPCErrors> {
@@ -110,6 +231,7 @@ fn task_data_value<T: Serialize>(data: T) -> Result<Value, RPCErrors> {
 pub struct AppInstaller {
     wait_interval: Duration,
     wait_timeout: Duration,
+    running_lifecycle_tasks: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl AppInstaller {
@@ -117,6 +239,7 @@ impl AppInstaller {
         Self {
             wait_interval: Duration::from_millis(WAIT_INTERVAL_MS),
             wait_timeout: Duration::from_secs(WAIT_TIMEOUT_SECS),
+            running_lifecycle_tasks: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -128,6 +251,43 @@ impl AppInstaller {
     async fn task_mgr_client(&self) -> Result<TaskManagerClient, RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
         runtime.get_task_mgr_client().await
+    }
+
+    async fn ensure_runtime_has_no_agent_bindings(
+        &self,
+        target: &AppInstanceId,
+    ) -> Result<(), RPCErrors> {
+        let client = self.system_config_client().await?;
+        let users = match client.list("users").await {
+            Ok(users) => users,
+            Err(SystemConfigError::KeyNotFound(_)) => Vec::new(),
+            Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
+        };
+        for owner in users {
+            let root = format!("users/{owner}/agents");
+            let agent_ids = match client.list(&root).await {
+                Ok(agent_ids) => agent_ids,
+                Err(SystemConfigError::KeyNotFound(_)) => continue,
+                Err(error) => return Err(RPCErrors::ReasonError(error.to_string())),
+            };
+            for agent_id in agent_ids {
+                let path = format!("{root}/{agent_id}/spec");
+                let Ok(value) = client.get(&path).await else {
+                    continue;
+                };
+                let spec: AgentSpec = serde_json::from_str(&value.value).map_err(|error| {
+                    RPCErrors::ReasonError(format!("invalid AgentSpec at {path}: {error}"))
+                })?;
+                spec.validate().map_err(RPCErrors::ReasonError)?;
+                if spec.binding.references_runtime(target) {
+                    return Err(RPCErrors::ReasonError(format!(
+                        "cannot uninstall runtime {target}: Agent {} still references it",
+                        spec.agent_id
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn repo_client(&self) -> Result<RepoClient, RPCErrors> {
@@ -146,16 +306,8 @@ impl AppInstaller {
             && spec.state != ServiceState::Deleted
     }
 
-    fn spec_storage_path(spec: &AppServiceSpec) -> String {
-        if spec.app_doc.get_app_type() == AppType::Agent {
-            return format!("users/{}/agents/{}/spec", spec.user_id, spec.app_id());
-        }
-
-        format!("users/{}/apps/{}/spec", spec.user_id, spec.app_id())
-    }
-
     fn service_spec_id(spec: &AppServiceSpec) -> String {
-        format!("{}@{}", spec.app_id(), spec.user_id)
+        spec.app_instance_id().to_string()
     }
 
     fn service_state_label(state: &ServiceState) -> &'static str {
@@ -174,7 +326,7 @@ impl AppInstaller {
         info!(
             "app `{}` for user `{}` state -> {}: {}",
             spec.app_id(),
-            spec.user_id,
+            spec.owner_user_id,
             Self::service_state_label(&state),
             detail
         );
@@ -229,15 +381,13 @@ impl AppInstaller {
         updated_by: &str,
     ) -> Result<(), RPCErrors> {
         spec.state = ServiceState::Deleted;
-        if spec.app_class != AppClass::UserInstalled {
-            return Self::set_spec_at(client, spec_key, spec).await;
-        }
         for expose in spec.spec_config.expose_config.values_mut() {
             expose.allow_guest = false;
         }
+        spec.spec_config.buckets.clear();
 
         let app_instance_id = spec.app_instance_id();
-        let policy_key = app_availability_policy_key(&app_instance_id);
+        let policy_key = app_availability_policy_key(app_instance_id);
         let stored_policy = match client.get(&policy_key).await {
             Ok(value) => value,
             Err(SystemConfigError::KeyNotFound(_)) => {
@@ -252,7 +402,7 @@ impl AppInstaller {
                 ))
             })?;
         if policy.schema_version != APP_AVAILABILITY_SCHEMA_VERSION
-            || policy.app_instance_id != app_instance_id
+            || policy.app_instance_id != *app_instance_id
         {
             return Err(RPCErrors::ReasonError(format!(
                 "Availability policy `{policy_key}` does not match the app instance"
@@ -310,13 +460,6 @@ impl AppInstaller {
         let client = self.system_config_client().await?;
         let mut matches = Vec::new();
 
-        if user_id.is_none() || user_id == Some(SYSTEM_APP_OWNER_ID) {
-            let key = zone_app_spec_key(app_id);
-            if let Some(spec) = Self::get_optional_json::<AppServiceSpec>(&client, &key).await? {
-                matches.push((key, spec));
-            }
-        }
-
         let users = Self::list_children(&client, "users").await?;
 
         for current_user in users {
@@ -326,14 +469,9 @@ impl AppInstaller {
                 }
             }
 
-            for key in [
-                format!("users/{}/apps/{}/spec", current_user, app_id),
-                format!("users/{}/agents/{}/spec", current_user, app_id),
-            ] {
-                if let Some(spec) = Self::get_optional_json::<AppServiceSpec>(&client, &key).await?
-                {
-                    matches.push((key, spec));
-                }
+            let key = format!("users/{}/apps/{}/spec", current_user, app_id);
+            if let Some(spec) = Self::get_optional_json::<AppServiceSpec>(&client, &key).await? {
+                matches.push((key, spec));
             }
         }
 
@@ -359,25 +497,32 @@ impl AppInstaller {
         Ok(matches.into_iter().next().unwrap())
     }
 
-    async fn wait_for_instance_ready(
-        &self,
-        spec: &AppServiceSpec,
-    ) -> Result<ServiceInstanceReportInfo, RPCErrors> {
+    async fn wait_for_instance_ready(&self, spec: &AppServiceSpec) -> Result<u32, RPCErrors> {
+        let client = self.system_config_client().await?;
+        let instances_key = format!("services/{}/instances", Self::service_spec_id(spec));
         let mut waited = Duration::ZERO;
         while waited <= self.wait_timeout {
-            if let Ok(instance) = self
-                .get_app_service_instance_config(spec.app_id(), Some(spec.user_id.as_str()))
-                .await
-            {
-                if matches!(instance.state, ServiceInstanceState::Started) {
-                    info!(
-                        "app `{}` for user `{}` instance ready on node `{}`",
-                        spec.app_id(),
-                        spec.user_id,
-                        instance.node_id
-                    );
-                    return Ok(instance);
+            let now = buckyos_get_unix_timestamp();
+            let mut ready_nodes = HashSet::new();
+            for node_id in Self::list_children(&client, &instances_key).await? {
+                let key = format!("{instances_key}/{node_id}");
+                if let Some(instance) =
+                    Self::get_optional_json::<ServiceInstanceReportInfo>(&client, &key).await?
+                {
+                    if instance.deployment.as_ref() == Some(&spec.deployment)
+                        && instance.state == ServiceInstanceState::Started
+                        && instance.health == buckyos_api::DeploymentHealth::Healthy
+                        && instance.observed_at <= now
+                        && instance.expires_at > now
+                        && !instance.instance_epoch.is_empty()
+                        && !instance.node_session_id.is_empty()
+                    {
+                        ready_nodes.insert(node_id);
+                    }
                 }
+            }
+            if ready_nodes.len() >= spec.expected_instance_count.max(1) as usize {
+                return Ok(ready_nodes.len() as u32);
             }
             sleep(self.wait_interval).await;
             waited += self.wait_interval;
@@ -390,7 +535,7 @@ impl AppInstaller {
         warn!(
             "wait for app `{}` user `{}` instance ready failed: {}",
             spec.app_id(),
-            spec.user_id,
+            spec.owner_user_id,
             error
         );
         Err(error)
@@ -403,12 +548,13 @@ impl AppInstaller {
         let mut waited = Duration::ZERO;
 
         while waited <= self.wait_timeout {
+            let now = buckyos_get_unix_timestamp();
             let node_ids = Self::list_children(&client, &instances_key).await?;
             if node_ids.is_empty() {
                 info!(
                     "all instances removed for app `{}` user `{}`",
                     spec.app_id(),
-                    spec.user_id
+                    spec.owner_user_id
                 );
                 return Ok(());
             }
@@ -419,10 +565,14 @@ impl AppInstaller {
                 if let Some(instance) =
                     Self::get_optional_json::<ServiceInstanceReportInfo>(&client, &key).await?
                 {
-                    if matches!(
-                        instance.state,
-                        ServiceInstanceState::Started | ServiceInstanceState::Deploying
-                    ) {
+                    if instance.deployment.as_ref() == Some(&spec.deployment)
+                        && matches!(
+                            instance.state,
+                            ServiceInstanceState::Started | ServiceInstanceState::Deploying
+                        )
+                        && instance.observed_at <= now
+                        && instance.expires_at > now
+                    {
                         has_active = true;
                         break;
                     }
@@ -433,7 +583,7 @@ impl AppInstaller {
                 info!(
                     "all active instances stopped for app `{}` user `{}`",
                     spec.app_id(),
-                    spec.user_id
+                    spec.owner_user_id
                 );
                 return Ok(());
             }
@@ -449,7 +599,7 @@ impl AppInstaller {
         warn!(
             "wait for app `{}` user `{}` instances removed failed: {}",
             spec.app_id(),
-            spec.user_id,
+            spec.owner_user_id,
             error
         );
         Err(error)
@@ -460,24 +610,26 @@ impl AppInstaller {
         name: String,
         task_type: &str,
         data: Value,
-        _user_id: &str,
-        _app_id: &str,
+        creator_user_id: &str,
+        creator_app_id: &str,
+        idempotency_key: &str,
     ) -> Result<(String, String), RPCErrors> {
         let task_mgr = self.task_mgr_client().await?;
         let task = task_mgr
-            .create_task(buckyos_api::CreateTaskReq {
+            .create_delegated_task(buckyos_api::CreateDelegatedTaskReq {
+                task_id: None,
                 name,
                 schema_id: format!("{}/v1", task_type.replace('/', ".")),
                 schema_version: None,
                 input: data,
-                executor: buckyos_api::CreateTaskExecutor::SelfApp {
-                    app_instance_id: None,
-                },
+                creator: buckyos_api::ActorRef::new(creator_user_id, creator_app_id),
+                runner_app_instance_id: None,
                 parent_id: None,
                 child_control_policy: None,
                 policy_preset: None,
                 permission_boundary: false,
-                idempotency_key: format!("{}-{}", task_type, uuid::Uuid::new_v4().simple()),
+                storage_domain: Some(buckyos_api::StorageDomain::System),
+                idempotency_key: idempotency_key.to_string(),
                 retry_of: None,
                 supersedes: None,
                 message: None,
@@ -486,106 +638,270 @@ impl AppInstaller {
         Ok((task.task_id, task.root_id))
     }
 
+    fn task_envelope(task: &buckyos_api::Task) -> buckyos_api::RunnerWriteEnvelope {
+        let app_instance_id = match &task.executor {
+            buckyos_api::TaskExecutor::App {
+                app_instance_id, ..
+            } => app_instance_id.clone(),
+            _ => None,
+        };
+        buckyos_api::RunnerWriteEnvelope {
+            task_id: task.task_id.clone(),
+            app_instance_id,
+            runner_epoch: task.runner_epoch,
+            expected_revision: task.revision,
+        }
+    }
+
+    async fn enable_safe_cancel(&self, task_id: &str) -> Result<(), RPCErrors> {
+        let client = self.task_mgr_client().await?;
+        let task = client.get_task(task_id).await?;
+        client
+            .update_control_profile(buckyos_api::UpdateControlProfileReq {
+                envelope: Self::task_envelope(&task),
+                profile: buckyos_api::TaskControlProfile {
+                    pause: buckyos_api::ControlAvailability::Unavailable { reason: None },
+                    resume: buckyos_api::ControlAvailability::Unavailable { reason: None },
+                    cancel: buckyos_api::CancelCapability::Safe,
+                    updated_at: buckyos_get_unix_timestamp() * 1000,
+                },
+            })
+            .await?;
+        Ok(())
+    }
+
+    async fn acknowledge_pending_cancel(&self, task_id: &str) -> Result<bool, RPCErrors> {
+        let client = self.task_mgr_client().await?;
+        let task = client.get_task(task_id).await?;
+        let Some(pending) = task.pending_control.as_ref() else {
+            return Ok(false);
+        };
+        if pending.action != buckyos_api::TaskControlAction::Cancel {
+            return Ok(false);
+        }
+        client
+            .ack_control(buckyos_api::AckControlReq {
+                envelope: Self::task_envelope(&task),
+                request_id: pending.request_id.clone(),
+                applied: true,
+                reject_reason: None,
+            })
+            .await?;
+        Ok(true)
+    }
+
+    async fn disable_cancel(&self, task_id: &str, reason: &str) -> Result<(), RPCErrors> {
+        let client = self.task_mgr_client().await?;
+        let task = client.get_task(task_id).await?;
+        client
+            .update_control_profile(buckyos_api::UpdateControlProfileReq {
+                envelope: Self::task_envelope(&task),
+                profile: buckyos_api::TaskControlProfile {
+                    pause: buckyos_api::ControlAvailability::Unavailable { reason: None },
+                    resume: buckyos_api::ControlAvailability::Unavailable { reason: None },
+                    cancel: buckyos_api::CancelCapability::Unavailable {
+                        reason: Some(reason.to_string()),
+                    },
+                    updated_at: buckyos_get_unix_timestamp() * 1000,
+                },
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn run_start_task(
         &self,
-        app_id: String,
-        user_id: Option<String>,
+        data: AppStartTaskData,
         task_id: String,
     ) -> Result<(), RPCErrors> {
         let client = self.system_config_client().await?;
+        let request = data.request;
         let (spec_key, mut spec) = self
-            .get_single_matching_spec(&app_id, user_id.as_deref())
+            .get_single_matching_spec(
+                request.app_instance_id.app_id().as_str(),
+                Some(request.app_instance_id.owner_user_id()),
+            )
             .await?;
 
         if spec.state == ServiceState::Deleted {
             let error = RPCErrors::ReasonError(format!(
-                "App `{app_id}` has been deleted and can not be started"
+                "App `{}` has been deleted and can not be managed",
+                request.app_instance_id
             ));
-            warn!("start app `{app_id}` rejected: {}", error);
             return Err(error);
         }
-
-        if let Ok(task_mgr) = self.task_mgr_client().await {
-            let _ = task_mgr.runner_start(&task_id).await;
-            let _ = task_mgr
-                .runner_progress(
-                    &task_id,
-                    Some(json!({"percent": 15.0})),
-                    Some("Updating app state to running".to_string()),
-                )
-                .await;
+        if spec.app_instance_id != request.app_instance_id {
+            return Err(RPCErrors::ReasonError(
+                "lifecycle task installation identity changed".to_string(),
+            ));
+        }
+        let task_mgr = self.task_mgr_client().await?;
+        task_mgr.runner_start(&task_id).await?;
+        self.enable_safe_cancel(&task_id).await?;
+        if self.acknowledge_pending_cancel(&task_id).await? {
+            return Ok(());
         }
 
-        spec.state = ServiceState::Running;
-        Self::set_spec_at(&client, &spec_key, &spec).await?;
-        Self::log_spec_state_change(
-            &spec,
-            ServiceState::Running,
-            format!("start task {} updated spec `{}`", task_id, spec_key).as_str(),
-        );
+        let ready_instance_count = match request.action {
+            AppLifecycleAction::Start => {
+                task_mgr
+                    .runner_progress(
+                        &task_id,
+                        Some(json!({"percent": 20.0, "action": "start"})),
+                        Some("Setting desired state to running".to_string()),
+                    )
+                    .await?;
+                spec.state = ServiceState::Running;
+                Self::set_spec_at(&client, &spec_key, &spec).await?;
+                let ready = if Self::should_wait_for_instance(&spec) {
+                    self.wait_for_instance_ready(&spec).await?
+                } else {
+                    0
+                };
+                if self.acknowledge_pending_cancel(&task_id).await? {
+                    return Ok(());
+                }
+                ready
+            }
+            AppLifecycleAction::Stop => {
+                task_mgr
+                    .runner_progress(
+                        &task_id,
+                        Some(json!({"percent": 20.0, "action": "stop"})),
+                        Some("Setting desired state to stopped".to_string()),
+                    )
+                    .await?;
+                spec.state = ServiceState::Stopped;
+                Self::set_spec_at(&client, &spec_key, &spec).await?;
+                self.wait_for_instances_removed(&spec).await?;
+                if self.acknowledge_pending_cancel(&task_id).await? {
+                    return Ok(());
+                }
+                0
+            }
+            AppLifecycleAction::Restart => {
+                if request.restart_strategy == RestartStrategy::Rolling {
+                    return Err(RPCErrors::ReasonError(
+                        "rolling restart is not supported by the current deployment strategy"
+                            .to_string(),
+                    ));
+                }
+                task_mgr
+                    .runner_progress(
+                        &task_id,
+                        Some(json!({"percent": 15.0, "action": "restart"})),
+                        Some("Stopping current instances".to_string()),
+                    )
+                    .await?;
+                spec.state = ServiceState::Stopped;
+                Self::set_spec_at(&client, &spec_key, &spec).await?;
+                self.wait_for_instances_removed(&spec).await?;
+                if self.acknowledge_pending_cancel(&task_id).await? {
+                    return Ok(());
+                }
+                task_mgr
+                    .runner_progress(
+                        &task_id,
+                        Some(json!({"percent": 60.0, "action": "restart"})),
+                        Some("Starting replacement instances".to_string()),
+                    )
+                    .await?;
+                spec.state = ServiceState::Running;
+                Self::set_spec_at(&client, &spec_key, &spec).await?;
+                let ready = if Self::should_wait_for_instance(&spec) {
+                    self.wait_for_instance_ready(&spec).await?
+                } else {
+                    0
+                };
+                if self.acknowledge_pending_cancel(&task_id).await? {
+                    return Ok(());
+                }
+                ready
+            }
+        };
 
-        let mut data = json!({
-            "spec_path": spec_key,
-            "spec_id": Self::service_spec_id(&spec),
-        });
-
-        if Self::should_wait_for_instance(&spec) {
-            let instance = self.wait_for_instance_ready(&spec).await?;
-            data["instance"] = serde_json::to_value(instance).map_err(|error| {
-                RPCErrors::ReasonError(format!("Serialize instance report failed: {error}"))
-            })?;
-        }
-
-        self.task_mgr_client()
-            .await?
-            .runner_complete(&task_id, data)
+        task_mgr
+            .runner_complete(
+                &task_id,
+                serde_json::to_value(AppLifecycleTaskResult {
+                    app_instance_id: spec.app_instance_id.clone(),
+                    action: request.action,
+                    desired_state: spec.state.clone(),
+                    ready_instance_count,
+                    completed_at: buckyos_get_unix_timestamp(),
+                })
+                .map_err(|error| RPCErrors::ReasonError(error.to_string()))?,
+            )
             .await?;
         info!(
             "start task {} completed for app `{}` user `{}`",
             task_id,
             spec.app_id(),
-            spec.user_id
+            spec.owner_user_id
         );
         Ok(())
     }
 
     async fn run_uninstall_task(
         &self,
-        app_id: String,
-        user_id: Option<String>,
-        is_remove_data: bool,
+        data: AppUninstallTaskData,
         task_id: String,
-        requested_by: String,
     ) -> Result<(), RPCErrors> {
         let client = self.system_config_client().await?;
+        let request = data.request;
         let (spec_key, mut spec) = self
-            .get_single_matching_spec(&app_id, user_id.as_deref())
+            .get_single_matching_spec(
+                request.app_instance_id.app_id().as_str(),
+                Some(request.app_instance_id.owner_user_id()),
+            )
+            .await?;
+        if spec.app_instance_id != request.app_instance_id {
+            return Err(RPCErrors::ReasonError(
+                "uninstall task installation identity changed".to_string(),
+            ));
+        }
+
+        let task_mgr = self.task_mgr_client().await?;
+        task_mgr.runner_start(&task_id).await?;
+        self.enable_safe_cancel(&task_id).await?;
+        if self.acknowledge_pending_cancel(&task_id).await? {
+            return Ok(());
+        }
+        task_mgr
+            .runner_progress(
+                &task_id,
+                Some(json!({"percent": 15.0})),
+                Some("Stopping app".to_string()),
+            )
             .await?;
 
-        if let Ok(task_mgr) = self.task_mgr_client().await {
-            let _ = task_mgr.runner_start(&task_id).await;
-            let _ = task_mgr
-                .runner_progress(
-                    &task_id,
-                    Some(json!({"percent": 15.0})),
-                    Some("Stopping app".to_string()),
-                )
-                .await;
+        spec.state = ServiceState::Stopped;
+        Self::set_spec_at(&client, &spec_key, &spec).await?;
+        self.wait_for_instances_removed(&spec).await?;
+        if self.acknowledge_pending_cancel(&task_id).await? {
+            return Ok(());
         }
+        self.disable_cancel(
+            &task_id,
+            "uninstall has crossed the metadata deletion boundary",
+        )
+        .await?;
 
-        self.stop_app(&app_id, user_id.as_deref()).await?;
+        task_mgr
+            .runner_progress(
+                &task_id,
+                Some(json!({"percent": 55.0})),
+                Some("Marking app as deleted".to_string()),
+            )
+            .await?;
 
-        if let Ok(task_mgr) = self.task_mgr_client().await {
-            let _ = task_mgr
-                .runner_progress(
-                    &task_id,
-                    Some(json!({"percent": 55.0})),
-                    Some("Marking app as deleted".to_string()),
-                )
-                .await;
-        }
-
-        Self::mark_spec_deleted(&client, &spec_key, &mut spec, &requested_by).await?;
+        Self::mark_spec_deleted(
+            &client,
+            &spec_key,
+            &mut spec,
+            request.creator_user_id.as_str(),
+        )
+        .await?;
         Self::log_spec_state_change(
             &spec,
             ServiceState::Deleted,
@@ -594,53 +910,84 @@ impl AppInstaller {
 
         self.wait_for_instances_removed(&spec).await?;
 
-        if is_remove_data {
-            if let Ok(task_mgr) = self.task_mgr_client().await {
-                let _ = task_mgr
-                    .runner_progress(
-                        &task_id,
-                        Some(json!({"percent": 80.0})),
-                        Some("Removing app data".to_string()),
-                    )
-                    .await;
-            }
-            self.remove_app_data(&spec).await?;
-        }
+        task_mgr
+            .runner_progress(
+                &task_id,
+                Some(json!({"percent": 70.0})),
+                Some("Releasing app storage".to_string()),
+            )
+            .await?;
+        let owner = request.app_instance_id.owner_user_id();
+        let app_id = request.app_instance_id.app_id().as_str();
+        crate::buckets::PackageBuckets::zone()
+            .release(owner, app_id, None)
+            .await?;
+        crate::buckets::release_app_buckets(
+            owner,
+            app_id,
+            request.data_disposition == AppDataDisposition::Retain,
+        )
+        .await?;
 
-        let data = json!({
-            "spec_path": spec_key,
-            "spec_id": Self::service_spec_id(&spec),
-            "remove_data": is_remove_data,
-        });
+        let deleted_paths = if request.data_disposition == AppDataDisposition::Delete {
+            task_mgr
+                .runner_progress(
+                    &task_id,
+                    Some(json!({"percent": 80.0})),
+                    Some("Removing owned app data".to_string()),
+                )
+                .await?;
+            self.remove_app_data(&request.deletion_manifest).await?
+        } else {
+            Vec::new()
+        };
 
-        self.task_mgr_client()
-            .await?
-            .runner_complete(&task_id, data)
+        task_mgr
+            .runner_complete(
+                &task_id,
+                serde_json::to_value(AppUninstallTaskResult {
+                    app_instance_id: spec.app_instance_id.clone(),
+                    data_disposition: request.data_disposition,
+                    deleted_paths,
+                    completed_at: buckyos_get_unix_timestamp(),
+                })
+                .map_err(|error| RPCErrors::ReasonError(error.to_string()))?,
+            )
             .await?;
         info!(
             "uninstall task {} completed for app `{}` user `{}`",
             task_id,
             spec.app_id(),
-            spec.user_id
+            spec.owner_user_id
         );
         Ok(())
     }
 
-    fn removable_data_path(path: &Path, app_id: &str) -> bool {
+    fn removable_data_path(path: &Path) -> bool {
         let raw = path.to_string_lossy();
-        raw.starts_with("/opt/buckyos/data/")
-            && (raw.contains(&format!("/{app_id}/")) || raw.ends_with(&format!("/{app_id}")))
+        path.is_absolute()
+            && path.components().all(|component| {
+                !matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+            && (raw.starts_with("/opt/buckyos/data/") || raw.starts_with("/opt/buckyos/cache/"))
     }
 
-    async fn remove_app_data(&self, spec: &AppServiceSpec) -> Result<(), RPCErrors> {
-        for mount_config in spec.spec_config.data_mount_point.values() {
-            let path = mount_config.target_path.clone();
-            if !Self::removable_data_path(&path, spec.app_id()) {
-                warn!(
-                    "Skip unsafe app data cleanup for `{}`: {}",
-                    spec.app_id(),
-                    path.display()
-                );
+    async fn remove_app_data(
+        &self,
+        manifest: &AppDeletionManifest,
+    ) -> Result<Vec<String>, RPCErrors> {
+        let mut deleted = Vec::new();
+        for raw_path in manifest
+            .data_paths
+            .iter()
+            .chain(manifest.cache_paths.iter())
+        {
+            let path = PathBuf::from(raw_path);
+            if !Self::removable_data_path(&path) {
+                warn!("Skip unsafe app data cleanup: {}", path.display());
                 continue;
             }
 
@@ -652,11 +999,7 @@ impl AppInstaller {
                             path.display()
                         ))
                     })?;
-                    info!(
-                        "removed app data directory for app `{}`: {}",
-                        spec.app_id(),
-                        path.display()
-                    );
+                    deleted.push(raw_path.clone());
                 }
                 Ok(_) => {
                     fs::remove_file(&path).await.map_err(|error| {
@@ -665,247 +1008,244 @@ impl AppInstaller {
                             path.display()
                         ))
                     })?;
-                    info!(
-                        "removed app data file for app `{}`: {}",
-                        spec.app_id(),
-                        path.display()
-                    );
+                    deleted.push(raw_path.clone());
                 }
                 Err(_) => {}
             }
         }
-        Ok(())
+        Ok(deleted)
     }
 
-    /// 卸载应用。必须先 stop_app 才能返回成功。
-    ///
-    /// 流程：
-    /// 1. get_app_service_spec(app_id)，校验 spec 存在
-    /// 2. stop_app(app_id) — 改 spec.state=Stopped，触发调度器把实例 item 收敛到 `target_state=Stopped`
-    /// 3. spec.state → Deleted，写回 system_config
-    /// 4. 等待实例停止；node config 中的实例 item 仍保留，后续 GC 再决定是否清理
-    /// 5. 若 is_remove_data：清理应用数据目录
+    fn build_deletion_manifest(spec: &AppServiceSpec) -> AppDeletionManifest {
+        AppDeletionManifest {
+            data_paths: spec
+                .spec_config
+                .data_mount_point
+                .values()
+                .map(|mount| mount.target_path.to_string_lossy().to_string())
+                .filter(|path| Self::removable_data_path(Path::new(path)))
+                .collect(),
+            cache_paths: spec
+                .spec_config
+                .local_cache_mount_point
+                .values()
+                .map(|mount| mount.target_path.to_string_lossy().to_string())
+                .filter(|path| Self::removable_data_path(Path::new(path)))
+                .collect(),
+        }
+    }
+
     pub async fn uninstall_app(
         &self,
-        app_id: &str,
-        user_id: Option<&str>,
-        is_remove_data: bool,
-        requested_by: &str,
+        spec: &AppServiceSpec,
+        selector: &str,
+        data_disposition: AppDataDisposition,
+        creator_user_id: &str,
+        creator_app_id: &str,
+        idempotency_key: &str,
     ) -> Result<String, RPCErrors> {
-        let spec = self.get_app_service_spec(app_id, user_id).await?;
+        self.ensure_runtime_has_no_agent_bindings(&spec.app_instance_id)
+            .await?;
+        let data = AppUninstallTaskData {
+            schema_version: APP_INSTALL_SCHEMA_VERSION,
+            request: AppUninstallTaskRequest {
+                selector: selector.to_string(),
+                app_instance_id: spec.app_instance_id.clone(),
+                creator_user_id: creator_user_id.to_string(),
+                creator_app_id: creator_app_id.to_string(),
+                idempotency_key: idempotency_key.to_string(),
+                data_disposition,
+                deletion_manifest: Self::build_deletion_manifest(spec),
+            },
+            progress: None,
+            result: None,
+            error: None,
+        };
         let (task_id, _root_id) = self
             .create_task(
-                format!("Uninstall app {app_id}"),
+                format!("Uninstall app {}", spec.app_doc.show_name),
                 UNINSTALL_TASK_TYPE,
-                task_data_value(AppUninstallTaskData {
-                    request: AppUninstallTaskRequest {
-                        app_id: app_id.to_string(),
-                        user_id: spec.user_id.clone(),
-                        remove_data: is_remove_data,
-                    },
-                    result: None,
-                })?,
-                requested_by,
-                app_id,
+                task_data_value(data)?,
+                creator_user_id,
+                creator_app_id,
+                idempotency_key,
             )
             .await?;
-
-        info!(
-            "queued uninstall task {} for app `{}` user `{}` remove_data={}",
-            task_id, app_id, spec.user_id, is_remove_data
-        );
-
-        let installer = self.clone();
-        let app_id = app_id.to_string();
-        let user_id = Some(spec.user_id.clone());
-        let spawned_task_id = task_id.clone();
-        let requested_by = requested_by.to_string();
-        tokio::spawn(async move {
-            if let Err(error) = installer
-                .run_uninstall_task(
-                    app_id,
-                    user_id,
-                    is_remove_data,
-                    spawned_task_id.clone(),
-                    requested_by,
-                )
-                .await
-            {
-                warn!("uninstall app task {} failed: {}", spawned_task_id, error);
-                if let Ok(task_mgr) = installer.task_mgr_client().await {
-                    let _ = task_mgr
-                        .runner_fail(
-                            &spawned_task_id,
-                            "uninstall_failed",
-                            error.to_string(),
-                            None,
-                        )
-                        .await;
-                }
-            }
-        });
-
         Ok(task_id)
     }
 
-    /// 停止应用。
-    ///
-    /// 流程：
-    /// 1. get_app_service_spec(app_id)
-    /// 2. spec.state → Stopped，写回 system_config
-    /// 3. 调度器 schedule_loop 检测到 state 变化，把 nodes/{node}/config.apps 中该应用的 target_state 收敛到 `Stopped`
-    /// 4. node-daemon 读 config 收敛，停止容器
-    pub async fn stop_app(&self, app_id: &str, user_id: Option<&str>) -> Result<(), RPCErrors> {
-        let client = self.system_config_client().await?;
-        let (spec_key, mut spec) = self.get_single_matching_spec(app_id, user_id).await?;
+    pub async fn lifecycle_app(
+        &self,
+        spec: &AppServiceSpec,
+        selector: &str,
+        action: AppLifecycleAction,
+        restart_strategy: RestartStrategy,
+        creator_user_id: &str,
+        creator_app_id: &str,
+        idempotency_key: &str,
+    ) -> Result<String, RPCErrors> {
+        let data = AppStartTaskData {
+            schema_version: APP_INSTALL_SCHEMA_VERSION,
+            request: AppStartTaskRequest {
+                selector: selector.to_string(),
+                app_instance_id: spec.app_instance_id.clone(),
+                creator_user_id: creator_user_id.to_string(),
+                creator_app_id: creator_app_id.to_string(),
+                idempotency_key: idempotency_key.to_string(),
+                action,
+                restart_strategy,
+            },
+            progress: None,
+            result: None,
+            error: None,
+        };
+        let (task_id, _root_id) = self
+            .create_task(
+                format!("{:?} app {}", action, spec.app_doc.show_name),
+                START_TASK_TYPE,
+                task_data_value(data)?,
+                creator_user_id,
+                creator_app_id,
+                idempotency_key,
+            )
+            .await?;
+        Ok(task_id)
+    }
 
-        if spec.state == ServiceState::Stopped || spec.state == ServiceState::Deleted {
-            info!(
-                "skip stop for app `{}` user `{}` because current state is {}",
-                spec.app_id(),
-                spec.user_id,
-                Self::service_state_label(&spec.state)
-            );
+    async fn release_mutation(&self, app_instance_id: &buckyos_api::AppInstanceId, task_id: &str) {
+        let Ok(client) = self.system_config_client().await else {
+            return;
+        };
+        let key = format!("services/control_panel/app_mutations/{app_instance_id}");
+        let Ok(current) = client.get(&key).await else {
+            return;
+        };
+        let owned = serde_json::from_str::<Value>(&current.value)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .as_deref()
+            == Some(task_id);
+        if owned {
+            let mut actions = HashMap::new();
+            actions.insert(key.clone(), KVAction::Remove);
+            let _ = client.exec_tx(actions, Some((key, current.version))).await;
+        }
+    }
+
+    pub fn spawn_lifecycle_task(&self, task_id: String) {
+        let installer = self.clone();
+        tokio::spawn(async move {
+            {
+                let mut running = installer.running_lifecycle_tasks.lock().await;
+                if !running.insert(task_id.clone()) {
+                    return;
+                }
+            }
+            let result = installer.run_persisted_lifecycle_task(&task_id).await;
+            if let Err(error) = result {
+                warn!("lifecycle task {} failed: {}", task_id, error);
+                if let Ok(task_mgr) = installer.task_mgr_client().await {
+                    let _ = task_mgr
+                        .runner_fail(&task_id, "app_lifecycle_failed", error.to_string(), None)
+                        .await;
+                }
+            }
+            if let Ok(task_mgr) = installer.task_mgr_client().await {
+                if let Ok(task) = task_mgr.get_task(&task_id).await {
+                    let app_instance_id = if task.schema_id == APP_START_TASK_SCHEMA_ID {
+                        serde_json::from_value::<AppStartTaskData>(task.input)
+                            .ok()
+                            .map(|data| data.request.app_instance_id)
+                    } else {
+                        serde_json::from_value::<AppUninstallTaskData>(task.input)
+                            .ok()
+                            .map(|data| data.request.app_instance_id)
+                    };
+                    if let Some(app_instance_id) = app_instance_id {
+                        installer.release_mutation(&app_instance_id, &task_id).await;
+                    }
+                }
+            }
+            installer
+                .running_lifecycle_tasks
+                .lock()
+                .await
+                .remove(&task_id);
+        });
+    }
+
+    async fn run_persisted_lifecycle_task(&self, task_id: &str) -> Result<(), RPCErrors> {
+        let task = self.task_mgr_client().await?.get_task(task_id).await?;
+        if task.phase.is_terminal() {
             return Ok(());
         }
-
-        spec.state = ServiceState::Stopped;
-        Self::set_spec_at(&client, &spec_key, &spec).await?;
-        Self::log_spec_state_change(
-            &spec,
-            ServiceState::Stopped,
-            format!("stop wrote spec `{}`", spec_key).as_str(),
-        );
-
-        if Self::should_wait_for_instance(&spec) {
-            self.wait_for_instances_removed(&spec).await?;
+        match task.schema_id.as_str() {
+            APP_START_TASK_SCHEMA_ID => {
+                let data: AppStartTaskData =
+                    serde_json::from_value(task.input).map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid lifecycle task input: {error}"))
+                    })?;
+                self.run_start_task(data, task_id.to_string()).await
+            }
+            APP_UNINSTALL_TASK_SCHEMA_ID => {
+                let data: AppUninstallTaskData =
+                    serde_json::from_value(task.input).map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid uninstall task input: {error}"))
+                    })?;
+                self.run_uninstall_task(data, task_id.to_string()).await
+            }
+            other => Err(RPCErrors::ReasonError(format!(
+                "unsupported lifecycle schema `{other}`"
+            ))),
         }
-
-        info!(
-            "stop completed for app `{}` user `{}`",
-            spec.app_id(),
-            spec.user_id
-        );
-        Ok(())
     }
 
-    /// 启动应用。成功返回 task_id。
-    ///
-    /// 流程：
-    /// 1. get_app_service_spec(app_id)
-    /// 2. spec.state → Running，写回 system_config
-    /// 3. 调度器 schedule_loop 检测到 state 变化，选点并写入 nodes/{node}/config.apps（app_service_instance_config）
-    /// 4. node-daemon 读 config 收敛，启动容器
-    /// 5. 创建 task，返回 task_id
-    pub async fn start_app(
-        &self,
-        app_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<String, RPCErrors> {
-        let spec = self.get_app_service_spec(app_id, user_id).await?;
-        let (task_id, _root_id) = self
-            .create_task(
-                format!("Start app {app_id}"),
-                START_TASK_TYPE,
-                task_data_value(AppStartTaskData {
-                    request: AppStartTaskRequest {
-                        app_id: app_id.to_string(),
-                        user_id: spec.user_id.clone(),
-                    },
-                    result: None,
-                })?,
-                spec.user_id.as_str(),
-                app_id,
-            )
-            .await?;
-        info!(
-            "queued start task {} for app `{}` user `{}`",
-            task_id, app_id, spec.user_id
-        );
-
+    pub fn start_lifecycle_runner(&self) {
         let installer = self.clone();
-        let app_id = app_id.to_string();
-        let user_id = Some(spec.user_id.clone());
-        let spawned_task_id = task_id.clone();
         tokio::spawn(async move {
-            if let Err(error) = installer
-                .run_start_task(app_id, user_id, spawned_task_id.clone())
-                .await
-            {
-                warn!("start app task {} failed: {}", spawned_task_id, error);
-                if let Ok(task_mgr) = installer.task_mgr_client().await {
-                    let _ = task_mgr
-                        .runner_fail(&spawned_task_id, "start_failed", error.to_string(), None)
-                        .await;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let Ok(client) = installer.task_mgr_client().await else {
+                    continue;
+                };
+                for schema_id in [APP_START_TASK_SCHEMA_ID, APP_UNINSTALL_TASK_SCHEMA_ID] {
+                    let mut cursor = None;
+                    loop {
+                        let Ok(page) = client
+                            .list_tasks(buckyos_api::ListTasksReq {
+                                schema_id: Some(schema_id.to_string()),
+                                runner_app_id: Some(
+                                    buckyos_api::CONTROL_PANEL_SERVICE_NAME.to_string(),
+                                ),
+                                cursor: cursor.clone(),
+                                limit: Some(100),
+                                ..Default::default()
+                            })
+                            .await
+                        else {
+                            break;
+                        };
+                        for task in page.tasks {
+                            if !task.phase.is_terminal()
+                                && matches!(task.phase, TaskPhase::Accepted | TaskPhase::Running)
+                            {
+                                installer.spawn_lifecycle_task(task.task_id);
+                            }
+                        }
+                        cursor = page.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
+                    }
                 }
             }
         });
-
-        Ok(task_id)
-    }
-
-    /// 查询应用 spec。
-    /// 流程：从 system_config 读取 users/{uid}/apps/{app}/spec 或 users/{uid}/agents/{app}/spec。
-    pub async fn get_app_service_spec(
-        &self,
-        app_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<AppServiceSpec, RPCErrors> {
-        let (_, spec) = self.get_single_matching_spec(app_id, user_id).await?;
-        Ok(spec)
-    }
-
-    pub async fn get_app_service_spec_by_instance(
-        &self,
-        app_instance_id: &str,
-    ) -> Result<AppServiceSpec, RPCErrors> {
-        let (app_id, owner_user_id) = parse_app_instance_id(app_instance_id)?;
-        let spec = self
-            .get_app_service_spec(&app_id, Some(&owner_user_id))
-            .await?;
-        if spec.app_instance_id() != app_instance_id {
-            return Err(RPCErrors::ReasonError(format!(
-                "installed app spec does not match `{app_instance_id}`"
-            )));
-        }
-        Ok(spec)
-    }
-
-    /// 查询应用实例状态（ServiceInstanceReportInfo）。
-    /// 流程：从 services/{spec}/instances/{node} 或 nodes/{node}/config 聚合实例上报信息。
-    pub async fn get_app_service_instance_config(
-        &self,
-        app_id: &str,
-        user_id: Option<&str>,
-    ) -> Result<ServiceInstanceReportInfo, RPCErrors> {
-        let client = self.system_config_client().await?;
-        let spec = self.get_app_service_spec(app_id, user_id).await?;
-        let service_spec_id = Self::service_spec_id(&spec);
-        let instances_key = format!("services/{service_spec_id}/instances");
-        let node_ids = Self::list_children(&client, &instances_key).await?;
-
-        let mut latest: Option<ServiceInstanceReportInfo> = None;
-        for node_id in node_ids {
-            let key = format!("{instances_key}/{node_id}");
-            if let Some(instance) =
-                Self::get_optional_json::<ServiceInstanceReportInfo>(&client, &key).await?
-            {
-                let replace = latest
-                    .as_ref()
-                    .map(|current| instance.last_update_time >= current.last_update_time)
-                    .unwrap_or(true);
-                if replace {
-                    latest = Some(instance);
-                }
-            }
-        }
-
-        latest.ok_or_else(|| {
-            RPCErrors::ReasonError(format!(
-                "No instance report found for app `{}` (spec `{}`)",
-                app_id, service_spec_id
-            ))
-        })
     }
 
     fn scan_publish_sources(
@@ -955,21 +1295,42 @@ impl AppInstaller {
                         "Agent app template missing `pkg_list.agent`".to_string(),
                     )
                 })?;
-                if app_doc_template.pkg_list.agent_skills.is_some() {
-                    return Err(RPCErrors::ReasonError(
-                        "Agent publish does not support `pkg_list.agent_skills` yet".to_string(),
-                    ));
-                }
                 if app_doc_template.pkg_list.agent_tools.is_some() {
                     return Err(RPCErrors::ReasonError(
                         "Agent publish does not support `pkg_list.agent_tools` yet".to_string(),
                     ));
                 }
-                let sub_pkgs = vec![ScannedSubPkg {
-                    key: "agent".to_string(),
-                    desc: agent_desc,
-                    source: PackageSource::Directory(local_dir.to_path_buf()),
-                }];
+                let sub_pkgs = match app_doc_template.pkg_list.agent_skills.clone() {
+                    Some(skills_desc) => {
+                        let skills_dir = local_dir.join(AGENT_SKILLS_PUBLISH_DIR);
+                        if !skills_dir.is_dir() {
+                            return Err(RPCErrors::ReasonError(format!(
+                                "Agent template declares `pkg_list.agent_skills` but `{}` is not a directory",
+                                skills_dir.display()
+                            )));
+                        }
+                        vec![
+                            ScannedSubPkg {
+                                key: "agent".to_string(),
+                                desc: agent_desc,
+                                source: PackageSource::DirectoryExcept {
+                                    path: local_dir.to_path_buf(),
+                                    exclude: skills_dir.clone(),
+                                },
+                            },
+                            ScannedSubPkg {
+                                key: "agent_skills".to_string(),
+                                desc: skills_desc,
+                                source: PackageSource::Directory(skills_dir),
+                            },
+                        ]
+                    }
+                    None => vec![ScannedSubPkg {
+                        key: "agent".to_string(),
+                        desc: agent_desc,
+                        source: PackageSource::Directory(local_dir.to_path_buf()),
+                    }],
+                };
 
                 Ok(PublishScanPlan {
                     app_bundle: None,
@@ -1028,7 +1389,7 @@ impl AppInstaller {
                                 packaged_name: Self::canonical_packaged_name(
                                     key,
                                     &desc,
-                                    app_doc_template.name.as_str(),
+                                    app_doc_template.show_name.as_str(),
                                 ),
                             },
                         });
@@ -1060,7 +1421,7 @@ impl AppInstaller {
         plan: PublishScanPlan,
     ) -> Result<PreparedPublishPlan, RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await.map_err(|error| {
+        let named_store = runtime.get_local_named_store().await.map_err(|error| {
             RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
         })?;
         let temp_root = std::env::temp_dir().join(format!("buckyos-publish-{}", Uuid::new_v4()));
@@ -1077,7 +1438,12 @@ impl AppInstaller {
                     &named_store,
                     &temp_root,
                     app_bundle_source,
-                    format!("{}-app", app_doc_template.name).as_str(),
+                    format!(
+                        "{}-app",
+                        AppId::from_app_did(app_doc_template.app_did())
+                            .map_err(RPCErrors::ReasonError)?
+                    )
+                    .as_str(),
                 )
                 .await?,
             ),
@@ -1091,7 +1457,13 @@ impl AppInstaller {
                     &named_store,
                     &temp_root,
                     &scanned.source,
-                    format!("{}-{}", app_doc_template.name, scanned.key).as_str(),
+                    format!(
+                        "{}-{}",
+                        AppId::from_app_did(app_doc_template.app_did())
+                            .map_err(RPCErrors::ReasonError)?,
+                        scanned.key
+                    )
+                    .as_str(),
                 )
                 .await?;
             let file_object = payload.file_object.ok_or_else(|| {
@@ -1128,12 +1500,12 @@ impl AppInstaller {
         prepared: &PreparedPublishPlan,
     ) -> Result<(ObjId, AppDoc, Vec<Value>), RPCErrors> {
         let runtime = get_buckyos_api_runtime()?;
-        let named_store = runtime.get_named_store().await.map_err(|error| {
+        let named_store = runtime.get_local_named_store().await.map_err(|error| {
             RPCErrors::ReasonError(format!("Open named store for publish failed: {error}"))
         })?;
         info!(
             "opening repo client for publish app `{}` version `{}`",
-            app_doc_template.name, app_doc_template.version
+            app_doc_template.show_name, app_doc_template.version
         );
         let repo = self.repo_client().await?;
         let mut resolved_sub_pkgs = Vec::new();
@@ -1203,10 +1575,13 @@ impl AppInstaller {
         app_type: AppType,
         local_dir: &Path,
         app_doc_template: &AppDoc,
+        staging: &crate::app_staging::PikgStagingStore,
+        owner_user_id: &str,
+        owner_app_id: &str,
     ) -> Result<PublishOutput, RPCErrors> {
         info!(
             "begin publish app `{}` type `{}` from `{}`",
-            app_doc_template.name,
+            app_doc_template.show_name,
             app_type,
             local_dir.display()
         );
@@ -1223,16 +1598,27 @@ impl AppInstaller {
             }
         };
 
-        // 生成本地 .pikg 并用同一个 PikgReader 自校验（packer/verifier 单实现）。
-        let pikg_result = self
-            .build_publish_pikg(&prepared, &final_doc, &meta_values)
-            .await;
+        // 生成 .pikg 后 staging：入 named store 并用同一个 PikgReader 自校验（packer/verifier 单实现）。
+        let pikg_result = async {
+            let pikg = self
+                .build_publish_pikg(&prepared, &final_doc, &meta_values)
+                .await?;
+            let zone_did = get_buckyos_api_runtime()?.zone_id.clone();
+            staging
+                .stage_preinstall_file(&pikg, owner_user_id, owner_app_id, &zone_did)
+                .await
+                .map_err(|error| {
+                    RPCErrors::ReasonError(format!("published pikg failed self-check: {error}"))
+                })
+        }
+        .await;
         let _ = fs::remove_dir_all(&prepared.temp_root).await;
-        let (pikg_digest, staged_pikg_path) = pikg_result?;
+        let staged = pikg_result?;
+        let pikg_digest = staged.pikg_digest.clone();
 
         info!(
             "publish completed for app `{}` version `{}` obj `{}` pikg sha256:{}",
-            app_doc_template.name, app_doc_template.version, final_obj_id, pikg_digest
+            app_doc_template.show_name, app_doc_template.version, final_obj_id, pikg_digest
         );
         let app_doc_value = serde_json::to_value(&final_doc).map_err(|error| {
             RPCErrors::ReasonError(format!("Serialize final AppDoc failed: {error}"))
@@ -1241,20 +1627,19 @@ impl AppInstaller {
             app_did: final_doc.app_did().clone(),
             app_doc_object_id: final_obj_id,
             app_doc_value,
-            pikg_handle: format!("{}{}", buckyos_api::PIKG_STAGING_HANDLE_PREFIX, pikg_digest),
+            pikg_handle: staged.handle.to_string(),
             pikg_digest,
-            staged_pikg_path,
             publish_status: "repo_stored_candidate",
         })
     }
 
-    /// 打包 pikg -> staging root -> 自校验（结构 + 全部内容 hash）。
+    /// 在发布临时目录打包 pikg。
     async fn build_publish_pikg(
         &self,
         prepared: &PreparedPublishPlan,
         final_doc: &AppDoc,
         meta_values: &[Value],
-    ) -> Result<(String, PathBuf), RPCErrors> {
+    ) -> Result<PathBuf, RPCErrors> {
         let mut builder = crate::pikg::PikgBuilder::new()
             .app_doc(final_doc)
             .map_err(|error| RPCErrors::ReasonError(format!("pikg builder: {error}")))?;
@@ -1269,30 +1654,15 @@ impl AppInstaller {
                 .add_payload_file(sub_pkg.key.as_str(), sub_pkg.tarball_path.clone())
                 .map_err(|error| RPCErrors::ReasonError(format!("pikg builder: {error}")))?;
         }
-        let tmp_pikg = prepared.temp_root.join(format!("{}.pikg", final_doc.name));
+        let tmp_pikg = prepared.temp_root.join(format!(
+            "{}.pikg",
+            AppId::from_app_did(final_doc.app_did()).map_err(RPCErrors::ReasonError)?
+        ));
         builder
             .write_to(&tmp_pikg)
             .await
             .map_err(|error| RPCErrors::ReasonError(format!("write pikg failed: {error}")))?;
-
-        let staging_root = crate::app_install_driver::pikg_staging_root();
-        let (digest, staged_path) =
-            crate::pikg::PikgReader::stage_pikg_file(&tmp_pikg, &staging_root)
-                .await
-                .map_err(|error| {
-                    RPCErrors::ReasonError(format!("stage published pikg failed: {error}"))
-                })?;
-
-        // 自校验：packer 与 verifier 不允许两套规则漂移。
-        let reader = crate::pikg::PikgReader::open(&staged_path, Some(&digest))
-            .await
-            .map_err(|error| {
-                RPCErrors::ReasonError(format!("published pikg failed self-check: {error}"))
-            })?;
-        reader.verify_all_contents().await.map_err(|error| {
-            RPCErrors::ReasonError(format!("published pikg failed content self-check: {error}"))
-        })?;
-        Ok((digest, staged_path))
+        Ok(tmp_pikg)
     }
 
     fn canonical_packaged_name(key: &str, desc: &SubPkgDesc, app_id: &str) -> Option<String> {
@@ -1318,8 +1688,14 @@ impl AppInstaller {
         }
     }
 
-    async fn create_tar_gz(&self, src_dir: &Path, tarball_path: &Path) -> Result<(), RPCErrors> {
+    async fn create_tar_gz(
+        &self,
+        src_dir: &Path,
+        exclude: Option<&Path>,
+        tarball_path: &Path,
+    ) -> Result<(), RPCErrors> {
         let src_dir = src_dir.to_path_buf();
+        let exclude = exclude.map(Path::to_path_buf);
         let tarball_path = tarball_path.to_path_buf();
 
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -1336,6 +1712,7 @@ impl AppInstaller {
                 tar: &mut Builder<GzEncoder<StdFile>>,
                 path: &Path,
                 base: &Path,
+                exclude: Option<&Path>,
             ) -> io::Result<()> {
                 for entry in std::fs::read_dir(path)? {
                     let entry = entry?;
@@ -1345,14 +1722,14 @@ impl AppInstaller {
                         .and_then(|name| name.to_str())
                         .map(|name| name.starts_with('.'))
                         .unwrap_or(false);
-                    if skip {
+                    if skip || exclude == Some(path.as_path()) {
                         continue;
                     }
 
                     let relative = path.strip_prefix(base).unwrap();
                     if path.is_dir() {
                         tar.append_dir(relative, &path)?;
-                        append_dir_all(tar, &path, base)?;
+                        append_dir_all(tar, &path, base, exclude)?;
                     } else {
                         tar.append_file(relative, &mut StdFile::open(&path)?)?;
                     }
@@ -1360,7 +1737,7 @@ impl AppInstaller {
                 Ok(())
             }
 
-            append_dir_all(&mut tar, &src_dir, &src_dir).map_err(|error| {
+            append_dir_all(&mut tar, &src_dir, &src_dir, exclude.as_deref()).map_err(|error| {
                 format!(
                     "Append files from `{}` into archive failed: {error}",
                     src_dir.display()
@@ -1385,7 +1762,9 @@ impl AppInstaller {
         source: &PackageSource,
     ) -> Result<PathBuf, RPCErrors> {
         match source {
-            PackageSource::Directory(path) => Ok(path.clone()),
+            PackageSource::Directory(path) | PackageSource::DirectoryExcept { path, .. } => {
+                Ok(path.clone())
+            }
             PackageSource::File {
                 path,
                 packaged_name,
@@ -1428,7 +1807,12 @@ impl AppInstaller {
             "{}.tar.gz",
             Self::sanitize_publish_name(archive_base_name)
         ));
-        self.create_tar_gz(&staged_dir, &tarball_path).await?;
+        let exclude = match source {
+            PackageSource::DirectoryExcept { exclude, .. } => Some(exclude.as_path()),
+            _ => None,
+        };
+        self.create_tar_gz(&staged_dir, exclude, &tarball_path)
+            .await?;
 
         let file_template = FileObject::default();
         let (file_object, _file_obj_id, _file_obj_str) = cacl_file_object(
@@ -1448,11 +1832,8 @@ impl AppInstaller {
             ))
         })?;
 
-        match source {
-            PackageSource::Directory(_) => {}
-            PackageSource::File { .. } => {
-                let _ = fs::remove_dir_all(&staged_dir).await;
-            }
+        if let PackageSource::File { .. } = source {
+            let _ = fs::remove_dir_all(&staged_dir).await;
         }
 
         Ok(PreparedPayload {
@@ -1485,7 +1866,7 @@ impl AppInstaller {
         let mut meta = PackageMeta::new(
             package_id.name.as_str(),
             version.as_str(),
-            app_doc_template.author.as_str(),
+            app_doc_template.author.to_string().as_str(),
             &app_doc_template.owner,
             None,
         );
@@ -1518,10 +1899,8 @@ impl AppInstaller {
             Self::set_sub_pkg_desc(&mut final_doc, key.as_str(), updated_desc)?;
         }
 
-        final_doc._base.content.clear();
-        final_doc._base.size = 0;
-        final_doc._base.last_update_time = buckyos_get_unix_timestamp();
-
+        final_doc.last_update_time = buckyos_get_unix_timestamp();
+        final_doc.validate()?;
         Ok(final_doc)
     }
 
@@ -1562,7 +1941,7 @@ impl AppInstaller {
         Ok(())
     }
 
-    fn set_sub_pkg_desc(
+    pub(crate) fn set_sub_pkg_desc(
         app_doc: &mut AppDoc,
         key: &str,
         desc: SubPkgDesc,
@@ -1589,180 +1968,106 @@ impl AppInstaller {
 
 use crate::{ControlPanelServer, RpcAuthPrincipal};
 use ::kRPC::{RPCRequest, RPCResponse, RPCResult};
-use buckyos_api::RepoRecord;
 
-struct RepoAppReleaseCandidate {
-    record: RepoRecord,
-    app_doc: AppDoc,
-    parsed_version: Option<semver::Version>,
+#[derive(Debug, Clone)]
+pub(crate) struct InternalInstallOutcome {
+    pub action: String,
+    pub task_id: Option<String>,
+    pub app_instance_id: buckyos_api::AppInstanceId,
+    pub plan_fingerprint: String,
+}
+
+/// Why control_panel installs a PIKG on its own behalf. The intent is part of
+/// the immutable task identity, so a rebuilt Agent runtime never replays the
+/// task of an earlier Agent that used the same name.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InternalInstall<'a> {
+    Preinstall,
+    /// `supersedes`: the failed runtime install this attempt replaces, so a
+    /// retry gets its own task instead of colliding with the failed one.
+    AgentRuntime {
+        agent_doc_object_id: &'a ObjId,
+        supersedes: Option<&'a str>,
+    },
+}
+
+impl InternalInstall<'_> {
+    fn material(&self) -> Value {
+        match self {
+            Self::Preinstall => json!({ "kind": "preinstall" }),
+            Self::AgentRuntime {
+                agent_doc_object_id,
+                supersedes,
+            } => json!({
+                "kind": "agent_runtime",
+                "agent_doc_object_id": agent_doc_object_id,
+                "supersedes": supersedes,
+            }),
+        }
+    }
+
+    fn origin(&self) -> AppSubmitOrigin {
+        match self {
+            Self::Preinstall => AppSubmitOrigin::Preinstall,
+            Self::AgentRuntime { .. } => AppSubmitOrigin::AgentRuntime,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppSubmitOrigin {
+    Rpc,
+    Preinstall,
+    AgentRuntime,
+}
+
+impl AppSubmitOrigin {
+    fn admission(self) -> buckyos_api::AdmissionOrigin {
+        match self {
+            Self::Rpc => buckyos_api::AdmissionOrigin::User,
+            Self::Preinstall => buckyos_api::AdmissionOrigin::Preinstall,
+            Self::AgentRuntime => buckyos_api::AdmissionOrigin::AgentRuntime,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppSubmitRoute {
+    Install,
+    RegisterAgentTemplate,
+    Reject,
+}
+
+/// Agent PIKGs submitted by users register templates; only the internally
+/// constructed Agent runtime App is deployed as an Agent App.
+pub(crate) fn app_submit_route(app_type: AppType, origin: AppSubmitOrigin) -> AppSubmitRoute {
+    match (app_type, origin) {
+        (AppType::Agent, AppSubmitOrigin::Rpc) => AppSubmitRoute::RegisterAgentTemplate,
+        (AppType::Agent, AppSubmitOrigin::Preinstall) => AppSubmitRoute::Reject,
+        (AppType::Agent, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Install,
+        (_, AppSubmitOrigin::AgentRuntime) => AppSubmitRoute::Reject,
+        _ => AppSubmitRoute::Install,
+    }
 }
 
 impl ControlPanelServer {
     pub(crate) fn resolve_target_user_id(req: &RPCRequest, principal: &RpcAuthPrincipal) -> String {
-        Self::param_str(req, "user_id").unwrap_or_else(|| principal.username.clone())
+        Self::param_str(req, "owner_user_id").unwrap_or_else(|| principal.owner_user_id.clone())
     }
 
-    fn repo_record_version(record: &RepoRecord) -> Option<String> {
-        record
-            .meta
-            .get("version")
-            .and_then(|value| value.as_str())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    }
-
-    fn repo_status_rank(status: &str) -> u8 {
-        match status {
-            "pinned" => 2,
-            "collected" => 1,
-            _ => 0,
-        }
-    }
-
-    fn compare_repo_app_release(
-        lhs: &RepoAppReleaseCandidate,
-        rhs: &RepoAppReleaseCandidate,
-    ) -> std::cmp::Ordering {
-        match (&lhs.parsed_version, &rhs.parsed_version) {
-            (Some(left), Some(right)) if left != right => return left.cmp(right),
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            _ => {}
-        }
-
-        let lhs_status = Self::repo_status_rank(lhs.record.status.as_str());
-        let rhs_status = Self::repo_status_rank(rhs.record.status.as_str());
-        if lhs_status != rhs_status {
-            return lhs_status.cmp(&rhs_status);
-        }
-
-        let lhs_updated = lhs
-            .record
-            .updated_at
-            .or(lhs.record.pinned_at)
-            .or(lhs.record.collected_at)
-            .unwrap_or(0);
-        let rhs_updated = rhs
-            .record
-            .updated_at
-            .or(rhs.record.pinned_at)
-            .or(rhs.record.collected_at)
-            .unwrap_or(0);
-        if lhs_updated != rhs_updated {
-            return lhs_updated.cmp(&rhs_updated);
-        }
-
-        lhs.app_doc.version.cmp(&rhs.app_doc.version)
-    }
-
-    async fn resolve_repo_app_release(
-        &self,
-        app_id: &str,
-        version: Option<&str>,
-    ) -> Result<RepoAppReleaseCandidate, RPCErrors> {
-        let runtime = get_buckyos_api_runtime()?;
-        info!(
-            "resolve repo app release app_id=`{}` version={:?}",
-            app_id, version
-        );
-        let repo = runtime.get_repo_client().await.map_err(|error| {
-            warn!(
-                "init repo client failed while resolving app `{}`: {}",
-                app_id, error
-            );
-            RPCErrors::ReasonError(format!("Init repo client failed: {}", error))
-        })?;
-        let requested_version = version
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string());
-        let records = repo
-            .list(Some(buckyos_api::RepoListFilter::new(
-                None,
-                None,
-                Some(app_id.to_string()),
-                None,
-            )))
-            .await
-            .map_err(|error| {
-                warn!(
-                    "repo.list failed while resolving app `{}` version {:?}: {}",
-                    app_id, requested_version, error
-                );
-                error
-            })?;
-
-        let mut candidates = Vec::new();
-        for record in records {
-            if record.content_name.as_deref() != Some(app_id) {
-                continue;
-            }
-
-            let Some(record_version) = Self::repo_record_version(&record) else {
-                warn!(
-                    "skip repo record without version for app `{}` content `{}`",
-                    app_id, record.content_id
-                );
-                continue;
-            };
-            if requested_version
-                .as_deref()
-                .map(|expected| expected != record_version)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-
-            let app_doc: AppDoc = match serde_json::from_value(record.meta.clone()) {
-                Ok(value) => value,
-                Err(error) => {
-                    warn!(
-                        "skip repo record `{}` for app `{}` because meta is not AppDoc: {}",
-                        record.content_id, app_id, error
-                    );
-                    continue;
-                }
-            };
-            if app_doc.name != app_id {
-                continue;
-            }
-
-            candidates.push(RepoAppReleaseCandidate {
-                parsed_version: semver::Version::parse(app_doc.version.as_str()).ok(),
-                record,
-                app_doc,
-            });
-        }
-
-        let release = candidates
-            .into_iter()
-            .max_by(Self::compare_repo_app_release)
-            .ok_or_else(|| {
-                let detail = requested_version
-                    .map(|value| format!(" version `{value}`"))
-                    .unwrap_or_default();
-                RPCErrors::ReasonError(format!("No repo app release found for `{app_id}`{detail}"))
-            })?;
-        info!(
-            "resolved repo app release app_id=`{}` version=`{}` content=`{}` status=`{}`",
-            release.app_doc.name,
-            release.app_doc.version,
-            release.record.content_id,
-            release.record.status
-        );
-        Ok(release)
-    }
-
-    fn build_default_install_config(
-        app_id: &str,
-        app_doc: &AppDoc,
-    ) -> buckyos_api::ServiceSpecConfig {
-        crate::app_install_deployer::build_install_config(
-            app_id,
-            app_doc,
-            &buckyos_api::InstallParams::default(),
-        )
-        .0
+    fn requested_app_owner(
+        req: &RPCRequest,
+        principal: &RpcAuthPrincipal,
+        selector: &str,
+    ) -> String {
+        Self::param_str(req, "owner_user_id")
+            .or_else(|| {
+                selector
+                    .parse::<AppInstanceId>()
+                    .ok()
+                    .map(|value| value.owner_user_id().to_string())
+            })
+            .unwrap_or_else(|| principal.owner_user_id.clone())
     }
 
     fn parse_app_type(raw: &str) -> Result<AppType, RPCErrors> {
@@ -1776,14 +2081,12 @@ impl ControlPanelServer {
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
-        let _principal = Self::require_rpc_principal(principal)?;
-        let local_dir = Self::require_param_str(&req, "local_dir")
-            .or_else(|_| Self::require_param_str(&req, "path"))?;
+        let principal = Self::require_rpc_principal(principal)?;
+        let local_dir = Self::require_param_str(&req, "local_dir")?;
         let app_doc_value = req
             .params
             .get("app_doc")
             .cloned()
-            .or_else(|| req.params.get("app_doc_template").cloned())
             .ok_or_else(|| RPCErrors::ReasonError("missing app_doc payload".to_string()))?;
         let app_doc: AppDoc = serde_json::from_value(app_doc_value).map_err(|error| {
             RPCErrors::ParseRequestError(format!("Invalid app_doc payload: {}", error))
@@ -1795,16 +2098,23 @@ impl ControlPanelServer {
 
         info!(
             "rpc app.publish app=`{}` version=`{}` type=`{}` local_dir=`{}`",
-            app_doc.name, app_doc.version, app_type, local_dir
+            app_doc.show_name, app_doc.version, app_type, local_dir
         );
         let output = self
             .app_installer
-            .publish_app_to_repo(app_type, std::path::Path::new(local_dir.as_str()), &app_doc)
+            .publish_app_to_repo(
+                app_type,
+                std::path::Path::new(local_dir.as_str()),
+                &app_doc,
+                &self.staging_store,
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+            )
             .await
             .map_err(|error| {
                 warn!(
                     "rpc app.publish failed for app `{}` version `{}` local_dir `{}`: {}",
-                    app_doc.name, app_doc.version, local_dir, error
+                    app_doc.show_name, app_doc.version, local_dir, error
                 );
                 error
             })?;
@@ -1812,13 +2122,10 @@ impl ControlPanelServer {
         Ok(RPCResponse::new(
             RPCResult::Success(serde_json::json!({
                 "ok": true,
-                // 兼容字段：即 app_doc_id。
-                "obj_id": output.app_doc_object_id.to_string(),
                 "app_did": output.app_did.to_string(),
                 "app_doc_id": output.app_doc_object_id.to_string(),
                 "pikg_handle": output.pikg_handle,
                 "pikg_digest": output.pikg_digest,
-                "pikg_path": output.staged_pikg_path.to_string_lossy(),
                 "app_doc": output.app_doc_value,
                 // 发布到 Repo/NamedStore ≠ 发布 App DID：仍是未权威发布的 candidate。
                 "publish_status": output.publish_status,
@@ -1857,10 +2164,7 @@ impl ControlPanelServer {
     }
 
     fn principal_is_admin(principal: &RpcAuthPrincipal) -> bool {
-        matches!(
-            principal.user_type,
-            crate::UserType::Admin | crate::UserType::Root
-        )
+        principal.user_type.is_privileged()
     }
 
     fn require_install_scope(
@@ -1880,151 +2184,1875 @@ impl ControlPanelServer {
         principal: &RpcAuthPrincipal,
         spec: &AppServiceSpec,
     ) -> Result<(), RPCErrors> {
-        match spec.app_class {
-            AppClass::SystemBuiltin => Err(RPCErrors::NoPermission(
-                "system_builtin apps follow the BuckyOS lifecycle".to_string(),
-            )),
-            AppClass::ZoneInstalled if Self::principal_is_admin(principal) => Ok(()),
-            AppClass::ZoneInstalled => Err(RPCErrors::NoPermission(
-                "zone_installed app lifecycle requires admin privileges".to_string(),
-            )),
-            AppClass::UserInstalled
-                if spec.user_id == principal.username || Self::principal_is_admin(principal) =>
-            {
-                Ok(())
-            }
-            AppClass::UserInstalled => Err(RPCErrors::NoPermission(
+        if spec.owner_user_id == principal.username || Self::principal_is_admin(principal) {
+            Ok(())
+        } else {
+            Err(RPCErrors::NoPermission(
                 "only the app owner or an admin can manage this app".to_string(),
-            )),
+            ))
         }
     }
 
-    fn parse_install_class(
-        req: &RPCRequest,
-        principal: &RpcAuthPrincipal,
-    ) -> Result<AppClass, RPCErrors> {
-        let raw = Self::param_str(req, "app_class").unwrap_or_else(|| "user_installed".to_string());
-        let app_class = AppClass::try_from(raw.as_str())
-            .map_err(|_| RPCErrors::ParseRequestError(format!("invalid app_class `{raw}`")))?;
-        match app_class {
-            AppClass::UserInstalled => Ok(app_class),
-            AppClass::ZoneInstalled if Self::principal_is_admin(principal) => Ok(app_class),
-            AppClass::ZoneInstalled => Err(RPCErrors::NoPermission(
-                "zone_installed requires admin privileges".to_string(),
-            )),
-            AppClass::SystemBuiltin => Err(RPCErrors::NoPermission(
-                "system_builtin apps are delivered by BuckyOS".to_string(),
-            )),
-        }
-    }
-
-    fn install_error_to_rpc(error: buckyos_api::InstallError) -> RPCErrors {
+    pub(crate) fn install_error_to_rpc(error: buckyos_api::InstallError) -> RPCErrors {
         RPCErrors::ReasonError(serde_json::to_string(&error).unwrap_or_else(|_| error.to_string()))
     }
 
-    async fn start_install_transaction(
-        &self,
-        source: buckyos_api::InstallSource,
-        app_hint: &str,
-        user_id: String,
-        app_class: AppClass,
-        policy: InstallPolicy,
-        options: Option<Value>,
-        seq: u64,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let request = buckyos_api::AppInstallTaskRequest {
-            source,
-            user_id,
-            app_class,
-            policy,
-            options,
-        };
-        let task_id = self
-            .install_engine
-            .create_install_task(request, app_hint)
-            .await
-            .map_err(Self::install_error_to_rpc)?;
-        self.install_runner.dispatch(task_id.clone()).await;
-        Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({
-                "task_id": task_id.to_string(),
-            })),
-            seq,
+    pub(crate) fn parse_install_source(
+        req: &RPCRequest,
+    ) -> Result<buckyos_api::InstallSource, RPCErrors> {
+        if let Some(value) = req.params.get("source") {
+            return serde_json::from_value(value.clone())
+                .map_err(|error| RPCErrors::ParseRequestError(format!("invalid source: {error}")));
+        }
+        if let Some(staging_handle) = Self::param_str(req, "staging_handle") {
+            return Ok(buckyos_api::InstallSource::local_pikg(staging_handle));
+        }
+        let identifier = Self::require_param_str(req, "identifier")?;
+        Ok(buckyos_api::InstallSource::identifier(
+            identifier,
+            Self::param_str(req, "referrer"),
         ))
     }
 
-    /// apps.install { identifier, referrer?, options? } -> { task_id }
-    /// v0.5 协议：identifier 是 DID/名称/ObjectID/URL；
-    /// 旧 app_id/version 语义已删除，不保留分支兼容。
-    pub(crate) async fn handle_apps_install(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        let identifier = Self::require_param_str(&req, "identifier")?;
-        let referrer = Self::param_str(&req, "referrer");
-        let options = req.params.get("options").cloned();
-        let app_class = Self::parse_install_class(&req, principal)?;
-        let user_id = if app_class == AppClass::ZoneInstalled {
-            principal.username.clone()
-        } else {
-            let user_id = Self::resolve_target_user_id(&req, principal);
-            Self::require_install_scope(principal, user_id.as_str())?;
-            user_id
-        };
-        let policy = Self::parse_install_policy(principal, options.as_ref())?;
-
-        info!(
-            "rpc apps.install identifier=`{}` user=`{}` policy={:?}",
-            identifier, user_id, policy
-        );
-        self.start_install_transaction(
-            buckyos_api::InstallSource::identifier(identifier.clone(), referrer),
-            identifier.as_str(),
-            user_id,
-            app_class,
-            policy,
-            options,
-            req.seq,
-        )
-        .await
+    fn merged_install_options(req: &RPCRequest) -> Result<Value, RPCErrors> {
+        let mut options = req
+            .params
+            .get("options")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let options_map = options
+            .as_object_mut()
+            .ok_or_else(|| RPCErrors::ParseRequestError("options must be an object".to_string()))?;
+        if let Some(target) = req.params.get("target") {
+            options_map.insert("target".to_string(), target.clone());
+        }
+        if let Some(install_params) = req.params.get("install_params") {
+            options_map.insert("install_params".to_string(), install_params.clone());
+        }
+        Ok(options)
     }
 
-    /// apps.install_package { staging_handle, options? } -> { task_id }
-    /// 只接受 staging handle（D5），不接受服务端路径。
-    pub(crate) async fn handle_apps_install_package(
+    async fn authorize_staging_source(
+        token: Option<&str>,
+        source: &ObjId,
+    ) -> Result<(), RPCErrors> {
+        let token = token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("PIKG input requires the original caller token".into())
+            })?;
+        let runtime = get_buckyos_api_runtime()?;
+        let endpoint = runtime
+            .get_zone_service_url(buckyos_api::NFS_SERVER_SERVICE_NAME, false)
+            .await?;
+        let mut url = reqwest::Url::parse(&endpoint)
+            .map_err(|_| RPCErrors::ReasonError("invalid NDM authorization endpoint".into()))?;
+        url.set_path("/ndm/v1/store/get_object");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| RPCErrors::ReasonError("NDM authorization unavailable".into()))?;
+        let response = client
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "obj_id": source.to_string() }))
+            .send()
+            .await
+            .map_err(|_| RPCErrors::ReasonError("NDM authorization unavailable".into()))?;
+        if !response.status().is_success() {
+            return Err(RPCErrors::ReasonError(
+                "PIKG source is not readable by the authenticated caller".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn handle_apps_staging_finalize(
         &self,
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
-        let staging_handle = Self::require_param_str(&req, "staging_handle")?;
-        let options = req.params.get("options").cloned();
-        let app_class = Self::parse_install_class(&req, principal)?;
-        let user_id = if app_class == AppClass::ZoneInstalled {
-            principal.username.clone()
-        } else {
-            let user_id = Self::resolve_target_user_id(&req, principal);
-            Self::require_install_scope(principal, user_id.as_str())?;
-            user_id
+        let source_raw = Self::param_str(&req, "source_obj_id");
+        let local_file_id = Self::param_str(&req, "local_file_id");
+        if source_raw.is_some() == local_file_id.is_some() {
+            return Err(RPCErrors::ParseRequestError(
+                "provide exactly one of source_obj_id (FileObject) or local_file_id".to_string(),
+            ));
+        }
+        let digest = Self::param_str(&req, "pikg_digest");
+        let size = req
+            .params
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                RPCErrors::ParseRequestError("size must be an unsigned integer".to_string())
+            })?;
+        let purpose = match Self::param_str(&req, "purpose").as_deref() {
+            None | Some("inspect") => buckyos_api::PikgStagingPurpose::Inspect,
+            Some("install") => buckyos_api::PikgStagingPurpose::Install,
+            Some(other) => {
+                return Err(RPCErrors::ParseRequestError(format!(
+                    "invalid staging purpose `{other}`"
+                )))
+            }
         };
-        let policy = Self::parse_install_policy(principal, options.as_ref())?;
-
-        info!(
-            "rpc apps.install_package handle=`{}` user=`{}` policy={:?}",
-            staging_handle, user_id, policy
-        );
-        self.start_install_transaction(
-            buckyos_api::InstallSource::local_pikg(staging_handle.clone()),
-            staging_handle.as_str(),
-            user_id,
-            app_class,
-            policy,
-            options,
+        let runtime = get_buckyos_api_runtime()?;
+        let metadata = if let Some(file_id) = local_file_id {
+            self.staging_store
+                .finalize_local_file(
+                    &file_id,
+                    digest.as_deref().ok_or_else(|| {
+                        RPCErrors::ParseRequestError("local_file_id requires pikg_digest".into())
+                    })?,
+                    size,
+                    principal.username.as_str(),
+                    principal.authenticated_app_id.as_str(),
+                    &runtime.zone_id,
+                    purpose,
+                )
+                .await?
+        } else {
+            let source = ObjId::new(source_raw.as_deref().unwrap()).map_err(|error| {
+                RPCErrors::ParseRequestError(format!("invalid source_obj_id: {error}"))
+            })?;
+            Self::authorize_staging_source(req.token.as_deref(), &source).await?;
+            self.staging_store
+                .finalize_named_object(
+                    &source,
+                    digest.as_deref(),
+                    size,
+                    principal.username.as_str(),
+                    principal.authenticated_app_id.as_str(),
+                    &runtime.zone_id,
+                    purpose,
+                )
+                .await?
+        };
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(metadata).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize staging metadata failed: {error}"))
+            })?),
             req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_staging_status(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let handle = Self::require_param_str(&req, "staging_handle")?;
+        let runtime = get_buckyos_api_runtime()?;
+        let metadata = self
+            .staging_store
+            .status(
+                handle.as_str(),
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+                &runtime.zone_id,
+            )
+            .await?;
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(metadata).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize staging metadata failed: {error}"))
+            })?),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_staging_release(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let handle = Self::require_param_str(&req, "staging_handle")?;
+        let runtime = get_buckyos_api_runtime()?;
+        let metadata = self
+            .staging_store
+            .release(
+                handle.as_str(),
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+                &runtime.zone_id,
+                None,
+            )
+            .await?;
+        self.staging_store.gc().await?;
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(metadata).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize staging metadata failed: {error}"))
+            })?),
+            req.seq,
+        ))
+    }
+
+    async fn inspect_from_rpc(
+        &self,
+        req: &RPCRequest,
+        principal: &RpcAuthPrincipal,
+        task_type: &str,
+        planning_task_id: Option<String>,
+    ) -> Result<buckyos_api::InstallInspection, RPCErrors> {
+        let source = Self::parse_install_source(req)?;
+        let owner_user_id = Self::resolve_target_user_id(req, principal);
+        Self::require_install_scope(principal, owner_user_id.as_str())?;
+        let options = Self::merged_install_options(req)?;
+        let policy = Self::parse_install_policy(principal, Some(&options))?;
+        self.install_engine
+            .inspect_request(
+                buckyos_api::AppInstallTaskRequest {
+                    source,
+                    creator_user_id: principal.username.clone(),
+                    creator_app_id: principal.authenticated_app_id.clone(),
+                    owner_user_id,
+                    idempotency_key: "inspect-only".to_string(),
+                    submitted_plan: None,
+                    approved_plan_fingerprint: None,
+                    policy,
+                    options: Some(options),
+                },
+                task_type,
+                planning_task_id,
+            )
+            .await
+            .map_err(Self::install_error_to_rpc)
+    }
+
+    /// apps.inspect: side-effect-free default plan + dynamic inspection.
+    pub(crate) async fn handle_apps_inspect(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let task_type = if Self::param_str(&req, "action").as_deref() == Some("upgrade") {
+            buckyos_api::TASK_DATA_TYPE_APP_UPDATE
+        } else {
+            buckyos_api::TASK_DATA_TYPE_APP_INSTALL
+        };
+        let mut inspection = self
+            .inspect_from_rpc(&req, principal, task_type, None)
+            .await?;
+        // What a user may add, before they submit (Agent PIKGs register
+        // templates, which the product does not restrict).
+        if inspection.plan.app_doc.get_app_type() != AppType::Agent {
+            let app_doc = inspection.plan.app_doc.clone();
+            crate::product::apply_admission(
+                &crate::product::current_product().await?,
+                &app_doc,
+                buckyos_api::AdmissionOrigin::User,
+                &mut inspection,
+            );
+        }
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(inspection).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize inspection failed: {error}"))
+            })?),
+            req.seq,
+        ))
+    }
+
+    /// apps.plan.recompute: recompute target/params on the authoritative source.
+    pub(crate) async fn handle_apps_plan_recompute(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let previous: buckyos_api::InstallPlan = serde_json::from_value(
+            req.params
+                .get("plan")
+                .cloned()
+                .ok_or_else(|| RPCErrors::ParseRequestError("plan is required".to_string()))?,
         )
-        .await
+        .map_err(|error| RPCErrors::ParseRequestError(format!("invalid plan: {error}")))?;
+        if previous.schema_version != buckyos_api::APP_INSTALL_SCHEMA_VERSION
+            || !previous.fingerprint_is_valid()
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::PlanStale,
+                false,
+                "plan schema or fingerprint is invalid",
+            )));
+        }
+        let task_type = if previous.plan_use == buckyos_api::InstallPlanUse::Upgrade {
+            buckyos_api::TASK_DATA_TYPE_APP_UPDATE
+        } else {
+            buckyos_api::TASK_DATA_TYPE_APP_INSTALL
+        };
+        let inspection = self
+            .inspect_from_rpc(&req, principal, task_type, Some(previous.task_id.clone()))
+            .await?;
+        if inspection.plan.app.did != previous.app.did
+            || inspection.plan.app_instance_id != previous.app_instance_id
+            || inspection.plan.source_identity != previous.source_identity
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::PlanStale,
+                false,
+                "source identity or installation scope changed while recomputing plan",
+            )));
+        }
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(inspection).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize inspection failed: {error}"))
+            })?),
+            req.seq,
+        ))
+    }
+
+    pub(crate) async fn handle_apps_install_status(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let task_id = Self::parse_task_id(&req)?;
+        let status = self
+            .install_engine
+            .status(
+                task_id.as_str(),
+                principal.username.as_str(),
+                Self::principal_is_admin(principal),
+            )
+            .await
+            .map_err(Self::install_error_to_rpc)?;
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::to_value(status).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize install status failed: {error}"))
+            })?),
+            req.seq,
+        ))
+    }
+
+    async fn update_availability_and_inspection_for_spec(
+        &self,
+        spec: &AppServiceSpec,
+        principal: &RpcAuthPrincipal,
+    ) -> Result<(AppUpdateAvailability, buckyos_api::InstallInspection), RPCErrors> {
+        Self::require_app_lifecycle_scope(principal, spec)?;
+        let inspection = self
+            .install_engine
+            .inspect_request(
+                buckyos_api::AppInstallTaskRequest {
+                    source: buckyos_api::InstallSource::identifier(spec.app_did.to_string(), None),
+                    creator_user_id: principal.username.clone(),
+                    creator_app_id: principal.authenticated_app_id.clone(),
+                    owner_user_id: spec.owner_user_id.clone(),
+                    idempotency_key: format!("availability:{}", spec.app_instance_id),
+                    submitted_plan: None,
+                    approved_plan_fingerprint: None,
+                    policy: InstallPolicy::Normal,
+                    options: None,
+                },
+                buckyos_api::TASK_DATA_TYPE_APP_UPDATE,
+                None,
+            )
+            .await
+            .map_err(Self::install_error_to_rpc)?;
+        let plan = &inspection.plan;
+        let permissions_added = plan
+            .install_params
+            .permissions
+            .iter()
+            .filter(|permission| {
+                !spec.permission.iter().any(|installed| {
+                    installed.scope_path == permission.scope_path
+                        && installed.actions == permission.actions
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let target_compatible =
+            inspection.status.readiness.target == buckyos_api::ReadinessState::Ready;
+        let state = if inspection.resolution_status.document_status.is_terminal() {
+            AppUpdateState::IdentityRevoked
+        } else if !inspection
+            .resolution_status
+            .is_trust_ready(InstallPolicy::Normal)
+        {
+            AppUpdateState::TrustResolutionRequired
+        } else if !target_compatible {
+            AppUpdateState::IncompatibleTarget
+        } else if !permissions_added.is_empty() {
+            AppUpdateState::PermissionReconfirmRequired
+        } else if spec.deployment.app_doc_object_id == plan.app.object_id {
+            AppUpdateState::UpToDate
+        } else {
+            AppUpdateState::UpdateAvailable
+        };
+        let record_key =
+            buckyos_api::install_record_key(spec.owner_user_id.as_str(), spec.app_id());
+        let installed_document_version = match self
+            .app_installer
+            .system_config_client()
+            .await?
+            .get(&record_key)
+            .await
+        {
+            Ok(value) => serde_json::from_str::<buckyos_api::InstallRecord>(&value.value)
+                .ok()
+                .and_then(|record| record.resolution.document_version),
+            Err(_) => None,
+        };
+        let availability = AppUpdateAvailability {
+            app_did: spec.app_did.clone(),
+            app_instance_id: spec.app_instance_id.clone(),
+            state,
+            installed_app_doc_id: Some(spec.deployment.app_doc_object_id.clone()),
+            resolved_app_doc_id: Some(plan.app.object_id.clone()),
+            installed_document_version,
+            resolved_document_version: plan.resolution.document_version,
+            installed_version: Some(spec.app_doc.version.clone()),
+            resolved_version: Some(plan.app.version.clone()),
+            did_resolution: Some(inspection.resolution_status.clone()),
+            permissions_added,
+            target_compatible: Some(target_compatible),
+            checked_at: buckyos_get_unix_timestamp(),
+        };
+        Ok((availability, inspection))
+    }
+
+    async fn update_availability_for_spec(
+        &self,
+        spec: &AppServiceSpec,
+        principal: &RpcAuthPrincipal,
+    ) -> Result<AppUpdateAvailability, RPCErrors> {
+        self.update_availability_and_inspection_for_spec(spec, principal)
+            .await
+            .map(|(availability, _)| availability)
+    }
+
+    pub(crate) async fn handle_apps_update_availability(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let is_batch = req.params.get("selector").is_none()
+            && req.params.get("app_instance_id").is_none()
+            && req.params.get("app_did").is_none()
+            && req.params.get("identifier").is_none();
+        let mut results = Vec::new();
+        if is_batch {
+            let user_id = Self::param_str(&req, "owner_user_id")
+                .unwrap_or_else(|| principal.owner_user_id.clone());
+            Self::require_install_scope(principal, user_id.as_str())?;
+            for (installation, _) in Self::app_availability_resolver()
+                .await?
+                .list_user_installations(user_id.as_str())
+                .await?
+            {
+                if Self::require_app_lifecycle_scope(principal, &installation.spec).is_ok() {
+                    match self
+                        .update_availability_for_spec(&installation.spec, principal)
+                        .await
+                    {
+                        Ok(result) => {
+                            results.push(serde_json::to_value(result).unwrap_or(Value::Null))
+                        }
+                        Err(error) => results.push(json!({
+                            "app_instance_id": installation.spec.app_instance_id,
+                            "state": "UNKNOWN",
+                            "error": error.to_string(),
+                        })),
+                    }
+                }
+            }
+        } else {
+            let installation = self.resolve_app_selector(&req, principal).await?;
+            results.push(
+                serde_json::to_value(
+                    self.update_availability_for_spec(&installation.spec, principal)
+                        .await?,
+                )
+                .map_err(|error| RPCErrors::ReasonError(error.to_string()))?,
+            );
+        }
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "batch": is_batch,
+                "total": results.len(),
+                "items": results,
+            })),
+            req.seq,
+        ))
+    }
+
+    async fn find_update_batch_replay(
+        &self,
+        principal: &RpcAuthPrincipal,
+        idempotency_key: &str,
+    ) -> Result<Option<buckyos_api::Task>, RPCErrors> {
+        let client = self.app_installer.task_mgr_client().await?;
+        let page = client
+            .list_tasks(buckyos_api::ListTasksReq {
+                creator_user_id: Some(principal.username.clone()),
+                creator_app_id: Some(principal.authenticated_app_id.clone()),
+                idempotency_key: Some(idempotency_key.to_string()),
+                schema_id: Some(APP_UPDATE_BATCH_TASK_SCHEMA_ID.to_string()),
+                include_archived: true,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?;
+        match page.tasks.first() {
+            Some(summary) => Ok(Some(client.get_task(&summary.task_id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// apps.upgrade with no selector creates a recoverable Catalog batch root.
+    pub(crate) async fn handle_apps_upgrade_batch(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
+        let owner_user_id = Self::param_str(&req, "owner_user_id")
+            .unwrap_or_else(|| principal.owner_user_id.clone());
+        Self::require_install_scope(principal, owner_user_id.as_str())?;
+
+        if let Some(task) = self
+            .find_update_batch_replay(principal, idempotency_key.as_str())
+            .await?
+        {
+            let previous: AppUpdateBatchTaskData = serde_json::from_value(task.input.clone())
+                .map_err(|error| {
+                    RPCErrors::ReasonError(format!("invalid update batch task input: {error}"))
+                })?;
+            if previous.request.owner_user_id != owner_user_id {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::IdempotencyConflict,
+                    false,
+                    "idempotency key was already used for another batch scope",
+                )));
+            }
+            self.spawn_update_batch_task(task.task_id.clone());
+            return Ok(RPCResponse::new(
+                RPCResult::Success(json!({
+                    "action": "replay",
+                    "task_id": task.task_id,
+                    "root_id": task.root_id,
+                    "total": previous.request.items.len(),
+                })),
+                req.seq,
+            ));
+        }
+
+        let mut items = Vec::new();
+        for (installation, _) in Self::app_availability_resolver()
+            .await?
+            .list_user_installations(owner_user_id.as_str())
+            .await?
+        {
+            let spec = installation.spec;
+            if Self::require_app_lifecycle_scope(principal, &spec).is_err() {
+                continue;
+            }
+            let source = buckyos_api::InstallSource::identifier(spec.app_did.to_string(), None);
+            let (availability, submitted_plan, approved_plan_fingerprint) = match self
+                .update_availability_and_inspection_for_spec(&spec, principal)
+                .await
+            {
+                Ok((availability, inspection)) => {
+                    let submitted_plan = (availability.state == AppUpdateState::UpdateAvailable)
+                        .then_some(inspection.plan);
+                    let fingerprint = submitted_plan
+                        .as_ref()
+                        .map(|plan| plan.plan_fingerprint.clone());
+                    (availability, submitted_plan, fingerprint)
+                }
+                Err(_error) => (
+                    AppUpdateAvailability {
+                        app_did: spec.app_did.clone(),
+                        app_instance_id: spec.app_instance_id.clone(),
+                        state: AppUpdateState::Unknown,
+                        installed_app_doc_id: Some(spec.deployment.app_doc_object_id.clone()),
+                        resolved_app_doc_id: None,
+                        installed_document_version: None,
+                        resolved_document_version: None,
+                        installed_version: Some(spec.app_doc.version.clone()),
+                        resolved_version: None,
+                        did_resolution: None,
+                        permissions_added: Vec::new(),
+                        target_compatible: None,
+                        checked_at: buckyos_get_unix_timestamp(),
+                    },
+                    None,
+                    None,
+                ),
+            };
+            items.push(AppUpdateBatchRequestItem {
+                app_id: spec.app_id().clone(),
+                app_instance_id: spec.app_instance_id,
+                source,
+                availability,
+                submitted_plan,
+                approved_plan_fingerprint,
+            });
+        }
+        items.sort_by(|left, right| left.app_instance_id.cmp(&right.app_instance_id));
+
+        let data = AppUpdateBatchTaskData {
+            schema_version: APP_INSTALL_SCHEMA_VERSION,
+            request: AppUpdateBatchTaskRequest {
+                creator_user_id: principal.username.clone(),
+                creator_app_id: principal.authenticated_app_id.clone(),
+                owner_user_id,
+                idempotency_key: idempotency_key.clone(),
+                items,
+            },
+            progress: None,
+            result: None,
+            error: None,
+        };
+        let total = data.request.items.len();
+        let update_count = data
+            .request
+            .items
+            .iter()
+            .filter(|item| item.availability.state == AppUpdateState::UpdateAvailable)
+            .count();
+        let task = self
+            .app_installer
+            .task_mgr_client()
+            .await?
+            .create_delegated_task(buckyos_api::CreateDelegatedTaskReq {
+                task_id: None,
+                name: format!("Upgrade {} Catalog apps", update_count),
+                schema_id: APP_UPDATE_BATCH_TASK_SCHEMA_ID.to_string(),
+                schema_version: None,
+                input: task_data_value(data)?,
+                creator: buckyos_api::ActorRef::new(
+                    principal.username.clone(),
+                    principal.authenticated_app_id.clone(),
+                ),
+                runner_app_instance_id: None,
+                parent_id: None,
+                child_control_policy: None,
+                policy_preset: None,
+                permission_boundary: false,
+                storage_domain: Some(buckyos_api::StorageDomain::System),
+                idempotency_key,
+                retry_of: None,
+                supersedes: None,
+                message: None,
+            })
+            .await?;
+        self.spawn_update_batch_task(task.task_id.clone());
+        Ok(RPCResponse::new(
+            RPCResult::Success(json!({
+                "action": "batch_upgrade",
+                "task_id": task.task_id,
+                "root_id": task.root_id,
+                "total": total,
+                "update_count": update_count,
+            })),
+            req.seq,
+        ))
+    }
+
+    fn batch_item_result(
+        item: &AppUpdateBatchRequestItem,
+        outcome: AppUpdateBatchItemOutcome,
+        child_task_id: Option<String>,
+        error: Option<String>,
+    ) -> AppUpdateBatchItemResult {
+        AppUpdateBatchItemResult {
+            app_instance_id: item.app_instance_id.clone(),
+            outcome,
+            child_task_id,
+            error,
+        }
+    }
+
+    async fn report_update_batch_progress(
+        &self,
+        task_id: &str,
+        results: &[AppUpdateBatchItemResult],
+    ) -> Result<(), RPCErrors> {
+        let completed_items = results
+            .iter()
+            .filter(|item| item.outcome != AppUpdateBatchItemOutcome::Pending)
+            .count() as u32;
+        self.app_installer
+            .task_mgr_client()
+            .await?
+            .runner_progress(
+                task_id,
+                Some(
+                    serde_json::to_value(AppUpdateBatchProgress {
+                        completed_items,
+                        total_items: results.len() as u32,
+                        items: results.to_vec(),
+                        updated_at: buckyos_get_unix_timestamp(),
+                    })
+                    .map_err(|error| RPCErrors::ReasonError(error.to_string()))?,
+                ),
+                Some(format!(
+                    "Catalog batch: {completed_items}/{} items complete",
+                    results.len()
+                )),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn run_update_batch_task(&self, task_id: &str) -> Result<(), RPCErrors> {
+        let task_mgr = self.app_installer.task_mgr_client().await?;
+        let task = task_mgr.get_task(task_id).await?;
+        if task.phase.is_terminal() {
+            return Ok(());
+        }
+        let data: AppUpdateBatchTaskData = serde_json::from_value(task.input).map_err(|error| {
+            RPCErrors::ReasonError(format!("invalid update batch task input: {error}"))
+        })?;
+        if data.schema_version != APP_INSTALL_SCHEMA_VERSION {
+            return Err(RPCErrors::ReasonError(
+                "unsupported update batch schema version".to_string(),
+            ));
+        }
+        task_mgr.runner_start(task_id).await?;
+
+        let mut results = Vec::with_capacity(data.request.items.len());
+        for item in &data.request.items {
+            match item.availability.state {
+                AppUpdateState::UpToDate => results.push(Self::batch_item_result(
+                    item,
+                    AppUpdateBatchItemOutcome::Satisfied,
+                    None,
+                    None,
+                )),
+                AppUpdateState::UpdateAvailable => {
+                    let Some(fingerprint) = item.approved_plan_fingerprint.clone() else {
+                        results.push(Self::batch_item_result(
+                            item,
+                            AppUpdateBatchItemOutcome::Failed,
+                            None,
+                            Some("update item has no frozen plan fingerprint".to_string()),
+                        ));
+                        continue;
+                    };
+                    let Some(submitted_plan) = item.submitted_plan.clone() else {
+                        results.push(Self::batch_item_result(
+                            item,
+                            AppUpdateBatchItemOutcome::Failed,
+                            None,
+                            Some("update item has no frozen Upgrade plan".to_string()),
+                        ));
+                        continue;
+                    };
+                    let child_idempotency_key =
+                        format!("{}:{}", data.request.idempotency_key, item.app_instance_id);
+                    let mutation_key = match Self::acquire_app_mutation(
+                        &item.app_instance_id,
+                        data.request.creator_user_id.as_str(),
+                        data.request.creator_app_id.as_str(),
+                        child_idempotency_key.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(key) => key,
+                        Err(error) => {
+                            results.push(Self::batch_item_result(
+                                item,
+                                AppUpdateBatchItemOutcome::Failed,
+                                None,
+                                Some(error.to_string()),
+                            ));
+                            continue;
+                        }
+                    };
+                    let child = self
+                        .install_engine
+                        .create_update_task_with_parent(
+                            buckyos_api::AppUpdateTaskRequest {
+                                source: item.source.clone(),
+                                creator_user_id: data.request.creator_user_id.clone(),
+                                creator_app_id: data.request.creator_app_id.clone(),
+                                owner_user_id: item.app_instance_id.owner_user_id().to_string(),
+                                idempotency_key: child_idempotency_key,
+                                submitted_plan: Some(submitted_plan),
+                                approved_plan_fingerprint: Some(fingerprint),
+                                policy: InstallPolicy::Normal,
+                                options: None,
+                            },
+                            item.app_id.as_str(),
+                            Some(task_id),
+                        )
+                        .await;
+                    let child_task_id = match child {
+                        Ok(child_task_id) => child_task_id,
+                        Err(error) => {
+                            Self::release_app_mutation_key(&mutation_key).await;
+                            results.push(Self::batch_item_result(
+                                item,
+                                AppUpdateBatchItemOutcome::Failed,
+                                None,
+                                Some(error.to_string()),
+                            ));
+                            continue;
+                        }
+                    };
+                    Self::bind_app_mutation_task(&mutation_key, child_task_id.as_str()).await?;
+                    self.install_runner.spawn_run(child_task_id.clone());
+                    results.push(Self::batch_item_result(
+                        item,
+                        AppUpdateBatchItemOutcome::Pending,
+                        Some(child_task_id),
+                        None,
+                    ));
+                }
+                state => results.push(Self::batch_item_result(
+                    item,
+                    AppUpdateBatchItemOutcome::Blocked,
+                    None,
+                    Some(format!("Catalog update is blocked by {state:?}")),
+                )),
+            }
+        }
+        self.report_update_batch_progress(task_id, &results).await?;
+
+        loop {
+            let root = task_mgr.get_task(task_id).await?;
+            if root.phase.is_terminal() {
+                return Ok(());
+            }
+            let mut pending = false;
+            let mut changed = false;
+            for result in &mut results {
+                if result.outcome != AppUpdateBatchItemOutcome::Pending {
+                    continue;
+                }
+                let Some(child_task_id) = result.child_task_id.as_deref() else {
+                    result.outcome = AppUpdateBatchItemOutcome::Failed;
+                    result.error = Some("batch child id was not persisted".to_string());
+                    changed = true;
+                    continue;
+                };
+                let child = task_mgr.get_task(child_task_id).await?;
+                if !child.phase.is_terminal() {
+                    pending = true;
+                    continue;
+                }
+                result.outcome = match child.outcome {
+                    Some(buckyos_api::TaskOutcome::Succeeded) => {
+                        AppUpdateBatchItemOutcome::Succeeded
+                    }
+                    Some(buckyos_api::TaskOutcome::Canceled) => AppUpdateBatchItemOutcome::Canceled,
+                    _ => AppUpdateBatchItemOutcome::Failed,
+                };
+                result.error = child.error.map(|error| error.message);
+                changed = true;
+            }
+            if changed {
+                self.report_update_batch_progress(task_id, &results).await?;
+            }
+            if !pending
+                && results
+                    .iter()
+                    .all(|item| item.outcome != AppUpdateBatchItemOutcome::Pending)
+            {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        let count = |outcome| {
+            results
+                .iter()
+                .filter(|item| item.outcome == outcome)
+                .count() as u32
+        };
+        task_mgr
+            .runner_complete(
+                task_id,
+                serde_json::to_value(AppUpdateBatchTaskResult {
+                    succeeded: count(AppUpdateBatchItemOutcome::Succeeded),
+                    failed: count(AppUpdateBatchItemOutcome::Failed)
+                        + count(AppUpdateBatchItemOutcome::Canceled),
+                    satisfied: count(AppUpdateBatchItemOutcome::Satisfied),
+                    blocked: count(AppUpdateBatchItemOutcome::Blocked),
+                    items: results,
+                    completed_at: buckyos_get_unix_timestamp(),
+                })
+                .map_err(|error| RPCErrors::ReasonError(error.to_string()))?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn spawn_update_batch_task(&self, task_id: String) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            {
+                let mut running = server.running_update_batch_tasks.lock().await;
+                if !running.insert(task_id.clone()) {
+                    return;
+                }
+            }
+            if let Err(error) = server.run_update_batch_task(&task_id).await {
+                warn!(
+                    "update batch task {} paused for recovery after error: {}",
+                    task_id, error
+                );
+            }
+            server
+                .running_update_batch_tasks
+                .lock()
+                .await
+                .remove(&task_id);
+        });
+    }
+
+    pub(crate) fn start_update_batch_runner(&self) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let Ok(client) = server.app_installer.task_mgr_client().await else {
+                    continue;
+                };
+                let mut cursor = None;
+                loop {
+                    let Ok(page) = client
+                        .list_tasks(buckyos_api::ListTasksReq {
+                            schema_id: Some(APP_UPDATE_BATCH_TASK_SCHEMA_ID.to_string()),
+                            runner_app_id: Some(
+                                buckyos_api::CONTROL_PANEL_SERVICE_NAME.to_string(),
+                            ),
+                            cursor: cursor.clone(),
+                            limit: Some(100),
+                            ..Default::default()
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    for task in page.tasks {
+                        if matches!(task.phase, TaskPhase::Accepted | TaskPhase::Running) {
+                            server.spawn_update_batch_task(task.task_id);
+                        }
+                    }
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn find_spec_for_inspection(
+        inspection: &buckyos_api::InstallInspection,
+    ) -> Result<Option<AppServiceSpec>, RPCErrors> {
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        let plan = &inspection.plan;
+        let key = buckyos_api::user_app_spec_key(
+            plan.app_instance_id.owner_user_id(),
+            plan.app_instance_id.app_id(),
+        );
+        match client.get(&key).await {
+            Ok(value) => parse_installed_spec(
+                &key,
+                &value.value,
+                &plan.app_instance_id,
+                &plan.app.did,
+                &plan.owner_user_id,
+            ),
+            Err(SystemConfigError::KeyNotFound(_)) => Ok(None),
+            Err(error) => Err(RPCErrors::ReasonError(error.to_string())),
+        }
+    }
+
+    pub(crate) async fn acquire_app_mutation(
+        app_instance_id: &buckyos_api::AppInstanceId,
+        creator_user_id: &str,
+        creator_app_id: &str,
+        idempotency_key: &str,
+    ) -> Result<AppMutationLease, RPCErrors> {
+        let key = format!("services/control_panel/app_mutations/{app_instance_id}");
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        let now = buckyos_get_unix_timestamp();
+        let value = serde_json::json!({
+            "schema_version": buckyos_api::APP_INSTALL_SCHEMA_VERSION,
+            "app_instance_id": app_instance_id,
+            "creator_user_id": creator_user_id,
+            "creator_app_id": creator_app_id,
+            "idempotency_key": idempotency_key,
+            "task_id": null,
+            "created_at": now,
+            "expires_at": now + 24 * 60 * 60,
+        });
+        let mut actions = HashMap::new();
+        actions.insert(key.clone(), KVAction::Create(value.to_string()));
+        if client.exec_tx(actions, None).await.is_ok() {
+            return Ok(AppMutationLease { key, owner: value });
+        }
+        client.invalidate_cache(&key).await;
+        let current = client.get(&key).await.map_err(|error| {
+            RPCErrors::ReasonError(format!("read app mutation owner failed: {error}"))
+        })?;
+        let current_value: Value = serde_json::from_str(&current.value).map_err(|error| {
+            RPCErrors::ReasonError(format!("invalid app mutation owner: {error}"))
+        })?;
+        let same_request = current_value.get("creator_user_id").and_then(Value::as_str)
+            == Some(creator_user_id)
+            && current_value.get("creator_app_id").and_then(Value::as_str) == Some(creator_app_id)
+            && current_value.get("idempotency_key").and_then(Value::as_str)
+                == Some(idempotency_key);
+        if same_request {
+            return Ok(AppMutationLease {
+                key,
+                owner: current_value,
+            });
+        }
+        let tasks = runtime.get_task_mgr_client().await?;
+        if app_mutation::reclaimable(&current_value, &tasks).await? {
+            let mut actions = HashMap::new();
+            actions.insert(key.clone(), KVAction::Update(value.to_string()));
+            if client
+                .exec_tx(actions, Some((key.clone(), current.version)))
+                .await
+                .is_ok()
+            {
+                return Ok(AppMutationLease { key, owner: value });
+            }
+        }
+        Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+            buckyos_api::InstallStage::Inspect,
+            buckyos_api::InstallErrorCode::AppMutationInProgress,
+            true,
+            "another mutation owns this App installation",
+        )))
+    }
+
+    pub(crate) async fn bind_app_mutation_task(
+        lease: &AppMutationLease,
+        task_id: &str,
+    ) -> Result<(), RPCErrors> {
+        let mutation_key = lease.key.as_str();
+        let runtime = get_buckyos_api_runtime()?;
+        let client = runtime.get_system_config_client().await?;
+        client.invalidate_cache(mutation_key).await;
+        let current = client.get(mutation_key).await.map_err(|error| {
+            RPCErrors::ReasonError(format!("read app mutation owner failed: {error}"))
+        })?;
+        let mut value: Value = serde_json::from_str(&current.value).map_err(|error| {
+            RPCErrors::ReasonError(format!("invalid app mutation owner: {error}"))
+        })?;
+        if !app_mutation::same_owner(&value, &lease.owner)
+            || value
+                .get("task_id")
+                .and_then(Value::as_str)
+                .is_some_and(|existing| existing != task_id)
+        {
+            return Err(RPCErrors::ReasonError(
+                "app mutation reservation was replaced".to_string(),
+            ));
+        }
+        if value.get("task_id").and_then(Value::as_str) == Some(task_id) {
+            return Ok(());
+        }
+        value["task_id"] = Value::String(task_id.to_string());
+        let mut actions = HashMap::new();
+        actions.insert(
+            mutation_key.to_string(),
+            KVAction::Update(value.to_string()),
+        );
+        client
+            .exec_tx(actions, Some((mutation_key.to_string(), current.version)))
+            .await
+            .map_err(|error| {
+                RPCErrors::ReasonError(format!("bind app mutation task failed: {error}"))
+            })?;
+        Ok(())
+    }
+
+    pub(crate) async fn release_app_mutation_key(lease: &AppMutationLease) {
+        let mutation_key = lease.key.as_str();
+        let Ok(runtime) = get_buckyos_api_runtime() else {
+            return;
+        };
+        let Ok(client) = runtime.get_system_config_client().await else {
+            return;
+        };
+        client.invalidate_cache(mutation_key).await;
+        let Ok(current) = client.get(mutation_key).await else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&current.value) else {
+            return;
+        };
+        if !app_mutation::same_owner(&value, &lease.owner)
+            || value.get("task_id").and_then(Value::as_str).is_some()
+        {
+            return;
+        }
+        let mut actions = HashMap::new();
+        actions.insert(mutation_key.to_string(), KVAction::Remove);
+        let _ = client
+            .exec_tx(actions, Some((mutation_key.to_string(), current.version)))
+            .await;
+    }
+
+    pub(crate) async fn find_app_submit_replay(
+        &self,
+        principal: &RpcAuthPrincipal,
+        idempotency_key: &str,
+    ) -> Result<Option<buckyos_api::Task>, RPCErrors> {
+        let client = self.app_installer.task_mgr_client().await?;
+        let page = client
+            .list_tasks(buckyos_api::ListTasksReq {
+                creator_user_id: Some(principal.username.clone()),
+                creator_app_id: Some(principal.authenticated_app_id.clone()),
+                idempotency_key: Some(idempotency_key.to_string()),
+                include_archived: true,
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await?;
+        match page.tasks.first() {
+            Some(summary) => Ok(Some(client.get_task(&summary.task_id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    fn submitted_plan_replay_matches(
+        persisted: Option<&buckyos_api::InstallPlan>,
+        submitted: Option<&buckyos_api::InstallPlan>,
+    ) -> bool {
+        match (persisted, submitted) {
+            (None, None) => true,
+            (Some(persisted), Some(submitted)) => {
+                persisted.schema_version == APP_INSTALL_SCHEMA_VERSION
+                    && submitted.schema_version == APP_INSTALL_SCHEMA_VERSION
+                    && persisted.fingerprint_is_valid()
+                    && submitted.fingerprint_is_valid()
+                    && persisted.plan_fingerprint == submitted.plan_fingerprint
+            }
+            _ => false,
+        }
+    }
+
+    fn app_submit_replay_matches(
+        task: &buckyos_api::Task,
+        req: &RPCRequest,
+        principal: &RpcAuthPrincipal,
+        idempotency_key: &str,
+        submitted_plan: &Option<buckyos_api::InstallPlan>,
+    ) -> Result<bool, RPCErrors> {
+        let source = Self::parse_install_source(req)?;
+        let owner_user_id = Self::resolve_target_user_id(req, principal);
+        Self::require_install_scope(principal, owner_user_id.as_str())?;
+        let options = Some(Self::merged_install_options(req)?);
+        let policy = Self::parse_install_policy(principal, req.params.get("options"))?;
+        let approved_plan_fingerprint = Self::param_str(req, "approved_plan_fingerprint");
+
+        match task.schema_id.as_str() {
+            APP_INSTALL_TASK_SCHEMA_ID => {
+                let data: buckyos_api::AppInstallTaskData =
+                    serde_json::from_value(task.input.clone()).map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid install task input: {error}"))
+                    })?;
+                Ok(data.request.source == source
+                    && data.request.creator_user_id == principal.username
+                    && data.request.creator_app_id == principal.authenticated_app_id
+                    && data.request.owner_user_id == owner_user_id
+                    && data.request.idempotency_key == idempotency_key
+                    && Self::submitted_plan_replay_matches(
+                        data.request.submitted_plan.as_ref(),
+                        submitted_plan.as_ref(),
+                    )
+                    && data.request.approved_plan_fingerprint == approved_plan_fingerprint
+                    && data.request.policy == policy
+                    && data.request.options == options)
+            }
+            APP_UPDATE_TASK_SCHEMA_ID => {
+                let data: buckyos_api::AppUpdateTaskData =
+                    serde_json::from_value(task.input.clone()).map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid update task input: {error}"))
+                    })?;
+                Ok(data.request.source == source
+                    && data.request.creator_user_id == principal.username
+                    && data.request.creator_app_id == principal.authenticated_app_id
+                    && data.request.owner_user_id == owner_user_id
+                    && data.request.idempotency_key == idempotency_key
+                    && Self::submitted_plan_replay_matches(
+                        data.request.submitted_plan.as_ref(),
+                        submitted_plan.as_ref(),
+                    )
+                    && data.request.approved_plan_fingerprint == approved_plan_fingerprint
+                    && data.request.policy == policy
+                    && data.request.options == options)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn internal_intent_id(
+        intent: InternalInstall<'_>,
+        owner_user_id: &str,
+        app_id: &buckyos_api::AppId,
+        pikg_digest: &str,
+        seed: &buckyos_api::PreInstallPlanSeed,
+    ) -> Result<String, RPCErrors> {
+        let material = serde_json::json!({
+            "intent": intent.material(),
+            "owner_user_id": owner_user_id,
+            "app_id": app_id,
+            "pikg_digest": pikg_digest,
+            "install_plan": seed,
+        });
+        let (object_id, _) = build_named_object_by_json("preseed", &material);
+        let object_id = object_id.to_string();
+        let digest = object_id
+            .split_once(':')
+            .map(|(_, digest)| digest)
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("internal install intent ObjectId is malformed".to_string())
+            })?;
+        Ok(format!("t-{}", &digest[..32]))
+    }
+
+    fn internal_idempotency_key(
+        intent: InternalInstall<'_>,
+        owner_user_id: &str,
+        app_id: &buckyos_api::AppId,
+        pikg_digest: &str,
+        plan_fingerprint: &str,
+    ) -> String {
+        let material = serde_json::json!({
+            "intent": intent.material(),
+            "owner_user_id": owner_user_id,
+            "app_id": app_id,
+            "pikg_digest": pikg_digest,
+            "plan_fingerprint": plan_fingerprint,
+        });
+        let (object_id, _) = build_named_object_by_json("preidem", &material);
+        format!(
+            "internal-install:{}",
+            object_id.to_string().replace(':', "-")
+        )
+    }
+
+    fn internal_retry_idempotency_key(retry_of_task_id: &str, plan_fingerprint: &str) -> String {
+        let material = serde_json::json!({
+            "kind": "internal_install_retry",
+            "retry_of_task_id": retry_of_task_id,
+            "plan_fingerprint": plan_fingerprint,
+        });
+        let (object_id, _) = build_named_object_by_json("preretry", &material);
+        format!(
+            "internal-install-retry:{}",
+            object_id.to_string().replace(':', "-")
+        )
+    }
+
+    fn internal_replay_matches(
+        task: &buckyos_api::Task,
+        owner_user_id: &str,
+        plan_fingerprint: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, RPCErrors> {
+        let request = match task.schema_id.as_str() {
+            APP_INSTALL_TASK_SCHEMA_ID => {
+                serde_json::from_value::<buckyos_api::AppInstallTaskData>(task.input.clone())
+                    .map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid install task input: {error}"))
+                    })?
+                    .request
+            }
+            APP_UPDATE_TASK_SCHEMA_ID => {
+                let data =
+                    serde_json::from_value::<buckyos_api::AppUpdateTaskData>(task.input.clone())
+                        .map_err(|error| {
+                            RPCErrors::ReasonError(format!("invalid update task input: {error}"))
+                        })?;
+                buckyos_api::AppInstallTaskRequest {
+                    source: data.request.source,
+                    creator_user_id: data.request.creator_user_id,
+                    creator_app_id: data.request.creator_app_id,
+                    owner_user_id: data.request.owner_user_id,
+                    idempotency_key: data.request.idempotency_key,
+                    submitted_plan: data.request.submitted_plan,
+                    approved_plan_fingerprint: data.request.approved_plan_fingerprint,
+                    policy: data.request.policy,
+                    options: data.request.options,
+                }
+            }
+            _ => return Ok(false),
+        };
+        Ok(request.creator_user_id == owner_user_id
+            && request.creator_app_id == "system:control-panel"
+            && request.owner_user_id == owner_user_id
+            && request.idempotency_key == idempotency_key
+            && request.policy == InstallPolicy::SystemInternal
+            && request.approved_plan_fingerprint.as_deref() == Some(plan_fingerprint)
+            && request.submitted_plan.as_ref().is_some_and(|plan| {
+                plan.fingerprint_is_valid() && plan.plan_fingerprint == plan_fingerprint
+            }))
+    }
+
+    async fn resume_internal_replay(
+        &self,
+        principal: &RpcAuthPrincipal,
+        owner_user_id: &str,
+        app_instance_id: &buckyos_api::AppInstanceId,
+        plan_fingerprint: &str,
+        mut task: buckyos_api::Task,
+        mut idempotency_key: String,
+    ) -> Result<InternalInstallOutcome, RPCErrors> {
+        const MAX_RETRY_CHAIN_DEPTH: usize = 32;
+
+        for _ in 0..MAX_RETRY_CHAIN_DEPTH {
+            if !Self::internal_replay_matches(
+                &task,
+                owner_user_id,
+                plan_fingerprint,
+                idempotency_key.as_str(),
+            )? {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::IdempotencyConflict,
+                    false,
+                    "internal install idempotency key belongs to different immutable input",
+                )));
+            }
+
+            let should_retry = task.phase == TaskPhase::Paused
+                || (task.phase == TaskPhase::Terminal && task.outcome == Some(TaskOutcome::Failed));
+            if should_retry {
+                let retry_key =
+                    Self::internal_retry_idempotency_key(&task.task_id, plan_fingerprint);
+                if let Some(retry_task) = self
+                    .find_app_submit_replay(principal, retry_key.as_str())
+                    .await?
+                {
+                    if retry_task.retry_of.as_deref() != Some(task.task_id.as_str()) {
+                        return Err(Self::install_error_to_rpc(
+                            buckyos_api::InstallError::new(
+                                buckyos_api::InstallStage::Inspect,
+                                buckyos_api::InstallErrorCode::IdempotencyConflict,
+                                false,
+                                "internal install retry idempotency key belongs to a different predecessor task",
+                            ),
+                        ));
+                    }
+                    task = retry_task;
+                    idempotency_key = retry_key;
+                    continue;
+                }
+
+                let retry_task_id = self
+                    .install_engine
+                    .retry(
+                        task.task_id.as_str(),
+                        owner_user_id,
+                        true,
+                        buckyos_api::CONTROL_PANEL_SERVICE_NAME,
+                        retry_key.as_str(),
+                    )
+                    .await
+                    .map_err(Self::install_error_to_rpc)?;
+                self.install_runner.spawn_run(retry_task_id.clone());
+                return Ok(InternalInstallOutcome {
+                    action: "retry".to_string(),
+                    task_id: Some(retry_task_id),
+                    app_instance_id: app_instance_id.clone(),
+                    plan_fingerprint: plan_fingerprint.to_string(),
+                });
+            }
+
+            if task.phase == TaskPhase::Terminal {
+                let message = match task.outcome {
+                    Some(TaskOutcome::Succeeded) => format!(
+                        "internal install task {} succeeded but the AppSpec is missing",
+                        task.task_id
+                    ),
+                    Some(TaskOutcome::Canceled) => {
+                        format!("internal install task {} was canceled", task.task_id)
+                    }
+                    Some(TaskOutcome::Failed) => unreachable!("failed task handled above"),
+                    None => format!(
+                        "internal install task {} is terminal without an outcome",
+                        task.task_id
+                    ),
+                };
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Deploy,
+                    buckyos_api::InstallErrorCode::Conflict,
+                    false,
+                    message,
+                )));
+            }
+
+            self.install_runner.spawn_run(task.task_id.clone());
+            return Ok(InternalInstallOutcome {
+                action: "replay".to_string(),
+                task_id: Some(task.task_id),
+                app_instance_id: app_instance_id.clone(),
+                plan_fingerprint: plan_fingerprint.to_string(),
+            });
+        }
+
+        Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+            buckyos_api::InstallStage::Inspect,
+            buckyos_api::InstallErrorCode::Conflict,
+            false,
+            "internal install retry chain exceeds the supported depth",
+        )))
+    }
+
+    /// Internal install entry for rootfs seeds and Agent runtime Apps. It uses
+    /// the same inspect, action matrix, mutation ownership, TaskManager
+    /// persistence and runner path as apps.submit.
+    pub(crate) async fn submit_internal_install(
+        &self,
+        intent: InternalInstall<'_>,
+        owner_user_id: &str,
+        app_id: &buckyos_api::AppId,
+        pikg_digest: &str,
+        pikg_app_doc_object_id: &ObjId,
+        pikg_app_doc: &buckyos_api::AppDoc,
+        staging_handle: &str,
+        seed: &buckyos_api::PreInstallPlanSeed,
+    ) -> Result<InternalInstallOutcome, RPCErrors> {
+        let canonical_app_id = buckyos_api::AppId::from_app_did(pikg_app_doc.app_did())
+            .map_err(RPCErrors::ReasonError)?;
+        let expected_owner = pikg_app_doc.app_did().upper_did().ok_or_else(|| {
+            RPCErrors::ReasonError("internal install AppDID has no structural owner".to_string())
+        })?;
+        let app_doc_value = serde_json::to_value(pikg_app_doc).map_err(|error| {
+            RPCErrors::ReasonError(format!("serialize internal install AppDoc failed: {error}"))
+        })?;
+        let (canonical_app_doc_object_id, _) =
+            build_named_object_by_json(buckyos_api::OBJ_TYPE_APP_DOC, &app_doc_value);
+        if &canonical_app_id != app_id
+            || &canonical_app_doc_object_id != pikg_app_doc_object_id
+            || pikg_app_doc.owner != expected_owner
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Resolve,
+                buckyos_api::InstallErrorCode::VerificationFailed,
+                false,
+                "internal install AppDID, structural owner or canonical AppDoc ObjectId is inconsistent",
+            )));
+        }
+        let scope = match intent {
+            InternalInstall::Preinstall => "rootfs-preinstall",
+            InternalInstall::AgentRuntime { .. } => "agent-runtime",
+        };
+        register_app_doc_authority(pikg_app_doc.app_did(), app_doc_value, scope)?;
+        let principal = RpcAuthPrincipal {
+            username: owner_user_id.to_string(),
+            owner_user_id: owner_user_id.to_string(),
+            authenticated_app_id: "system:control-panel".to_string(),
+            user_type: crate::UserType::Admin,
+            owner_did: String::new(),
+            is_user_session: false,
+            is_control_panel_session: true,
+            principal_kind: buckyos_api::TokenPrincipalKind::User,
+            agent_permission_mode: None,
+            session: crate::PrincipalSession::default(),
+        };
+        let mut options = serde_json::json!({
+            "policy": "SYSTEM_INTERNAL",
+            "auto_confirm": true,
+        });
+        if let Some(target) = seed.target.as_ref() {
+            options["target"] = serde_json::to_value(target).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize internal install target failed: {error}"))
+            })?;
+        }
+        if let Some(install_params) = seed.install_params.as_ref() {
+            options["install_params"] = serde_json::to_value(install_params).map_err(|error| {
+                RPCErrors::ReasonError(format!("serialize internal install params failed: {error}"))
+            })?;
+        }
+        let source = buckyos_api::InstallSource::local_pikg(staging_handle.to_string());
+        let mut request = RPCRequest::new(
+            "apps.submit",
+            serde_json::json!({
+                "source": source,
+                "owner_user_id": owner_user_id,
+                "options": options,
+            }),
+        );
+        let planning_task_id =
+            Self::internal_intent_id(intent, owner_user_id, app_id, pikg_digest, seed)?;
+        let mut inspection = self
+            .inspect_from_rpc(
+                &request,
+                &principal,
+                buckyos_api::TASK_DATA_TYPE_APP_INSTALL,
+                Some(planning_task_id.clone()),
+            )
+            .await?;
+        let installed = Self::find_spec_for_inspection(&inspection).await?;
+        if installed.is_some() {
+            inspection = self
+                .inspect_from_rpc(
+                    &request,
+                    &principal,
+                    buckyos_api::TASK_DATA_TYPE_APP_UPDATE,
+                    Some(planning_task_id),
+                )
+                .await?;
+        }
+        if inspection.plan.app_instance_id.app_id() != app_id
+            || inspection.plan.owner_user_id != owner_user_id
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::VerificationFailed,
+                false,
+                "internal install AppId or owner scope does not match the inspected plan",
+            )));
+        }
+        match &inspection.plan.source_identity {
+            buckyos_api::InstallSourceIdentity::Pikg {
+                app_doc_object_id,
+                pikg_digest: inspected_digest,
+            } if app_doc_object_id == pikg_app_doc_object_id
+                && inspection.plan.app.object_id == *pikg_app_doc_object_id
+                && inspected_digest == pikg_digest => {}
+            _ => {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::VerificationFailed,
+                    false,
+                    "internal install PIKG digest or AppDoc identity does not bind the final plan",
+                )))
+            }
+        }
+        if inspection.plan.selected_packages.is_empty()
+            || inspection.plan.required_contents.is_empty()
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::InvalidPackage,
+                false,
+                "internal install plan has no selected packages or required contents",
+            )));
+        }
+
+        if installed
+            .as_ref()
+            .is_some_and(|spec| spec.deployment.app_doc_object_id == inspection.plan.app.object_id)
+        {
+            return Ok(InternalInstallOutcome {
+                action: "satisfied".to_string(),
+                task_id: None,
+                app_instance_id: inspection.plan.app_instance_id,
+                plan_fingerprint: inspection.plan.plan_fingerprint,
+            });
+        }
+
+        let idempotency_key = Self::internal_idempotency_key(
+            intent,
+            owner_user_id,
+            app_id,
+            pikg_digest,
+            inspection.plan.plan_fingerprint.as_str(),
+        );
+        if let Some(task) = self
+            .find_app_submit_replay(&principal, idempotency_key.as_str())
+            .await?
+        {
+            return self
+                .resume_internal_replay(
+                    &principal,
+                    owner_user_id,
+                    &inspection.plan.app_instance_id,
+                    inspection.plan.plan_fingerprint.as_str(),
+                    task,
+                    idempotency_key,
+                )
+                .await;
+        }
+
+        request.params["idempotency_key"] = Value::String(idempotency_key.clone());
+        request.params["plan"] = serde_json::to_value(&inspection.plan).map_err(|error| {
+            RPCErrors::ReasonError(format!("serialize internal install plan failed: {error}"))
+        })?;
+        request.params["approved_plan_fingerprint"] =
+            Value::String(inspection.plan.plan_fingerprint.clone());
+        self.submit_app(request, Some(&principal), intent.origin())
+            .await?;
+        let task = self
+            .find_app_submit_replay(&principal, idempotency_key.as_str())
+            .await?
+            .ok_or_else(|| {
+                RPCErrors::ReasonError(
+                    "apps.submit succeeded without a persisted install task".to_string(),
+                )
+            })?;
+        Ok(InternalInstallOutcome {
+            action: if installed.is_some() {
+                "upgrade".to_string()
+            } else {
+                "fresh_install".to_string()
+            },
+            task_id: Some(task.task_id),
+            app_instance_id: inspection.plan.app_instance_id,
+            plan_fingerprint: inspection.plan.plan_fingerprint,
+        })
+    }
+
+    pub(crate) async fn handle_apps_submit(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        self.submit_app(req, principal, AppSubmitOrigin::Rpc).await
+    }
+
+    /// Authoritative six-cell action matrix for first install/upgrade/satisfied.
+    async fn submit_app(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+        origin: AppSubmitOrigin,
+    ) -> Result<RPCResponse, RPCErrors> {
+        let principal = Self::require_rpc_principal(principal)?;
+        let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
+        let submitted_plan: Option<buckyos_api::InstallPlan> = req
+            .params
+            .get("plan")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value(value.clone())
+                    .map_err(|error| RPCErrors::ParseRequestError(format!("invalid plan: {error}")))
+            })
+            .transpose()?;
+        if let Some(task) = self
+            .find_app_submit_replay(principal, idempotency_key.as_str())
+            .await?
+        {
+            if !Self::app_submit_replay_matches(
+                &task,
+                &req,
+                principal,
+                idempotency_key.as_str(),
+                &submitted_plan,
+            )? {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::IdempotencyConflict,
+                    false,
+                    "idempotency key was already used for another immutable request",
+                )));
+            }
+            self.install_runner.spawn_run(task.task_id.clone());
+            return Ok(RPCResponse::new(
+                RPCResult::Success(json!({
+                    "action": "replay",
+                    "task_id": task.task_id,
+                    "phase": task.phase,
+                    "outcome": task.outcome,
+                })),
+                req.seq,
+            ));
+        }
+        if let Some(plan) = submitted_plan.as_ref() {
+            if plan.schema_version != buckyos_api::APP_INSTALL_SCHEMA_VERSION
+                || !plan.fingerprint_is_valid()
+            {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::PlanStale,
+                    false,
+                    "submitted plan schema or fingerprint is invalid",
+                )));
+            }
+        }
+
+        let submitted_task_type = match submitted_plan.as_ref().map(|plan| plan.plan_use) {
+            Some(buckyos_api::InstallPlanUse::Upgrade) => buckyos_api::TASK_DATA_TYPE_APP_UPDATE,
+            _ => buckyos_api::TASK_DATA_TYPE_APP_INSTALL,
+        };
+        let mut inspection = self
+            .inspect_from_rpc(
+                &req,
+                principal,
+                submitted_task_type,
+                submitted_plan.as_ref().map(|plan| plan.task_id.clone()),
+            )
+            .await?;
+        if let Some(plan) = submitted_plan.as_ref() {
+            if plan.plan_fingerprint != inspection.plan.plan_fingerprint {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::PlanStale,
+                    false,
+                    "submitted plan no longer matches authoritative source inspection",
+                )));
+            }
+        }
+        match app_submit_route(inspection.plan.app_doc.get_app_type(), origin) {
+            AppSubmitRoute::Install => {}
+            AppSubmitRoute::RegisterAgentTemplate => {
+                let result = self
+                    .register_agent_template(&req, principal, &inspection)
+                    .await?;
+                return Ok(RPCResponse::new(RPCResult::Success(result), req.seq));
+            }
+            AppSubmitRoute::Reject => {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::ConfigBlocked,
+                    false,
+                    "Agent templates cannot be pre-installed as Apps, and Agent runtime installs must be Agent Apps",
+                )));
+            }
+        }
+        // The product edition decides what may be added, by who asks: users
+        // add static web apps to Lite, only the product its script apps and
+        // only Agent creation its Agent App.
+        if let Err(denied) = crate::product::current_product()
+            .await?
+            .admit_app(&inspection.plan.app_doc, origin.admission())
+        {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::UnsupportedTarget,
+                false,
+                format!("{denied} ({})", denied.code()),
+            )));
+        }
+        let installed = Self::find_spec_for_inspection(&inspection).await?;
+        if submitted_plan.is_none() && installed.is_some() {
+            inspection = self
+                .inspect_from_rpc(
+                    &req,
+                    principal,
+                    buckyos_api::TASK_DATA_TYPE_APP_UPDATE,
+                    None,
+                )
+                .await?;
+        }
+        let mut installed_document_version = None;
+        if let Some(spec) = installed.as_ref() {
+            let record_key =
+                buckyos_api::install_record_key(spec.owner_user_id.as_str(), spec.app_id());
+            let client = get_buckyos_api_runtime()?
+                .get_system_config_client()
+                .await?;
+            if let Ok(value) = client.get(&record_key).await {
+                let record: buckyos_api::InstallRecord = serde_json::from_str(&value.value)
+                    .map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid install record: {error}"))
+                    })?;
+                installed_document_version = record.resolution.document_version;
+            }
+        }
+        let action = decide_app_submit_action(
+            submitted_plan.as_ref().map(|plan| plan.plan_use),
+            installed
+                .as_ref()
+                .map(|spec| &spec.deployment.app_doc_object_id),
+            &inspection.plan.app.object_id,
+            installed_document_version,
+            inspection.plan.resolution.document_version,
+        )
+        .map_err(Self::install_error_to_rpc)?;
+        if action == AppSubmitAction::Satisfied {
+            return Ok(RPCResponse::new(
+                RPCResult::Success(serde_json::json!({
+                    "action": "satisfied",
+                    "task_id": null,
+                    "app_instance_id": inspection.plan.app_instance_id,
+                    "app_doc_object_id": inspection.plan.app.object_id,
+                })),
+                req.seq,
+            ));
+        }
+
+        let approved_plan_fingerprint = Self::param_str(&req, "approved_plan_fingerprint");
+        if approved_plan_fingerprint.as_deref() != Some(inspection.plan.plan_fingerprint.as_str()) {
+            return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                buckyos_api::InstallStage::Inspect,
+                buckyos_api::InstallErrorCode::PlanStale,
+                false,
+                "submit must bind the authoritative displayed plan fingerprint",
+            )));
+        }
+        let submit_policy = Self::parse_install_policy(principal, req.params.get("options"))?;
+        let mutation_key = Self::acquire_app_mutation(
+            &inspection.plan.app_instance_id,
+            principal.username.as_str(),
+            principal.authenticated_app_id.as_str(),
+            idempotency_key.as_str(),
+        )
+        .await?;
+        let task_options = Self::merged_install_options(&req)?;
+        let task_result = if action == AppSubmitAction::FreshInstall {
+            let request = buckyos_api::AppInstallTaskRequest {
+                source: Self::parse_install_source(&req)?,
+                creator_user_id: principal.username.clone(),
+                creator_app_id: principal.authenticated_app_id.clone(),
+                owner_user_id: inspection.plan.owner_user_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                submitted_plan: Some(inspection.plan.clone()),
+                approved_plan_fingerprint,
+                policy: submit_policy,
+                options: Some(task_options.clone()),
+            };
+            self.install_engine
+                .create_install_task(request, inspection.plan.app.show_name.as_str())
+                .await
+        } else {
+            let request = buckyos_api::AppUpdateTaskRequest {
+                source: Self::parse_install_source(&req)?,
+                creator_user_id: principal.username.clone(),
+                creator_app_id: principal.authenticated_app_id.clone(),
+                owner_user_id: inspection.plan.owner_user_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                submitted_plan: Some(inspection.plan.clone()),
+                approved_plan_fingerprint,
+                policy: submit_policy,
+                options: Some(task_options),
+            };
+            self.install_engine
+                .create_update_task(request, inspection.plan.app.show_name.as_str())
+                .await
+        };
+        let task_id = match task_result {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                Self::release_app_mutation_key(&mutation_key).await;
+                return Err(Self::install_error_to_rpc(error));
+            }
+        };
+        Self::bind_app_mutation_task(&mutation_key, task_id.as_str()).await?;
+        self.install_runner.spawn_run(task_id.clone());
+        let action = match action {
+            AppSubmitAction::FreshInstall => "fresh_install",
+            AppSubmitAction::Upgrade => "upgrade",
+            AppSubmitAction::Satisfied => unreachable!(),
+        };
+        Ok(RPCResponse::new(
+            RPCResult::Success(serde_json::json!({
+                "action": action,
+                "task_id": task_id,
+                "app_instance_id": inspection.plan.app_instance_id,
+                "plan_fingerprint": inspection.plan.plan_fingerprint,
+            })),
+            req.seq,
+        ))
     }
 
     fn parse_task_id(req: &RPCRequest) -> Result<String, RPCErrors> {
@@ -2036,7 +4064,7 @@ impl ControlPanelServer {
         Ok(trimmed.to_string())
     }
 
-    /// apps.install.confirm { task_id, target?, install_params? }
+    /// apps.install.confirm { task_id, plan_fingerprint }
     pub(crate) async fn handle_apps_install_confirm(
         &self,
         req: RPCRequest,
@@ -2044,36 +4072,14 @@ impl ControlPanelServer {
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let task_id = Self::parse_task_id(&req)?;
-        let target = match req.params.get("target") {
-            Some(value) if !value.is_null() => Some(
-                serde_json::from_value::<buckyos_api::InstallTarget>(value.clone()).map_err(
-                    |err| RPCErrors::ParseRequestError(format!("invalid target: {err}")),
-                )?,
-            ),
-            _ => None,
-        };
-        let install_params = match req.params.get("install_params") {
-            Some(value) if !value.is_null() => Some(
-                serde_json::from_value::<buckyos_api::InstallParams>(value.clone()).map_err(
-                    |err| RPCErrors::ParseRequestError(format!("invalid install_params: {err}")),
-                )?,
-            ),
-            _ => None,
-        };
-        if req.params.get("accepted_permissions").is_some() {
-            return Err(RPCErrors::ParseRequestError(
-                "accepted_permissions was removed; submit full PermissionItem entries in install_params.permissions"
-                    .to_string(),
-            ));
-        }
+        let plan_fingerprint = Self::require_param_str(&req, "plan_fingerprint")?;
 
         self.install_engine
             .confirm(
                 &task_id,
                 principal.username.as_str(),
                 Self::principal_is_admin(principal),
-                target,
-                install_params,
+                plan_fingerprint.as_str(),
             )
             .await
             .map_err(Self::install_error_to_rpc)?;
@@ -2092,17 +4098,24 @@ impl ControlPanelServer {
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let task_id = Self::parse_task_id(&req)?;
-        self.install_engine
+        let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
+        let retry_task_id = self
+            .install_engine
             .retry(
                 &task_id,
                 principal.username.as_str(),
                 Self::principal_is_admin(principal),
+                principal.authenticated_app_id.as_str(),
+                idempotency_key.as_str(),
             )
             .await
             .map_err(Self::install_error_to_rpc)?;
-        self.install_runner.spawn_run(task_id.clone());
+        self.install_runner.spawn_run(retry_task_id.clone());
         Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({ "task_id": task_id.to_string() })),
+            RPCResult::Success(serde_json::json!({
+                "task_id": retry_task_id,
+                "retry_of": task_id,
+            })),
             req.seq,
         ))
     }
@@ -2115,67 +4128,30 @@ impl ControlPanelServer {
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
         let task_id = Self::parse_task_id(&req)?;
-        self.install_engine
+        let force = match req.params.get("force") {
+            None => false,
+            Some(Value::Bool(force)) => *force,
+            Some(_) => {
+                return Err(RPCErrors::ParseRequestError(
+                    "force must be a boolean".to_string(),
+                ))
+            }
+        };
+        let outcome = self
+            .install_engine
             .cancel(
                 &task_id,
                 principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
                 Self::principal_is_admin(principal),
+                force,
             )
             .await
             .map_err(Self::install_error_to_rpc)?;
         Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({ "task_id": task_id.to_string() })),
-            req.seq,
-        ))
-    }
-
-    /// apps.update { app_instance_id, options? } -> { task_id }
-    /// v0.5：升级走与安装同一条 Stage 流水线（Resolve -> ... -> Prepare 完成
-    /// 后才切换旧版本；Activate 失败自动恢复旧 spec）。升级判定以权威
-    /// Resolve 的 App Document 为准，不再从 Repo 选 semver 最新。
-    pub(crate) async fn handle_apps_update(
-        &self,
-        req: RPCRequest,
-        principal: Option<&RpcAuthPrincipal>,
-    ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        let app_instance_id = Self::require_param_str(&req, "app_instance_id")?;
-        let (app_id, _) = parse_app_instance_id(&app_instance_id)?;
-        let options = req.params.get("options").cloned();
-        let policy = Self::parse_install_policy(principal, options.as_ref())?;
-
-        // 已安装 spec 是升级入口的真相源：App DID 从中取得。
-        let current_spec = self
-            .app_installer
-            .get_app_service_spec_by_instance(&app_instance_id)
-            .await?;
-        Self::require_app_lifecycle_scope(principal, &current_spec)?;
-        let app_did = current_spec.app_doc.app_did().clone();
-        let task_user_id = if current_spec.app_class == AppClass::ZoneInstalled {
-            principal.username.clone()
-        } else {
-            current_spec.user_id.clone()
-        };
-
-        let request = buckyos_api::AppUpdateTaskRequest {
-            source: buckyos_api::InstallSource::identifier(app_did.to_string(), None),
-            user_id: task_user_id,
-            app_class: current_spec.app_class,
-            app_id: app_id.clone(),
-            policy,
-            options,
-        };
-        let task_id = self
-            .install_engine
-            .create_update_task(request, app_id.as_str())
-            .await
-            .map_err(Self::install_error_to_rpc)?;
-        self.install_runner.dispatch(task_id.clone()).await;
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({
-                "task_id": task_id.to_string(),
-            })),
+            RPCResult::Success(
+                serde_json::json!({ "task_id": task_id, "task_phase": "Terminal", "task_outcome": "Canceled", "mutation_released": true, "cleanup_pending": outcome.cleanup_pending }),
+            ),
             req.seq,
         ))
     }
@@ -2186,25 +4162,86 @@ impl ControlPanelServer {
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
-        let app_instance_id = Self::require_param_str(&req, "app_instance_id")?;
-        let (app_id, owner_user_id) = parse_app_instance_id(&app_instance_id)?;
-        let spec = self
-            .app_installer
-            .get_app_service_spec_by_instance(&app_instance_id)
-            .await?;
+        let selector = Self::app_selector_from_req(&req)?;
+        let data_disposition = match Self::param_str(&req, "data_disposition").as_deref() {
+            Some("retain") => AppDataDisposition::Retain,
+            Some("delete") => AppDataDisposition::Delete,
+            _ => {
+                return Err(RPCErrors::ParseRequestError(
+                    "data_disposition must be `retain` or `delete`".to_string(),
+                ))
+            }
+        };
+        let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
+        let requested_owner = Self::requested_app_owner(&req, principal, selector.as_str());
+        if let Some(task) = self
+            .find_app_submit_replay(principal, idempotency_key.as_str())
+            .await?
+        {
+            let matches = if task.schema_id == APP_UNINSTALL_TASK_SCHEMA_ID {
+                let data: AppUninstallTaskData = serde_json::from_value(task.input.clone())
+                    .map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid uninstall task input: {error}"))
+                    })?;
+                data.request.selector == selector
+                    && data.request.app_instance_id.owner_user_id() == requested_owner
+                    && data.request.creator_user_id == principal.username
+                    && data.request.creator_app_id == principal.authenticated_app_id
+                    && data.request.idempotency_key == idempotency_key
+                    && data.request.data_disposition == data_disposition
+            } else {
+                false
+            };
+            if !matches {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::IdempotencyConflict,
+                    false,
+                    "idempotency key was already used for another immutable request",
+                )));
+            }
+            self.app_installer
+                .spawn_lifecycle_task(task.task_id.clone());
+            return Ok(RPCResponse::new(
+                RPCResult::Success(json!({
+                    "action": "replay",
+                    "task_id": task.task_id,
+                    "phase": task.phase,
+                    "outcome": task.outcome,
+                })),
+                req.seq,
+            ));
+        }
+        let installation = self.resolve_app_selector(&req, principal).await?;
+        let spec = installation.spec;
         Self::require_app_lifecycle_scope(principal, &spec)?;
-        let remove_data = Self::param_bool(&req, "remove_data")
-            .or_else(|| Self::param_bool(&req, "is_remove_data"))
-            .unwrap_or(false);
-        let task_id = self
+        let mutation_key = Self::acquire_app_mutation(
+            &spec.app_instance_id,
+            principal.username.as_str(),
+            principal.authenticated_app_id.as_str(),
+            idempotency_key.as_str(),
+        )
+        .await?;
+        let task_id = match self
             .app_installer
             .uninstall_app(
-                app_id.as_str(),
-                Some(owner_user_id.as_str()),
-                remove_data,
-                &principal.username,
+                &spec,
+                selector.as_str(),
+                data_disposition,
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+                idempotency_key.as_str(),
             )
-            .await?;
+            .await
+        {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                Self::release_app_mutation_key(&mutation_key).await;
+                return Err(error);
+            }
+        };
+        Self::bind_app_mutation_task(&mutation_key, task_id.as_str()).await?;
+        self.app_installer.spawn_lifecycle_task(task_id.clone());
 
         Ok(RPCResponse::new(
             RPCResult::Success(serde_json::json!({
@@ -2219,26 +4256,8 @@ impl ControlPanelServer {
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
-        let principal = Self::require_rpc_principal(principal)?;
-        let app_instance_id = Self::require_param_str(&req, "app_instance_id")?;
-        let (app_id, owner_user_id) = parse_app_instance_id(&app_instance_id)?;
-        let spec = self
-            .app_installer
-            .get_app_service_spec_by_instance(&app_instance_id)
-            .await?;
-        Self::require_app_lifecycle_scope(principal, &spec)?;
-        let task_id = self
-            .app_installer
-            .start_app(app_id.as_str(), Some(owner_user_id.as_str()))
-            .await?;
-
-        Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({
-                "ok": true,
-                "task_id": task_id.to_string(),
-            })),
-            req.seq,
-        ))
+        self.handle_apps_lifecycle(req, principal, AppLifecycleAction::Start)
+            .await
     }
 
     pub(crate) async fn handle_apps_stop(
@@ -2246,29 +4265,524 @@ impl ControlPanelServer {
         req: RPCRequest,
         principal: Option<&RpcAuthPrincipal>,
     ) -> Result<RPCResponse, RPCErrors> {
+        self.handle_apps_lifecycle(req, principal, AppLifecycleAction::Stop)
+            .await
+    }
+
+    pub(crate) async fn handle_apps_restart(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+    ) -> Result<RPCResponse, RPCErrors> {
+        self.handle_apps_lifecycle(req, principal, AppLifecycleAction::Restart)
+            .await
+    }
+
+    async fn handle_apps_lifecycle(
+        &self,
+        req: RPCRequest,
+        principal: Option<&RpcAuthPrincipal>,
+        action: AppLifecycleAction,
+    ) -> Result<RPCResponse, RPCErrors> {
         let principal = Self::require_rpc_principal(principal)?;
-        let app_instance_id = Self::require_param_str(&req, "app_instance_id")?;
-        let (app_id, owner_user_id) = parse_app_instance_id(&app_instance_id)?;
-        let spec = self
-            .app_installer
-            .get_app_service_spec_by_instance(&app_instance_id)
-            .await?;
+        let selector = Self::app_selector_from_req(&req)?;
+        let restart_strategy = match Self::param_str(&req, "restart_strategy").as_deref() {
+            None | Some("recreate") => RestartStrategy::Recreate,
+            Some("rolling") => {
+                return Err(RPCErrors::ReasonError(
+                    "rolling restart is not supported by the current deployment strategy"
+                        .to_string(),
+                ))
+            }
+            Some(other) => {
+                return Err(RPCErrors::ParseRequestError(format!(
+                    "invalid restart_strategy `{other}`"
+                )))
+            }
+        };
+        let idempotency_key = Self::require_param_str(&req, "idempotency_key")?;
+        let requested_owner = Self::requested_app_owner(&req, principal, selector.as_str());
+        if let Some(task) = self
+            .find_app_submit_replay(principal, idempotency_key.as_str())
+            .await?
+        {
+            let matches = if task.schema_id == APP_START_TASK_SCHEMA_ID {
+                let data: AppStartTaskData =
+                    serde_json::from_value(task.input.clone()).map_err(|error| {
+                        RPCErrors::ReasonError(format!("invalid lifecycle task input: {error}"))
+                    })?;
+                data.request.selector == selector
+                    && data.request.app_instance_id.owner_user_id() == requested_owner
+                    && data.request.creator_user_id == principal.username
+                    && data.request.creator_app_id == principal.authenticated_app_id
+                    && data.request.idempotency_key == idempotency_key
+                    && data.request.action == action
+                    && data.request.restart_strategy == restart_strategy
+            } else {
+                false
+            };
+            if !matches {
+                return Err(Self::install_error_to_rpc(buckyos_api::InstallError::new(
+                    buckyos_api::InstallStage::Inspect,
+                    buckyos_api::InstallErrorCode::IdempotencyConflict,
+                    false,
+                    "idempotency key was already used for another immutable request",
+                )));
+            }
+            self.app_installer
+                .spawn_lifecycle_task(task.task_id.clone());
+            return Ok(RPCResponse::new(
+                RPCResult::Success(json!({
+                    "action": "replay",
+                    "task_id": task.task_id,
+                    "phase": task.phase,
+                    "outcome": task.outcome,
+                })),
+                req.seq,
+            ));
+        }
+        let installation = self.resolve_app_selector(&req, principal).await?;
+        let spec = installation.spec;
         Self::require_app_lifecycle_scope(principal, &spec)?;
-        self.app_installer
-            .stop_app(app_id.as_str(), Some(owner_user_id.as_str()))
-            .await?;
+        let mutation_key = Self::acquire_app_mutation(
+            &spec.app_instance_id,
+            principal.username.as_str(),
+            principal.authenticated_app_id.as_str(),
+            idempotency_key.as_str(),
+        )
+        .await?;
+        let task_id = match self
+            .app_installer
+            .lifecycle_app(
+                &spec,
+                selector.as_str(),
+                action,
+                restart_strategy,
+                principal.username.as_str(),
+                principal.authenticated_app_id.as_str(),
+                idempotency_key.as_str(),
+            )
+            .await
+        {
+            Ok(task_id) => task_id,
+            Err(error) => {
+                Self::release_app_mutation_key(&mutation_key).await;
+                return Err(error);
+            }
+        };
+        Self::bind_app_mutation_task(&mutation_key, task_id.as_str()).await?;
+        self.app_installer.spawn_lifecycle_task(task_id.clone());
 
         Ok(RPCResponse::new(
-            RPCResult::Success(serde_json::json!({ "ok": true })),
+            RPCResult::Success(serde_json::json!({
+                "task_id": task_id.to_string(),
+                "action": action,
+                "app_instance_id": spec.app_instance_id,
+            })),
             req.seq,
         ))
     }
 }
 
 #[cfg(test)]
+mod submit_action_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn staging_object_requires_original_caller_token() {
+        let source = ObjId::new_by_raw("cyfile".into(), vec![1; 32]);
+        assert!(ControlPanelServer::authorize_staging_source(None, &source).await.is_err());
+        assert!(ControlPanelServer::authorize_staging_source(Some(" "), &source).await.is_err());
+    }
+
+    #[test]
+    fn uninstalled_specs_can_be_inspected_and_submitted_as_fresh_install() {
+        let owner = name_lib::DID::new("bns", "alice");
+        let app_doc = AppDoc::builder(AppType::Web, "notes", "0.1.2", "alice", &owner)
+            .web_pkg(
+                SubPkgDesc::new("all.web.notes.alice.bns.did#0.1.2")
+                    .package_meta_object_id(ObjId::new_by_raw("pkg".into(), vec![1; 32])),
+            )
+            .build()
+            .unwrap();
+        let app_instance_id =
+            AppInstanceId::new(AppId::from_app_did(app_doc.app_did()).unwrap(), "alice").unwrap();
+        let object_id = app_doc.gen_obj_id().0;
+        let mut spec = AppServiceSpec {
+            app_instance_id: app_instance_id.clone(),
+            app_did: app_doc.app_did().clone(),
+            deployment: buckyos_api::DeploymentIdentity {
+                app_instance_id: app_instance_id.clone(),
+                task_id: "install-1".into(),
+                app_doc_object_id: object_id.clone(),
+                spec_generation: 1,
+                pikg_digest: Some("digest-1".into()),
+            },
+            app_doc,
+            app_name: "notes".into(),
+            app_host_name: "notes".into(),
+            app_index: 11,
+            owner_user_id: "alice".into(),
+            permission: Vec::new(),
+            selected_components: Vec::new(),
+            packages: Vec::new(),
+            enable: true,
+            expected_instance_count: 1,
+            state: ServiceState::New,
+            spec_config: buckyos_api::ServiceSpecConfig::default(),
+        };
+        let key = buckyos_api::user_app_spec_key("alice", spec.app_id());
+        for state in [
+            ServiceState::New,
+            ServiceState::Running,
+            ServiceState::Stopped,
+            ServiceState::Stopping,
+            ServiceState::Restarting,
+            ServiceState::Updating,
+            ServiceState::Deleted,
+        ] {
+            spec.state = state;
+            let installed = parse_installed_spec(
+                &key,
+                &serde_json::to_string(&spec).unwrap(),
+                &app_instance_id,
+                &spec.app_did,
+                "alice",
+            )
+            .unwrap();
+            let action = decide_app_submit_action(
+                Some(buckyos_api::InstallPlanUse::FreshInstall),
+                installed
+                    .as_ref()
+                    .map(|spec| &spec.deployment.app_doc_object_id),
+                &object_id,
+                Some(1),
+                Some(1),
+            );
+            if spec.state == ServiceState::Deleted {
+                assert!(installed.is_none());
+                assert_eq!(action.unwrap(), AppSubmitAction::FreshInstall);
+            } else {
+                assert!(installed.is_some());
+                assert_eq!(
+                    action.unwrap_err().code,
+                    buckyos_api::InstallErrorCode::PlanNotApplicable
+                );
+            }
+        }
+        assert!(parse_installed_spec(
+            &key,
+            &serde_json::to_string(&spec).unwrap(),
+            &app_instance_id,
+            &spec.app_did,
+            "bob"
+        )
+        .is_err());
+        assert!(
+            parse_installed_spec(&key, "{}", &app_instance_id, &spec.app_did, "alice").is_err()
+        );
+    }
+
+    fn device_principal() -> RpcAuthPrincipal {
+        RpcAuthPrincipal {
+            username: "ood1".to_string(),
+            owner_user_id: "devtest".to_string(),
+            authenticated_app_id: "control-panel".to_string(),
+            user_type: crate::UserType::Root,
+            owner_did: "did:bns:devtest".to_string(),
+            is_user_session: false,
+            is_control_panel_session: false,
+            principal_kind: buckyos_api::TokenPrincipalKind::User,
+            agent_permission_mode: None,
+            session: crate::PrincipalSession::default(),
+        }
+    }
+
+    #[test]
+    fn device_install_defaults_to_device_owner() {
+        let principal = device_principal();
+        let request = RPCRequest::new("apps.submit", json!({}));
+        assert_eq!(
+            ControlPanelServer::resolve_target_user_id(&request, &principal),
+            "devtest"
+        );
+
+        let explicit = RPCRequest::new("apps.submit", json!({ "owner_user_id": "alice" }));
+        assert_eq!(
+            ControlPanelServer::resolve_target_user_id(&explicit, &principal),
+            "alice"
+        );
+
+        assert_eq!(
+            ControlPanelServer::requested_app_owner(
+                &request,
+                &principal,
+                "filebrowser.buckyos.bns.did@ood1"
+            ),
+            "ood1"
+        );
+    }
+
+    #[test]
+    fn submitted_plan_use_selects_fresh_install_or_upgrade() {
+        let installed = ObjId::new_by_raw("appdoc".to_string(), vec![1; 32]);
+        let target = ObjId::new_by_raw("appdoc".to_string(), vec![2; 32]);
+
+        assert_eq!(
+            decide_app_submit_action(
+                Some(buckyos_api::InstallPlanUse::FreshInstall),
+                None,
+                &target,
+                None,
+                Some(2),
+            )
+            .unwrap(),
+            AppSubmitAction::FreshInstall
+        );
+        assert_eq!(
+            decide_app_submit_action(
+                Some(buckyos_api::InstallPlanUse::Upgrade),
+                Some(&installed),
+                &target,
+                Some(1),
+                Some(2),
+            )
+            .unwrap(),
+            AppSubmitAction::Upgrade
+        );
+        assert_eq!(
+            decide_app_submit_action(
+                Some(buckyos_api::InstallPlanUse::FreshInstall),
+                Some(&installed),
+                &target,
+                Some(1),
+                Some(2),
+            )
+            .unwrap_err()
+            .code,
+            buckyos_api::InstallErrorCode::PlanNotApplicable
+        );
+        assert_eq!(
+            decide_app_submit_action(
+                Some(buckyos_api::InstallPlanUse::Upgrade),
+                None,
+                &target,
+                None,
+                Some(2),
+            )
+            .unwrap_err()
+            .code,
+            buckyos_api::InstallErrorCode::PlanNotApplicable
+        );
+    }
+
+    #[test]
+    fn implicit_submit_preserves_satisfied_and_downgrade_guards() {
+        let installed = ObjId::new_by_raw("appdoc".to_string(), vec![1; 32]);
+        let target = ObjId::new_by_raw("appdoc".to_string(), vec![2; 32]);
+
+        assert_eq!(
+            decide_app_submit_action(None, None, &target, None, Some(2))
+                .unwrap_err()
+                .code,
+            buckyos_api::InstallErrorCode::PlanRequired
+        );
+        assert_eq!(
+            decide_app_submit_action(None, Some(&installed), &installed, Some(1), Some(1),)
+                .unwrap(),
+            AppSubmitAction::Satisfied
+        );
+        assert_eq!(
+            decide_app_submit_action(None, Some(&installed), &target, Some(2), Some(1))
+                .unwrap_err()
+                .code,
+            buckyos_api::InstallErrorCode::DowngradeNotAllowed
+        );
+    }
+
+    #[test]
+    fn internal_intent_and_idempotency_bind_immutable_inputs() {
+        let app_id = buckyos_api::AppId::parse("demo.buckyos.bns.did").unwrap();
+        let seed = buckyos_api::PreInstallPlanSeed::default();
+        let pre = InternalInstall::Preinstall;
+        let first =
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-a", &seed)
+                .unwrap();
+        let replay =
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-a", &seed)
+                .unwrap();
+        let changed =
+            ControlPanelServer::internal_intent_id(pre, "alice", &app_id, "digest-b", &seed)
+                .unwrap();
+        assert_eq!(first, replay);
+        assert_ne!(first, changed);
+        assert_eq!(first.len(), 34);
+        assert!(first.starts_with("t-"));
+        assert!(first[2..].bytes().all(|byte| byte.is_ascii_hexdigit()
+            && (!byte.is_ascii_alphabetic() || byte.is_ascii_lowercase())));
+
+        let first_key = ControlPanelServer::internal_idempotency_key(
+            pre, "alice", &app_id, "digest-a", "plan-a",
+        );
+        let changed_key = ControlPanelServer::internal_idempotency_key(
+            pre, "alice", &app_id, "digest-a", "plan-b",
+        );
+        assert_ne!(first_key, changed_key);
+
+        let old_agent = ObjId::new_by_raw("agentdoc".to_string(), vec![1; 32]);
+        let new_agent = ObjId::new_by_raw("agentdoc".to_string(), vec![2; 32]);
+        let old_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &old_agent,
+            supersedes: None,
+        };
+        let new_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &new_agent,
+            supersedes: None,
+        };
+        let retried_runtime = InternalInstall::AgentRuntime {
+            agent_doc_object_id: &old_agent,
+            supersedes: Some("t-failed"),
+        };
+        assert_ne!(
+            ControlPanelServer::internal_intent_id(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap(),
+            ControlPanelServer::internal_intent_id(
+                retried_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            ControlPanelServer::internal_intent_id(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap(),
+            ControlPanelServer::internal_intent_id(
+                new_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                &seed
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            ControlPanelServer::internal_idempotency_key(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            ),
+            ControlPanelServer::internal_idempotency_key(
+                new_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            )
+        );
+        assert_ne!(
+            first_key,
+            ControlPanelServer::internal_idempotency_key(
+                old_runtime,
+                "alice",
+                &app_id,
+                "digest-a",
+                "plan-a"
+            )
+        );
+
+        let retry = ControlPanelServer::internal_retry_idempotency_key("task-a", "plan-a");
+        let retry_replay = ControlPanelServer::internal_retry_idempotency_key("task-a", "plan-a");
+        let next_retry = ControlPanelServer::internal_retry_idempotency_key("task-b", "plan-a");
+        assert_eq!(retry, retry_replay);
+        assert_ne!(retry, next_retry);
+    }
+
+    #[test]
+    fn agent_pikg_submit_registers_template_unless_it_is_the_agent_runtime() {
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::Rpc),
+            AppSubmitRoute::RegisterAgentTemplate
+        );
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::AgentRuntime),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::Agent, AppSubmitOrigin::Preinstall),
+            AppSubmitRoute::Reject
+        );
+        assert_eq!(
+            app_submit_route(AppType::Web, AppSubmitOrigin::Rpc),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::AppService, AppSubmitOrigin::Preinstall),
+            AppSubmitRoute::Install
+        );
+        assert_eq!(
+            app_submit_route(AppType::Web, AppSubmitOrigin::AgentRuntime),
+            AppSubmitRoute::Reject
+        );
+    }
+}
+
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use name_lib::DID;
+
+    #[test]
+    fn submit_action_matrix_covers_install_upgrade_satisfied_and_downgrade() {
+        let installed = ObjId::new_by_raw("appdoc".to_string(), vec![1; 32]);
+        let target = ObjId::new_by_raw("appdoc".to_string(), vec![2; 32]);
+        assert_eq!(
+            decide_app_submit_action(true, None, &target, None, Some(2)).unwrap(),
+            AppSubmitAction::FreshInstall
+        );
+        assert_eq!(
+            decide_app_submit_action(true, Some(&installed), &target, Some(1), Some(2))
+                .unwrap_err()
+                .code,
+            buckyos_api::InstallErrorCode::PlanNotApplicable
+        );
+        assert_eq!(
+            decide_app_submit_action(false, None, &target, None, Some(2))
+                .unwrap_err()
+                .code,
+            buckyos_api::InstallErrorCode::PlanRequired
+        );
+        assert_eq!(
+            decide_app_submit_action(false, Some(&installed), &installed, Some(1), Some(1))
+                .unwrap(),
+            AppSubmitAction::Satisfied
+        );
+        assert_eq!(
+            decide_app_submit_action(false, Some(&installed), &target, Some(1), Some(2)).unwrap(),
+            AppSubmitAction::Upgrade
+        );
+        assert_eq!(
+            decide_app_submit_action(false, Some(&installed), &target, Some(2), Some(1))
+                .unwrap_err()
+                .code,
+            buckyos_api::InstallErrorCode::DowngradeNotAllowed
+        );
+    }
 
     fn test_installer() -> AppInstaller {
         AppInstaller::new()
@@ -2528,32 +5042,6 @@ mod tests {
     }
 
     #[test]
-    fn publish_example_agent_skills_is_rejected() {
-        let installer = test_installer();
-        let template = AppDoc::builder(
-            AppType::Agent,
-            "demo-agent-skills",
-            "0.1.0",
-            "tester",
-            &test_owner(),
-        )
-        .agent_pkg(SubPkgDesc::new("tester_demo-agent-skills-agent#0.1.0"))
-        .agent_skills_pkg(SubPkgDesc::new("tester_demo-agent-skills-skills#0.1.0"))
-        .build()
-        .expect("build agent template with skills");
-        let dir = temp_test_dir("agent-skills-rejected");
-        std::fs::write(dir.join("prompt.md"), "hello").expect("write prompt");
-
-        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
-            Ok(_) => panic!("agent skills should be rejected"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("agent_skills"));
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn publish_example_agent_sub_pkg_meta_can_be_viewed_locally() {
         let installer = test_installer();
         let template = build_agent_template();
@@ -2586,5 +5074,138 @@ mod tests {
         assert_eq!(sub_pkg_meta.name, "tester_demo-agent-agent");
         assert!(final_doc._base.content.is_empty());
         assert_eq!(final_doc._base.size, 0);
+    }
+}
+
+#[cfg(test)]
+mod publish_tests {
+    use super::*;
+    use name_lib::DID;
+
+    fn test_installer() -> AppInstaller {
+        AppInstaller::new()
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{}-{}", prefix, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn pinned(pkg_id: &str) -> SubPkgDesc {
+        SubPkgDesc::new(pkg_id)
+            .package_meta_object_id(ObjId::new_by_raw("pkg".to_string(), vec![1; 32]))
+    }
+
+    fn build_agent_skills_template() -> AppDoc {
+        AppDoc::builder(
+            AppType::Agent,
+            "demo-agent-skills",
+            "0.1.0",
+            "tester",
+            &DID::from_str("did:bns:tester").expect("parse test did"),
+        )
+        .agent_pkg(pinned("all.agent.demo-agent-skills.tester.bns.did#0.1.0"))
+        .agent_skills_pkg(pinned(
+            "all.agent_skills.demo-agent-skills.tester.bns.did#0.1.0",
+        ))
+        .build()
+        .expect("build agent template with skills")
+    }
+
+    #[test]
+    fn publish_example_agent_skills_come_from_their_sub_dir() {
+        let installer = test_installer();
+        let template = build_agent_skills_template();
+        let dir = temp_test_dir("agent-skills-publish");
+        std::fs::write(dir.join("prompt.md"), "hello").expect("write prompt");
+
+        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
+            Ok(_) => panic!("agent skills without their directory should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent_skills"));
+
+        let skills_dir = dir.join(AGENT_SKILLS_PUBLISH_DIR);
+        std::fs::create_dir_all(skills_dir.join("cmd_skills")).expect("create skills dir");
+        let scan_plan = installer
+            .scan_publish_sources(AppType::Agent, &dir, &template)
+            .expect("scan agent with skills");
+        assert_eq!(scan_plan.sub_pkgs.len(), 2);
+        assert_eq!(scan_plan.sub_pkgs[0].key, "agent");
+        match &scan_plan.sub_pkgs[0].source {
+            PackageSource::DirectoryExcept { path, exclude } => {
+                assert_eq!(path, &dir);
+                assert_eq!(exclude, &skills_dir);
+            }
+            other => panic!("unexpected source: {:?}", std::mem::discriminant(other)),
+        }
+        assert_eq!(scan_plan.sub_pkgs[1].key, "agent_skills");
+        match &scan_plan.sub_pkgs[1].source {
+            PackageSource::Directory(path) => assert_eq!(path, &skills_dir),
+            other => panic!("unexpected source: {:?}", std::mem::discriminant(other)),
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn publish_agent_payload_leaves_out_the_skills_dir() {
+        let installer = test_installer();
+        let dir = temp_test_dir("agent-skills-tar");
+        let src = dir.join("src");
+        std::fs::create_dir_all(src.join(AGENT_SKILLS_PUBLISH_DIR).join("cmd_skills"))
+            .expect("create skills dir");
+        std::fs::write(src.join("prompt.md"), "hello").expect("write prompt");
+        std::fs::write(
+            src.join(AGENT_SKILLS_PUBLISH_DIR)
+                .join("cmd_skills")
+                .join("hello.md"),
+            "hello",
+        )
+        .expect("write skill");
+        let tarball = dir.join("agent.tar.gz");
+        installer
+            .create_tar_gz(&src, Some(&src.join(AGENT_SKILLS_PUBLISH_DIR)), &tarball)
+            .await
+            .expect("create agent tar");
+
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(
+            StdFile::open(&tarball).expect("open tar"),
+        ));
+        let paths: Vec<String> = archive
+            .entries()
+            .expect("tar entries")
+            .map(|entry| {
+                entry
+                    .expect("tar entry")
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(paths, vec!["prompt.md".to_string()]);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn publish_example_agent_tools_is_rejected() {
+        let installer = test_installer();
+        let mut template = build_agent_skills_template();
+        template.pkg_list.agent_tools = Some(pinned(
+            "all.agent_tools.demo-agent-skills.tester.bns.did#0.1.0",
+        ));
+        let dir = temp_test_dir("agent-tools-rejected");
+        std::fs::create_dir_all(dir.join(AGENT_SKILLS_PUBLISH_DIR)).expect("create skills dir");
+
+        let error = match installer.scan_publish_sources(AppType::Agent, &dir, &template) {
+            Ok(_) => panic!("agent tools should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("agent_tools"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

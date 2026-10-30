@@ -4,9 +4,9 @@
 
 1. **API Type 枚举**:Provider 必须从这个有限集合声明能力,新增需主版本升级。
 2. **一级逻辑目录**:用户/Agent 调用 AICC 时使用的 namespace。
-3. **Provider 逻辑挂点 + 物理型号索引**:供 `logical_mounts` 和 `items` 软链接使用。
+3. **厂商规格、模型家族与物理 instance**:LLM 通过 `items` 引用规格和固定家族预设，非 LLM 保留原有挂点设计。
 
-更新基线时间:2026-04-24。
+LLM 实现更新：2026-09-25，依据 `service/model_defaults.rs` 头部契约；非 LLM 内容保留 2026-04-24 基线。以下 LLM 结构已实现，离线验收见 [实现报告](model_driver_v2_implementation.md)，字段与 OpenAI 示例见 [Metadata 目标契约](driver_metadata_schema.md#llm-target-contract-vendor-specifications-and-model-families)。
 
 ---
 
@@ -18,10 +18,10 @@ API Type 决定 request/response schema。**Provider 不能自定义 api_type**,
 
 | api_type | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `llm.chat` | `messages[]`(可含 image/audio block) | `message` + 可选 `tool_calls` | 主流 chat completion,事实标准 |
-| `llm.completion` | `prompt: string` | `text: string` | 兼容老接口,新模型不必声明 |
+| `llm` | `messages[]`(可含 image/audio block) | `message` + 可选 `tool_calls` | 主流 chat completion,事实标准 |
 | `embedding.text` | `string \| string[]` | `number[][]` | 文本/代码 embedding |
 | `embedding.multimodal` | `text \| image \| (text+image)` | `number[][]` | CLIP 类跨模态 embedding |
+| `decision` | `state, questions[]` | `answers[]`（保留概率） | 独立混合类型问题求值 |
 | `rerank` | `query, docs[]` | `score[]` | Cross-encoder 重排序 |
 
 ### 1.2 图像类
@@ -44,7 +44,7 @@ API Type 决定 request/response schema。**Provider 不能自定义 api_type**,
 
 | api_type | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `audio.tts` | `text + voice_id` | `audio` | 文转语音 |
+| `audio.tts` | `text + voice contract` | `audio` | Provider/模型无关的文转语音 |
 | `audio.asr` | `audio` | `text + 可选 timestamps` | 语音识别(转录/字幕) |
 | `audio.music` | `prompt + duration` | `audio` | 音乐生成 |
 | `audio.enhance` | `audio + 任务参数` | `audio` | 降噪、人声分离、混响去除 |
@@ -53,11 +53,12 @@ API Type 决定 request/response schema。**Provider 不能自定义 api_type**,
 
 | api_type | 输入 | 输出 | 说明 |
 |---|---|---|---|
-| `video.txt2video` | `prompt + 参数` | `video` | 文生视频 |
-| `video.img2video` | `image + prompt` | `video` | 图生视频 |
-| `video.video2video` | `video + prompt` | `video` | 视频编辑/风格转换 |
-| `video.extend` | `video + prompt` | `video` | 视频续写 |
-| `video.upscale` | `video + scale` | `video` | 视频超分 |
+| `video.generate` | `prompt? + conditions[] + output?` | `videos[]` | 视频生成：文本、首尾帧（`keyframe`）、参考图/视频/音频 |
+| `video.edit` | `video + prompt` | `videos[]` | 视频编辑/风格转换 |
+| `video.extend` | `video + prompt` | `videos[]` | 视频续写 |
+| `video.upscale` | `video + scale` | `videos[]` | 视频超分 |
+
+视频请求、条件与能力合同见 [统一视频生成协议](video_generation.md)。
 
 ### 1.5 Agent Runtime Support 类
 
@@ -74,8 +75,9 @@ API Type 决定 request/response schema。**Provider 不能自定义 api_type**,
 
 | 一级目录 | 默认 api_type | fallback 策略 | 默认调度 profile |
 |---|---|---|---|
-| `llm` | `llm.chat`(主)、`llm.completion` | parent | balanced |
+| `llm` | `llm` | namespace-only；无 Parent fallback | 功能目录分别配置 |
 | `embedding` | `embedding.text`、`embedding.multimodal` | **strict**(向量空间不通用) | latency_first |
+| `decision` | `decision` | strict | cost_first |
 | `rerank` | `rerank` | strict | latency_first |
 | `image` | `image.*`、`vision.*` | parent within same api_type | quality_first |
 | `audio` | `audio.*` | strict(音色/语种不能跨) | latency_first(tts/asr)、quality_first(music) |
@@ -90,17 +92,14 @@ llm
 ├── chat       # 通用对话(默认入口)
 ├── plan       # 高质量规划(Agent 用)
 ├── code       # 代码任务
-├── reason     # 显式 reasoning(o1/r1/k2-thinking 类,延迟高)
 ├── vision     # 需要传图的对话(VLM)
 ├── swift      # 极速响应(短回复、低延迟)
-├── summarize  # 总结/抽取(gpt mini 默认挂载)
-├── summary    # 总结/抽取(可用便宜模型)
+├── summarize  # 总结/抽取，通过规格选择
 ├── translate  # 翻译
-├── long       # 超长上下文(>200k)
-└── fallback   # 兜底兜底
+└── fallback   # 默认空，只接收显式配置
 ```
 
-支持的 api_type:`llm.chat`(主)。`llm.completion` 只在历史模型上保留。
+支持的 api_type：`llm`。纯文本 completion 由调用方转换为单条 message，不定义独立 api_type。
 
 ### 2.2 `embedding` 子目录
 
@@ -149,9 +148,8 @@ audio
 
 ```
 video
-├── txt2video     # api_type: video.txt2video
-├── img2video     # api_type: video.img2video
-├── video2video   # api_type: video.video2video
+├── generate      # api_type: video.generate
+├── edit          # api_type: video.edit
 ├── extend        # api_type: video.extend
 └── upscale       # api_type: video.upscale
 ```
@@ -168,110 +166,50 @@ agent_runtime
 
 ## 三、模型逻辑挂点与物理型号索引
 
-### 设计约定
+### LLM 设计约定（目标）
 
-- **逻辑挂点**是 Provider 内稳定的 tier 名或角色目录挂载,永远代表该 tier / 角色下的最新可用版本,如 `llm.opus`、`llm.gemini-flash`、`llm.chat`。
-- **物理型号**是带版本号的具体快照,如 `claude-opus-4.7@anthropic`、`gpt-5.5@openai`,只用于复现、锁定、审计和 Provider 侧实际路由。
-- **任务抽象目录**默认通过内置树链接到 Provider 逻辑挂点,也允许 Provider inventory 直接挂载精确模型。OpenAI 当前按角色直接挂载:GPT nano -> `llm.swift`;GPT mini -> `llm.gpt-mini` + `llm.summarize`;GPT 标准非 pro -> `llm.chat` + `llm.code` + `llm.gpt-standard`;GPT pro -> `llm.plan` + `llm.reason`;其它 OpenAI LLM -> `llm.gpt`。
-- **家族目录**保留为 UI 展示、用户偏好和物理型号索引用途。物理型号可以同时归入家族目录,但不作为任务抽象目录的直接 target。
-- **挂载受 `min_line` admission 约束**:逻辑模型名可带 `LogicalModelDefinition`(`min_line` / `disable_line` / `mount_mode`,见 `doc/aicc/aicc_router.md` §6.7)。无论是 Provider inventory 的 `logical_mounts` 还是 auto-mount,候选模型都必须满足该逻辑模型名的 `min_line`(如 `tool_call` / `json_schema` / `min_context_tokens`)才能挂入;不满足的模型被过滤,原因写入 route trace。`mount_mode=auto/hybrid` 时,满足 `min_line` 的 inventory 模型会被自动挂载,无需逐个手配 item。
-- **reasoning 档位是精确模型 variant**:同一 base model 的不同 reasoning effort 表现为不同精确模型(如 `gpt-5.1:reasoning-high@openai`),由 driver metadata 的 `variants` 展开,而不是普通请求参数。
+- **功能目录**如 `llm.plan`、`llm.chat`，通过带偏好权重的 item 引用厂商规格。功能目录不直接接收 inventory 的 exact model，也不使用通用 Auto/Hybrid 按能力自动吸入模型。
+- **规格目录**由每个原厂 Model Driver 的 `specs` 独立声明，路径为 `llm.{spec.id}`。规格名不带版本号；既可以是产品线，也可以是 code/highspeed 等专用规格，没有跨厂商统一档位。
+- **模型家族目录**通常为 `llm.{归一化官方模型ID}`，如 `llm.gpt-5-6-sol`；它是确定官方模型的可选择入口，也是多个物理 instance 的汇集处。官方 ID 中的小数点等分隔符归一为连字符，保留原始 ID 用于匹配/调用，并校验与功能、规格和其他家族的重名。
+- **固定思考预设**表示为 `llm.gpt-5-6-sol:high`；`:high` 是预设选择器，不是逻辑子目录。模型条目通过主规格及 `additional_specs` 明确每个规格采用的预设和权重，家族直选的默认预设另行声明。只能声明实际支持的强度；`none`、`thinking`、`native` 分别表示关闭、仅开关的开启、不可调原生行为。
+- **物理 instance**沿用 exact model 身份，例如 `gpt-5.6-sol:reasoning-high@provider-a`。不同渠道的模型名先由 Provider Rules/discovery 归一到同一官方身份，才能共享家族。渠道不支持所需预设时跳过该实例，不能静默换成另一个思考强度。
+- 自定义 Provider 没有专用 Rules、且使用协议族默认 Adapter 时，复用该协议默认 Rules 中匹配模型的思考强度映射，生成可执行的家族预设。`reasoning-high` 属于 AICC 的精确模型身份，请求发往远端时仍使用原始模型名，并单独传递协议要求的思考参数。
+- **能力约束与偏好分开**：家族、预设和实例仍必须通过原任务/request 的能力、库存、Provider 状态及策略筛选；能力合格不等于可以绕过规格归属。
 
-### 3.1 `llm` Provider 逻辑挂点目录
+### 3.1 `llm` 规格、家族与实例
 
-```
+以下是 OpenAI 目标结构的局部示意。五个通用规格为 `gpt-nano/mini/standard/pro/max`，`gpt-codex` 是额外的专用规格。具体归档及功能权重以 `model_defaults.rs` 头部设计为准，规格由 metadata 声明，功能权重由 builtin overlay 维护。
+
+```text
 llm
-├── gpt-standard         # OpenAI 标准多模态 GPT
-├── opus                 # Anthropic 旗舰推理与 agentic 编排
-├── sonnet               # Anthropic 性价比主力
-├── haiku                # Anthropic 轻量快速
-├── gemini-deepthink     # Google Deep Think 极限推理
-├── gemini-pro           # Google Gemini Pro 旗舰推理
-├── gemini-flash         # Google Gemini Flash 平衡速度/能力
-├── gemini-flash-lite    # Google Gemini Flash-Lite 高吞吐极轻量
-├── grok-heavy           # xAI Grok Heavy 多 agent 重型
-├── grok                 # xAI Grok 旗舰
-├── grok-fast            # xAI Grok Fast 低成本低延迟
-├── deepseek-pro         # DeepSeek 旗舰
-├── deepseek-flash       # DeepSeek 平衡速度与成本
-├── deepseek-reasoner    # DeepSeek R 系列独立推理线
-├── qwen-max             # Alibaba Qwen 旗舰
-├── qwen-plus            # Alibaba Qwen 主力均衡
-├── qwen-coder           # Alibaba Qwen 编码专精
-├── qwen-small           # Alibaba Qwen 本地/边缘部署
-├── glm                  # Z.ai GLM 旗舰
-├── glm-flash            # Z.ai GLM 轻量
-├── kimi                 # Moonshot Kimi 旗舰
-└── kimi-thinking        # Moonshot Kimi 推理线
+├── plan
+│   └── gpt_pro -> llm.gpt-pro (2.3，功能偏好)
+├── gpt-nano                  [规格；可为空]
+├── gpt-mini                  [规格；可为空]
+├── gpt-standard              [规格；可为空]
+├── gpt-pro                   [规格]
+│   ├── llm.gpt-5-6-sol -> llm.gpt-5-6-sol:high (56，metadata llm.weight)
+│   └── llm.gpt-5-5-pro -> llm.gpt-5-5-pro:high (55，metadata llm.weight)
+├── gpt-max                   [规格；可为空]
+├── gpt-codex                 [专用规格；可为空]
+├── gpt-5-6-sol               [动态家族]
+│   └── :high                [固定预设；不是 .high 子目录]
+│       ├── provider_a -> gpt-5.6-sol:reasoning-high@provider-a
+│       └── provider_b -> gpt-5.6-sol:reasoning-high@provider-b
+└── gpt-5-5-pro               [动态家族]
+    └── :high
+        └── provider_a -> gpt-5.5-pro:reasoning-high@provider-a
 ```
 
-#### 主流 AI Provider 逻辑挂点清单(2026-04 基线)
+上图假设两个 Provider 的调用 ID 相同；渠道 ID 不同时，exact target 使用各自真实 ID，家族仍按官方身份合并。`56/55` 是 model-driver metadata 为各模型声明的 `llm.weight`，Registry 原样写入规格到家族的默认 item 权重，路由不从模型名解析版本；该权重只在同一规格内比较，不与功能偏好 `2.3` 相乘，也不与其它规格或厂商的权重比较，因此不同系列重复使用 `55` 没有冲突。多个 Provider 不增加规格到家族的引用次数或权重；家族到 instance 的默认权重为 `1.0`。两层权重都可通过 `item_overrides` 覆盖（只改权重，不改成员归属），覆盖值、默认值及来源在目录视图和 trace 中可见。
 
-| Provider | 逻辑挂点 | 当前指向 | 定位 |
-|---|---|---|---|
-| OpenAI | `llm.plan` + `llm.reason` | GPT-5.5 Pro | 研究级深度推理 |
-| OpenAI | `llm.chat` / `llm.code` / `llm.gpt-standard` | GPT-5.5 | 标准多模态 GPT,旗舰对话与编码 |
-| OpenAI | `llm.gpt-mini` + `llm.summarize` | GPT-5.4-mini | 低延迟、低成本主力 |
-| OpenAI | `llm.swift` | GPT-5.4-nano | 极轻量、批量场景 |
-| OpenAI | `llm.gpt` | o-series 等其它 OpenAI LLM | 非标准 GPT tier 的 OpenAI LLM |
-| Anthropic | `llm.opus` | Claude Opus 4.7 | 最强推理与 agentic 编排 |
-| Anthropic | `llm.sonnet` | Claude Sonnet 4.6 | 性价比主力,接近 Opus |
-| Anthropic | `llm.haiku` | Claude Haiku 4.5 | 轻量快速 |
-| Google | `llm.gemini-deepthink` | Gemini 3 Deep Think | Ultra 订阅专享,极限推理 |
-| Google | `llm.gemini-pro` | Gemini 3.1 Pro | 旗舰推理 |
-| Google | `llm.gemini-flash` | Gemini 3 Flash | 平衡速度/能力 |
-| Google | `llm.gemini-flash-lite` | Gemini 3.1 Flash-Lite | 高吞吐成本敏感极轻量 |
-| xAI | `llm.grok-heavy` | Grok 4.3 / Grok 4 Heavy | 多 agent 并行重型 |
-| xAI | `llm.grok` | Grok 4.20 | 旗舰,四 agent 架构 |
-| xAI | `llm.grok-fast` | Grok 4.1 Fast | 低成本低延迟 |
-| DeepSeek | `llm.deepseek-pro` | DeepSeek-V4-Pro | 旗舰 |
-| DeepSeek | `llm.deepseek-flash` | DeepSeek-V4-Flash | 平衡速度与成本 |
-| DeepSeek | `llm.deepseek-reasoner` | DeepSeek R 系列 | 独立推理线 |
-| Alibaba | `llm.qwen-max` | Qwen 3.6 Plus | 旗舰,1M context、原生 function calling |
-| Alibaba | `llm.qwen-plus` | Qwen 3.5 系列 | 主力均衡 |
-| Alibaba | `llm.qwen-coder` | Qwen 3 Coder | 编码专精线 |
-| Alibaba | `llm.qwen-small` | Qwen 3.5 9B / 27B | 本地/边缘部署 |
-| Z.ai | `llm.glm` | GLM-5.1 | 旗舰 |
-| Z.ai | `llm.glm-flash` | GLM-4.7 Flash / GLM-5 Flash | 轻量本地 |
-| Moonshot | `llm.kimi` | Kimi K2.6 | 旗舰 |
-| Moonshot | `llm.kimi-thinking` | Kimi K2 Thinking | 推理线 |
+零 Provider 时只保留功能目录、声明的规格及功能到规格的引用。metadata 与有效 inventory 相交后才创建家族及预设；最后一个对应实例消失时删除动态家族和引用，规格恢复为空。官方 Provider 下线不删除其他渠道仍可提供的家族，也不删除其模型定义。
 
-#### 物理型号索引示例
+选择分两阶段。阶段一逐层展开：功能目录、规格、家族预设各自只展开本层可用 item 中权重最大的一组，并列全部展开；某组没有任何可用候选（无库存、admission 不满足、运行状态或策略被硬过滤）时才尝试同层下一权重组，全部不可用则该目录为空。同权重规格不按规格 ID 提前淘汰，而是各自展开后共同进入阶段二。阶段二把展开得到的合格 instance 合并成候选池，按调度 profile（默认成本优先）选择，策略项全部相同时按默认顺序（配置书写顺序；家族按路径、instance 按 exact model 名）。`stability = experimental` 只是准入条件：请求未允许实验版时硬过滤，允许后不再被隐式排在稳定版之后。运行时 failover 只在本轮候选池内进行。
 
-物理型号只作为逻辑挂点的当前指向或可锁定快照存在。OpenAI GPT 由 Provider inventory 直接挂载到角色目录;其它 Provider 主要通过家族挂点进入角色目录。
+任务、规格、家族没有隐式 Parent fallback；`llm` 不收集模型，`llm.fallback` 默认空。家族直选默认 strict，使用声明的默认预设，不自动升级其他家族。显式 fallback 保留原请求及原任务约束。每个规格须被功能引用或标记 `direct_only`，后者不能通过功能或 fallback 暗中接入。
 
-| 逻辑挂点 | 物理型号 | 家族 | api_type | attributes.tier |
-|---|---|---|---|---|
-| `llm.plan` / `llm.reason` | `gpt-5.5-pro@openai` | openai | llm.chat | flagship |
-| `llm.chat` / `llm.code` / `llm.gpt-standard` | `gpt-5.5@openai` | openai | llm.chat | flagship |
-| `llm.gpt-mini` / `llm.summarize` | `gpt-5.4-mini@openai` | openai | llm.chat | mid |
-| `llm.swift` | `gpt-5.4-nano@openai` | openai | llm.chat | nano |
-| `llm.gpt` | `o1-2024-12-17@openai` | openai | llm.chat | flagship |
-| `llm.opus` | `claude-opus-4.7@anthropic` | claude | llm.chat | flagship |
-| `llm.sonnet` | `claude-sonnet-4.6@anthropic` | claude | llm.chat | mid |
-| `llm.haiku` | `claude-haiku-4.5@anthropic` | claude | llm.chat | nano |
-| `llm.gemini-deepthink` | `gemini-3-deepthink@google` | gemini | llm.chat | flagship |
-| `llm.gemini-pro` | `gemini-3.1-pro@google` | gemini | llm.chat | flagship |
-| `llm.gemini-flash` | `gemini-3-flash@google` | gemini | llm.chat | mid |
-| `llm.gemini-flash-lite` | `gemini-3.1-flash-lite@google` | gemini | llm.chat | nano |
-| `llm.grok-heavy` | `grok-4-heavy@xai` | grok | llm.chat | flagship |
-| `llm.grok` | `grok-4.20@xai` | grok | llm.chat | flagship |
-| `llm.grok-fast` | `grok-4.1-fast@xai` | grok | llm.chat | mid |
-| `llm.deepseek-pro` | `deepseek-v4-pro@deepseek` | deepseek | llm.chat | flagship |
-| `llm.deepseek-flash` | `deepseek-v4-flash@deepseek` | deepseek | llm.chat | mid |
-| `llm.deepseek-reasoner` | `deepseek-r@deepseek` | deepseek | llm.chat | flagship |
-| `llm.qwen-max` | `qwen-3.6-plus@alibaba` | qwen | llm.chat | flagship |
-| `llm.qwen-plus` | `qwen-3.5-plus@alibaba` | qwen | llm.chat | mid |
-| `llm.qwen-coder` | `qwen-3-coder@alibaba` | qwen | llm.chat | flagship |
-| `llm.qwen-small` | `qwen-3.5-9b@local` | qwen | llm.chat | nano |
-| `llm.kimi` | `kimi-k2.6@moonshot` | kimi | llm.chat | flagship |
-| `llm.kimi-thinking` | `kimi-k2-thinking@moonshot` | kimi | llm.chat | flagship |
-| `llm.glm` | `glm-5.1@zai` | glm | llm.chat | flagship |
-| `llm.glm-flash` | `glm-5-flash@zai` | glm | llm.chat | nano |
-
-**Reasoning 角色专属**:`llm.reason` 默认只挂载支持强 reasoning / thinking 的逻辑挂点,如 `llm.gemini-deepthink`、`llm.opus`、OpenAI GPT Pro 直接挂载、`llm.grok-heavy`、`llm.deepseek-reasoner`、`llm.kimi-thinking`。具体物理型号由对应 Provider 挂点解析。
-
-**Vision 角色**:`llm.vision` 挂载支持图像输入的逻辑挂点,如 `llm.gpt-standard`、`llm.gemini-pro`、`llm.opus`。纯文本逻辑挂点通过 Provider metadata 过滤。
+以下非 LLM 家族目录保留原有设计，不套用本节的规格规则。
 
 ### 3.2 `embedding` 家族目录
 
@@ -410,23 +348,25 @@ video
 
 | 精确模型 | 家族 | 任务挂载 |
 |---|---|---|
-| `seedance-2.0@bytedance` | seedance | video.txt2video、video.img2video |
-| `kling-3.0@kling` | kling | video.txt2video、video.img2video |
-| `kling-3.0-omni@kling` | kling | video.video2video |
-| `wan-2.7@alibaba` | wan | video.img2video |
-| `sora-2@openai` | sora | video.txt2video |
-| `veo-3@google` | veo | video.txt2video |
-| `pixverse-v5@pixverse` | pixverse | video.txt2video |
+| `seedance-2.0@bytedance` | seedance | video.generate |
+| `kling-3.0@kling` | kling | video.generate |
+| `kling-3.0-omni@kling` | kling | video.edit |
+| `wan-2.7@alibaba` | wan | video.generate |
+| `sora-2@openai` | sora | video.generate |
+| `veo-3@google` | veo | video.generate |
+| `pixverse-v5@pixverse` | pixverse | video.generate |
 | `grok-imagine-video@xai` | grok_imagine | video.extend |
-| `hunyuan-video@local` | hunyuan_video | video.txt2video |
+| `hunyuan-video@local` | hunyuan_video | video.generate |
 | `topaz-video-upscale@topaz` | topaz_video | video.upscale |
+
+各模型在 `video.generate` 下支持哪些条件（纯文本、首帧、首尾帧、参考素材）以及能否挂到 `video.edit`，以模型能力合同为准；当前 Provider 支持矩阵见 [video_generation.md](video_generation.md) §7。
 
 
 ---
 
-## 四、配置示例:一份完整系统全局 routing config
+## 四、全局 routing config 示意
 
-把上面的目录树落到 AICC 系统配置时，写入 `services/aicc/settings.routing_config`。AICC 读取配置时会先加载默认逻辑目录配置，再叠加这份 system_config 配置；request/session 配置只在调用期继续叠加。
+以下沿用本文 YAML 展示形式说明功能到规格的偏好，不是当前公共 DTO 的可直接写入配置；LLM 部分为新设计，非 LLM 示例保留原基线。实际 overlay 结构与 factory/system/user/session 顺序见 [冻结设计](frozen_model_driver_and_logical_model_fs.md)。规格及动态家族由 metadata/inventory 生成，无须在路由偏好里重复声明。
 
 ```yaml
 routing_config:
@@ -435,128 +375,87 @@ routing_config:
   default_profile: balanced
   
   logical_tree:
-    # ===== LLM =====
+    # ===== LLM：局部示意，其余功能权重见 model_defaults.rs 头部契约 =====
+    llm.chat:
+      items:
+        - { name: gpt_standard, target: llm.gpt-standard, weight: 2.2 }
+        - { name: gpt_mini, target: llm.gpt-mini, weight: 1.4 }
+      fallback: { mode: disabled }
+
     llm.plan:
       items:
-        opus:     { target: llm.opus,      weight: 2.5 }
-        gemini:   { target: llm.gemini-pro, weight: 2.4 }
-        qwen_max: { target: llm.qwen-max,  weight: 1.8 }
-        deepseek: { target: llm.deepseek-pro, weight: 1.5 }
-      fallback: { mode: parent }
+        - { name: gpt_max, target: llm.gpt-max, weight: 3.2 }
+        - { name: gpt_pro, target: llm.gpt-pro, weight: 3.1 }
+      fallback: { mode: disabled }
       profile: quality_first
 
     llm.code:
       items:
-        opus:        { target: llm.opus,        weight: 2.5 }
-        gemini:      { target: llm.gemini-pro,  weight: 2.4 }
-        qwen_coder:  { target: llm.qwen-coder,  weight: 2.0 }
-        kimi:        { target: llm.kimi,        weight: 2.0 }
-        glm:         { target: llm.glm,         weight: 1.5 }
-        deepseek:    { target: llm.deepseek-pro, weight: 1.5 }
-      fallback: { mode: parent }
+        - { name: gpt_codex, target: llm.gpt-codex, weight: 3.2 }
+        - { name: gpt_standard, target: llm.gpt-standard, weight: 3.0 }
+      fallback: { mode: disabled }
 
     llm.swift:
       items:
-        haiku:        { target: llm.haiku,             weight: 2.5 }
-        flash_lite:   { target: llm.gemini-flash-lite, weight: 2.5 }
-        grok_fast:    { target: llm.grok-fast,         weight: 2.0 }
-        qwen_small:   { target: llm.qwen-small,        weight: 2.0 }
-        glm_flash:    { target: llm.glm-flash,         weight: 1.5 }
-      fallback: { mode: parent }
+        - { name: gpt_nano, target: llm.gpt-nano, weight: 1.1 }
+      fallback: { mode: disabled }
       profile: latency_first
 
-    llm.summarize:
-      item_overrides: {}
-      fallback: { mode: parent }
-      profile: cost_first
-
-    llm.reason:
-      items:
-        gemini_deepthink: { target: llm.gemini-deepthink,  weight: 2.5 }
-        opus:             { target: llm.opus,              weight: 2.5 }
-        grok_heavy:       { target: llm.grok-heavy,        weight: 2.0 }
-        kimi_thinking:    { target: llm.kimi-thinking,     weight: 2.0 }
-        deepseek_reasoner: { target: llm.deepseek-reasoner, weight: 2.0 }
-      fallback: { mode: disabled }   # reason 任务不允许降级
-      profile: quality_first
-
-    llm.vision:
-      items:
-        gpt:    { target: llm.gpt-standard, weight: 3.0 }
-        opus:   { target: llm.opus,       weight: 2.5 }
-        gemini: { target: llm.gemini-pro, weight: 2.5 }
-        qwen:   { target: llm.qwen-max,   weight: 1.0 }
-      fallback: { mode: parent }
-
-    llm.long:
-      items:
-        gemini:  { target: llm.gemini-pro, weight: 2.0 }
-        qwen:    { target: llm.qwen-max,   weight: 2.0 }
-        sonnet:  { target: llm.sonnet,     weight: 1.5 }
-      fallback: { mode: parent }
-
     llm.fallback:
-      items:
-        haiku:      { target: llm.haiku,             weight: 1.0 }
-        flash_lite: { target: llm.gemini-flash-lite, weight: 1.0 }
-        qwen_small: { target: llm.qwen-small,        weight: 1.0 }
+      items: []
       fallback: { mode: disabled }
 
     # ===== Embedding =====
     embedding.text:
       items:
-        bge:       { target: bge-m3@local, weight: 2.0 }
-        voyage:    { target: voyage-3@voyageai, weight: 2.0 }
-        openai:    { target: text-embedding-3-large@openai, weight: 1.0 }
+        - { name: bge, target: bge-m3@local, weight: 2.0 }
+        - { name: voyage, target: voyage-3@voyageai, weight: 2.0 }
+        - { name: openai, target: text-embedding-3-large@openai, weight: 1.0 }
       fallback: { mode: strict }   # 向量空间不通用
 
     # ===== Image =====
     image.txt2img:
       items:
-        flux:     { target: image.flux,     weight: 2.5 }
-        seedream: { target: image.seedream, weight: 2.0 }
-        imagen:   { target: image.imagen,   weight: 2.5 }
-        sd_local: { target: image.sd,       weight: 1.0 }
+        - { name: seedream, target: image.seedream, weight: 2.0 }
       fallback: { mode: parent }
       profile: quality_first
 
     image.img2img:
       items:
-        kontext:  { target: image.flux_kontext, weight: 2.0 }
-        seedream: { target: image.seedream,     weight: 2.0 }
-        gpt_img:  { target: gpt-image-1@openai, weight: 2.0 }
+        - { name: kontext, target: image.flux_kontext, weight: 2.0 }
+        - { name: gpt_img, target: gpt-image-1@openai, weight: 2.0 }
       fallback: { mode: parent }
 
     image.upscale:
       items:
-        topaz: { target: image.topaz, weight: 2.0 }
-        esrgan:{ target: image.real_esrgan, weight: 1.0 }
+        - { name: topaz, target: image.topaz, weight: 2.0 }
+        - { name: esrgan, target: image.real_esrgan, weight: 1.0 }
       fallback: { mode: parent }
 
     # ===== Audio =====
     audio.tts:
       items:
-        eleven: { target: eleven-v3@elevenlabs, weight: 2.5 }
-        openai: { target: tts-1-hd@openai, weight: 2.0 }
-        kokoro: { target: kokoro-82m@local, weight: 1.0 }
+        - { name: eleven, target: eleven-v3@elevenlabs, weight: 2.5 }
+        - { name: openai, target: tts-1-hd@openai, weight: 2.0 }
+        - { name: kokoro, target: kokoro-82m@local, weight: 1.0 }
       fallback: { mode: strict }   # 音色不能换
       profile: latency_first
 
     audio.asr:
       items:
-        whisper_local: { target: whisper-large-v3@local, weight: 2.5 }
-        sensevoice:    { target: sensevoice-small@local, weight: 2.0 }
-        whisper_api:   { target: whisper-1@openai, weight: 1.0 }
+        - { name: whisper_local, target: whisper-large-v3@local, weight: 2.5 }
+        - { name: sensevoice, target: sensevoice-small@local, weight: 2.0 }
+        - { name: whisper_api, target: whisper-1@openai, weight: 1.0 }
       fallback: { mode: parent }
       profile: latency_first
 
     # ===== Video =====
-    video.txt2video:
+    video.generate:
       items:
-        kling:    { target: kling-3.0@kling, weight: 2.5 }
-        seedance: { target: seedance-2.0@bytedance, weight: 2.5 }
-        veo:      { target: veo-3@google, weight: 2.0 }
-        sora:     { target: sora-2@openai, weight: 2.0 }
+        - { name: kling, target: kling-3.0@kling, weight: 2.5 }
+        - { name: seedance, target: seedance-2.0@bytedance, weight: 2.5 }
+        - { name: veo, target: veo-3@google, weight: 2.0 }
+        - { name: sora, target: sora-2@openai, weight: 2.0 }
       fallback: { mode: parent }
       profile: quality_first
 
@@ -566,7 +465,7 @@ routing_config:
     blocked_provider_instances: []
 ```
 
-实现中这份内置树以 `item_overrides` 形式应用,不会覆盖 Provider inventory 直接挂到同一角色目录的精确模型。
+LLM 目标中，功能 item 只引用已声明规格；Provider inventory 的物理实例归入动态家族预设，不直接挂入功能目录。显式 overlay 调整偏好后仍须通过规格引用和图校验。
 
 ---
 
@@ -576,3 +475,7 @@ routing_config:
 2. **图像家族中模型变体的层级**:如 `flux-dev` / `flux-schnell` / `flux-1.1-pro` 都属于 `flux` 家族,但延迟和质量差一档。应在 attributes 中加 `tier: flagship/mid/swift`。
 3. **`agent_runtime` 的 fallback 语义**:跨 sandbox 的环境状态不通用(local Docker 启动的容器在云端 E2B 看不到),实际上 strict 更合理。但 strict 会让 fallback 失效,需要在 Provider 层做"会话级 sandbox 粘性"。
 4. **多模态 any-to-any 的 schema 收敛**:暂时让 OpenAI GPT 角色挂点、`llm.gemini-pro`、`llm.qwen-max` 这类逻辑挂点各自挂多个目录。等业界 API 形态收敛后再考虑合并 namespace。
+
+## Decision 逻辑入口（2026-09-25）
+
+一级入口新增 `decision`，采用非 LLM Hybrid 挂点、strict 回退和 cost_first 调度。零 Provider 时保留目录但无候选。TypeSafe 模型挂点为 `decision`、`decision.typesafe` 与模型子路径，不归入 LLM 规格或 effort。题型、结构化输入与容量约束在逻辑、exact 和 preview 路由均生效。完整契约、示例及核验来源见 [Decision API](decision_api.md)。

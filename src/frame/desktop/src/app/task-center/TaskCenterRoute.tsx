@@ -1,8 +1,9 @@
 /* ── TaskCenter standalone route – supports ?taskid=xxx ── */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useI18n } from '../../i18n/provider'
+import { useDocumentTitle } from '../../presentation/documentHead'
 import { useThemeMode } from '../../theme/provider'
 import { StandaloneAppTitleBar } from '../../desktop/StandaloneAppTitleBar'
 import { MobileNavProvider } from '../../desktop/windows/MobileNavContext'
@@ -44,10 +45,12 @@ function PageRouter({
 export function TaskCenterRoute() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
-  const { locale } = useI18n()
+  const { locale, t } = useI18n()
+  useDocumentTitle(t('apps.taskCenter'))
   const { themeMode } = useThemeMode()
   const taskId = searchParams.get('taskid') ?? undefined
   const [store] = useState(() => createTaskCenterModel())
+  useEffect(() => () => store.dispose(), [store])
 
   return (
     <main className="flex h-dvh min-h-dvh flex-col bg-[color:var(--cp-bg)] px-0 py-0 md:block md:h-auto md:px-5 md:py-5">

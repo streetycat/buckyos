@@ -21,7 +21,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUCKYOS_ROOT="${BUCKYOS_ROOT:-/opt/buckyos}"
-APP_ID="buckyos_systest"
+APP_ID="buckyos-systest.buckyos.bns.did"
 OWNER_USER_ID="devtest"
 
 if [[ $# -gt 0 && "${1}" != -* ]]; then
@@ -74,6 +74,8 @@ fi
 mkdir -p "${TARGET_ROOT}"
 install -m 0644 "${SOURCE_ROOT}/deno.json" "${TARGET_ROOT}/deno.json"
 install -m 0644 "${SOURCE_ROOT}/main.ts" "${TARGET_ROOT}/main.ts"
+install -m 0644 "${SOURCE_ROOT}/static_web.ts" "${TARGET_ROOT}/static_web.ts"
+install -m 0644 "${SOURCE_ROOT}/xllm_selftest.ts" "${TARGET_ROOT}/xllm_selftest.ts"
 rm -rf "${TARGET_ROOT}/dist"
 cp -R "${SOURCE_ROOT}/dist" "${TARGET_ROOT}/dist"
 

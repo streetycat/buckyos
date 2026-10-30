@@ -1,0 +1,2872 @@
+pub(crate) mod policy;
+
+use crate::canonical::{resolve_canonical_field, CanonicalMatchQuality};
+use crate::error::{ModelRegistryError, RoutingError};
+use crate::model::logical_item_source_name;
+use crate::model::{
+    AdmissionRecord, ExactModelName, ExpansionState, ExpansionStep, FallbackStep, ModelRegistry,
+    RegisteredModel, RegistryCandidate,
+};
+use buckyos_api::{
+    features, AiccFallbackMode, AiccFallbackRule, AiccSchedulerProfile, AiccSchedulerProfileConfig,
+    AiccSchedulerProfileWeights, ApiType, Capability, Feature, ModelDisable, ModelRequirement,
+    Money,
+};
+#[allow(unused_imports)]
+pub(crate) use policy::{
+    policy_engine_for_route, resolve_effective_routing_policy, scheduler_profile_for_route_profile,
+    CallerIdentity, EffectiveRoutingPolicy, PolicyEngine, QuotaLookup, QuotaSnapshot,
+    QuotaSourceFactory, QuotaTruthPort,
+};
+use policy::{
+    CandidatePolicyInput, CredentialScope, LocalityPreference, PolicyReason, ProviderPrivacy,
+    ProviderTrustView, ProviderType, QuotaSource, RequestPolicyInput,
+};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
+
+const FALLBACK_DEPTH_LIMIT: usize = 5;
+const EPSILON: f64 = 1e-12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RouteModelKind {
+    Exact,
+    Logical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProviderHealthStatus {
+    Available,
+    Degraded,
+    Unavailable,
+    CircuitOpen,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CandidateRuntimeState {
+    pub enabled: bool,
+    pub credential_available: bool,
+    pub model_available: bool,
+    pub health: ProviderHealthStatus,
+    pub provider_privacy: ProviderPrivacy,
+    pub trust: Option<ProviderTrustView>,
+    pub credential_scope: CredentialScope,
+    pub estimated_cost: Option<Money>,
+    pub p50_latency_ms: Option<f64>,
+    pub p95_latency_ms: Option<f64>,
+    pub error_rate_5m: Option<f64>,
+    pub recent_failures: u32,
+    pub cache_hit_probability: Option<f64>,
+}
+
+impl CandidateRuntimeState {
+    fn is_local(&self) -> bool {
+        self.trust
+            .as_ref()
+            .is_some_and(|trust| trust.provider_type == ProviderType::LocalInference)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RoutingRequest {
+    pub trace_id: String,
+    pub request_id: String,
+    pub model: String,
+    pub api_type: ApiType,
+    pub method: String,
+    pub capability: Capability,
+    pub requirements: ModelRequirement,
+    pub disable: ModelDisable,
+    pub exact_fallback: Option<AiccFallbackRule>,
+    pub allow_experimental: bool,
+    pub previous_exact_model: Option<String>,
+    pub request_units: u64,
+    pub estimated_input_tokens: Option<u64>,
+    pub estimated_output_tokens: Option<u64>,
+    /// Measured clip lengths of a video request's references.
+    pub video_clips: crate::video::ClipSummary,
+    pub caller: CallerIdentity,
+}
+
+impl RoutingRequest {
+    pub(crate) fn new(
+        trace_id: impl Into<String>,
+        request_id: impl Into<String>,
+        model: impl Into<String>,
+        api_type: ApiType,
+        caller: CallerIdentity,
+    ) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+            request_id: request_id.into(),
+            model: model.into(),
+            api_type,
+            method: api_type.typed_method().to_owned(),
+            capability: api_type.capability(),
+            requirements: ModelRequirement::default(),
+            disable: ModelDisable::default(),
+            exact_fallback: None,
+            allow_experimental: false,
+            previous_exact_model: None,
+            request_units: 1,
+            estimated_input_tokens: None,
+            estimated_output_tokens: None,
+            video_clips: Default::default(),
+            caller,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SelectedRoute {
+    pub exact_model: String,
+    pub model_uid: String,
+    pub provider_instance_name: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub model_driver_id: String,
+    pub origin_model_id: String,
+    pub provider_model_id: String,
+    pub operation: String,
+    pub inventory_revision: String,
+    pub enabled_capabilities: Vec<Feature>,
+    pub disabled_capabilities: Vec<Feature>,
+    pub estimated_cost: Option<Money>,
+    pub final_score: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RouteDecision {
+    pub selected: SelectedRoute,
+    pub fallback_candidates: Vec<SelectedRoute>,
+    pub trace: RoutingTrace,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct RoutingTrace {
+    pub trace_id: String,
+    pub request_id: String,
+    pub api_type: String,
+    pub requested_model: String,
+    pub requested_model_type: RouteModelKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_logical_path: Option<String>,
+    pub selected_exact_model: String,
+    pub selected_provider_instance_name: String,
+    pub candidate_count_before_filter: usize,
+    pub candidate_count_after_filter: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filtered_candidates: Vec<FilteredCandidateTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ranked_candidates: Vec<RankedCandidateTrace>,
+    pub fallback_applied: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fallback_chain: Vec<FallbackTraceStep>,
+    pub scheduler_profile: String,
+    pub score_breakdown: ScoreBreakdown,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<Money>,
+    pub runtime_failover_count: u32,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub logical_item_sources: Vec<LogicalItemSourceTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub logical_admission: Vec<LogicalAdmissionTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub logical_expansion: Vec<LogicalExpansionTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub disabled_capabilities: Vec<Feature>,
+    pub user_summary: UserFacingRouteSummary,
+}
+
+impl RoutingTrace {
+    /// Drop every exact model the viewer may not see (PRD §3.4: traces must
+    /// not disclose hidden candidates). Logical paths are kept.
+    pub(crate) fn retain_models(&mut self, allowed: &dyn Fn(&str) -> bool) {
+        let keep = |name: &str| !name.contains('@') || allowed(name);
+        self.filtered_candidates
+            .retain(|candidate| keep(&candidate.exact_model));
+        self.ranked_candidates
+            .retain(|candidate| keep(&candidate.exact_model));
+        self.fallback_chain
+            .retain(|step| keep(&step.from) && keep(&step.to));
+        self.logical_item_sources
+            .retain(|source| keep(&source.exact_model));
+        self.logical_admission
+            .retain(|admission| keep(&admission.exact_model));
+        for expansion in &mut self.logical_expansion {
+            expansion.items.retain(|item| keep(&item.target));
+        }
+        self.candidate_count_before_filter =
+            self.candidate_count_after_filter + self.filtered_candidates.len();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct FilteredCandidateTrace {
+    pub exact_model: String,
+    pub provider_instance_name: String,
+    pub reasons: Vec<FilterReasonTrace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct FilterReasonTrace {
+    pub code: String,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct RankedCandidateTrace {
+    pub exact_model: String,
+    pub provider_instance_name: String,
+    pub default_order: usize,
+    pub item_weights: Vec<f64>,
+    pub exact_model_weight: f64,
+    pub provider_weight: f64,
+    pub score_inputs: ScoreInputs,
+    pub final_score: f64,
+    pub selected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ScoreInputs {
+    pub cost: f64,
+    pub quality: f64,
+    pub preference: f64,
+    pub cache: f64,
+    pub local: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct ScoreBreakdown {
+    pub cost: f64,
+    pub quality: f64,
+    pub preference: f64,
+    pub cache: f64,
+    pub local: f64,
+    pub final_score: f64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct FallbackTraceStep {
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct LogicalItemSourceTrace {
+    pub exact_model: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct LogicalExpansionTrace {
+    pub logical_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_weight: Option<f64>,
+    pub items: Vec<LogicalExpansionItemTrace>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct LogicalExpansionItemTrace {
+    pub name: String,
+    pub target: String,
+    pub weight: f64,
+    pub weight_source: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct LogicalAdmissionTrace {
+    pub logical_path: String,
+    pub exact_model: String,
+    pub provider_model_id: String,
+    pub admitted: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_requirements: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct UserFacingRouteSummary {
+    pub display_name: String,
+    pub model_family: String,
+    pub provider_origin: String,
+    pub reason_short: String,
+    pub was_fallback: bool,
+    pub was_failover: bool,
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(reason) => write!(formatter, "invalid route request: {reason}"),
+            Self::InvalidExactModel(model) => write!(formatter, "exact model not found: {model}"),
+            Self::ExactModelUnavailable {
+                exact_model,
+                reasons,
+            } => {
+                write!(
+                    formatter,
+                    "exact model unavailable: {exact_model}{}",
+                    format_filter_reasons(reasons)
+                )
+            }
+            Self::NoCandidate { model, filtered } => {
+                write!(
+                    formatter,
+                    "no candidate for {model}{}",
+                    if filtered.is_empty() {
+                        "; no executable route: check model identity, channel presets and task/specification admission".to_owned()
+                    } else {
+                        format_filtered_candidates(filtered)
+                    }
+                )
+            }
+            Self::FallbackNotAllowed(model) => {
+                write!(formatter, "fallback is not allowed for {model}")
+            }
+            Self::InvalidFallback(reason) => write!(formatter, "invalid fallback: {reason}"),
+            Self::FallbackLoop(model) => write!(formatter, "fallback loop at {model}"),
+            Self::FallbackDepthExceeded(limit) => {
+                write!(formatter, "fallback depth exceeds {limit}")
+            }
+            Self::Registry(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn format_filter_reasons(reasons: &[FilterReasonTrace]) -> String {
+    if reasons.is_empty() {
+        return String::new();
+    }
+    let joined = reasons
+        .iter()
+        .take(4)
+        .map(|reason| reason.code.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let suffix = if reasons.len() > 4 { ",..." } else { "" };
+    format!(": filtered by {joined}{suffix}")
+}
+
+fn format_filtered_candidates(candidates: &[FilteredCandidateTrace]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let joined = candidates
+        .iter()
+        .take(4)
+        .map(|candidate| {
+            let reasons = candidate
+                .reasons
+                .iter()
+                .take(3)
+                .map(|reason| reason.code.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{}@{}[{reasons}]",
+                candidate.exact_model, candidate.provider_instance_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let suffix = if candidates.len() > 4 { "; ..." } else { "" };
+    format!(": filtered candidates {joined}{suffix}")
+}
+
+impl Error for RoutingError {}
+
+impl From<ModelRegistryError> for RoutingError {
+    fn from(value: ModelRegistryError) -> Self {
+        Self::Registry(value)
+    }
+}
+
+pub(crate) struct Router<'a, Q> {
+    registry: &'a ModelRegistry,
+    policy: &'a PolicyEngine<Q>,
+    runtime: &'a BTreeMap<String, CandidateRuntimeState>,
+}
+
+impl<'a, Q: QuotaSource> Router<'a, Q> {
+    pub(crate) fn new(
+        registry: &'a ModelRegistry,
+        policy: &'a PolicyEngine<Q>,
+        runtime: &'a BTreeMap<String, CandidateRuntimeState>,
+    ) -> Self {
+        Self {
+            registry,
+            policy,
+            runtime,
+        }
+    }
+
+    pub(crate) fn route(&self, request: &RoutingRequest) -> Result<RouteDecision, RoutingError> {
+        let mut request = request.clone();
+        request.disable.web_search |= request.api_type == ApiType::Llm
+            && !matches!(
+                request.model.as_str(),
+                "llm.chat" | "llm.plan" | "llm.vision"
+            )
+            && !(request.model.contains('@') && request.requirements.web_search);
+        let request = &request;
+        validate_request(request)?;
+        if request.model.contains('@') {
+            self.route_exact(request)
+        } else {
+            self.route_logical(request, &request.model, RouteModelKind::Logical, Vec::new())
+        }
+    }
+
+    fn route_exact(&self, request: &RoutingRequest) -> Result<RouteDecision, RoutingError> {
+        ExactModelName::parse(&request.model)
+            .map_err(|_| RoutingError::InvalidExactModel(request.model.clone()))?;
+        let model = self
+            .registry
+            .exact_model(&request.model)
+            .ok_or_else(|| RoutingError::InvalidExactModel(request.model.clone()))?;
+        let evaluated = self.evaluate_candidates(
+            request,
+            None,
+            ModelDisable::default(),
+            vec![RegistryCandidate {
+                model: model.clone(),
+                paths: Vec::new(),
+                experimental: false,
+                exact_model_weight: 1.0,
+                provider_weight: 1.0,
+            }],
+        );
+        if !evaluated.allowed.is_empty() {
+            return self.finish(
+                request,
+                RouteModelKind::Exact,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                evaluated,
+                AiccSchedulerProfile::Balanced,
+            );
+        }
+        let reasons = evaluated
+            .filtered
+            .first()
+            .map(|candidate| candidate.reasons.clone())
+            .unwrap_or_default();
+        if !self.policy.policy().allow_exact_model_fallback.value {
+            return Err(RoutingError::ExactModelUnavailable {
+                exact_model: request.model.clone(),
+                reasons,
+            });
+        }
+        if !self.policy.policy().allow_fallback.value {
+            return Err(RoutingError::FallbackNotAllowed(request.model.clone()));
+        }
+        let rule = request.exact_fallback.as_ref().ok_or_else(|| {
+            RoutingError::InvalidFallback("exact fallback requires an explicit target".into())
+        })?;
+        let target = rule.target.as_ref().ok_or_else(|| {
+            RoutingError::InvalidFallback("exact fallback target is missing".into())
+        })?;
+        let step = FallbackTraceStep {
+            from: request.model.clone(),
+            to: target.clone(),
+            reason: "exact_model_unavailable".into(),
+        };
+        match rule.mode {
+            AiccFallbackMode::TargetLogical => {
+                self.route_logical(request, target, RouteModelKind::Exact, vec![step])
+            }
+            AiccFallbackMode::TargetExact => {
+                let mut fallback_request = request.clone();
+                fallback_request.model = target.clone();
+                fallback_request.exact_fallback = None;
+                let mut decision = self.route_exact(&fallback_request)?;
+                decision.trace.requested_model = request.model.clone();
+                decision.trace.fallback_applied = true;
+                decision.trace.fallback_chain.insert(0, step);
+                decision.trace.user_summary.was_fallback = true;
+                Ok(decision)
+            }
+            _ => Err(RoutingError::InvalidFallback(
+                "exact fallback only supports target_exact or target_logical".into(),
+            )),
+        }
+    }
+
+    fn route_logical(
+        &self,
+        request: &RoutingRequest,
+        initial_path: &str,
+        requested_kind: RouteModelKind,
+        mut trace_chain: Vec<FallbackTraceStep>,
+    ) -> Result<RouteDecision, RoutingError> {
+        let mut effective_request = request.clone();
+        let task = self.registry.logical_requirement(initial_path);
+        let task_disable = self.registry.disable_line(initial_path);
+        for feature in task_disable.feature_names() {
+            effective_request.disable.set_feature_disabled(&feature);
+        }
+        effective_request.disable.min_context_tokens = effective_request
+            .disable
+            .min_context_tokens
+            .max(task_disable.min_context_tokens);
+        if let Some(decision) = &task.decision {
+            effective_request
+                .requirements
+                .decision
+                .get_or_insert_with(Default::default)
+                .merge(decision);
+        }
+        for feature in task.feature_names() {
+            effective_request
+                .requirements
+                .set_feature_required(&feature);
+        }
+        effective_request.requirements.min_context_tokens = effective_request
+            .requirements
+            .min_context_tokens
+            .max(task.min_context_tokens);
+        for (field, requirement) in task.canonical_fields {
+            effective_request
+                .requirements
+                .canonical_fields
+                .entry(field)
+                .or_insert(requirement);
+        }
+        let request = &effective_request;
+        let directory_disable = self.registry.disable_line(initial_path);
+        let mut filtered = Vec::<FilteredCandidateTrace>::new();
+        let set = self.registry.resolve_available_candidates(
+            initial_path,
+            request.api_type,
+            &mut |logical_path, candidate| {
+                let reasons =
+                    self.filter_reasons(request, Some(logical_path), &directory_disable, candidate);
+                if reasons.is_empty() {
+                    return true;
+                }
+                if !filtered
+                    .iter()
+                    .any(|trace| trace.exact_model == candidate.model.exact_model.as_str())
+                {
+                    filtered.push(FilteredCandidateTrace {
+                        exact_model: candidate.model.exact_model.as_str().to_owned(),
+                        provider_instance_name: candidate
+                            .model
+                            .identity
+                            .provider_instance_name
+                            .clone(),
+                        reasons,
+                    });
+                }
+                false
+            },
+        )?;
+        append_registry_fallbacks(&mut trace_chain, &set.fallback_chain);
+        if trace_chain.len() > FALLBACK_DEPTH_LIMIT {
+            return Err(RoutingError::FallbackDepthExceeded(FALLBACK_DEPTH_LIMIT));
+        }
+        if !trace_chain.is_empty() && !self.policy.policy().allow_fallback.value {
+            return Err(RoutingError::FallbackNotAllowed(request.model.clone()));
+        }
+        let mut evaluated = self.evaluate_candidates(
+            request,
+            Some(&set.resolved_logical_path),
+            set.disable_line.clone(),
+            set.candidates,
+        );
+        evaluated.before_count += filtered.len();
+        evaluated.filtered.splice(0..0, filtered);
+        if evaluated.allowed.is_empty() {
+            return Err(RoutingError::NoCandidate {
+                model: request.model.clone(),
+                filtered: evaluated.filtered,
+            });
+        }
+        self.finish(
+            request,
+            requested_kind,
+            Some(set.resolved_logical_path),
+            trace_chain,
+            set.admissions,
+            set.expansions,
+            evaluated,
+            set.scheduler_profile,
+        )
+    }
+
+    fn filter_reasons(
+        &self,
+        request: &RoutingRequest,
+        logical_path: Option<&str>,
+        directory_disable: &ModelDisable,
+        candidate: &RegistryCandidate,
+    ) -> Vec<FilterReasonTrace> {
+        let exact_model = candidate.model.exact_model.as_str();
+        let provider = &candidate.model.identity.provider_instance_name;
+        let mut reasons = hard_filter_model(request, &candidate.model, directory_disable);
+        if !request.allow_experimental && candidate.experimental {
+            reasons.push(filter_reason(
+                "experimental_model_disabled",
+                "experimental model requires explicit policy permission",
+            ));
+        }
+        if candidate.provider_weight == 0.0 {
+            reasons.push(filter_reason(
+                "provider_weight_zero",
+                "provider is disabled by its routing weight",
+            ));
+        }
+        let Some(state) = self.runtime.get(exact_model) else {
+            reasons.push(filter_reason(
+                "provider_state_unavailable",
+                "provider runtime state is unavailable",
+            ));
+            return reasons;
+        };
+        hard_filter_runtime(
+            state,
+            self.policy.policy().max_latency_ms.value,
+            &mut reasons,
+        );
+        let policy_request = RequestPolicyInput {
+            caller: &request.caller,
+            method: &request.method,
+            capability: request.capability.clone(),
+            estimated_cost: state.estimated_cost.clone(),
+            request_units: request.request_units,
+        };
+        let policy_candidate = CandidatePolicyInput {
+            provider_instance_name: provider,
+            api_type: request.api_type,
+            logical_path,
+            provider_privacy: state.provider_privacy,
+            trust: state.trust.as_ref(),
+            credential_scope: &state.credential_scope,
+        };
+        reasons.extend(
+            self.policy
+                .evaluate(&policy_request, &policy_candidate)
+                .reasons
+                .into_iter()
+                .map(filter_reason_from_policy),
+        );
+        reasons
+    }
+
+    fn evaluate_candidates(
+        &self,
+        request: &RoutingRequest,
+        logical_path: Option<&str>,
+        directory_disable: ModelDisable,
+        candidates: Vec<RegistryCandidate>,
+    ) -> EvaluatedCandidates {
+        let before_count = candidates.len();
+        let mut allowed = Vec::new();
+        let mut filtered = Vec::new();
+        for (order, candidate) in candidates.into_iter().enumerate() {
+            let reasons =
+                self.filter_reasons(request, logical_path, &directory_disable, &candidate);
+            let exact_model = candidate.model.exact_model.as_str();
+            match self.runtime.get(exact_model) {
+                Some(state) if reasons.is_empty() => allowed.push(PendingCandidate {
+                    canonical_quality: canonical_quality(request, &candidate.model),
+                    order,
+                    state: state.clone(),
+                    candidate,
+                }),
+                _ => filtered.push(FilteredCandidateTrace {
+                    exact_model: exact_model.to_owned(),
+                    provider_instance_name: candidate.model.identity.provider_instance_name.clone(),
+                    reasons,
+                }),
+            }
+        }
+        EvaluatedCandidates {
+            before_count,
+            allowed,
+            filtered,
+            directory_disable,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        &self,
+        request: &RoutingRequest,
+        requested_kind: RouteModelKind,
+        resolved_logical_path: Option<String>,
+        fallback_chain: Vec<FallbackTraceStep>,
+        admissions: Vec<AdmissionRecord>,
+        expansions: Vec<ExpansionStep>,
+        evaluated: EvaluatedCandidates,
+        directory_profile: AiccSchedulerProfile,
+    ) -> Result<RouteDecision, RoutingError> {
+        let profile = if self.policy.policy().profile.source.is_some() {
+            self.policy.policy().profile.value.clone()
+        } else {
+            directory_profile
+        };
+        let candidate_count_after_filter = evaluated.allowed.len();
+        let weights = scheduler_weights(
+            &profile,
+            self.policy.policy().scheduler_profiles.value.as_ref(),
+        )?;
+        let mut ranked = score_candidates(
+            evaluated.allowed,
+            &weights,
+            request.previous_exact_model.as_deref(),
+            self.policy.policy().locality_preference(),
+        );
+        ranked.sort_by(compare_ranked);
+        let selected = ranked.first().ok_or_else(|| RoutingError::NoCandidate {
+            model: request.model.clone(),
+            filtered: evaluated.filtered.clone(),
+        })?;
+        let selected_result = selected_route(selected, request, &evaluated.directory_disable);
+        let fallback_candidates = ranked
+            .iter()
+            .skip(1)
+            .map(|candidate| selected_route(candidate, request, &evaluated.directory_disable))
+            .collect();
+        let selected_score = selected.score.clone();
+        let was_fallback = !fallback_chain.is_empty();
+        let trace = RoutingTrace {
+            trace_id: request.trace_id.clone(),
+            request_id: request.request_id.clone(),
+            api_type: api_type_name(request.api_type),
+            requested_model: request.model.clone(),
+            requested_model_type: requested_kind,
+            resolved_logical_path,
+            selected_exact_model: selected_result.exact_model.clone(),
+            selected_provider_instance_name: selected_result.provider_instance_name.clone(),
+            candidate_count_before_filter: evaluated.before_count,
+            candidate_count_after_filter,
+            filtered_candidates: evaluated.filtered,
+            ranked_candidates: ranked
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| ranked_trace(candidate, index == 0))
+                .collect(),
+            fallback_applied: was_fallback,
+            fallback_chain,
+            scheduler_profile: scheduler_profile_name(&profile).into(),
+            score_breakdown: score_breakdown(&selected_score, &weights),
+            estimated_cost: selected_result.estimated_cost.clone(),
+            warnings: [
+                selected_result
+                    .estimated_cost
+                    .is_none()
+                    .then(|| "Selected model has no verified cost estimate".to_owned()),
+                was_fallback.then(|| "Routing used a fallback model".to_owned()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            runtime_failover_count: 0,
+            logical_item_sources: logical_sources(&ranked),
+            logical_admission: admission_trace(admissions),
+            logical_expansion: expansion_trace(expansions),
+            disabled_capabilities: disabled_features(
+                &evaluated.directory_disable,
+                &request.disable,
+            ),
+            user_summary: user_summary(selected, &profile, was_fallback),
+        };
+        Ok(RouteDecision {
+            selected: selected_result,
+            fallback_candidates,
+            trace,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingCandidate {
+    candidate: RegistryCandidate,
+    state: CandidateRuntimeState,
+    canonical_quality: CanonicalMatchQuality,
+    order: usize,
+}
+
+#[derive(Clone, Debug)]
+struct EvaluatedCandidates {
+    before_count: usize,
+    allowed: Vec<PendingCandidate>,
+    filtered: Vec<FilteredCandidateTrace>,
+    directory_disable: ModelDisable,
+}
+
+#[derive(Clone, Debug)]
+struct RankedCandidate {
+    pending: PendingCandidate,
+    score: ScoreComponents,
+}
+
+#[derive(Clone, Debug)]
+struct ScoreComponents {
+    inputs: ScoreInputs,
+    final_score: f64,
+}
+
+fn validate_request(request: &RoutingRequest) -> Result<(), RoutingError> {
+    if request.trace_id.trim().is_empty()
+        || request.request_id.trim().is_empty()
+        || request.model.trim().is_empty()
+    {
+        return Err(RoutingError::InvalidRequest(
+            "trace_id, request_id, and model must not be empty".into(),
+        ));
+    }
+    if request.method != request.api_type.typed_method() {
+        return Err(RoutingError::InvalidRequest(
+            "method does not match api_type".into(),
+        ));
+    }
+    if request.capability != request.api_type.capability() {
+        return Err(RoutingError::InvalidRequest(
+            "capability does not match api_type".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn hard_filter_model(
+    request: &RoutingRequest,
+    model: &RegisteredModel,
+    directory_disable: &ModelDisable,
+) -> Vec<FilterReasonTrace> {
+    let mut reasons = Vec::new();
+    if !model.api_types.contains(&request.api_type) {
+        reasons.push(filter_reason(
+            "api_type_mismatch",
+            "model does not support api_type",
+        ));
+    }
+    if resolve_operation(model, request).is_none() {
+        reasons.push(filter_reason(
+            "operation_not_supported",
+            "model has no operation for the canonical method or api_type",
+        ));
+    }
+    if request.api_type == ApiType::Decision {
+        let requirements = request.requirements.decision.clone().unwrap_or_default();
+        for feature in requirements.features() {
+            if model.capabilities.get(&feature).and_then(Value::as_bool) != Some(true) {
+                reasons.push(filter_reason(
+                    "required_feature_missing",
+                    format!("model does not support {feature}"),
+                ));
+            }
+        }
+        for (limit, required) in requirements.limits() {
+            if required > 0
+                && model
+                    .capabilities
+                    .get(limit)
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    < required
+            {
+                reasons.push(filter_reason(
+                    "decision_limit_exceeded",
+                    format!("model {limit} is below {required}"),
+                ));
+            }
+        }
+    }
+    for feature in request.requirements.feature_names() {
+        if request.disable.disables_feature(&feature)
+            || directory_disable.disables_feature(&feature)
+        {
+            reasons.push(filter_reason(
+                "required_feature_disabled",
+                format!("required feature {feature} is disabled"),
+            ));
+        } else if !model
+            .capabilities
+            .get(&feature)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            reasons.push(filter_reason(
+                "required_feature_missing",
+                format!("model does not support required feature {feature}"),
+            ));
+        }
+    }
+    if let Some(required) = request.requirements.min_context_tokens {
+        let available = model
+            .capabilities
+            .get("max_context_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if available < required {
+            reasons.push(filter_reason(
+                "context_length_insufficient",
+                format!("model context length is below {required}"),
+            ));
+        }
+    }
+    if let Some(required) = request.estimated_output_tokens {
+        let available = model
+            .capabilities
+            .get("max_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if available < required {
+            reasons.push(filter_reason(
+                "output_length_insufficient",
+                format!("model output length is below {required}"),
+            ));
+        }
+    }
+    if let Some(required) = request
+        .estimated_input_tokens
+        .and_then(|input| input.checked_add(request.estimated_output_tokens.unwrap_or_default()))
+    {
+        let available = model
+            .capabilities
+            .get("max_context_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        if available < required {
+            reasons.push(filter_reason(
+                "context_length_insufficient",
+                format!("model context length is below estimated request size {required}"),
+            ));
+        }
+    }
+    for (pointer, requirement) in &request.requirements.canonical_fields {
+        let resolved = resolve_canonical_field(model.canonical_fields.get(pointer), requirement);
+        if !resolved.satisfies(requirement) {
+            reasons.push(filter_reason(
+                "canonical_field_unsatisfied",
+                format!("model cannot satisfy canonical field {pointer}"),
+            ));
+        }
+    }
+    if request.api_type == ApiType::VideoGenerate {
+        match crate::video::VideoGenerationContract::from_capabilities(&model.capabilities) {
+            None => reasons.push(filter_reason(
+                "video_contract_missing",
+                "model declares no video generation contract",
+            )),
+            Some(contract) => {
+                if let Some(requirement) = &request.requirements.video {
+                    for unmet in crate::video::unmet_requirements(
+                        &contract,
+                        requirement,
+                        &request.video_clips,
+                    ) {
+                        reasons.push(filter_reason(
+                            "video_requirement_unsatisfied",
+                            format!("{}: {}", unmet.field, unmet.reason),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    reasons
+}
+
+fn canonical_quality(request: &RoutingRequest, model: &RegisteredModel) -> CanonicalMatchQuality {
+    request
+        .requirements
+        .canonical_fields
+        .iter()
+        .map(|(pointer, requirement)| {
+            resolve_canonical_field(model.canonical_fields.get(pointer), requirement).quality
+        })
+        .min()
+        .unwrap_or(CanonicalMatchQuality::Exact)
+}
+
+fn hard_filter_runtime(
+    state: &CandidateRuntimeState,
+    max_latency_ms: Option<u64>,
+    reasons: &mut Vec<FilterReasonTrace>,
+) {
+    if !state.enabled {
+        reasons.push(filter_reason("provider_disabled", "provider is disabled"));
+    }
+    if !state.credential_available {
+        reasons.push(filter_reason(
+            "credential_unavailable",
+            "provider credential is unavailable",
+        ));
+    }
+    if !state.model_available {
+        reasons.push(filter_reason(
+            "model_unavailable",
+            "provider model is unavailable",
+        ));
+    }
+    match state.health {
+        ProviderHealthStatus::Unavailable => reasons.push(filter_reason(
+            "health_unavailable",
+            "provider health is unavailable",
+        )),
+        ProviderHealthStatus::CircuitOpen => reasons.push(filter_reason(
+            "circuit_open",
+            "provider circuit breaker is open",
+        )),
+        ProviderHealthStatus::Available | ProviderHealthStatus::Degraded => {}
+    }
+    if let Some(max_latency_ms) = max_latency_ms {
+        match state.p95_latency_ms {
+            Some(latency)
+                if latency.is_finite() && latency >= 0.0 && latency <= max_latency_ms as f64 => {}
+            Some(latency) if latency.is_finite() && latency >= 0.0 => reasons.push(filter_reason(
+                "latency_ceiling_exceeded",
+                format!("provider p95 latency exceeds {max_latency_ms} ms"),
+            )),
+            _ => reasons.push(filter_reason(
+                "latency_unavailable",
+                "provider p95 latency is unavailable",
+            )),
+        }
+    }
+}
+
+fn resolve_operation<'a>(model: &'a RegisteredModel, request: &RoutingRequest) -> Option<&'a str> {
+    model
+        .operations
+        .get(&request.method)
+        .or_else(|| model.operations.get(&api_type_name(request.api_type)))
+        .map(String::as_str)
+        .filter(|operation| !operation.trim().is_empty())
+}
+
+fn scheduler_weights(
+    profile: &AiccSchedulerProfile,
+    config: Option<&AiccSchedulerProfileConfig>,
+) -> Result<AiccSchedulerProfileWeights, RoutingError> {
+    let configured = config.and_then(|config| match profile {
+        AiccSchedulerProfile::CostFirst => config.cost_first.as_ref(),
+        AiccSchedulerProfile::LatencyFirst => config.latency_first.as_ref(),
+        AiccSchedulerProfile::QualityFirst => config.quality_first.as_ref(),
+        AiccSchedulerProfile::Balanced => config.balanced.as_ref(),
+        AiccSchedulerProfile::LocalFirst => config.local_first.as_ref(),
+        AiccSchedulerProfile::StrictLocal => config.strict_local.as_ref(),
+    });
+    let weights = configured
+        .cloned()
+        .unwrap_or_else(|| default_weights(profile));
+    let values = [
+        weights.cost,
+        weights.quality,
+        weights.preference,
+        weights.cache,
+        weights.local,
+    ];
+    if values
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+        || values.iter().all(|weight| *weight == 0.0)
+    {
+        return Err(RoutingError::InvalidRequest(
+            "scheduler weights must be finite, non-negative, and not all zero".into(),
+        ));
+    }
+    Ok(weights)
+}
+
+fn default_weights(profile: &AiccSchedulerProfile) -> AiccSchedulerProfileWeights {
+    let values = match profile {
+        AiccSchedulerProfile::CostFirst => (1.0, 0.0, 0.0, 0.0, 0.0),
+        AiccSchedulerProfile::LatencyFirst => (0.5, 0.0, 0.0, 0.0, 0.5),
+        AiccSchedulerProfile::QualityFirst => (0.3, 0.7, 0.0, 0.0, 0.0),
+        AiccSchedulerProfile::Balanced => (0.5, 0.3, 0.2, 0.0, 0.0),
+        AiccSchedulerProfile::LocalFirst => (0.3, 0.0, 0.0, 0.0, 0.7),
+        AiccSchedulerProfile::StrictLocal => (0.5, 0.3, 0.2, 0.0, 0.0),
+    };
+    AiccSchedulerProfileWeights {
+        cost: values.0,
+        quality: values.1,
+        preference: values.2,
+        cache: values.3,
+        local: values.4,
+    }
+}
+
+fn score_candidates(
+    candidates: Vec<PendingCandidate>,
+    weights: &AiccSchedulerProfileWeights,
+    previous_exact_model: Option<&str>,
+    locality: LocalityPreference,
+) -> Vec<RankedCandidate> {
+    let costs = candidates
+        .iter()
+        .map(|candidate| {
+            candidate
+                .state
+                .estimated_cost
+                .as_ref()
+                .filter(|cost| cost.currency == "USD")
+                .map(|cost| cost.amount)
+        })
+        .collect::<Vec<_>>();
+    let cache = candidates
+        .iter()
+        .map(|candidate| candidate.state.cache_hit_probability)
+        .collect::<Vec<_>>();
+    let configured_weights = candidates
+        .iter()
+        .map(|candidate| {
+            Some(candidate.candidate.exact_model_weight * candidate.candidate.provider_weight)
+        })
+        .collect::<Vec<_>>();
+    let cost_scores = normalize(&costs, false);
+    let cache_scores = normalize(&cache, true);
+    let preference_scores = normalize(&configured_weights, true);
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, pending)| {
+            let exact = pending.candidate.model.exact_model.as_str();
+            let history =
+                previous_exact_model.map(|previous| if previous == exact { 0.0 } else { 1.0 });
+            let preference = history
+                .map(|history| (preference_scores[index] + history) / 2.0)
+                .unwrap_or(preference_scores[index]);
+            let local = match locality {
+                LocalityPreference::PreferLocal if !pending.state.is_local() => 1.0,
+                _ => 0.0,
+            };
+            let inputs = ScoreInputs {
+                cost: cost_scores[index],
+                quality: canonical_quality_score(pending.canonical_quality),
+                preference,
+                cache: cache_scores[index],
+                local,
+            };
+            let final_score = weighted_score(&inputs, weights);
+            RankedCandidate {
+                pending,
+                score: ScoreComponents {
+                    inputs,
+                    final_score,
+                },
+            }
+        })
+        .collect()
+}
+
+fn canonical_quality_score(quality: CanonicalMatchQuality) -> f64 {
+    match quality {
+        CanonicalMatchQuality::Exact => 0.0,
+        CanonicalMatchQuality::Fuzzy => 0.25,
+        CanonicalMatchQuality::Default => 0.5,
+        CanonicalMatchQuality::Prompt => 0.75,
+        CanonicalMatchQuality::Unsupported => 1.0,
+    }
+}
+
+fn normalize(values: &[Option<f64>], invert: bool) -> Vec<f64> {
+    let valid = values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect::<Vec<_>>();
+    let min = valid.iter().copied().reduce(f64::min);
+    let max = valid.iter().copied().reduce(f64::max);
+    values
+        .iter()
+        .map(|value| match (value, min, max) {
+            (Some(value), Some(min), Some(max)) if value.is_finite() && *value >= 0.0 => {
+                let normalized = if (max - min).abs() < EPSILON {
+                    if invert {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (*value - min) / (max - min)
+                };
+                if invert {
+                    1.0 - normalized
+                } else {
+                    normalized
+                }
+            }
+            _ => 1.0,
+        })
+        .collect()
+}
+
+fn weighted_score(inputs: &ScoreInputs, weights: &AiccSchedulerProfileWeights) -> f64 {
+    inputs.cost * weights.cost
+        + inputs.quality * weights.quality
+        + inputs.preference * weights.preference
+        + inputs.cache * weights.cache
+        + inputs.local * weights.local
+}
+
+fn compare_ranked(left: &RankedCandidate, right: &RankedCandidate) -> std::cmp::Ordering {
+    left.score
+        .final_score
+        .total_cmp(&right.score.final_score)
+        .then_with(|| left.pending.order.cmp(&right.pending.order))
+}
+
+fn selected_route(
+    candidate: &RankedCandidate,
+    request: &RoutingRequest,
+    directory_disable: &ModelDisable,
+) -> SelectedRoute {
+    let model = &candidate.pending.candidate.model;
+    SelectedRoute {
+        exact_model: model.exact_model.as_str().into(),
+        model_uid: model.model_uid.as_stable_string(),
+        provider_instance_name: model.identity.provider_instance_name.clone(),
+        provider_profile_id: model.identity.provider_profile_id.clone(),
+        protocol_adapter_id: model.identity.protocol_adapter_id.clone(),
+        model_driver_id: model.identity.model_driver_id.clone(),
+        origin_model_id: model.identity.origin_model_id.clone(),
+        provider_model_id: model.identity.provider_model_id.clone(),
+        operation: resolve_operation(model, request)
+            .expect("ranked model has operation")
+            .into(),
+        inventory_revision: model.inventory_revision.clone(),
+        enabled_capabilities: enabled_features(model, directory_disable, &request.disable),
+        disabled_capabilities: disabled_features(directory_disable, &request.disable),
+        estimated_cost: candidate.pending.state.estimated_cost.clone(),
+        final_score: candidate.score.final_score,
+    }
+}
+
+fn enabled_features(
+    model: &RegisteredModel,
+    directory_disable: &ModelDisable,
+    request_disable: &ModelDisable,
+) -> Vec<Feature> {
+    let mut result = model
+        .capabilities
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .as_bool()
+                .filter(|supported| *supported)
+                .filter(|_| !directory_disable.disables_feature(name))
+                .filter(|_| !request_disable.disables_feature(name))
+                .map(|_| name.clone())
+        })
+        .collect::<Vec<_>>();
+    result.sort();
+    result
+}
+
+fn disabled_features(directory: &ModelDisable, request: &ModelDisable) -> Vec<Feature> {
+    [
+        ("streaming", directory.streaming || request.streaming),
+        (
+            features::TOOL_CALL,
+            directory.tool_call || request.tool_call,
+        ),
+        (
+            features::JSON_SCHEMA,
+            directory.json_schema || request.json_schema,
+        ),
+        (
+            features::WEB_SEARCH,
+            directory.web_search || request.web_search,
+        ),
+        (features::VISION, directory.vision || request.vision),
+        (
+            features::IMAGE_GENERATION,
+            directory.image_generation || request.image_generation,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, disabled)| *disabled)
+    .map(|(name, _)| name.to_owned())
+    .collect()
+}
+
+fn ranked_trace(candidate: &RankedCandidate, selected: bool) -> RankedCandidateTrace {
+    RankedCandidateTrace {
+        exact_model: candidate
+            .pending
+            .candidate
+            .model
+            .exact_model
+            .as_str()
+            .into(),
+        provider_instance_name: candidate
+            .pending
+            .candidate
+            .model
+            .identity
+            .provider_instance_name
+            .clone(),
+        default_order: candidate.pending.order,
+        item_weights: candidate
+            .pending
+            .candidate
+            .paths
+            .first()
+            .map(|path| path.weights.clone())
+            .unwrap_or_default(),
+        exact_model_weight: candidate.pending.candidate.exact_model_weight,
+        provider_weight: candidate.pending.candidate.provider_weight,
+        score_inputs: candidate.score.inputs.clone(),
+        final_score: candidate.score.final_score,
+        selected,
+    }
+}
+
+fn score_breakdown(
+    score: &ScoreComponents,
+    weights: &AiccSchedulerProfileWeights,
+) -> ScoreBreakdown {
+    ScoreBreakdown {
+        cost: score.inputs.cost * weights.cost,
+        quality: score.inputs.quality * weights.quality,
+        preference: score.inputs.preference * weights.preference,
+        cache: score.inputs.cache * weights.cache,
+        local: score.inputs.local * weights.local,
+        final_score: score.final_score,
+    }
+}
+
+fn logical_sources(candidates: &[RankedCandidate]) -> Vec<LogicalItemSourceTrace> {
+    let mut result = BTreeSet::new();
+    for candidate in candidates {
+        let exact = candidate.pending.candidate.model.exact_model.as_str();
+        for path in &candidate.pending.candidate.paths {
+            for source in &path.sources {
+                result.insert((
+                    exact.to_owned(),
+                    logical_item_source_name(*source).to_owned(),
+                ));
+            }
+        }
+    }
+    result
+        .into_iter()
+        .map(|(exact_model, source)| LogicalItemSourceTrace {
+            exact_model,
+            source,
+        })
+        .collect()
+}
+
+fn admission_trace(admissions: Vec<AdmissionRecord>) -> Vec<LogicalAdmissionTrace> {
+    admissions
+        .into_iter()
+        .map(|admission| {
+            let provider_model_id = admission
+                .exact_model
+                .split_once('@')
+                .map(|(model, _)| model.split_once(':').map_or(model, |(base, _)| base))
+                .unwrap_or(&admission.exact_model)
+                .to_owned();
+            LogicalAdmissionTrace {
+                logical_path: admission.logical_path,
+                exact_model: admission.exact_model,
+                provider_model_id,
+                admitted: admission.admitted,
+                missing_requirements: admission.missing_requirements,
+            }
+        })
+        .collect()
+}
+
+fn expansion_trace(expansions: Vec<ExpansionStep>) -> Vec<LogicalExpansionTrace> {
+    expansions
+        .into_iter()
+        .map(|step| LogicalExpansionTrace {
+            logical_path: step.logical_path,
+            max_weight: step.max_weight,
+            items: step
+                .items
+                .into_iter()
+                .map(|item| LogicalExpansionItemTrace {
+                    name: item.name,
+                    target: item.target,
+                    weight: item.weight,
+                    weight_source: logical_item_source_name(item.weight_source).to_owned(),
+                    state: match item.state {
+                        ExpansionState::Expanded => "expanded",
+                        ExpansionState::Unavailable => "unavailable",
+                        ExpansionState::NotExpanded => "not_expanded",
+                    }
+                    .to_owned(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn user_summary(
+    selected: &RankedCandidate,
+    profile: &AiccSchedulerProfile,
+    was_fallback: bool,
+) -> UserFacingRouteSummary {
+    let model = &selected.pending.candidate.model;
+    let provider_origin = if selected.pending.state.is_local() {
+        "local"
+    } else if selected
+        .pending
+        .state
+        .trust
+        .as_ref()
+        .is_some_and(|trust| trust.provider_type == ProviderType::CloudApi)
+    {
+        "cloud"
+    } else {
+        "proxy_unknown"
+    };
+    let reason = match profile {
+        AiccSchedulerProfile::CostFirst => "最高权重候选内成本最低",
+        AiccSchedulerProfile::LatencyFirst => "按延迟优先策略（本地与成本）选择",
+        AiccSchedulerProfile::QualityFirst => "按最高质量策略选择",
+        AiccSchedulerProfile::Balanced => "按均衡策略选择",
+        AiccSchedulerProfile::LocalFirst => "按本地优先策略选择",
+        AiccSchedulerProfile::StrictLocal => "高隐私策略只允许本地 Provider",
+    };
+    UserFacingRouteSummary {
+        display_name: model.exact_model.as_str().into(),
+        model_family: model.identity.model_driver_id.clone(),
+        provider_origin: provider_origin.into(),
+        reason_short: reason.into(),
+        was_fallback,
+        was_failover: false,
+    }
+}
+
+fn filter_reason(code: impl Into<String>, summary: impl Into<String>) -> FilterReasonTrace {
+    FilterReasonTrace {
+        code: code.into(),
+        summary: summary.into(),
+    }
+}
+
+fn filter_reason_from_policy(reason: PolicyReason) -> FilterReasonTrace {
+    filter_reason(reason.code.as_str(), reason.summary)
+}
+
+fn append_registry_fallbacks(trace: &mut Vec<FallbackTraceStep>, steps: &[FallbackStep]) {
+    trace.extend(steps.iter().map(|step| FallbackTraceStep {
+        from: step.from.clone(),
+        to: step.to.clone(),
+        reason: "no_available_candidate".into(),
+    }));
+}
+
+fn api_type_name(api_type: ApiType) -> String {
+    serde_json::to_value(api_type)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .expect("ApiType serialization is a string")
+}
+
+fn scheduler_profile_name(profile: &AiccSchedulerProfile) -> &'static str {
+    match profile {
+        AiccSchedulerProfile::CostFirst => "cost_first",
+        AiccSchedulerProfile::LatencyFirst => "latency_first",
+        AiccSchedulerProfile::QualityFirst => "quality_first",
+        AiccSchedulerProfile::Balanced => "balanced",
+        AiccSchedulerProfile::LocalFirst => "local_first",
+        AiccSchedulerProfile::StrictLocal => "strict_local",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{CanonicalFallback, CanonicalFieldConverter, CanonicalFieldMapping};
+    use crate::catalog::{
+        CatalogBuildOptions, CatalogDocuments, CatalogSnapshot, ModelDriverCatalog,
+    };
+    use crate::model::{
+        InventoryModel, LogicalModelDefinition, MountMode, ProviderInventory, RegistryLayers,
+    };
+    use buckyos_api::{
+        AiccLogicalNodeOverlay, AiccLogicalTreeOverlay, AiccPolicyConfig, AiccRouteOverlay,
+        AiccSessionLogicalProfile, LockedValue, LogicalItem, QuotaState, RoutePolicy,
+        RoutePolicyProfile,
+    };
+    use policy::{
+        EffectiveRoutingPolicy, PolicyError, ProviderTrustLevel, ProviderTypeSource, QuotaLookup,
+        QuotaSnapshot, QuotaSourceError, RoutingPolicyLayers, RoutingPolicyPatch,
+    };
+    use serde_json::json;
+
+    #[derive(Clone)]
+    struct OpenQuota;
+
+    impl QuotaSource for OpenQuota {
+        fn query(&self, _lookup: &QuotaLookup) -> Result<QuotaSnapshot, QuotaSourceError> {
+            Ok(QuotaSnapshot {
+                state: Some(QuotaState::Normal),
+                remaining_request_units: Some(100),
+                remaining_cost: None,
+                reset_at: None,
+            })
+        }
+    }
+
+    fn catalog() -> CatalogSnapshot {
+        let driver: ModelDriverCatalog = serde_json::from_value(json!({
+            "format": "buckyos.aicc.model-driver-catalog",
+            "schema_version": 2,
+            "schema_revision": 0,
+            "model_driver_id": "driver",
+            "revision_seq": 1,
+            "models": [],
+            "patterns": [{
+                "match": {"origin_model_id": ["cheap", "fast", "local"]},
+                "api_types": ["image.txt2img"],
+                "capabilities": {"streaming": true}
+            }],
+            "defaults": {},
+            "specs": []
+        }))
+        .unwrap();
+        CatalogSnapshot::build(
+            1,
+            CatalogDocuments {
+                model_drivers: vec![driver],
+                ..CatalogDocuments::default()
+            },
+            &CatalogBuildOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn inventory(instance: &str, id: &str, tool_call: bool) -> ProviderInventory {
+        let canonical_fields = match id {
+            "fast" => BTreeMap::from([(
+                "/voice".into(),
+                CanonicalFieldMapping::required(CanonicalFieldConverter::GeminiTtsVoiceV1),
+            )]),
+            "cheap" => BTreeMap::from([(
+                "/voice".into(),
+                CanonicalFieldMapping {
+                    converter: CanonicalFieldConverter::OpenaiTtsVoiceV2,
+                    fallback: CanonicalFallback::Default { value: json!({}) },
+                },
+            )]),
+            _ => BTreeMap::new(),
+        };
+        ProviderInventory {
+            provider_instance_name: instance.into(),
+            provider_profile_id: "profile".into(),
+            protocol_adapter_id: "adapter".into(),
+            inventory_revision: format!("rev-{instance}"),
+            models: vec![InventoryModel {
+                provider_model_id: id.into(),
+                model_driver_id: "driver".into(),
+                origin_model_id: id.into(),
+                api_types: vec![ApiType::ImageTextToImage],
+                logical_mounts: Vec::new(),
+                variants: Vec::new(),
+                capabilities: BTreeMap::from([
+                    ("tool_call".into(), json!(tool_call)),
+                    ("max_context_tokens".into(), json!(128_000)),
+                ]),
+                canonical_fields,
+                attributes: BTreeMap::new(),
+                operations: BTreeMap::from([("image.txt2img".into(), "responses.create".into())]),
+            }],
+        }
+    }
+
+    fn definition(
+        path: &str,
+        fallback: AiccFallbackMode,
+        profile: AiccSchedulerProfile,
+    ) -> LogicalModelDefinition {
+        LogicalModelDefinition {
+            path: path.into(),
+            api_type: ApiType::ImageTextToImage,
+            min_line: ModelRequirement::default(),
+            disable_line: ModelDisable::default(),
+            default_options: BTreeMap::new(),
+            mount_mode: MountMode::Manual,
+            scheduler_profile: profile,
+            fallback: Some(AiccFallbackRule {
+                mode: fallback,
+                target: None,
+            }),
+            route_policy: AiccPolicyConfig::default(),
+            user_visible_tier: None,
+        }
+    }
+
+    fn node(items: &[(&str, &str, f64)]) -> AiccLogicalNodeOverlay {
+        AiccLogicalNodeOverlay {
+            items: Some(
+                items
+                    .iter()
+                    .map(|(name, target, weight)| LogicalItem::new(*name, *target, *weight))
+                    .collect(),
+            ),
+            ..AiccLogicalNodeOverlay::default()
+        }
+    }
+
+    fn registry(profile: AiccSchedulerProfile) -> ModelRegistry {
+        registry_with_directory_policy(profile, AiccPolicyConfig::default())
+    }
+
+    fn registry_with_directory_policy(
+        profile: AiccSchedulerProfile,
+        route_policy: AiccPolicyConfig,
+    ) -> ModelRegistry {
+        let inventories = vec![
+            inventory("cloud-a", "cheap", true),
+            inventory("cloud-b", "fast", false),
+            inventory("local", "local", true),
+        ];
+        let mut weighted = node(&[("a", "cheap@cloud-a", 1.0), ("b", "fast@cloud-b", 1.0)]);
+        weighted
+            .exact_model_weights
+            .insert("fast@cloud-b".into(), 2.0);
+        let factory = AiccRouteOverlay {
+            logical_tree: BTreeMap::from([
+                ("image".into(), node(&[("fallback", "cheap@cloud-a", 1.0)])),
+                (
+                    "image.plan".into(),
+                    node(&[
+                        ("preferred", "image.family", 3.0),
+                        ("backup", "local@local", 2.0),
+                    ]),
+                ),
+                (
+                    "image.family".into(),
+                    node(&[("a", "cheap@cloud-a", 1.0), ("b", "fast@cloud-b", 1.0)]),
+                ),
+                (
+                    "image.special".into(),
+                    node(&[("only", "fast@cloud-b", 1.0)]),
+                ),
+                (
+                    "image.all".into(),
+                    node(&[
+                        ("cloud", "cheap@cloud-a", 1.0),
+                        ("local", "local@local", 1.0),
+                    ]),
+                ),
+                ("image.weighted".into(), weighted),
+                (
+                    "image.ordered".into(),
+                    node(&[
+                        ("z_first", "local@local", 1.0),
+                        ("a_second", "cheap@cloud-a", 1.0),
+                    ]),
+                ),
+            ]),
+            ..AiccRouteOverlay::default()
+        };
+        let mut definitions = vec![
+            definition("image", AiccFallbackMode::Strict, profile.clone()),
+            definition("image.plan", AiccFallbackMode::Parent, profile.clone()),
+            definition("image.family", AiccFallbackMode::Strict, profile.clone()),
+            definition("image.special", AiccFallbackMode::Parent, profile.clone()),
+            definition(
+                "image.all",
+                AiccFallbackMode::Strict,
+                AiccSchedulerProfile::Balanced,
+            ),
+            definition(
+                "image.weighted",
+                AiccFallbackMode::Strict,
+                AiccSchedulerProfile::CostFirst,
+            ),
+            definition(
+                "image.ordered",
+                AiccFallbackMode::Strict,
+                AiccSchedulerProfile::CostFirst,
+            ),
+        ];
+        definitions
+            .iter_mut()
+            .find(|definition| definition.path == "image.family")
+            .unwrap()
+            .route_policy = route_policy;
+        ModelRegistry::build(
+            &catalog(),
+            &inventories,
+            definitions,
+            RegistryLayers {
+                factory: Some(&factory),
+                ..RegistryLayers::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn trust(provider_type: ProviderType) -> ProviderTrustView {
+        ProviderTrustView {
+            provider_type,
+            provider_type_source: ProviderTypeSource::SystemConfig,
+            provider_type_revision: "rev-1".into(),
+            asserted_at_ms: 1,
+            trust_level: ProviderTrustLevel::Verified,
+        }
+    }
+
+    fn state(local: bool, cost: f64, latency: f64) -> CandidateRuntimeState {
+        CandidateRuntimeState {
+            enabled: true,
+            credential_available: true,
+            model_available: true,
+            health: ProviderHealthStatus::Available,
+            provider_privacy: if local {
+                ProviderPrivacy::Local
+            } else {
+                ProviderPrivacy::PublicCloud
+            },
+            trust: Some(trust(if local {
+                ProviderType::LocalInference
+            } else {
+                ProviderType::CloudApi
+            })),
+            credential_scope: CredentialScope::Tenant {
+                tenant_id: "tenant".into(),
+            },
+            estimated_cost: Some(Money::new(cost, "USD")),
+            p50_latency_ms: Some(latency),
+            p95_latency_ms: Some(latency),
+            error_rate_5m: Some(0.0),
+            recent_failures: 0,
+            cache_hit_probability: None,
+        }
+    }
+
+    fn runtime() -> BTreeMap<String, CandidateRuntimeState> {
+        BTreeMap::from([
+            ("cheap@cloud-a".into(), state(false, 0.1, 500.0)),
+            ("fast@cloud-b".into(), state(false, 0.3, 100.0)),
+            ("local@local".into(), state(true, 0.2, 300.0)),
+        ])
+    }
+
+    fn request(model: &str) -> RoutingRequest {
+        RoutingRequest::new(
+            "trace-1",
+            "request-1",
+            model,
+            ApiType::ImageTextToImage,
+            CallerIdentity {
+                tenant_id: "tenant".into(),
+                user_id: "user".into(),
+                app_id: Some("app".into()),
+            },
+        )
+    }
+
+    fn engine(patch: &RoutingPolicyPatch) -> PolicyEngine<OpenQuota> {
+        let effective = EffectiveRoutingPolicy::merge(RoutingPolicyLayers {
+            system: Some(patch),
+            user: None,
+            app: None,
+            session: None,
+            request: None,
+        })
+        .unwrap();
+        PolicyEngine::new(effective, OpenQuota).unwrap()
+    }
+
+    fn route(
+        profile: AiccSchedulerProfile,
+        patch: &RoutingPolicyPatch,
+        request: &RoutingRequest,
+        runtime: &BTreeMap<String, CandidateRuntimeState>,
+    ) -> Result<RouteDecision, RoutingError> {
+        let registry = registry(profile);
+        let engine = engine(patch);
+        Router::new(&registry, &engine, runtime).route(request)
+    }
+
+    #[test]
+    fn logical_route_expands_only_the_highest_available_weight_group() {
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &RoutingPolicyPatch::default(),
+            &request("image.plan"),
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        assert_eq!(
+            decision
+                .fallback_candidates
+                .iter()
+                .map(|candidate| candidate.exact_model.as_str())
+                .collect::<Vec<_>>(),
+            ["fast@cloud-b"]
+        );
+        let plan = decision
+            .trace
+            .logical_expansion
+            .iter()
+            .find(|step| step.logical_path == "image.plan")
+            .unwrap();
+        assert_eq!(plan.max_weight, Some(3.0));
+        assert_eq!(plan.items[1].state, "not_expanded");
+
+        let mut runtime = runtime();
+        runtime.get_mut("cheap@cloud-a").unwrap().health = ProviderHealthStatus::Unavailable;
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &RoutingPolicyPatch::default(),
+            &request("image.plan"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "fast@cloud-b");
+        assert!(decision.fallback_candidates.is_empty());
+
+        runtime.get_mut("fast@cloud-b").unwrap().health = ProviderHealthStatus::CircuitOpen;
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &RoutingPolicyPatch::default(),
+            &request("image.plan"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "local@local");
+        assert_eq!(decision.trace.filtered_candidates.len(), 2);
+        let plan = decision
+            .trace
+            .logical_expansion
+            .iter()
+            .find(|step| step.logical_path == "image.plan")
+            .unwrap();
+        assert_eq!(plan.max_weight, Some(2.0));
+        assert_eq!(plan.items[0].state, "unavailable");
+
+        runtime.get_mut("local@local").unwrap().enabled = false;
+        assert!(matches!(
+            route(
+                AiccSchedulerProfile::CostFirst,
+                &RoutingPolicyPatch::default(),
+                &request("image.plan"),
+                &runtime,
+            ),
+            Err(RoutingError::FallbackNotAllowed(_)) | Err(RoutingError::NoCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn equal_weight_branches_compare_cost_then_keep_document_order() {
+        let selected = |runtime: &BTreeMap<String, CandidateRuntimeState>| {
+            route(
+                AiccSchedulerProfile::CostFirst,
+                &RoutingPolicyPatch::default(),
+                &request("image.ordered"),
+                runtime,
+            )
+            .unwrap()
+        };
+        let mut runtime = runtime();
+        assert_eq!(selected(&runtime).selected.exact_model, "cheap@cloud-a");
+        runtime.get_mut("cheap@cloud-a").unwrap().estimated_cost = Some(Money::new(0.3, "USD"));
+        assert_eq!(selected(&runtime).selected.exact_model, "local@local");
+        runtime.get_mut("cheap@cloud-a").unwrap().estimated_cost = Some(Money::new(0.2, "USD"));
+        let decision = selected(&runtime);
+        assert_eq!(decision.selected.exact_model, "local@local");
+        assert_eq!(decision.fallback_candidates[0].exact_model, "cheap@cloud-a");
+        assert_eq!(decision.trace.ranked_candidates[0].default_order, 0);
+        runtime.get_mut("local@local").unwrap().estimated_cost = None;
+        assert_eq!(selected(&runtime).selected.exact_model, "cheap@cloud-a");
+        runtime.get_mut("local@local").unwrap().estimated_cost = Some(Money::new(0.0, "USD"));
+        assert_eq!(selected(&runtime).selected.exact_model, "local@local");
+    }
+
+    #[test]
+    fn zero_provider_weight_is_a_hard_filter() {
+        let registry = registry(AiccSchedulerProfile::Balanced)
+            .with_session_overlay(&AiccRouteOverlay {
+                provider_weights: BTreeMap::from([
+                    ("cloud-a".to_owned(), 0.0),
+                    ("cloud-b".to_owned(), 1.0),
+                ]),
+                ..AiccRouteOverlay::default()
+            })
+            .unwrap();
+        let decision = Router::new(
+            &registry,
+            &engine(&RoutingPolicyPatch::default()),
+            &runtime(),
+        )
+        .route(&request("image.family"))
+        .unwrap();
+
+        assert_eq!(decision.selected.provider_instance_name, "cloud-b");
+        assert!(decision.trace.filtered_candidates.iter().any(|candidate| {
+            candidate.provider_instance_name == "cloud-a"
+                && candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.code == "provider_weight_zero")
+        }));
+    }
+
+    #[test]
+    fn exact_voice_mappings_are_ranked_by_the_selected_profile() {
+        let mut request = request("image.family");
+        request.requirements.canonical_fields.insert(
+            "/voice".into(),
+            buckyos_api::CanonicalFieldRequirement::new(json!({"style": "warm"})),
+        );
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &RoutingPolicyPatch::default(),
+            &request,
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        assert_eq!(decision.fallback_candidates[0].exact_model, "fast@cloud-b");
+    }
+
+    #[test]
+    fn missing_canonical_mapping_does_not_filter_non_strict_requests() {
+        let mut request = request("local@local");
+        request.requirements.canonical_fields.insert(
+            "/voice".into(),
+            buckyos_api::CanonicalFieldRequirement::new(json!({"language": "zh-CN"})),
+        );
+
+        let decision = route(
+            AiccSchedulerProfile::Balanced,
+            &RoutingPolicyPatch::default(),
+            &request,
+            &runtime(),
+        )
+        .unwrap();
+
+        assert_eq!(decision.selected.exact_model, "local@local");
+    }
+
+    #[test]
+    fn exact_route_does_not_fallback_by_default() {
+        let mut runtime = runtime();
+        runtime.get_mut("fast@cloud-b").unwrap().health = ProviderHealthStatus::Unavailable;
+        let error = route(
+            AiccSchedulerProfile::Balanced,
+            &RoutingPolicyPatch::default(),
+            &request("fast@cloud-b"),
+            &runtime,
+        )
+        .unwrap_err();
+        assert!(matches!(error, RoutingError::ExactModelUnavailable { .. }));
+    }
+
+    #[test]
+    fn exact_route_fallback_requires_explicit_policy_and_target() {
+        let mut runtime = runtime();
+        runtime.get_mut("fast@cloud-b").unwrap().health = ProviderHealthStatus::Unavailable;
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                allow_exact_model_fallback: Some(LockedValue::new(true)),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let mut request = request("fast@cloud-b");
+        request.exact_fallback = Some(AiccFallbackRule {
+            mode: AiccFallbackMode::TargetLogical,
+            target: Some("image".into()),
+        });
+        let decision = route(AiccSchedulerProfile::Balanced, &patch, &request, &runtime).unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        assert!(decision.trace.fallback_applied);
+    }
+
+    #[test]
+    fn exact_model_weight_is_a_configurable_preference_not_an_override() {
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &RoutingPolicyPatch::default(),
+            &request("image.weighted"),
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                scheduler_profiles: Some(LockedValue::new(AiccSchedulerProfileConfig {
+                    cost_first: Some(AiccSchedulerProfileWeights {
+                        cost: 0.4,
+                        preference: 0.6,
+                        ..AiccSchedulerProfileWeights::default()
+                    }),
+                    ..AiccSchedulerProfileConfig::default()
+                })),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &patch,
+            &request("image.weighted"),
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "fast@cloud-b");
+    }
+
+    #[test]
+    fn hard_filters_feature_health_and_allow_list() {
+        let mut request = request("image.family");
+        request.requirements.tool_call = true;
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                allowed_provider_instances: Some(LockedValue::new(vec!["cloud-*".into()])),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let decision = route(AiccSchedulerProfile::Balanced, &patch, &request, &runtime()).unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+    }
+
+    #[test]
+    fn budget_and_block_rules_are_applied_before_weight_and_score() {
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                blocked_provider_instances: Some(LockedValue::new(vec!["cloud-a".into()])),
+                max_estimated_cost: Some(LockedValue::new(Money::new(0.25, "USD"))),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let decision = route(
+            AiccSchedulerProfile::CostFirst,
+            &patch,
+            &request("image.plan"),
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "local@local");
+        let codes = decision
+            .trace
+            .filtered_candidates
+            .iter()
+            .flat_map(|candidate| candidate.reasons.iter().map(|reason| reason.code.as_str()))
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"provider_blocked"));
+        assert!(codes.contains(&"cost_ceiling_exceeded"));
+    }
+
+    #[test]
+    fn all_filtered_candidates_fallback_to_parent() {
+        let mut runtime = runtime();
+        runtime.get_mut("fast@cloud-b").unwrap().health = ProviderHealthStatus::Unavailable;
+        let decision = route(
+            AiccSchedulerProfile::Balanced,
+            &RoutingPolicyPatch::default(),
+            &request("image.special"),
+            &runtime,
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        assert!(decision.trace.fallback_applied);
+        assert_eq!(decision.trace.fallback_chain[0].from, "image.special");
+    }
+
+    #[test]
+    fn scheduler_profiles_ignore_volatile_latency_observations() {
+        for (profile, expected) in [
+            (AiccSchedulerProfile::CostFirst, "cheap@cloud-a"),
+            (AiccSchedulerProfile::LatencyFirst, "cheap@cloud-a"),
+            (AiccSchedulerProfile::QualityFirst, "cheap@cloud-a"),
+        ] {
+            let decision = route(
+                profile,
+                &RoutingPolicyPatch::default(),
+                &request("image.family"),
+                &runtime(),
+            )
+            .unwrap();
+            assert_eq!(decision.selected.exact_model, expected);
+        }
+    }
+
+    #[test]
+    fn volatile_runtime_metrics_do_not_change_equal_cost_selection() {
+        let mut runtime = runtime();
+        runtime.get_mut("fast@cloud-b").unwrap().estimated_cost = Some(Money::new(0.1, "USD"));
+        let selected = |runtime: &BTreeMap<String, CandidateRuntimeState>| {
+            route(
+                AiccSchedulerProfile::Balanced,
+                &RoutingPolicyPatch::default(),
+                &request("image.family"),
+                runtime,
+            )
+            .unwrap()
+            .selected
+            .exact_model
+        };
+        assert_eq!(selected(&runtime), "cheap@cloud-a");
+        let cheap = runtime.get_mut("cheap@cloud-a").unwrap();
+        cheap.health = ProviderHealthStatus::Degraded;
+        cheap.p50_latency_ms = Some(9_000.0);
+        cheap.p95_latency_ms = Some(9_000.0);
+        cheap.error_rate_5m = Some(0.9);
+        cheap.recent_failures = 9;
+        assert_eq!(selected(&runtime), "cheap@cloud-a");
+    }
+
+    #[test]
+    fn local_and_strict_local_profiles_work() {
+        for profile in [
+            AiccSchedulerProfile::LocalFirst,
+            AiccSchedulerProfile::StrictLocal,
+        ] {
+            let patch = RoutingPolicyPatch {
+                route: AiccPolicyConfig {
+                    profile: Some(LockedValue::new(profile.clone())),
+                    ..AiccPolicyConfig::default()
+                },
+                ..RoutingPolicyPatch::default()
+            };
+            let model = if profile == AiccSchedulerProfile::LocalFirst {
+                "image.all"
+            } else {
+                "image.plan"
+            };
+            let decision = route(
+                AiccSchedulerProfile::Balanced,
+                &patch,
+                &request(model),
+                &runtime(),
+            )
+            .unwrap();
+            assert_eq!(decision.selected.exact_model, "local@local");
+        }
+    }
+
+    #[test]
+    fn session_history_is_soft_and_cannot_bypass_health() {
+        let mut request = request("image.family");
+        request.previous_exact_model = Some("fast@cloud-b".into());
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                profile: Some(LockedValue::new(AiccSchedulerProfile::Balanced)),
+                scheduler_profiles: Some(LockedValue::new(AiccSchedulerProfileConfig {
+                    balanced: Some(AiccSchedulerProfileWeights {
+                        preference: 1.0,
+                        ..AiccSchedulerProfileWeights::default()
+                    }),
+                    ..AiccSchedulerProfileConfig::default()
+                })),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let decision = route(AiccSchedulerProfile::Balanced, &patch, &request, &runtime()).unwrap();
+        assert_eq!(decision.selected.exact_model, "fast@cloud-b");
+
+        let mut runtime = runtime();
+        runtime.get_mut("fast@cloud-b").unwrap().health = ProviderHealthStatus::Unavailable;
+        let decision = route(AiccSchedulerProfile::Balanced, &patch, &request, &runtime).unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+    }
+
+    #[test]
+    fn tie_break_is_deterministic_and_trace_persists_ranked_candidates() {
+        let patch = RoutingPolicyPatch {
+            route: AiccPolicyConfig {
+                profile: Some(LockedValue::new(AiccSchedulerProfile::Balanced)),
+                scheduler_profiles: Some(LockedValue::new(AiccSchedulerProfileConfig {
+                    balanced: Some(AiccSchedulerProfileWeights {
+                        preference: 1.0,
+                        ..AiccSchedulerProfileWeights::default()
+                    }),
+                    ..AiccSchedulerProfileConfig::default()
+                })),
+                ..AiccPolicyConfig::default()
+            },
+            ..RoutingPolicyPatch::default()
+        };
+        let decision = route(
+            AiccSchedulerProfile::Balanced,
+            &patch,
+            &request("image.family"),
+            &runtime(),
+        )
+        .unwrap();
+        assert_eq!(decision.selected.exact_model, "cheap@cloud-a");
+        assert_eq!(decision.trace.trace_id, "trace-1");
+        assert_eq!(decision.trace.ranked_candidates.len(), 2);
+        let trace = serde_json::to_string(&decision.trace).unwrap();
+        assert!(trace.contains("\"trace_id\":\"trace-1\""));
+        assert!(!trace.contains("provider_trace_id"));
+        for forbidden in ["prompt", "credential", "secret", "options"] {
+            assert!(!trace.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn method_and_capability_must_match_api_type() {
+        let mut bad_method = request("image.family");
+        bad_method.method = "chat.completions.create".into();
+        assert!(matches!(
+            route(
+                AiccSchedulerProfile::Balanced,
+                &RoutingPolicyPatch::default(),
+                &bad_method,
+                &runtime()
+            ),
+            Err(RoutingError::InvalidRequest(_))
+        ));
+
+        let mut bad_capability = request("image.family");
+        bad_capability.capability = Capability::Llm;
+        assert!(matches!(
+            route(
+                AiccSchedulerProfile::Balanced,
+                &RoutingPolicyPatch::default(),
+                &bad_capability,
+                &runtime()
+            ),
+            Err(RoutingError::InvalidRequest(_))
+        ));
+
+        let mut missing_trace_id = request("image.family");
+        missing_trace_id.trace_id.clear();
+        assert!(matches!(
+            route(
+                AiccSchedulerProfile::Balanced,
+                &RoutingPolicyPatch::default(),
+                &missing_trace_id,
+                &runtime()
+            ),
+            Err(RoutingError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn production_policy_resolver_merges_directory_session_and_request() {
+        let directory = AiccPolicyConfig {
+            profile: Some(LockedValue::new(AiccSchedulerProfile::CostFirst)),
+            allow_fallback: Some(LockedValue::new(false)),
+            ..AiccPolicyConfig::default()
+        };
+        let registry = registry_with_directory_policy(AiccSchedulerProfile::Balanced, directory);
+
+        let directory_only =
+            resolve_effective_routing_policy(&registry, "image.family", None, None).unwrap();
+        assert_eq!(
+            directory_only.profile.value,
+            AiccSchedulerProfile::CostFirst
+        );
+        assert!(!directory_only.allow_fallback.value);
+
+        let session = AiccRouteOverlay {
+            policy: AiccPolicyConfig {
+                profile: Some(LockedValue::new(AiccSchedulerProfile::LatencyFirst)),
+                ..AiccPolicyConfig::default()
+            },
+            logical_profile: Some(AiccSessionLogicalProfile {
+                overlays: vec![AiccLogicalTreeOverlay {
+                    path: "image.family".into(),
+                    route_policy_override: Some(AiccPolicyConfig {
+                        allow_fallback: Some(LockedValue::new(true)),
+                        ..AiccPolicyConfig::default()
+                    }),
+                    ..AiccLogicalTreeOverlay::default()
+                }],
+                ..AiccSessionLogicalProfile::default()
+            }),
+            ..AiccRouteOverlay::default()
+        };
+        let session_effective =
+            resolve_effective_routing_policy(&registry, "image.family", Some(&session), None)
+                .unwrap();
+        assert_eq!(
+            session_effective.profile.value,
+            AiccSchedulerProfile::LatencyFirst
+        );
+        assert!(session_effective.allow_fallback.value);
+
+        let request = RoutePolicy {
+            profile: RoutePolicyProfile::Quality,
+            max_latency_ms: Some(250),
+            ..RoutePolicy::default()
+        };
+        let effective = resolve_effective_routing_policy(
+            &registry,
+            "image.family",
+            Some(&session),
+            Some(&request),
+        )
+        .unwrap();
+        assert_eq!(effective.profile.value, AiccSchedulerProfile::QualityFirst);
+        assert_eq!(effective.profile.source, Some(policy::PolicyScope::Request));
+        assert_eq!(effective.max_latency_ms.value, Some(250));
+    }
+
+    #[test]
+    fn production_policy_resolver_preserves_locked_directory_values() {
+        let registry = registry_with_directory_policy(
+            AiccSchedulerProfile::Balanced,
+            AiccPolicyConfig {
+                local_only: Some(LockedValue::locked(true)),
+                ..AiccPolicyConfig::default()
+            },
+        );
+        let error = resolve_effective_routing_policy(
+            &registry,
+            "image.family",
+            None,
+            Some(&RoutePolicy::default()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PolicyError::LockedOverride {
+                field: "local_only",
+                locked_by: policy::PolicyScope::Directory,
+                attempted_by: policy::PolicyScope::Request,
+            }
+        );
+    }
+
+    #[test]
+    fn public_route_profiles_have_one_scheduler_mapping() {
+        for (profile, expected) in [
+            (RoutePolicyProfile::Cheap, AiccSchedulerProfile::CostFirst),
+            (RoutePolicyProfile::Fast, AiccSchedulerProfile::LatencyFirst),
+            (RoutePolicyProfile::Balanced, AiccSchedulerProfile::Balanced),
+            (
+                RoutePolicyProfile::Quality,
+                AiccSchedulerProfile::QualityFirst,
+            ),
+        ] {
+            assert_eq!(scheduler_profile_for_route_profile(&profile), expected);
+        }
+    }
+
+    #[test]
+    fn max_latency_rejects_unknown_and_slow_candidates() {
+        let registry = registry(AiccSchedulerProfile::Balanced);
+        let request_policy = RoutePolicy {
+            profile: RoutePolicyProfile::Fast,
+            max_latency_ms: Some(250),
+            ..RoutePolicy::default()
+        };
+        let engine = policy_engine_for_route(
+            &registry,
+            "image.family",
+            None,
+            Some(&request_policy),
+            OpenQuota,
+        )
+        .unwrap();
+        let mut runtime = runtime();
+        runtime.get_mut("cheap@cloud-a").unwrap().p95_latency_ms = None;
+        let decision = Router::new(&registry, &engine, &runtime)
+            .route(&request("image.family"))
+            .unwrap();
+        assert_eq!(decision.selected.exact_model, "fast@cloud-b");
+        assert_eq!(
+            decision.trace.filtered_candidates[0].reasons[0].code,
+            "latency_unavailable"
+        );
+
+        runtime.get_mut("fast@cloud-b").unwrap().p95_latency_ms = Some(300.0);
+        let error = Router::new(&registry, &engine, &runtime)
+            .route(&request("image.family"))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no candidate for image.family"));
+        assert!(message.contains("cheap@cloud-a@cloud-a[latency_unavailable]"));
+        assert!(message.contains("fast@cloud-b@cloud-b[latency_ceiling_exceeded]"));
+        let RoutingError::NoCandidate { filtered, .. } = error else {
+            panic!("expected all candidates to be rejected by max latency");
+        };
+        let codes = filtered
+            .iter()
+            .flat_map(|candidate| candidate.reasons.iter().map(|reason| reason.code.as_str()))
+            .collect::<Vec<_>>();
+        assert!(codes.contains(&"latency_unavailable"));
+        assert!(codes.contains(&"latency_ceiling_exceeded"));
+    }
+    fn llm_registry(stocks: &[ProviderInventory], experimental: bool) -> ModelRegistry {
+        let mut document = crate::model::llm_tests::openai_document();
+        if experimental {
+            document["models"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|model| model["id"] == "gpt-5.6-sol")
+                .unwrap()["llm"]["stability"] = json!("experimental");
+        }
+        let catalog =
+            crate::model::llm_tests::compile(vec![serde_json::from_value(document).unwrap()])
+                .unwrap();
+        let mut overlay = crate::model::llm_tests::gpt_overlay();
+        let items = overlay
+            .logical_tree
+            .get_mut("llm.chat")
+            .unwrap()
+            .items
+            .as_mut()
+            .unwrap();
+        for item in items.iter_mut() {
+            item.weight = match item.name.as_str() {
+                "pro" => 10.0,
+                "max" => 1.0,
+                "nano" => 100.0,
+                _ => 0.1,
+            };
+        }
+        let mut task = crate::model::llm_tests::definition("llm.chat");
+        task.min_line.tool_call = true;
+        ModelRegistry::build(
+            &catalog,
+            stocks,
+            vec![task],
+            RegistryLayers {
+                factory: Some(&overlay),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn llm_route(
+        registry: &ModelRegistry,
+        experimental: bool,
+        unavailable: &[&str],
+    ) -> Result<RouteDecision, RoutingError> {
+        let mut runtime: BTreeMap<_, _> = registry
+            .model_views()
+            .into_iter()
+            .map(|model| (model.exact_model, state(false, 0.1, 100.0)))
+            .collect();
+        for exact in unavailable {
+            runtime.get_mut(*exact).unwrap().model_available = false;
+        }
+        let mut request = request("llm.chat");
+        request.api_type = ApiType::Llm;
+        request.method = ApiType::Llm.typed_method().into();
+        request.capability = ApiType::Llm.capability();
+        request.allow_experimental = experimental;
+        Router::new(registry, &engine(&RoutingPolicyPatch::default()), &runtime).route(&request)
+    }
+
+    #[test]
+    fn web_search_is_optional_and_respects_request_and_directory_disables() {
+        let catalog = crate::model::llm_tests::compile(vec![serde_json::from_value(
+            crate::model::llm_tests::openai_document(),
+        )
+        .unwrap()])
+        .unwrap();
+        let stocks = [crate::model::llm_tests::inventory(
+            "openai",
+            "gpt-5.4",
+            "gpt-5.4",
+            "openai",
+            &["medium"],
+        )];
+        let overlay = crate::model::llm_tests::gpt_overlay();
+        let policy = engine(&RoutingPolicyPatch::default());
+        for (path, search_allowed) in [
+            ("llm.chat", true),
+            ("llm.plan", true),
+            ("llm.vision", true),
+            ("llm.code", false),
+            ("llm.swift", false),
+            ("llm.summarize", false),
+            ("llm.translate", false),
+            ("llm.fallback", false),
+            ("llm.chat.custom", false),
+        ] {
+            for directory_disables in [false, true] {
+                let mut definition = crate::model::llm_tests::definition(path);
+                definition.disable_line.web_search = directory_disables;
+                let mut overlay = overlay.clone();
+                if path != "llm.chat" {
+                    let chat = overlay.logical_tree.remove("llm.chat").unwrap();
+                    overlay.logical_tree.insert(path.into(), chat);
+                }
+                let registry = ModelRegistry::build(
+                    &catalog,
+                    &stocks,
+                    vec![definition],
+                    RegistryLayers {
+                        factory: Some(&overlay),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let runtime: BTreeMap<_, _> = registry
+                    .model_views()
+                    .into_iter()
+                    .map(|model| (model.exact_model, state(false, 0.1, 100.0)))
+                    .collect();
+                let router = Router::new(&registry, &policy, &runtime);
+                for request_disables in [false, true] {
+                    let mut request = RoutingRequest::new(
+                        "trace-search",
+                        "request-search",
+                        path,
+                        ApiType::Llm,
+                        request(path).caller,
+                    );
+                    request.disable.web_search = request_disables;
+                    let route = router.route(&request).unwrap();
+                    assert_eq!(
+                        route
+                            .selected
+                            .enabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"),
+                        search_allowed && !directory_disables && !request_disables,
+                        "{path}"
+                    );
+                    assert_eq!(
+                        route
+                            .selected
+                            .disabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"),
+                        !search_allowed || directory_disables || request_disables,
+                        "{path}"
+                    );
+                    assert_eq!(
+                        route.trace.disabled_capabilities,
+                        route.selected.disabled_capabilities
+                    );
+                    request.requirements.web_search = true;
+                    assert_eq!(
+                        router.route(&request).is_ok(),
+                        search_allowed && !directory_disables && !request_disables,
+                        "{path}"
+                    );
+                }
+                for model in [
+                    "llm.gpt-standard",
+                    "llm.gpt-5-4:medium",
+                    "gpt-5.4:reasoning-medium@openai",
+                ] {
+                    let mut request = RoutingRequest::new(
+                        "trace-search",
+                        "request-search",
+                        model,
+                        ApiType::Llm,
+                        request(model).caller,
+                    );
+                    let route = router.route(&request).unwrap();
+                    assert!(
+                        !route
+                            .selected
+                            .enabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"),
+                        "{model}"
+                    );
+                    assert!(
+                        route
+                            .selected
+                            .disabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"),
+                        "{model}"
+                    );
+                    request.requirements.web_search = true;
+                    let explicit = router.route(&request);
+                    assert_eq!(explicit.is_ok(), model.contains('@'), "{model}");
+                    if let Ok(route) = explicit {
+                        assert!(route
+                            .selected
+                            .enabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"));
+                        assert!(!route
+                            .trace
+                            .disabled_capabilities
+                            .iter()
+                            .any(|feature| feature == "web_search"));
+                    }
+                    request.disable.web_search = true;
+                    assert!(router.route(&request).is_err(), "{model}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_gpt_token_limits_preserve_priority_and_enforce_boundaries() {
+        let catalog = crate::model::llm_tests::builtin_catalog();
+        let policy = engine(&RoutingPolicyPatch::default());
+        for (model, context) in [
+            ("gpt-5.4", 1_050_000),
+            ("gpt-5.5", 1_050_000),
+            ("gpt-5.4-pro", 1_050_000),
+            ("gpt-5.5-pro", 1_050_000),
+            ("gpt-5.4-mini", 400_000),
+            ("gpt-5.4-nano", 400_000),
+            ("gpt-5.3-codex", 400_000),
+        ] {
+            let llm = catalog.llm_model("openai", model).unwrap();
+            let effort = llm.semantics.effort.as_str();
+            let stocks = [
+                crate::model::llm_tests::inventory("openai", model, model, "openai", &[effort]),
+                crate::model::llm_tests::inventory(
+                    "openai",
+                    model,
+                    &format!("openai/{model}"),
+                    "openrouter",
+                    &[effort],
+                ),
+                crate::model::llm_tests::inventory(
+                    "claude",
+                    "claude-sonnet-5",
+                    "claude-sonnet-5",
+                    "claude",
+                    &["high"],
+                ),
+            ];
+            let overlay = AiccRouteOverlay {
+                logical_tree: BTreeMap::from([(
+                    "llm.chat".into(),
+                    AiccLogicalNodeOverlay {
+                        items: Some(
+                            catalog
+                                .model_drivers()
+                                .flat_map(|driver| &driver.specs)
+                                .filter(|spec| !spec.direct_only)
+                                .map(|spec| {
+                                    LogicalItem::new(
+                                        spec.id.clone(),
+                                        format!("llm.{}", spec.id),
+                                        if spec.id == llm.semantics.spec {
+                                            2.2
+                                        } else if spec.id == "claude-sonnet" {
+                                            2.1
+                                        } else {
+                                            0.1
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        ),
+                        ..Default::default()
+                    },
+                )]),
+                ..Default::default()
+            };
+            let registry = ModelRegistry::build(
+                &catalog,
+                &stocks,
+                vec![crate::model::llm_tests::definition("llm.chat")],
+                RegistryLayers {
+                    factory: Some(&overlay),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let runtime: BTreeMap<_, _> = registry
+                .model_views()
+                .into_iter()
+                .map(|model| (model.exact_model, state(false, 0.1, 100.0)))
+                .collect();
+            let router = Router::new(&registry, &policy, &runtime);
+            let mut request = RoutingRequest::new(
+                "trace-token-limits",
+                "request-token-limits",
+                "llm.chat",
+                ApiType::Llm,
+                request("llm.chat").caller,
+            );
+            request.requirements.tool_call = true;
+            request.estimated_input_tokens = Some(1_000);
+            for output in [8_192, 128_000] {
+                request.estimated_output_tokens = Some(output);
+                let decision = router.route(&request).unwrap();
+                assert_eq!(decision.selected.origin_model_id, model);
+                assert!(decision
+                    .fallback_candidates
+                    .iter()
+                    .all(|candidate| candidate.origin_model_id == model));
+            }
+            for instance in registry
+                .model_views()
+                .into_iter()
+                .filter(|m| m.model_driver_id == "openai")
+            {
+                request.model = instance.exact_model;
+                request.estimated_output_tokens = Some(128_000);
+                assert!(router.route(&request).is_ok(), "{}", request.model);
+                request.estimated_output_tokens = Some(128_001);
+                assert!(router.route(&request).is_err(), "{}", request.model);
+                request.estimated_output_tokens = Some(8_192);
+                request.estimated_input_tokens = Some(context - 8_192);
+                assert!(router.route(&request).is_ok(), "{}", request.model);
+                request.estimated_input_tokens = Some(context - 8_192 + 1);
+                assert!(router.route(&request).is_err(), "{}", request.model);
+                request.estimated_input_tokens = Some(1_000);
+            }
+        }
+    }
+
+    #[test]
+    fn llm_lower_weights_are_tried_only_when_higher_groups_are_unavailable() {
+        let old =
+            crate::model::llm_tests::inventory("openai", "gpt-5.5-pro", "old", "old", &["high"]);
+        let new =
+            crate::model::llm_tests::inventory("openai", "gpt-5.6-sol", "new", "new", &["high"]);
+        let duplicate = crate::model::llm_tests::inventory(
+            "openai",
+            "gpt-5.6-sol",
+            "other",
+            "other",
+            &["high"],
+        );
+        let lower =
+            crate::model::llm_tests::inventory("openai", "gpt-6-astra", "six", "six", &["high"]);
+        let registry = llm_registry(&[old.clone(), new.clone(), duplicate, lower.clone()], false);
+        let decision = llm_route(&registry, false, &[]).unwrap();
+        assert_eq!(decision.selected.origin_model_id, "gpt-5.6-sol");
+        assert_eq!(
+            decision
+                .fallback_candidates
+                .iter()
+                .map(|candidate| candidate.origin_model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.6-sol"]
+        );
+        let decision = llm_route(
+            &registry,
+            false,
+            &["new:reasoning-high@new", "other:reasoning-high@other"],
+        )
+        .unwrap();
+        assert_eq!(decision.selected.origin_model_id, "gpt-5.5-pro");
+        let decision = llm_route(
+            &registry,
+            false,
+            &[
+                "new:reasoning-high@new",
+                "other:reasoning-high@other",
+                "old:reasoning-high@old",
+            ],
+        )
+        .unwrap();
+        assert_eq!(decision.selected.origin_model_id, "gpt-6-astra");
+        let mut incapable = new;
+        incapable.models[0].capabilities.remove("tool_call");
+        let registry = llm_registry(&[old, incapable, lower], false);
+        assert_eq!(
+            llm_route(&registry, false, &[])
+                .unwrap()
+                .selected
+                .origin_model_id,
+            "gpt-5.5-pro"
+        );
+    }
+
+    #[test]
+    fn llm_stability_is_admission_only_and_fallback_keeps_requirements() {
+        let old =
+            crate::model::llm_tests::inventory("openai", "gpt-5.5-pro", "old", "old", &["high"]);
+        let new =
+            crate::model::llm_tests::inventory("openai", "gpt-5.6-sol", "new", "new", &["high"]);
+        let registry = llm_registry(&[old, new.clone()], true);
+        assert_eq!(
+            llm_route(&registry, true, &[])
+                .unwrap()
+                .selected
+                .origin_model_id,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            llm_route(&registry, false, &[])
+                .unwrap()
+                .selected
+                .origin_model_id,
+            "gpt-5.5-pro"
+        );
+        let registry = llm_registry(&[new], true);
+        assert!(matches!(
+            llm_route(&registry, false, &[]),
+            Err(RoutingError::NoCandidate { .. })
+        ));
+        assert_eq!(
+            llm_route(&registry, true, &[])
+                .unwrap()
+                .selected
+                .exact_model,
+            "new:reasoning-high@new"
+        );
+        let mut incapable =
+            crate::model::llm_tests::inventory("openai", "gpt-5.6-sol", "weak", "weak", &["low"]);
+        incapable.models[0].capabilities.remove("tool_call");
+        let registry = llm_registry(&[incapable], false);
+        let overlay: AiccRouteOverlay=serde_json::from_value(json!({"logical_tree":{"llm.chat":{"fallback":{"mode":"target_exact","target":"weak:reasoning-low@weak"}}}})).unwrap();
+        let registry = registry.with_session_overlay(&overlay).unwrap();
+        assert!(matches!(
+            llm_route(&registry, false, &[]),
+            Err(RoutingError::NoCandidate { .. })
+        ));
+    }
+    #[test]
+    fn same_family_fixed_effort_uses_converted_price_before_latency_and_unknowns() {
+        let inventories = [
+            crate::model::llm_tests::inventory("openai", "gpt-5.6-sol", "cn", "cn", &["high"]),
+            crate::model::llm_tests::inventory("openai", "gpt-5.6-sol", "us", "us", &["high"]),
+        ];
+        let registry = llm_registry(&inventories, false);
+        let fx=CatalogSnapshot::build(1,CatalogDocuments {known_providers:vec![serde_json::from_value(json!({"format":"buckyos.aicc.known-provider-catalog","schema_version":1,"schema_revision":1,"revision_seq":1,"catalog_id":"fx","providers":[],"exchange_rates":{"source_url":"https://rates.example/test","observed_at_ms":100,"expires_at_ms":200,"usd_per_unit":{"CNY":0.14}}})).unwrap()],..Default::default()},&Default::default()).unwrap();
+        let mut runtime: BTreeMap<_, _> = registry
+            .model_views()
+            .into_iter()
+            .map(|m| {
+                let cn = m.provider_instance_name == "cn";
+                let mut state = state(false, 0.1, if cn { 1000.0 } else { 1.0 });
+                state.estimated_cost = fx.cost_in_usd(
+                    if cn {
+                        Money::new(0.5, "CNY")
+                    } else {
+                        Money::new(0.1, "USD")
+                    },
+                    150,
+                );
+                (m.exact_model, state)
+            })
+            .collect();
+        let mut request = request("llm.chat");
+        request.api_type = ApiType::Llm;
+        request.method = ApiType::Llm.typed_method().into();
+        request.capability = ApiType::Llm.capability();
+        let policy = engine(&RoutingPolicyPatch::default());
+        let route = Router::new(&registry, &policy, &runtime)
+            .route(&request)
+            .unwrap();
+        assert_eq!(route.selected.provider_instance_name, "cn");
+        runtime
+            .get_mut("cn:reasoning-high@cn")
+            .unwrap()
+            .estimated_cost = fx.cost_in_usd(Money::new(0.5, "CNY"), 200);
+        assert_eq!(
+            Router::new(&registry, &policy, &runtime)
+                .route(&request)
+                .unwrap()
+                .selected
+                .provider_instance_name,
+            "us"
+        );
+    }
+    include!("decision_tests.rs");
+}

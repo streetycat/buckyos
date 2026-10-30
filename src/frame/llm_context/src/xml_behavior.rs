@@ -12,10 +12,10 @@
 //! ```xml
 //! <response>
 //!   <observation>...reading of the previous action's result...</observation>
-//!   <thinking>...free-form reasoning...</thinking>
+//!   <intent>...the next move, in one short sentence...</intent>
 //!
 //!   <actions>
-//!     <exec_bash>cargo test</exec_bash>
+//!     <shell>cargo test</shell>
 //!     <write_file path="src/foo.rs"><![CDATA[
 //! pub fn bar() -> u32 { 42 }
 //! ]]></write_file>
@@ -28,7 +28,7 @@
 //!
 //! ## Recognized Action tags (first-class, hardcoded allowlist)
 //!
-//! `exec_bash`, `write_file`, `edit_file`, `read`, `sendmsg`,
+//! `shell`, `write_file`, `edit_file`, `read`, `sendmsg`,
 //! `subscribe_event`, `unsubscribe_event`. Any other element inside
 //! `<actions>` is silently skipped — the v2 Action set is prompt-coupled,
 //! not registry-driven.
@@ -39,7 +39,7 @@
 //! dedicated slots on [`LLMBehaviorResult`]:
 //!
 //! - `<sendmsg target="...">` inside `<actions>` → `messages_to_send` (ordered)
-//! - `<report>` outside `<actions>`              → `self_report` (last one wins)
+//! - `<report>` outside `<actions>`              → `self_report` and `report_end`
 //!
 //! This keeps process messaging and LLMContext last-state updates separate:
 //! `<sendmsg>` is the side-effect action shape, while `<report>` updates
@@ -55,7 +55,7 @@
 //!    content). Non-CDATA bodies go through `xml_unescape`.
 //! 5. Provider-returned `tool_calls` (when the model uses native function
 //!    calling) take precedence over `<actions>` parsing.
-//! 6. Empty response (no text, no tool_calls) is the only hard error.
+//! 6. Invalid report or empty control decisions are recoverable protocol errors.
 
 use std::collections::HashMap;
 
@@ -63,6 +63,7 @@ use buckyos_api::{AiResponse, AiToolCall};
 use serde_json::Value;
 
 use crate::behavior_loop::{LLMBehaviorResult, LLMResultParser, SendMessageRecord};
+use crate::xml_util::{parse_attrs, xml_unescape};
 
 /// Prompt snippet that teaches an LLM to emit the XML Behavior v2 result
 /// format accepted by [`XmlBehaviorParser`].
@@ -76,17 +77,17 @@ The response MUST be parseable by XMLParser. Example:
 ```
 <response>
   <observation>follow process rules</observation>
-  <thinking>follow process rules</thinking>
+  <intent>follow process rules</intent>
   <actions>
     <write_file path="test.py"><![CDATA[
 print("test")
     ]]></write_file>
-    <exec_bash><![CDATA[
+    <shell><![CDATA[
 python3 test.py
-    ]]></exec_bash>
-    <exec_bash><![CDATA[
+    ]]></shell>
+    <shell><![CDATA[
 ifconfig
-    ]]></exec_bash>
+    ]]></shell>
     <edit_file path="src/foo.rs">
       <old_string><![CDATA[println!("hello");]]></old_string>
       <new_string><![CDATA[println!("hi");]]></new_string>
@@ -107,13 +108,18 @@ Message to the user; optional; SHOULD only be provided when there is important p
 
 - MUST set `<next_behavior>` only when `<actions>` is empty; action execution results MUST be observed before changing behavior.
 - `<next_behavior>` is the key field used to maintain the behavior state machine and MUST follow the process rules.
+- Never use END or done as next_behavior. To finish, submit a non-empty `<report end="true">final text</report>` with no actions, sendmsg, native tool_calls, or non-empty next_behavior.
+- `<report>` and `<report end="false">` submit a progress report and continue. Report text is free text or Markdown, not a message to the user.
+- Only one report is allowed per response; end accepts only true or false. Empty `<actions/>` is allowed with an ending report.
+- Optional report attachments use `<artifacts>["relative/file", "cyfile:…"]</artifacts>` (files relative to the work directory, or object ids) and optional machine-readable output uses `<result>{"key":"value"}</result>`; both require a report in the same response.
+- A response must contain actions, a report, or next_behavior; thought-only output is a protocol error.
 
 ## <actions> Usage Rules
 
 - Actions are executed in order, and later actions can depend on the results of earlier actions.
-- You SHOULD always prefer `write_file` / `edit_file` / `read` over `exec_bash`. MUST NOT use `echo`, `cat`, or heredoc to write files
+- You SHOULD always prefer `write_file` / `edit_file` / `read` over `shell`. MUST NOT use `echo`, `cat`, or heredoc to write files
 - `<edit_file>` MUST provide `old_string` and `new_string`. `new_string` MUST be different from `old_string`. `old_string` MUST match exactly once in the target file, otherwise the edit fails.
-- `<exec_bash>` MUST contain online bash commands in its body, and each `<exec_bash>` SHOULD complete exactly one task.
+- `<shell>` MUST contain bash commands in its body (run by the runtime's shell), and each `<shell>` SHOULD complete exactly one task.
 
 "#;
 
@@ -124,7 +130,7 @@ Message to the user; optional; SHOULD only be provided when there is important p
 /// but it's never dispatched as an action — see the `<sendmsg>` handling
 /// note above.
 pub const V2_ACTION_TAGS: &[&str] = &[
-    "exec_bash",
+    "shell",
     "write_file",
     "edit_file",
     "read",
@@ -146,7 +152,7 @@ const EDIT_FILE_ARG_TAGS: &[&str] = &["old_string", "new_string"];
 pub fn is_v2_action_tag(name: &str) -> bool {
     matches!(
         name,
-        "exec_bash" | "write_file" | "edit_file" | "read" | "subscribe_event" | "unsubscribe_event"
+        "shell" | "write_file" | "edit_file" | "read" | "subscribe_event" | "unsubscribe_event"
     )
 }
 
@@ -154,7 +160,7 @@ pub fn is_v2_action_tag(name: &str) -> bool {
 /// (e.g. `<read uri="..."/>`) or are special-cased (`sendmsg`).
 fn body_arg_name(tag: &str) -> Option<&'static str> {
     match tag {
-        "exec_bash" => Some("command"),
+        "shell" => Some("command"),
         "write_file" => Some("content"),
         _ => None,
     }
@@ -166,7 +172,7 @@ fn body_arg_name(tag: &str) -> Option<&'static str> {
 pub struct XmlBehaviorParser {
     /// When `true`, parse succeeds only if at least one of `do_actions` /
     /// `self_report` / `messages_to_send` / `next_behavior` is set. Defaults
-    /// to `false` (lenient: a pure-text response is a valid terminal step).
+    /// to `false`; report and completion validation always applies.
     pub strict: bool,
 }
 
@@ -197,45 +203,71 @@ impl LLMResultParser for XmlBehaviorParser {
             None => unfenced.to_string(),
         };
 
-        let thought = extract_tag_body(&scan_region, "thinking")
-            .map(|s| s.trim().to_string())
+        // `<intent>` is the protocol tag; `<thinking>` is the legacy alias
+        // that older snapshots and scripted responses still carry.
+        let thought = scan_known_tags(&scan_region, &["intent", "thinking"])
+            .into_iter()
+            .next()
+            .map(|node| node.body.trim().to_string())
             .filter(|s| !s.is_empty());
-        let observation = extract_tag_body(&scan_region, "observation")
-            .map(|s| s.trim().to_string())
+        let observation = scan_known_tags(&scan_region, &["observation"])
+            .into_iter()
+            .next()
+            .map(|node| node.body.trim().to_string())
             .filter(|s| !s.is_empty());
-        let next_behavior = extract_tag_body(&scan_region, "next_behavior")
-            .map(|s| s.trim().to_string())
+        let next_nodes = scan_known_tags(&scan_region, &["next_behavior"]);
+        if next_nodes.len() > 1 {
+            return Err("duplicate next_behavior nodes are invalid".into());
+        }
+        let next_behavior = next_nodes
+            .into_iter()
+            .next()
+            .map(|node| node.body.trim().to_string())
             .filter(|s| !s.is_empty());
 
         // Provider-native tool_calls win when present; otherwise parse the
         // v2 XML actions. Reports are extracted from the XML even when
         // provider tool_calls are present — they're a separate slot.
-        let (mut do_actions, self_report, messages_to_send) = extract_v2_actions(&scan_region);
+        let (mut do_actions, self_report, report_end, messages_to_send) =
+            extract_v2_actions(&scan_region)?;
         if !provider_calls.is_empty() {
             do_actions = provider_calls;
         }
 
-        if self.strict
-            && do_actions.is_empty()
-            && next_behavior.is_none()
-            && self_report.is_none()
-            && messages_to_send.is_empty()
-        {
-            return Err(
-                "strict parse: response has no <actions>, <sendmsg>, <report>, or <next_behavior>"
-                    .to_string(),
-            );
+        let artifact_nodes = scan_known_tags(&scan_region, &["artifacts"]);
+        let result_nodes = scan_known_tags(&scan_region, &["result"]);
+        if artifact_nodes.len() > 1 || result_nodes.len() > 1 {
+            return Err("duplicate artifacts/result nodes".into());
         }
+        if self_report.is_none() && (!artifact_nodes.is_empty() || !result_nodes.is_empty()) {
+            return Err("artifacts/result require a report in the same response".into());
+        }
+        let report_artifacts = artifact_nodes
+            .first()
+            .map(|node| serde_json::from_str::<Vec<String>>(&node.body))
+            .transpose()
+            .map_err(|err| format!("invalid artifacts: {err}"))?
+            .unwrap_or_default();
+        let report_result = result_nodes
+            .first()
+            .map(|node| serde_json::from_str::<Value>(&node.body))
+            .transpose()
+            .map_err(|err| format!("invalid result: {err}"))?;
 
-        Ok(LLMBehaviorResult {
+        let result = LLMBehaviorResult {
             do_actions,
             next_behavior,
             assistant_text: raw_text,
             observation,
             thought,
             self_report,
+            report_end,
+            report_artifacts,
+            report_result,
             messages_to_send,
-        })
+        };
+        result.validate()?;
+        Ok(result)
     }
 }
 
@@ -257,7 +289,15 @@ impl LLMResultParser for XmlBehaviorParser {
 ///    is a last-state update, not an action.
 fn extract_v2_actions(
     scan_region: &str,
-) -> (Vec<AiToolCall>, Option<String>, Vec<SendMessageRecord>) {
+) -> Result<
+    (
+        Vec<AiToolCall>,
+        Option<String>,
+        bool,
+        Vec<SendMessageRecord>,
+    ),
+    String,
+> {
     let actions_body =
         extract_tag_body(scan_region, "actions").unwrap_or_else(|| scan_region.to_string());
 
@@ -316,15 +356,44 @@ fn extract_v2_actions(
     // Pass 2: scan for `<report>` outside `<actions>`. Self Report updates
     // the LLMContext last state; it is not an action and has no target mode.
     let mut self_report: Option<String> = None;
+    let mut report_end = false;
     let action_ranges = find_tag_ranges(scan_region, "actions");
     for raw in scan_self_report_tags(scan_region) {
         if is_in_ranges(raw.start, &action_ranges) {
-            continue;
+            return Err("report must be outside actions".into());
         }
+        if self_report.is_some() {
+            return Err("duplicate report nodes are invalid".into());
+        }
+        let opening = scan_region[raw.start..]
+            .split_once('>')
+            .map(|(opening, _)| opening)
+            .unwrap_or_default();
+        if attribute_count(
+            opening.trim_start_matches('<').trim_start_matches("report"),
+            "end",
+        ) > 1
+        {
+            return Err("duplicate report.end attributes are invalid".into());
+        }
+        report_end = match raw.attrs.get("end").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err("report.end must be true or false".into()),
+        };
         self_report = Some(raw.body);
     }
 
-    (do_actions, self_report, messages_to_send)
+    if report_end {
+        let has_action_body = scan_known_tags(scan_region, &["actions"])
+            .iter()
+            .any(|raw| !raw.body.trim().is_empty());
+        let has_actions = !scan_v2_action_tags(scan_region).is_empty();
+        if has_action_body || has_actions {
+            return Err("an ending report cannot contain actions or sendmsg".into());
+        }
+    }
+    Ok((do_actions, self_report, report_end, messages_to_send))
 }
 
 /// One v2 Action tag occurrence, in document order.
@@ -356,6 +425,40 @@ fn scan_known_tags(input: &str, tags: &'static [&'static str]) -> Vec<RawActionT
             break;
         };
         let open = cursor + rel;
+        if input[open..].starts_with("<![CDATA[") {
+            cursor = input[open + 9..]
+                .find("]]>")
+                .map(|end| open + 9 + end + 3)
+                .unwrap_or(input.len());
+            continue;
+        }
+        if input[open..].starts_with("<!--") {
+            cursor = input[open + 4..]
+                .find("-->")
+                .map(|end| open + 4 + end + 3)
+                .unwrap_or(input.len());
+            continue;
+        }
+        let skipped = ["report", "intent", "thinking", "observation", "artifacts", "result"]
+            .into_iter()
+            .find(|tag| {
+                !tags.contains(tag)
+                    && lc_input[open + 1..].starts_with(tag)
+                    && bytes.get(open + 1 + tag.len()).is_some_and(|byte| {
+                        matches!(*byte, b'>' | b' ' | b'\t' | b'\n' | b'\r' | b'/')
+                    })
+            });
+        if let Some(tag) = skipped {
+            if let Some(open_end) = input[open..].find('>') {
+                let open_end = open + open_end;
+                cursor = if input[open..open_end].trim_end().ends_with('/') {
+                    open_end + 1
+                } else {
+                    extract_body_cdata_aware(input, &lc_input, open_end + 1, &format!("</{tag}>")).1
+                };
+                continue;
+            }
+        }
 
         // Try matching against each known tag name. Byte-level comparison
         // (not str slicing!) — when `tag.len()` extends past the tag name
@@ -396,7 +499,13 @@ fn scan_known_tags(input: &str, tags: &'static [&'static str]) -> Vec<RawActionT
         } else {
             opening_inner
         };
-        let attrs = parse_attrs(attrs_str);
+        // The attributes follow the tag name.
+        let attrs = parse_attrs(
+            attrs_str
+                .trim_start()
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest),
+        );
 
         if self_closing {
             out.push(RawActionTag {
@@ -425,6 +534,52 @@ fn scan_known_tags(input: &str, tags: &'static [&'static str]) -> Vec<RawActionT
     }
 
     out
+}
+
+fn attribute_count(input: &str, expected: &str) -> usize {
+    let bytes = input.as_bytes();
+    let mut cursor = 0;
+    let mut count = 0;
+    while cursor < bytes.len() {
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        let start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'=')
+        {
+            cursor += 1;
+        }
+        if input[start..cursor].eq_ignore_ascii_case(expected) {
+            count += 1;
+        }
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if let Some(quote @ (b'"' | b'\'')) = bytes.get(cursor).copied() {
+            cursor += 1;
+            while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+                cursor += 1;
+            }
+            cursor = (cursor + 1).min(bytes.len());
+        } else {
+            while bytes
+                .get(cursor)
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+            {
+                cursor += 1;
+            }
+        }
+    }
+    count
 }
 
 fn find_tag_ranges(input: &str, tag: &str) -> Vec<(usize, usize)> {
@@ -567,7 +722,7 @@ fn strip_code_fences(input: &str) -> String {
 /// the opening tag to end-of-input. Returns `None` if no opening tag exists.
 ///
 /// This helper is **not** CDATA-aware — it's used for short, scalar-style
-/// tags (`<thinking>`, `<observation>`, `<next_behavior>`, `<actions>`,
+/// tags (`<intent>`, `<observation>`, `<next_behavior>`, `<actions>`,
 /// `<response>`) where CDATA collisions are not expected.
 pub(crate) fn extract_tag_body(input: &str, tag: &str) -> Option<String> {
     let lc_input = input.to_ascii_lowercase();
@@ -608,126 +763,6 @@ pub(crate) fn extract_tag_body(input: &str, tag: &str) -> Option<String> {
     Some(input[body_start..body_end].to_string())
 }
 
-/// Parse an XML attribute string like `tag attr="x" path='y' flag` into a
-/// key→string map. Leading tag name is discarded. Quotes optional; unquoted
-/// values terminate at the next whitespace. Flag attributes (no `=`) bind
-/// to the empty string.
-fn parse_attrs(input: &str) -> HashMap<String, String> {
-    let mut out: HashMap<String, String> = HashMap::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-
-    // Skip leading tag-name token.
-    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if key_start == i {
-            i += 1;
-            continue;
-        }
-        let key = input[key_start..i].to_ascii_lowercase();
-
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' {
-            out.insert(key, String::new());
-            continue;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-
-        let value = if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-            let quote = bytes[i];
-            i += 1;
-            let v_start = i;
-            while i < bytes.len() && bytes[i] != quote {
-                i += 1;
-            }
-            let v = &input[v_start..i];
-            if i < bytes.len() {
-                i += 1;
-            }
-            xml_unescape(v)
-        } else {
-            let v_start = i;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            xml_unescape(&input[v_start..i])
-        };
-
-        out.insert(key, value);
-    }
-
-    out
-}
-
-/// Decode the five baseline XML entities. Unknown entities pass through.
-pub(crate) fn xml_unescape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(amp_idx) = rest.find('&') {
-        out.push_str(&rest[..amp_idx]);
-        let tail = &rest[amp_idx..];
-        match tail.find(';') {
-            Some(end) => {
-                let entity = &tail[1..end];
-                let decoded = match entity {
-                    "amp" => Some('&'),
-                    "lt" => Some('<'),
-                    "gt" => Some('>'),
-                    "quot" => Some('"'),
-                    "apos" => Some('\''),
-                    _ => None,
-                };
-                match decoded {
-                    Some(c) => out.push(c),
-                    None => out.push_str(&tail[..=end]),
-                }
-                rest = &tail[end + 1..];
-            }
-            None => {
-                out.push_str(tail);
-                return out;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Escape the five baseline XML entities. Used by the renderer.
-pub(crate) fn xml_escape(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 // =========================================================================
 // Tests
 // =========================================================================
@@ -743,19 +778,55 @@ mod tests {
     }
 
     #[test]
+    fn ending_report_boundaries() {
+        let parser = XmlBehaviorParser::new();
+        for source in [
+            r#"<report end="yes">done</report>"#,
+            r#"<report end="TRUE">done</report>"#,
+            r#"<report end="true" end="false">done</report>"#,
+            r#"<report END = "false" end = "true">done</report>"#,
+            r#"<report end="true"> </report>"#,
+            r#"<report>one</report><report end="true">two</report>"#,
+            r#"<report end="true">done</report><next_behavior>CHECK</next_behavior>"#,
+            r#"<report end="true">done</report><next_behavior/><next_behavior>CHECK</next_behavior>"#,
+            r#"<report end="true">done</report><sendmsg>side effect</sendmsg>"#,
+            r#"<report end="true">done</report><actions><unknown/></actions>"#,
+            r#"<next_behavior>END</next_behavior>"#,
+            r#"<next_behavior>done</next_behavior>"#,
+            r#"<artifacts>[]</artifacts>"#,
+            r#"<result>null</result>"#,
+            r#"<report>stage</report><artifacts>{}</artifacts>"#,
+            r#"<report>stage</report><result>{</result>"#,
+            r#"<report>stage</report><result>null</result><result>1</result>"#,
+        ] {
+            assert!(parser.parse(&resp(source)).is_err(), "accepted {source}");
+        }
+        for source in [
+            r#"<report>stage</report>"#,
+            r#"<report end="false">stage</report>"#,
+        ] {
+            assert!(!parser.parse(&resp(source)).unwrap().report_end);
+        }
+        let result = parser.parse(&resp(r#"<actions/><report end="true"><![CDATA[Example <shell>text</shell> and <next_behavior>END</next_behavior>]]></report><artifacts>["result.txt"]</artifacts><result>null</result>"#)).unwrap();
+        assert!(result.report_end);
+        assert!(result.next_behavior.is_none());
+        assert_eq!(result.report_artifacts, vec!["result.txt"]);
+        assert_eq!(result.report_result, Some(Value::Null));
+        let restored: LLMBehaviorResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(restored.report_result, Some(Value::Null));
+    }
+
+    #[test]
     fn empty_response_is_error() {
         let parser = XmlBehaviorParser::new();
         assert!(parser.parse(&AiResponse::default()).is_err());
     }
 
     #[test]
-    fn pure_text_is_terminal_step() {
+    fn pure_text_requires_protocol_correction() {
         let parser = XmlBehaviorParser::new();
-        let out = parser.parse(&resp("just thinking out loud")).unwrap();
-        assert_eq!(out.assistant_text, "just thinking out loud");
-        assert!(out.do_actions.is_empty());
-        assert!(out.next_behavior.is_none());
-        assert!(out.self_report.is_none());
+        assert!(parser.parse(&resp("just thinking out loud")).is_err());
     }
 
     #[test]
@@ -770,7 +841,7 @@ mod tests {
         let out = parser
             .parse(&resp(
                 r#"<response>
-<thinking>step 1</thinking>
+<intent>step 1</intent>
 <observation>previous run produced 3 files</observation>
 <next_behavior>plan_review</next_behavior>
 </response>"#,
@@ -787,16 +858,16 @@ mod tests {
     // ---- v2 first-class Action tags ----
 
     #[test]
-    fn exec_bash_body_maps_to_command_arg() {
+    fn shell_body_maps_to_command_arg() {
         let parser = XmlBehaviorParser::new();
         let out = parser
             .parse(&resp(
-                r#"<actions><exec_bash>ls -la | head -5</exec_bash></actions>"#,
+                r#"<actions><shell>ls -la | head -5</shell></actions>"#,
             ))
             .unwrap();
         assert_eq!(out.do_actions.len(), 1);
         let call = &out.do_actions[0];
-        assert_eq!(call.name, "exec_bash");
+        assert_eq!(call.name, "shell");
         assert_eq!(call.args.get("command"), Some(&json!("ls -la | head -5")));
     }
 
@@ -877,20 +948,20 @@ mod tests {
         let out = parser
             .parse(&resp(
                 r#"<actions>
-<exec_bash>echo first</exec_bash>
+<shell>echo first</shell>
 <write_file path="a">A</write_file>
-<exec_bash>echo third</exec_bash>
+<shell>echo third</shell>
 </actions>"#,
             ))
             .unwrap();
         assert_eq!(out.do_actions.len(), 3);
-        assert_eq!(out.do_actions[0].name, "exec_bash");
+        assert_eq!(out.do_actions[0].name, "shell");
         assert_eq!(
             out.do_actions[0].args.get("command"),
             Some(&json!("echo first"))
         );
         assert_eq!(out.do_actions[1].name, "write_file");
-        assert_eq!(out.do_actions[2].name, "exec_bash");
+        assert_eq!(out.do_actions[2].name, "shell");
         assert_eq!(
             out.do_actions[2].args.get("command"),
             Some(&json!("echo third"))
@@ -904,12 +975,12 @@ mod tests {
             .parse(&resp(
                 r#"<actions>
 <unknown_thing>nope</unknown_thing>
-<exec_bash>ok</exec_bash>
+<shell>ok</shell>
 </actions>"#,
             ))
             .unwrap();
         assert_eq!(out.do_actions.len(), 1);
-        assert_eq!(out.do_actions[0].name, "exec_bash");
+        assert_eq!(out.do_actions[0].name, "shell");
     }
 
     #[test]
@@ -918,10 +989,10 @@ mod tests {
         // `<response>` still get picked up.
         let parser = XmlBehaviorParser::new();
         let out = parser
-            .parse(&resp(r#"<response><exec_bash>ls</exec_bash></response>"#))
+            .parse(&resp(r#"<response><shell>ls</shell></response>"#))
             .unwrap();
         assert_eq!(out.do_actions.len(), 1);
-        assert_eq!(out.do_actions[0].name, "exec_bash");
+        assert_eq!(out.do_actions[0].name, "shell");
     }
 
     // ---- <sendmsg> / <report> handling ----
@@ -932,16 +1003,16 @@ mod tests {
         let out = parser
             .parse(&resp(
                 r#"<response>
-<actions><exec_bash>echo done</exec_bash></actions>
+<actions><shell>echo done</shell></actions>
 <report><![CDATA[本步骤完成]]></report>
-<next_behavior>END</next_behavior>
+<next_behavior>CHECK</next_behavior>
 </response>"#,
             ))
             .unwrap();
         assert_eq!(out.do_actions.len(), 1);
         assert_eq!(out.self_report.as_deref(), Some("本步骤完成"));
         assert!(out.messages_to_send.is_empty());
-        assert_eq!(out.next_behavior.as_deref(), Some("END"));
+        assert_eq!(out.next_behavior.as_deref(), Some("CHECK"));
     }
 
     #[test]
@@ -960,16 +1031,13 @@ mod tests {
     }
 
     #[test]
-    fn report_inside_actions_is_ignored() {
+    fn report_inside_actions_is_not_a_valid_report() {
         let parser = XmlBehaviorParser::new();
-        let out = parser
+        assert!(parser
             .parse(&resp(
-                r#"<actions><report target="user">旧协议消息</report></actions>"#,
+                r#"<actions><report target="user">旧协议消息</report></actions>"#
             ))
-            .unwrap();
-        assert!(out.do_actions.is_empty());
-        assert!(out.self_report.is_none());
-        assert!(out.messages_to_send.is_empty());
+            .is_err());
     }
 
     #[test]
@@ -980,14 +1048,14 @@ mod tests {
                 r#"<response>
 <actions>
 <sendmsg target="user">中途反馈</sendmsg>
-<exec_bash>echo work</exec_bash>
+<shell>echo work</shell>
 </actions>
 <report>最终总结</report>
 </response>"#,
             ))
             .unwrap();
         assert_eq!(out.do_actions.len(), 1);
-        assert_eq!(out.do_actions[0].name, "exec_bash");
+        assert_eq!(out.do_actions[0].name, "shell");
         assert_eq!(out.self_report.as_deref(), Some("最终总结"));
         assert_eq!(out.messages_to_send.len(), 1);
         assert_eq!(out.messages_to_send[0].target, "user");
@@ -995,12 +1063,11 @@ mod tests {
     }
 
     #[test]
-    fn multiple_self_reports_last_one_wins() {
+    fn multiple_self_reports_are_rejected() {
         let parser = XmlBehaviorParser::new();
-        let out = parser
+        assert!(parser
             .parse(&resp(r#"<report>first</report><report>second</report>"#))
-            .unwrap();
-        assert_eq!(out.self_report.as_deref(), Some("second"));
+            .is_err());
     }
 
     // ---- precedence / strictness ----
@@ -1018,8 +1085,7 @@ mod tests {
         let response = AiResponse {
             message: AiResponse::message_from_parts(
                 Some(
-                    r#"<actions><exec_bash>ignored</exec_bash></actions><report>kept</report>"#
-                        .to_string(),
+                    r#"<actions><shell>ignored</shell></actions><report>kept</report>"#.to_string(),
                 ),
                 vec![provider_call],
                 vec![],
@@ -1045,24 +1111,33 @@ mod tests {
     // ---- tolerance / quirks ----
 
     #[test]
+    fn legacy_thinking_tag_is_still_accepted() {
+        let parser = XmlBehaviorParser::new();
+        let out = parser
+            .parse(&resp("<response><thinking>old</thinking><next_behavior>CHECK</next_behavior></response>"))
+            .unwrap();
+        assert_eq!(out.thought.as_deref(), Some("old"));
+    }
+
+    #[test]
     fn markdown_fences_are_stripped() {
         let parser = XmlBehaviorParser::new();
         let out = parser
             .parse(&resp(
-                "```xml\n<thinking>fenced</thinking>\n<next_behavior>END</next_behavior>\n```",
+                "```xml\n<intent>fenced</intent>\n<next_behavior>CHECK</next_behavior>\n```",
             ))
             .unwrap();
         assert_eq!(out.thought.as_deref(), Some("fenced"));
-        assert_eq!(out.next_behavior.as_deref(), Some("END"));
+        assert_eq!(out.next_behavior.as_deref(), Some("CHECK"));
     }
 
     #[test]
     fn missing_close_tag_recovers() {
         let parser = XmlBehaviorParser::new();
         let out = parser
-            .parse(&resp("<thinking>unclosed body until eof"))
+            .parse(&resp("<report>unclosed body until eof"))
             .unwrap();
-        assert_eq!(out.thought.as_deref(), Some("unclosed body until eof"));
+        assert_eq!(out.self_report.as_deref(), Some("unclosed body until eof"));
     }
 
     #[test]
@@ -1070,10 +1145,10 @@ mod tests {
         let parser = XmlBehaviorParser::new();
         let out = parser
             .parse(&resp(
-                "Sure, let me think.\n<response><thinking>inside</thinking></response>\nDone.",
+                "Sure, let me think.\n<response><report>inside</report></response>\nDone.",
             ))
             .unwrap();
-        assert_eq!(out.thought.as_deref(), Some("inside"));
+        assert_eq!(out.self_report.as_deref(), Some("inside"));
     }
 
     #[test]
@@ -1093,7 +1168,7 @@ mod tests {
         let parser = XmlBehaviorParser::new();
         let out = parser
             .parse(&resp(
-                r#"<actions><exec_bash>echo &lt;hi&gt;</exec_bash></actions>"#,
+                r#"<actions><shell>echo &lt;hi&gt;</shell></actions>"#,
             ))
             .unwrap();
         assert_eq!(

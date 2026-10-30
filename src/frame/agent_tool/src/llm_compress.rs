@@ -47,7 +47,7 @@
 //! 调用方在 `LLMContext::run` 的 `ContextLimitReached` 分支里调它，然后用
 //! `ResumeFill::RewrittenHistory { history }` 喂回 `LLMContext::resume`。
 //! 本模块还提供 [`LlmSummarizeCompressor`]——把上面那个自由函数包成
-//! `local_llm_context::Compressor` 实现，可直接喂给
+//! `xllm::Compressor` 实现，可直接喂给
 //! `LocalLLMContext::drive_to_terminal`。
 //!
 //! ## 实现注意事项
@@ -73,12 +73,9 @@ use sha2::{Digest, Sha256};
 use llm_context::deps::{LLMContextDeps, LlmInferenceRequest};
 use llm_context::error::LLMComputeError;
 
-use crate::local_llm_context::{Compressor, LocalLLMContextError};
+use crate::xllm::{Compressor, XllmError};
 use crate::{AgentHistoryShowLevel, AgentToolResult, AgentToolStatus, AGENT_TOOL_PROTOCOL_VERSION};
 
-/// 兼容旧调用方的尾部消息数常量；当前实现按 pair 使用
-/// [`DEFAULT_HOT_TAIL_PAIRS`]。
-pub const DEFAULT_KEEP_RECENT_MESSAGES: usize = 8;
 pub const DEFAULT_HEAD_KEEP_PAIRS: usize = 1;
 pub const DEFAULT_HOT_TAIL_PAIRS: usize = 2;
 
@@ -94,7 +91,6 @@ const MECHANICAL_TOOL_RESULT_MIN_AFTER_PAIRS: usize = DEFAULT_HOT_TAIL_PAIRS + 2
 const COMPRESS_META_MARKER: &str = "[LLM_MESSAGE_COMPRESS_META_V1]";
 const COMPRESS_SUMMARY_MARKER: &str = "[LLM_MESSAGE_COMPRESS_SUMMARY_V1]";
 const MECHANICAL_COMPRESS_META_MARKER: &str = "[LLM_MECHANICAL_COMPRESS_META_V1]";
-const LEGACY_SUMMARY_MARKER: &str = "[Conversation summary]";
 const PROMPT_VERSION: &str = "llm_message_compress_v1";
 
 #[derive(Clone, Debug)]
@@ -228,6 +224,7 @@ pub async fn compress(
     ];
 
     let req = LlmInferenceRequest {
+        trace_id: None,
         messages: summarize_messages,
         model_alias: model_alias.to_string(),
         fallbacks: Vec::new(),
@@ -456,7 +453,6 @@ fn is_compress_summary_message(msg: &AiMessage) -> bool {
 
 fn is_stable_boundary_message(msg: &AiMessage) -> bool {
     matches!(msg.role, AiRole::System | AiRole::Developer)
-        || msg.text_content().contains(LEGACY_SUMMARY_MARKER)
         || is_compress_meta_message(msg)
         || is_compress_summary_message(msg)
 }
@@ -1116,7 +1112,7 @@ impl Compressor for LlmSummarizeCompressor {
         &self,
         accumulated: Vec<AiMessage>,
         _dir: &Path,
-    ) -> Result<Vec<AiMessage>, LocalLLMContextError> {
+    ) -> Result<Vec<AiMessage>, XllmError> {
         compress(
             &accumulated,
             &self.deps,
@@ -1125,7 +1121,7 @@ impl Compressor for LlmSummarizeCompressor {
             None,
         )
         .await
-        .map_err(|e| LocalLLMContextError::CompressorFailed(e.to_string()))
+        .map_err(|e| XllmError::Compressor(e.to_string()))
     }
 }
 
@@ -1160,12 +1156,14 @@ mod tests {
         async fn call_tool(
             &self,
             call: buckyos_api::AiToolCall,
-        ) -> llm_context::observation::Observation {
-            llm_context::observation::Observation::Error {
+            _ctx: llm_context::deps::ToolCallCtx,
+        ) -> Result<llm_context::observation::Observation, llm_context::deps::ToolDispatchError>
+        {
+            Ok(llm_context::observation::Observation::Error {
                 call_id: call.call_id,
                 message: "stub".to_string(),
                 tool_result: None,
-            }
+            })
         }
     }
 
@@ -1636,7 +1634,7 @@ mod tests {
             AiRole::Assistant,
             vec![buckyos_api::AiContent::tool_use(
                 "call-1",
-                "exec_bash",
+                "shell",
                 HashMap::new(),
             )],
         ));

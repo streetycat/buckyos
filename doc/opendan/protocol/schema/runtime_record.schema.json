@@ -1,0 +1,250 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "BaselineCheck": {
+      "description": "The last check of a runtime's standard tools ([`crate::baseline`]): only a hint, the declaration decides (Q5).",
+      "properties": {
+        "checked_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "error": {
+          "description": "Why the check could not run (the runtime was not reachable).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "missing": {
+          "default": [],
+          "description": "Standard commands not found on the runtime's PATH.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "checked_at_ms",
+        "ok"
+      ],
+      "type": "object"
+    },
+    "ComputerAccess": {
+      "description": "ComputerUse capability of an Agent on a runtime: `none` grants no Computer operation, `observe` grants inspect/observe, `control` adds act.",
+      "enum": [
+        "none",
+        "observe",
+        "control"
+      ],
+      "type": "string"
+    },
+    "RuntimeAvailability": {
+      "enum": [
+        "available",
+        "runtime_unavailable",
+        "permission_denied"
+      ],
+      "type": "string"
+    },
+    "RuntimeBaseline": {
+      "description": "Declared environment baseline of an execution runtime: `standard` has the core Agent tools and BuckyOS access, `extended` adds build tool chains and heavy tools. Declared by whoever registers the runtime, never probed.",
+      "enum": [
+        "standard",
+        "extended"
+      ],
+      "type": "string"
+    },
+    "RuntimeKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "container",
+            "remote_ssh"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The owner's desktop host (`host`): a node's embedded executor.",
+          "enum": [
+            "host_native"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Another node's embedded executor.",
+          "enum": [
+            "remote_node"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RuntimePlatform": {
+      "description": "The platform of a runtime: `os` is `linux | macos | windows`, `shell` the program name commands are written for (`bash`, `pwsh`, …).",
+      "properties": {
+        "arch": {
+          "default": "",
+          "type": "string"
+        },
+        "os": {
+          "default": "",
+          "type": "string"
+        },
+        "shell": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "properties": {
+    "availability": {
+      "$ref": "#/definitions/RuntimeAvailability"
+    },
+    "baseline": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RuntimeBaseline"
+        }
+      ],
+      "description": "The environment its registrar declares (Q5): decides the sessions' cmd_skills and what their prompts say."
+    },
+    "baseline_check": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BaselineCheck"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The last check of its standard tools; a hint that never changes `baseline`."
+    },
+    "builtin": {
+      "default": false,
+      "description": "Created by the host; cannot be unregistered.",
+      "type": "boolean"
+    },
+    "capabilities": {
+      "default": null,
+      "description": "`{tools, network, os}` as far as known."
+    },
+    "checked_at_ms": {
+      "default": null,
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "computer": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ComputerAccess"
+        }
+      ],
+      "default": "none",
+      "description": "ComputerUse the owner granted the agent on this runtime."
+    },
+    "default": {
+      "default": false,
+      "description": "The session-runtime new sessions take unless one is named or inherited (the owner's `default_runtime_id`); exactly one record carries it.",
+      "type": "boolean"
+    },
+    "description": {
+      "default": "",
+      "type": "string"
+    },
+    "exec": {
+      "default": null,
+      "description": "How the runtime layer reaches it (`agent_tool` RuntimeConfig); `None`: there is no executor for it yet."
+    },
+    "kind": {
+      "$ref": "#/definitions/RuntimeKind"
+    },
+    "last_error": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string"
+    },
+    "platform": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RuntimePlatform"
+        }
+      ],
+      "default": {
+        "arch": "",
+        "os": "",
+        "shell": ""
+      },
+      "description": "Learned from the runtime when it is checked."
+    },
+    "registered_at_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "registered_by": {
+      "type": "string"
+    },
+    "revision": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "roots": {
+      "default": [],
+      "description": "Where workspaces are best placed in it.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "runtime_host": {
+      "description": "`native_host_id()` of the host that registered it.",
+      "type": "string"
+    },
+    "runtime_id": {
+      "type": "string"
+    },
+    "updated_at_ms": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "availability",
+    "baseline",
+    "kind",
+    "name",
+    "registered_at_ms",
+    "registered_by",
+    "revision",
+    "runtime_host",
+    "runtime_id",
+    "updated_at_ms",
+    "version"
+  ],
+  "title": "RuntimeRecord",
+  "type": "object"
+}

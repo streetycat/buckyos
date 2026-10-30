@@ -52,6 +52,164 @@ fn ctx() -> RPCContext {
 }
 
 #[tokio::test]
+async fn group_rpc_requires_authentication_at_the_service_boundary() {
+    use kRPC::{RPCErrors, RPCHandler, RPCRequest};
+
+    let (center, _tmp) = new_center("removed_self_host_group_rpc").await;
+    let zone_sync = std::sync::Arc::new(crate::ZoneSync::new(
+        center.clone(),
+        std::sync::Arc::new(crate::msg_tunnel::DeliveryExecutorMgr::new()),
+    ));
+    let server = crate::MsgCenterHttpServer::new(center, zone_sync);
+    for method in ["group.create", "group.list_by_member", "group.check_access"] {
+        let result = server
+            .handle_rpc_call(
+                RPCRequest::new(method, json!({})),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await;
+        assert!(matches!(result, Err(RPCErrors::NoPermission(_))));
+    }
+}
+
+#[tokio::test]
+async fn cyfs_dispatch_confirms_only_the_current_receiver_and_survives_restart() {
+    let (center, tmp) = new_center("cyfs_dispatch").await;
+    let sender = DID::new("bns", "sender");
+    let alice = DID::new("bns", "alice");
+    let bob = DID::new("bns", "bob");
+    center.register_local_recipients([alice.clone(), bob.clone()]);
+    let msg = make_msg(
+        sender.clone(),
+        vec![alice.clone(), bob.clone()],
+        MsgObjKind::Chat,
+    );
+    let id = msg.gen_obj_id().0;
+    let target = "https://alice.example/inbox";
+    let first = center
+        .dispatch_to_receiver(msg.clone(), None, alice.clone(), target.into())
+        .await
+        .unwrap();
+    assert_eq!(first.msg_id, id);
+    assert_eq!(first.delivered_recipients, vec![alice.clone()]);
+    assert!(!first.delivered_recipients.contains(&bob));
+    let duplicate = center
+        .dispatch_to_receiver(msg.clone(), None, alice.clone(), target.into())
+        .await
+        .unwrap();
+    assert_eq!(duplicate.delivered_recipients, first.delivered_recipients);
+    assert!(center
+        .query_cyfs_dispatch(&bob.to_string(), target, &id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(center
+        .query_cyfs_dispatch(&sender.to_string(), "https://alice.example/other", &id)
+        .await
+        .unwrap()
+        .is_none());
+    drop(center);
+    let path = tmp
+        .path()
+        .join("msg-center.db")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let center = open_center_at(&format!("sqlite:///{path}?mode=rwc")).await;
+    center.register_local_recipients([alice.clone(), bob.clone()]);
+    assert_eq!(
+        center
+            .query_cyfs_dispatch(&sender.to_string(), target, &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .msg_id,
+        id
+    );
+    let second = center
+        .dispatch_to_receiver(msg, None, bob.clone(), "https://alice.example/second".into())
+        .await
+        .unwrap();
+    assert_eq!(second.delivered_recipients, vec![bob]);
+}
+
+#[tokio::test]
+async fn cyfs_dispatch_cached_reports_retry_and_late_failure_cannot_downgrade_accepted() {
+    let (center, _tmp) = new_center("cyfs_sender").await;
+    let hub = DID::new("bns", "hub");
+    center.set_message_hub_did(hub);
+    let recipient = DID::new("bns", "remote");
+    let msg = make_msg(DID::new("bns", "sender"), vec![recipient], MsgObjKind::Chat);
+    let (id, original) = msg.gen_obj_id();
+    let post = center.handle_post_send(msg, None, ctx()).await.unwrap();
+    let delivery_id = post.deliveries[0].delivery_id.clone();
+    let result = ndn_lib::CyfsDispatchResult::new(
+        Some(id.clone()),
+        "https://remote.example/inbox".into(),
+        ndn_lib::CyfsDispatchStatus::Cached,
+    );
+    let report = crate::cyfs_dispatch::delivery_report(result);
+    assert!(!report.ok);
+    let pending = center
+        .handle_report_delivery(delivery_id.clone(), report.clone(), ctx())
+        .await
+        .unwrap();
+    assert_eq!(pending.state, DeliveryState::Wait);
+    assert!(pending.next_retry_at_ms.is_some());
+    assert_eq!(pending.envelope.msg_id, id);
+    let accepted = center
+        .handle_report_delivery(
+            delivery_id.clone(),
+            DeliveryReportResult {
+                ok: true,
+                ..Default::default()
+            },
+            ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.state, DeliveryState::Sent);
+    let late = center
+        .handle_report_delivery(delivery_id, report, ctx())
+        .await
+        .unwrap();
+    assert_eq!(late.state, DeliveryState::Sent);
+    assert_eq!(late.delivered_at_ms, accepted.delivered_at_ms);
+    assert_eq!(
+        ndn_lib::validate_cyfs_dispatch_object(original.as_bytes(), Some(&id.to_string())).unwrap(),
+        id
+    );
+}
+
+#[tokio::test]
+async fn cyfs_dispatch_http_rejects_forged_identity_before_receiving() {
+    use http_body_util::{BodyExt, Full};
+    let (center, _tmp) = new_center("cyfs_auth").await;
+    let receiver = DID::new("bns", "alice");
+    center.register_local_recipients([receiver]);
+    *center.cyfs_dispatch.write().unwrap() = crate::cyfs_dispatch::CyfsDispatchSettings::parse(&json!({
+        "cyfs_dispatch": {"target_zone":"alice.example", "accepted_paths":{"/inbox":"did:bns:alice"}}
+    })).unwrap();
+    let req = http::Request::builder()
+        .method("PUT")
+        .uri("/inbox")
+        .header("host", "alice.example")
+        .header("cyfs-original-user", "did:bns:sender")
+        .header("content-type", ndn_lib::CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
+        .body(
+            Full::new(bytes::Bytes::from_static(b"{}"))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap();
+    let response = crate::cyfs_dispatch::serve(&center, req).await;
+    assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()[ndn_lib::CYFS_HEADER_DISPATCH_STATUS],
+        "rejected"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_single_chat_goes_to_inbox_and_locking_moves_state() {
     let (center, _tmp) = new_center("dispatch_inbox").await;
     let sender = DID::new("bns", "sender-a");
@@ -87,7 +245,11 @@ async fn dispatch_single_chat_goes_to_inbox_and_locking_moves_state() {
 
     let inbox = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -106,7 +268,11 @@ async fn dispatch_single_chat_goes_to_inbox_and_locking_moves_state() {
 
     let next = center
         .handle_get_next(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -119,7 +285,15 @@ async fn dispatch_single_chat_goes_to_inbox_and_locking_moves_state() {
     assert_eq!(next.record.state, RecipientState::Reading);
 
     let no_more_unread = center
-        .handle_get_next(recipient, MailboxKind::Inbox, None, None, None, ctx())
+        .handle_get_next(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert!(no_more_unread.is_none());
@@ -130,7 +304,7 @@ async fn dispatch_stranger_goes_to_request_box() {
     let (center, _tmp) = new_center("dispatch_request").await;
     let sender = DID::new("bns", "sender-b");
     let recipient = DID::new("bns", "recipient-b");
-    let msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
 
     let dispatch = center
         .handle_dispatch(msg, None, None, ctx())
@@ -141,7 +315,11 @@ async fn dispatch_stranger_goes_to_request_box() {
 
     let inbox = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -153,7 +331,15 @@ async fn dispatch_stranger_goes_to_request_box() {
     assert_eq!(inbox.len(), 0);
 
     let request_box = center
-        .handle_peek_box(recipient, MailboxKind::RequestBox, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::RequestBox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert_eq!(request_box.len(), 1);
@@ -161,60 +347,20 @@ async fn dispatch_stranger_goes_to_request_box() {
 }
 
 #[tokio::test]
-async fn dispatch_group_message_creates_group_and_agent_views() {
-    let (center, _tmp) = new_center("dispatch_group").await;
-    let group_id = DID::new("bns", "group-a");
-    let author = DID::new("bns", "author-a");
-    let agent_1 = DID::new("bns", "agent-a1");
-    let agent_2 = DID::new("bns", "agent-a2");
-
+async fn contact_subscribers_do_not_create_or_authorize_hosted_groups() {
+    let (center, _tmp) = new_center("unregistered_group").await;
+    let group = DID::new("bns", "group-a");
+    let reader = DID::new("bns", "reader");
     center
-        .handle_set_group_subscribers(
-            group_id.clone(),
-            vec![agent_1.clone(), agent_2.clone(), agent_2.clone()],
-            None,
-            ctx(),
-        )
+        .handle_set_group_subscribers(group.clone(), vec![reader.clone()], None, ctx())
         .await
         .unwrap();
-
-    let msg = make_msg(author, vec![group_id.clone()], MsgObjKind::GroupMsg);
-    let dispatch = center
-        .handle_dispatch(msg, None, None, ctx())
-        .await
-        .unwrap();
-    assert_eq!(dispatch.delivered_group, Some(group_id.clone()));
-    assert_eq!(dispatch.delivered_agents.len(), 2);
-
-    let group_box = center
-        .handle_peek_box(
-            group_id.clone(),
-            MailboxKind::GroupInbox,
-            None,
-            None,
-            None,
-            ctx(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(group_box.len(), 1);
-    // Group records key their session on the group DID.
-    assert_eq!(
-        group_box[0].record.session_id.as_deref(),
-        Some(group_id.to_string().as_str())
-    );
-
-    let agent1_box = center
-        .handle_peek_box(agent_1, MailboxKind::Inbox, None, None, None, ctx())
-        .await
-        .unwrap();
-    assert_eq!(agent1_box.len(), 1);
-
-    let agent2_box = center
-        .handle_peek_box(agent_2, MailboxKind::Inbox, None, None, None, ctx())
-        .await
-        .unwrap();
-    assert_eq!(agent2_box.len(), 1);
+    let msg = make_msg(reader, vec![group.clone()], MsgObjKind::GroupMsg);
+    assert!(matches!(
+        center.handle_dispatch(msg, None, None, ctx()).await,
+        Err(kRPC::RPCErrors::NoPermission(_))
+    ));
+    assert!(center.groups.load(&group).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -227,6 +373,184 @@ async fn dispatch_group_message_without_group_target_fails() {
 
     let err = center.handle_dispatch(msg, None, None, ctx()).await;
     assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn unregistered_group_sessions_and_topic_only_group_messages_are_rejected() {
+    let (center, _tmp) = new_center("group_routes").await;
+    let mut msg = make_msg(
+        DID::new("bns", "sender"),
+        vec![DID::new("bns", "unknown-group")],
+        MsgObjKind::GroupMsg,
+    );
+    msg.to_session = Some("private".into());
+    assert!(center
+        .handle_dispatch(msg.clone(), None, None, ctx())
+        .await
+        .is_err());
+    msg.to_session = None;
+    msg.thread.topic = Some("private".into());
+    assert!(
+        matches!(center.handle_dispatch(msg, None, None, ctx()).await, Err(kRPC::RPCErrors::ParseRequestError(reason)) if reason.contains("missing-to-session"))
+    );
+}
+
+#[tokio::test]
+async fn direct_message_topic_is_only_a_hint() {
+    let (center, _tmp) = new_center("dm_topic_hint").await;
+    let sender = DID::new("bns", "hint-sender");
+    let recipient = DID::new("bns", "hint-recipient");
+    center
+        .handle_grant_temporary_access(
+            vec![sender.clone()],
+            "ctx-hint".to_string(),
+            60,
+            Some(recipient.clone()),
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let mut msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
+    msg.thread.topic = Some("not-a-session".into());
+    center
+        .handle_dispatch(
+            msg,
+            Some(IngressContext {
+                context_id: Some("ctx-hint".to_string()),
+                ..Default::default()
+            }),
+            None,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let dm = center
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dm.len(), 1);
+}
+
+#[tokio::test]
+async fn invalid_v2_message_objects_are_rejected_at_ingress() {
+    let (center, _tmp) = new_center("v2_invalid").await;
+    center.set_message_hub_did(DID::new("bns", "hub"));
+    let sender = DID::new("bns", "v2-sender");
+    let a = DID::new("bns", "v2-a");
+    let b = DID::new("bns", "v2-b");
+
+    let mut multi = make_msg(sender.clone(), vec![a.clone(), b.clone()], MsgObjKind::Chat);
+    multi.to_session = Some("s".into());
+    assert!(center.handle_post_send(multi, None, ctx()).await.is_err());
+
+    // `proof` was removed in v2 and is a reserved key.
+    let mut proof = make_msg(sender.clone(), vec![a.clone()], MsgObjKind::Chat);
+    proof.meta.insert("proof".into(), json!("proof-001"));
+    assert!(center
+        .handle_post_send(proof.clone(), None, ctx())
+        .await
+        .is_err());
+    assert!(center
+        .handle_dispatch(proof, None, None, ctx())
+        .await
+        .is_err());
+
+    let mut empty_mentions = make_msg(sender, vec![a], MsgObjKind::Chat);
+    empty_mentions.mentions = Some(ndn_lib::MsgMentions::default());
+    assert!(center
+        .handle_post_send(empty_mentions, None, ctx())
+        .await
+        .is_err());
+}
+
+const JWT_TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr\n-----END PRIVATE KEY-----\n";
+const JWT_TEST_PUBLIC_X: &str = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+
+#[tokio::test]
+async fn cyfs_dispatch_verifies_and_keeps_the_jwt_original_of_a_signed_message() {
+    let (center, _tmp) = new_center("cyfs_jwt").await;
+    // did:dev embeds its Ed25519 key, so no name resolver is needed.
+    let sender = DID::new("dev", JWT_TEST_PUBLIC_X);
+    let alice = DID::new("bns", "jwt-alice");
+    center.register_local_recipients([alice.clone()]);
+    let mut msg = make_msg(sender.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    msg.to_session = Some("signed".into());
+    msg.nonce = Some(42);
+    let id = msg.gen_obj_id().0;
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(JWT_TEST_PRIVATE_KEY.as_bytes()).unwrap();
+    let jwt = msg
+        .to_jwt(&key, &format!("{}#main_key", sender.to_string()))
+        .unwrap();
+
+    let signed = crate::cyfs_dispatch::verify_signed_message(&jwt)
+        .await
+        .unwrap();
+    assert_eq!(signed.obj_id, id);
+    assert_eq!(signed.msg, msg);
+
+    // The kid must name a key of `from`.
+    let forged = msg.to_jwt(&key, "did:bns:someone-else#main_key").unwrap();
+    assert_eq!(
+        crate::cyfs_dispatch::verify_signed_message(&forged)
+            .await
+            .unwrap_err()
+            .1,
+        "signer-mismatch"
+    );
+    // A JWT signed by another key does not verify.
+    let mut other = msg.clone();
+    other.from = DID::new("dev", "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+    other.to_session = Some("signed".into());
+    let wrong_key = other
+        .to_jwt(&key, &format!("{}#main_key", other.from.to_string()))
+        .unwrap();
+    assert_eq!(
+        crate::cyfs_dispatch::verify_signed_message(&wrong_key)
+            .await
+            .unwrap_err()
+            .1,
+        "invalid-signature"
+    );
+
+    let result = center
+        .dispatch_to_receiver(
+            signed.msg,
+            Some(jwt.clone()),
+            alice.clone(),
+            "https://alice.example/inbox".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.msg_id, id);
+    assert_eq!(result.delivered_recipients, vec![alice.clone()]);
+    assert_eq!(
+        center.msg_box_db.get_msg_jwt(&id).await.unwrap().as_deref(),
+        Some(jwt.as_str())
+    );
+    // An unknown sender lands in the request box, keyed on to_session.
+    let requests = center
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(alice, Some("signed".into())).unwrap(),
+            MailboxKind::RequestBox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1);
 }
 
 #[tokio::test]
@@ -256,7 +580,15 @@ async fn post_send_to_endpoint_did_creates_sent_and_delivery_records() {
     ));
 
     let sent_box = center
-        .handle_peek_box(author, MailboxKind::Sent, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(author, Some(format!("dm:{}", target.to_string())))
+                .unwrap(),
+            MailboxKind::Sent,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert_eq!(sent_box.len(), 1);
@@ -325,7 +657,14 @@ async fn post_send_to_shareable_did_fails_without_message_hub() {
 
     // Phase-1 failure keeps the database clean: no SENT record was written.
     let sent_box = center
-        .handle_peek_box(author, MailboxKind::Sent, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(author, None).unwrap(),
+            MailboxKind::Sent,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert!(sent_box.is_empty());
@@ -354,7 +693,14 @@ async fn post_send_rejects_message_without_target() {
 
     assert!(matches!(err, kRPC::RPCErrors::ParseRequestError(_)));
     let sent_box = center
-        .handle_peek_box(author, MailboxKind::Sent, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(author, None).unwrap(),
+            MailboxKind::Sent,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert!(sent_box.is_empty());
@@ -428,7 +774,7 @@ async fn report_delivery_handles_success_and_failure_paths() {
     assert_eq!(failed_record.attempts, 1);
     assert!(failed_record.last_error.is_some());
 
-    let success_msg = make_msg(sender, vec![target], MsgObjKind::Chat);
+    let success_msg = make_msg(sender.clone(), vec![target], MsgObjKind::Chat);
     let success_post = center
         .handle_post_send(success_msg, None, ctx())
         .await
@@ -464,7 +810,7 @@ async fn retryable_failure_requeues_with_backoff() {
         .unwrap();
     let sender = DID::new("bns", "sender-retry");
     let target = DID::new("msgtunnel", "42.user.tg-retry-tunnel");
-    let msg = make_msg(sender, vec![target], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![target], MsgObjKind::Chat);
     let post = center.handle_post_send(msg, None, ctx()).await.unwrap();
     let delivery_id = post.deliveries[0].delivery_id.clone();
 
@@ -510,7 +856,7 @@ async fn update_record_state_checks_transition_rules() {
         .await
         .unwrap();
 
-    let msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
     center
         .handle_dispatch(
             msg,
@@ -525,7 +871,15 @@ async fn update_record_state_checks_transition_rules() {
         .unwrap();
 
     let inbox = center
-        .handle_peek_box(recipient, MailboxKind::Inbox, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     let record_id = inbox[0].record.record_id.clone();
@@ -561,7 +915,7 @@ async fn dispatch_replay_preserves_existing_recipient_state() {
         .await
         .unwrap();
 
-    let msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
     let ingress = IngressContext {
         context_id: Some(context_id),
         ..Default::default()
@@ -577,7 +931,11 @@ async fn dispatch_replay_preserves_existing_recipient_state() {
         .unwrap();
     let inbox = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -603,7 +961,11 @@ async fn dispatch_replay_preserves_existing_recipient_state() {
         .unwrap();
     let record = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -624,7 +986,11 @@ async fn dispatch_replay_preserves_existing_recipient_state() {
         .unwrap();
     let record = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -644,7 +1010,15 @@ async fn dispatch_replay_preserves_existing_recipient_state() {
         .await
         .unwrap();
     let record = center
-        .handle_peek_box(recipient, MailboxKind::Inbox, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert_eq!(record[0].record.state, RecipientState::Deleted);
@@ -667,7 +1041,7 @@ async fn update_record_session_sets_session_id() {
         .await
         .unwrap();
 
-    let msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
     center
         .handle_dispatch(
             msg,
@@ -682,13 +1056,21 @@ async fn update_record_session_sets_session_id() {
         .unwrap();
 
     let inbox = center
-        .handle_peek_box(recipient, MailboxKind::Inbox, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     let record_id = inbox[0].record.record_id.clone();
 
     let updated = center
-        .handle_update_record_session(record_id.clone(), " ui-session-record ".to_string(), ctx())
+        .handle_update_record_session(record_id.clone(), "ui-session-record".to_string(), ctx())
         .await
         .unwrap();
     assert_eq!(updated.session_id.as_deref(), Some("ui-session-record"));
@@ -781,7 +1163,7 @@ async fn list_box_by_time_supports_pagination() {
         .unwrap();
 
     let first_msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
-    let second_msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let second_msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
     center
         .handle_dispatch(
             first_msg,
@@ -809,7 +1191,11 @@ async fn list_box_by_time_supports_pagination() {
 
     let page_1 = center
         .handle_list_box_by_time(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             Some(1),
@@ -827,7 +1213,8 @@ async fn list_box_by_time_supports_pagination() {
 
     let page_2 = center
         .handle_list_box_by_time(
-            recipient,
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
             MailboxKind::Inbox,
             None,
             Some(1),
@@ -891,7 +1278,7 @@ async fn session_projection_merges_directions_and_aggregates_delivery() {
     // Both directions land in the same peer-keyed session.
     let session_id = format!("dm:{}", peer.to_string());
     let sessions = center
-        .handle_list_sessions(owner.clone(), None, None, None, None, ctx())
+        .handle_list_sessions(owner.clone(), None, None, None, None, None, None, ctx())
         .await
         .unwrap();
     assert_eq!(sessions.items.len(), 1);
@@ -966,12 +1353,12 @@ async fn session_projection_merges_directions_and_aggregates_delivery() {
 }
 
 #[tokio::test]
-async fn read_receipt_can_be_set_and_queried() {
+async fn direct_message_receipt_can_be_set_and_queried() {
     let (center, _tmp) = new_center("read_receipt").await;
     let group = DID::new("bns", "group-b");
     let author = DID::new("bns", "author-b");
     let reader = DID::new("bns", "reader-b");
-    let msg = make_msg(author, vec![group.clone()], MsgObjKind::GroupMsg);
+    let msg = make_msg(author, vec![group.clone()], MsgObjKind::Chat);
     let msg_id = msg.gen_obj_id().0;
 
     center
@@ -1057,7 +1444,11 @@ async fn idempotency_key_prevents_duplicate_records() {
 
     let inbox = center
         .handle_peek_box(
-            recipient.clone(),
+            buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap(),
             MailboxKind::Inbox,
             None,
             None,
@@ -1068,7 +1459,7 @@ async fn idempotency_key_prevents_duplicate_records() {
         .unwrap();
     assert_eq!(inbox.len(), 1);
 
-    let send_msg = make_msg(sender, vec![endpoint_target], MsgObjKind::Chat);
+    let send_msg = make_msg(sender.clone(), vec![endpoint_target], MsgObjKind::Chat);
     let first_post = center
         .handle_post_send(
             send_msg.clone(),
@@ -1118,7 +1509,7 @@ async fn idempotency_key_survives_message_center_restart() {
         .await
         .unwrap();
 
-    let msg = make_msg(sender, vec![recipient.clone()], MsgObjKind::Chat);
+    let msg = make_msg(sender.clone(), vec![recipient.clone()], MsgObjKind::Chat);
     let first_dispatch = first_center
         .handle_dispatch(
             msg.clone(),
@@ -1150,7 +1541,15 @@ async fn idempotency_key_survives_message_center_restart() {
     assert_eq!(first_dispatch, second_dispatch);
 
     let inbox = second_center
-        .handle_peek_box(recipient, MailboxKind::Inbox, None, None, None, ctx())
+        .handle_peek_box(
+            buckyos_api::MailboxAddress::new(recipient, Some(format!("dm:{}", sender.to_string())))
+                .unwrap(),
+            MailboxKind::Inbox,
+            None,
+            None,
+            None,
+            ctx(),
+        )
         .await
         .unwrap();
     assert_eq!(inbox.len(), 1);
@@ -1238,4 +1637,2141 @@ fn telegram_retention_bucket_uses_bot_and_chat_not_sender() {
 
     assert_eq!(first, second);
     assert_ne!(first, other_bot);
+}
+
+// ---------------------------------------------------------------------------
+// Owner-scoped session lifecycle, activity ordering, registration, auth.
+// ---------------------------------------------------------------------------
+
+mod owner_session_tests {
+    use super::*;
+    use crate::owner_session::{SessionTokenVerifier, ZoneAgentInfo};
+    use buckyos_api::{
+        bind_token_principal_kind, bind_token_target, AuthTarget, MsgCenterCreateSessionReq,
+        SessionLifecycle, SessionListLifecycleFilter, SessionListOrder, SystemServiceId,
+        TokenPrincipalKind, TokenUse, VERIFY_HUB_UNIQUE_ID,
+    };
+    use jsonwebtoken::{DecodingKey, EncodingKey};
+    use kRPC::{RPCErrors, RPCSessionToken, RPCSessionTokenType};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn chat_at(from: &DID, to: Vec<DID>, text: &str, created_at_ms: u64) -> MsgObject {
+        let mut msg = make_msg(from.clone(), to, MsgObjKind::Chat);
+        msg.created_at_ms = created_at_ms;
+        msg.content.content = text.to_string();
+        msg
+    }
+
+    async fn grant(center: &MessageCenter, peer: &DID, owner: &DID, context: &str) {
+        center
+            .handle_grant_temporary_access(
+                vec![peer.clone()],
+                context.to_string(),
+                3600,
+                Some(owner.clone()),
+                ctx(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn inbound(center: &MessageCenter, msg: MsgObject, context: &str, key: &str) {
+        center
+            .handle_dispatch(
+                msg,
+                Some(IngressContext {
+                    context_id: Some(context.to_string()),
+                    ..Default::default()
+                }),
+                Some(key.to_string()),
+                ctx(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn list(
+        center: &MessageCenter,
+        owner: &DID,
+        lifecycle: SessionListLifecycleFilter,
+        order: SessionListOrder,
+        limit: Option<usize>,
+        cursor: Option<(u64, String)>,
+    ) -> buckyos_api::SessionSummaryPage {
+        let (cursor_value, cursor_session) = match cursor {
+            Some((value, id)) => (Some(value), Some(id)),
+            None => (None, None),
+        };
+        center
+            .handle_list_sessions(
+                owner.clone(),
+                limit,
+                cursor_value,
+                cursor_session,
+                Some(false),
+                Some(lifecycle),
+                Some(order),
+                ctx(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn timeline_len(center: &MessageCenter, owner: &DID, session_id: &str) -> usize {
+        center
+            .handle_list_session(
+                owner.clone(),
+                session_id.to_string(),
+                None,
+                None,
+                None,
+                Some(false),
+                Some(false),
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .items
+            .len()
+    }
+
+    #[tokio::test]
+    async fn lifecycle_archive_restore_delete_and_watermark() {
+        let (center, _tmp) = new_center("lifecycle").await;
+        let owner = DID::new("bns", "lc-owner");
+        let other = DID::new("bns", "lc-other");
+        let peer = DID::new("bns", "lc-peer");
+        grant(&center, &peer, &owner, "lc").await;
+        grant(&center, &peer, &other, "lc").await;
+        let session_id = format!("dm:{}", peer.to_string());
+
+        let msg1 = chat_at(&peer, vec![owner.clone(), other.clone()], "one", 2_000_000);
+        inbound(&center, msg1.clone(), "lc", "lc-1").await;
+        let active = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].session_id, session_id);
+        assert_eq!(active.items[0].unread_count, 1);
+        assert_eq!(active.items[0].last_activity_ms, 2_000_000);
+        assert_eq!(active.items[0].lifecycle, SessionLifecycle::Active);
+
+        // Archive keeps the per-record read state and the unread count.
+        let archived = center
+            .handle_archive_session(owner.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+        assert_eq!(archived.lifecycle, SessionLifecycle::Archived);
+        assert!(archived.archived_at_ms.is_some());
+        assert!(list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None
+        )
+        .await
+        .items
+        .is_empty());
+        let archived_list = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Archived,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(archived_list.items.len(), 1);
+        assert_eq!(archived_list.items[0].unread_count, 1);
+        assert_eq!(archived_list.items[0].lifecycle, SessionLifecycle::Archived);
+        // Idempotent repeat.
+        center
+            .handle_archive_session(owner.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+
+        // Restore keeps history and activity time.
+        let restored = center
+            .handle_restore_session(owner.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+        assert_eq!(restored.lifecycle, SessionLifecycle::Active);
+        let active = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].last_activity_ms, 2_000_000);
+        assert_eq!(timeline_len(&center, &owner, &session_id).await, 1);
+
+        // Archive again: a read-state change must not re-activate, an event
+        // message must not re-activate, a new chat message must.
+        center
+            .handle_archive_session(owner.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+        let record_id = center
+            .handle_list_session(
+                owner.clone(),
+                session_id.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .items[0]
+            .record_id
+            .clone();
+        center
+            .handle_update_record_state(record_id, RecipientState::Read, ctx())
+            .await
+            .unwrap();
+        assert!(list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None
+        )
+        .await
+        .items
+        .is_empty());
+        let mut event = chat_at(&peer, vec![owner.clone()], "log", 2_000_500);
+        event.kind = MsgObjKind::Event;
+        event.to_session = Some(session_id.clone());
+        inbound(&center, event, "lc", "lc-event").await;
+        assert!(list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None
+        )
+        .await
+        .items
+        .is_empty());
+        let msg2 = chat_at(&peer, vec![owner.clone()], "two", 2_001_000);
+        inbound(&center, msg2, "lc", "lc-2").await;
+        let active = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].lifecycle, SessionLifecycle::Active);
+        assert_eq!(active.items[0].unread_count, 2);
+        assert_eq!(active.items[0].last_activity_ms, 2_001_000);
+        assert_eq!(timeline_len(&center, &owner, &session_id).await, 3);
+
+        // Delete: only this owner's visibility changes.
+        let deleted = center
+            .handle_delete_session(owner.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+        assert!(deleted.delete_watermark_sort_key.unwrap() >= 2_001_000);
+        assert!(!deleted.registered);
+        assert!(list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::All,
+            SessionListOrder::Activity,
+            None,
+            None
+        )
+        .await
+        .items
+        .is_empty());
+        assert_eq!(timeline_len(&center, &owner, &session_id).await, 0);
+        let others = list(
+            &center,
+            &other,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(others.items.len(), 1);
+        assert_eq!(timeline_len(&center, &other, &session_id).await, 1);
+
+        // Replaying the deleted message does not resurrect it.
+        inbound(&center, msg1, "lc", "lc-replay").await;
+        assert!(list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::All,
+            SessionListOrder::Activity,
+            None,
+            None
+        )
+        .await
+        .items
+        .is_empty());
+        assert_eq!(timeline_len(&center, &owner, &session_id).await, 0);
+
+        // A genuinely new message forms a fresh visible history.
+        let watermark = deleted.delete_watermark_sort_key.unwrap();
+        let msg3 = chat_at(&peer, vec![owner.clone()], "three", watermark + 10);
+        inbound(&center, msg3, "lc", "lc-3").await;
+        let active = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(active.items.len(), 1);
+        assert_eq!(active.items[0].unread_count, 1);
+        assert_eq!(active.items[0].last_activity_ms, watermark + 10);
+        assert_eq!(timeline_len(&center, &owner, &session_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn activity_order_ignores_read_state_and_events_and_pages_consistently() {
+        let (center, _tmp) = new_center("activity").await;
+        let owner = DID::new("bns", "act-owner");
+        let peer = DID::new("bns", "act-peer");
+        grant(&center, &peer, &owner, "act").await;
+
+        let mut s1 = chat_at(&peer, vec![owner.clone()], "s1", 3_000_000);
+        s1.to_session = Some("s1".to_string());
+        let mut s2 = chat_at(&peer, vec![owner.clone()], "s2", 3_000_100);
+        s2.to_session = Some("s2".to_string());
+        inbound(&center, s1, "act", "act-1").await;
+        inbound(&center, s2, "act", "act-2").await;
+
+        let order = |page: &buckyos_api::SessionSummaryPage| {
+            page.items
+                .iter()
+                .map(|i| i.session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(
+                &list(
+                    &center,
+                    &owner,
+                    SessionListLifecycleFilter::Active,
+                    SessionListOrder::Activity,
+                    None,
+                    None
+                )
+                .await
+            ),
+            vec!["s2", "s1"]
+        );
+
+        // Reading s1 bumps updated_at_ms (legacy order) but not activity.
+        let record_id = center
+            .handle_list_session(
+                owner.clone(),
+                "s1".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .items[0]
+            .record_id
+            .clone();
+        center
+            .handle_update_record_state(record_id, RecipientState::Read, ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            order(
+                &list(
+                    &center,
+                    &owner,
+                    SessionListLifecycleFilter::Active,
+                    SessionListOrder::Updated,
+                    None,
+                    None
+                )
+                .await
+            ),
+            vec!["s1", "s2"]
+        );
+        assert_eq!(
+            order(
+                &list(
+                    &center,
+                    &owner,
+                    SessionListLifecycleFilter::Active,
+                    SessionListOrder::Activity,
+                    None,
+                    None
+                )
+                .await
+            ),
+            vec!["s2", "s1"]
+        );
+
+        // An event (action log) in s1 does not move it either.
+        let mut event = chat_at(&peer, vec![owner.clone()], "log", 3_000_200);
+        event.kind = MsgObjKind::Event;
+        event.to_session = Some("s1".to_string());
+        inbound(&center, event, "act", "act-3").await;
+        let page = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(order(&page), vec!["s2", "s1"]);
+        assert_eq!(page.items[1].last_activity_ms, 3_000_000);
+        assert_eq!(
+            page.items[1].unread_count, 1,
+            "persistent event still counts as unread"
+        );
+
+        // A new chat in s1 moves it first; paging with limit 1 is stable.
+        let mut chat = chat_at(&peer, vec![owner.clone()], "s1 again", 3_000_300);
+        chat.to_session = Some("s1".to_string());
+        inbound(&center, chat, "act", "act-4").await;
+        let first = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            Some(1),
+            None,
+        )
+        .await;
+        assert_eq!(order(&first), vec!["s1"]);
+        assert_eq!(first.next_cursor_updated_at_ms, Some(3_000_300));
+        assert_eq!(first.next_cursor_session_id.as_deref(), Some("s1"));
+        let second = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            Some(1),
+            Some((3_000_300, "s1".to_string())),
+        )
+        .await;
+        assert_eq!(order(&second), vec!["s2"]);
+        assert!(second.next_cursor_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_session_registers_empty_session_and_first_message_joins_it() {
+        let (center, _tmp) = new_center("create").await;
+        let hub = DID::new("bns", "hub-create");
+        center.set_message_hub_did(hub);
+        let owner = DID::new("bns", "cr-owner");
+        let agent = DID::new("bns", "cr-agent");
+        center.register_local_recipients([agent.clone()]);
+
+        let create = |title: &str| MsgCenterCreateSessionReq {
+            owner: owner.clone(),
+            peer_did: agent.clone(),
+            session_id: None,
+            title: Some(title.to_string()),
+            binding: Some(json!({ "kind": "native", "targetDid": agent.to_string() })),
+            origin: None,
+        };
+        let first = center
+            .handle_create_session(create("Plan"), ctx())
+            .await
+            .unwrap();
+        let second = center
+            .handle_create_session(create("Plan"), ctx())
+            .await
+            .unwrap();
+        assert_ne!(
+            first.session_id, second.session_id,
+            "same title, independent sessions"
+        );
+        assert!(first.registered);
+        assert_eq!(first.title.as_deref(), Some("Plan"));
+        assert_eq!(first.origin.as_deref(), Some("manual"));
+
+        let page = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(page.items.len(), 2);
+        let empty = page
+            .items
+            .iter()
+            .find(|i| i.session_id == first.session_id)
+            .unwrap();
+        assert!(empty.last_record.is_none());
+        assert_eq!(empty.unread_count, 0);
+        assert_eq!(empty.last_activity_ms, first.created_at_ms);
+        assert_eq!(timeline_len(&center, &owner, &first.session_id).await, 0);
+
+        // Caller-chosen id is idempotent; a title over 64 chars is rejected.
+        let mut fixed = create("Fixed");
+        fixed.session_id = Some("fixed-id".to_string());
+        let a = center
+            .handle_create_session(fixed.clone(), ctx())
+            .await
+            .unwrap();
+        let b = center.handle_create_session(fixed, ctx()).await.unwrap();
+        assert_eq!(a, b);
+        assert!(center
+            .handle_create_session(create(&"x".repeat(65)), ctx())
+            .await
+            .is_err());
+
+        // The first message targets the session via to_session and lands there.
+        let mut msg = chat_at(&owner, vec![agent.clone()], "hello", 4_000_000);
+        msg.to_session = Some(first.session_id.clone());
+        let post = center.handle_post_send(msg, None, ctx()).await.unwrap();
+        assert!(post.ok, "{:?}", post.reason);
+        assert_eq!(timeline_len(&center, &owner, &first.session_id).await, 1);
+        let page = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::Active,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        let joined = page
+            .items
+            .iter()
+            .find(|i| i.session_id == first.session_id)
+            .unwrap();
+        assert_eq!(joined.last_activity_ms, 4_000_000);
+        assert_eq!(
+            joined.last_record.as_ref().unwrap().record.box_kind,
+            MailboxKind::Sent
+        );
+        assert!(joined.state.as_ref().unwrap().registered);
+
+        // Deleting a registered session drops the registration too.
+        center
+            .handle_delete_session(owner.clone(), first.session_id.clone(), ctx())
+            .await
+            .unwrap();
+        let page = list(
+            &center,
+            &owner,
+            SessionListLifecycleFilter::All,
+            SessionListOrder::Activity,
+            None,
+            None,
+        )
+        .await;
+        assert!(page.items.iter().all(|i| i.session_id != first.session_id));
+    }
+
+    #[tokio::test]
+    async fn owner_scoped_ui_state_is_isolated_and_cleared_by_delete() {
+        let (center, _tmp) = new_center("ui-state").await;
+        let a = DID::new("bns", "ui-a");
+        let b = DID::new("bns", "ui-b");
+        let peer = DID::new("bns", "ui-peer");
+        grant(&center, &peer, &a, "ui").await;
+        inbound(
+            &center,
+            chat_at(&peer, vec![a.clone()], "hi", 5_000_000),
+            "ui",
+            "ui-1",
+        )
+        .await;
+        let session_id = format!("dm:{}", peer.to_string());
+
+        center
+            .handle_update_owner_ui_session_state(
+                a.clone(),
+                session_id.clone(),
+                "ui.title".into(),
+                json!("Mine"),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        let mine = center
+            .handle_get_owner_ui_session_state(
+                a.clone(),
+                session_id.clone(),
+                "ui.title".into(),
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mine.value, json!("Mine"));
+        assert!(center
+            .handle_get_owner_ui_session_state(
+                b.clone(),
+                session_id.clone(),
+                "ui.title".into(),
+                ctx()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            center
+                .handle_get_ui_session_state(session_id.clone(), "ui.title".into(), ctx())
+                .await
+                .unwrap()
+                .is_none(),
+            "legacy session-only KV is untouched"
+        );
+        assert_eq!(
+            center
+                .handle_list_owner_ui_session_state(a.clone(), session_id.clone(), ctx())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        center
+            .handle_delete_session(a.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap();
+        assert!(center
+            .handle_list_owner_ui_session_state(a.clone(), session_id.clone(), ctx())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // ---- authorization -------------------------------------------------
+
+    const TEST_PRIVATE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
+-----END PRIVATE KEY-----"#;
+    const TEST_PUBLIC_X: &str = "T4Quc1L6Ogu4N2tTKOvneV1yYnBcmhP89B_RsuFsJZ8";
+
+    struct StaticKeyVerifier {
+        key: DecodingKey,
+        users: HashMap<String, DID>,
+        /// agent → owner
+        agents: HashMap<DID, DID>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionTokenVerifier for StaticKeyVerifier {
+        async fn authorize(
+            &self,
+            _token: &str,
+            _resource: &str,
+            _action: &str,
+        ) -> std::result::Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn verify(&self, token: &str) -> std::result::Result<RPCSessionToken, RPCErrors> {
+            let mut parsed = RPCSessionToken::from_string(token)?;
+            parsed.verify_by_key(&self.key)?;
+            Ok(parsed)
+        }
+
+        async fn resolve_user_did(&self, user_id: &str) -> std::result::Result<DID, RPCErrors> {
+            self.users
+                .get(user_id)
+                .cloned()
+                .ok_or_else(|| RPCErrors::KeyNotExist(format!("users/{}/profile", user_id)))
+        }
+
+        async fn zone_agent(
+            &self,
+            did: &DID,
+        ) -> std::result::Result<Option<ZoneAgentInfo>, RPCErrors> {
+            Ok(self.agents.get(did).map(|owner| ZoneAgentInfo {
+                owner: owner.clone(),
+                allow_group: false,
+            }))
+        }
+    }
+
+    struct ScopedVerifier {
+        inner: StaticKeyVerifier,
+        resource: String,
+        write: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionTokenVerifier for ScopedVerifier {
+        async fn verify(&self, token: &str) -> std::result::Result<RPCSessionToken, RPCErrors> {
+            self.inner.verify(token).await
+        }
+        async fn resolve_user_did(&self, user: &str) -> std::result::Result<DID, RPCErrors> {
+            self.inner.resolve_user_did(user).await
+        }
+        async fn zone_agent(
+            &self,
+            did: &DID,
+        ) -> std::result::Result<Option<ZoneAgentInfo>, RPCErrors> {
+            self.inner.zone_agent(did).await
+        }
+        async fn authorize(
+            &self,
+            _token: &str,
+            resource: &str,
+            action: &str,
+        ) -> std::result::Result<(), RPCErrors> {
+            if resource == self.resource && (action == "read" || self.write) {
+                Ok(())
+            } else {
+                Err(RPCErrors::NoPermission("outside granted mailbox".into()))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_mailbox_grant_cannot_read_consume_or_move_other_sessions() {
+        let (center, _tmp) = new_center("scoped-mailbox").await;
+        let owner = DID::new("bns", "alice");
+        let peer = DID::new("bns", "peer");
+        let a = buckyos_api::MailboxAddress::new(owner.clone(), Some("a".into())).unwrap();
+        let b = buckyos_api::MailboxAddress::new(owner.clone(), Some("b".into())).unwrap();
+        let default = buckyos_api::MailboxAddress::new(owner.clone(), None).unwrap();
+        grant(&center, &peer, &owner, "scoped").await;
+        for session in ["a", "b", "default-source"] {
+            let mut msg = make_msg(peer.clone(), vec![owner.clone()], MsgObjKind::Chat);
+            msg.to_session = Some(session.into());
+            inbound(&center, msg, "scoped", session).await;
+        }
+        let seed =
+            buckyos_api::MailboxAddress::new(owner.clone(), Some("default-source".into())).unwrap();
+        let seed_record = center
+            .handle_get_next(seed, MailboxKind::Inbox, None, Some(false), None, ctx())
+            .await
+            .unwrap()
+            .unwrap()
+            .record;
+        center
+            .handle_move_record(seed_record.record_id.clone(), default.clone(), ctx())
+            .await
+            .unwrap();
+        let other = center
+            .handle_get_next(
+                b.clone(),
+                MailboxKind::Inbox,
+                None,
+                Some(false),
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .record;
+        center
+            .handle_archive_session(owner.clone(), "a".into(), ctx())
+            .await
+            .unwrap();
+        let pending = center
+            .handle_list_mailboxes(owner.clone(), MailboxKind::Inbox, ctx())
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 3);
+        for mailbox in [&default, &a, &b] {
+            assert!(pending.contains(mailbox));
+        }
+        center.set_token_verifier(Arc::new(ScopedVerifier {
+            inner: StaticKeyVerifier {
+                key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+                users: HashMap::from([("alice".into(), owner.clone())]),
+                agents: HashMap::new(),
+            },
+            resource: a.resource(MailboxKind::Inbox),
+            write: true,
+        }));
+        let mine = center
+            .handle_peek_box(
+                a.clone(),
+                MailboxKind::Inbox,
+                None,
+                None,
+                None,
+                user_ctx("alice"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].record.mailbox, a);
+        for mailbox in [b.clone(), default.clone()] {
+            assert!(is_denied(
+                center
+                    .handle_get_next(
+                        mailbox.clone(),
+                        MailboxKind::Inbox,
+                        None,
+                        None,
+                        None,
+                        user_ctx("alice")
+                    )
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_peek_box(
+                        mailbox.clone(),
+                        MailboxKind::Inbox,
+                        None,
+                        None,
+                        None,
+                        user_ctx("alice")
+                    )
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_list_box_by_time(
+                        mailbox,
+                        MailboxKind::Inbox,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        user_ctx("alice")
+                    )
+                    .await
+            ));
+        }
+        for record in [&other, &seed_record] {
+            assert!(is_denied(
+                center
+                    .handle_get_record(record.record_id.clone(), Some(true), user_ctx("alice"))
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_get_message(record.msg_id.clone(), user_ctx("alice"))
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_update_record_state(
+                        record.record_id.clone(),
+                        RecipientState::Read,
+                        user_ctx("alice")
+                    )
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_update_record_session(
+                        record.record_id.clone(),
+                        "a".into(),
+                        user_ctx("alice")
+                    )
+                    .await
+            ));
+            assert!(is_denied(
+                center
+                    .handle_move_record(record.record_id.clone(), a.clone(), user_ctx("alice"))
+                    .await
+            ));
+        }
+        let mine_id = mine[0].record.record_id.clone();
+        assert!(is_denied(
+            center
+                .handle_move_record(mine_id.clone(), b.clone(), user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_update_record_session(mine_id.clone(), "b".into(), user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_mailboxes(owner.clone(), MailboxKind::Inbox, user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_sessions(
+                    owner.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_get_next_delivery(owner.clone(), None, Some(true), user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_get_next(
+                    a.clone(),
+                    MailboxKind::Inbox,
+                    None,
+                    None,
+                    None,
+                    RPCContext {
+                        from_ip: Some("127.0.0.1".parse().unwrap()),
+                        ..Default::default()
+                    }
+                )
+                .await
+        ));
+        let taken = center
+            .handle_get_next(
+                a.clone(),
+                MailboxKind::Inbox,
+                None,
+                None,
+                None,
+                user_ctx("alice"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(taken.record.record_id, mine_id);
+        assert_eq!(taken.record.state, RecipientState::Reading);
+        assert!(center
+            .handle_get_next(
+                a.clone(),
+                MailboxKind::Inbox,
+                None,
+                None,
+                None,
+                user_ctx("alice")
+            )
+            .await
+            .unwrap()
+            .is_none());
+        center
+            .handle_update_record_state(mine_id, RecipientState::Read, user_ctx("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            center
+                .handle_get_record(other.record_id, None, ctx())
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .state,
+            RecipientState::Unread
+        );
+        assert_eq!(
+            center
+                .handle_get_next(default, MailboxKind::Inbox, None, None, None, ctx())
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .record_id,
+            seed_record.record_id
+        );
+        center.set_token_verifier(Arc::new(ScopedVerifier {
+            inner: StaticKeyVerifier {
+                key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+                users: HashMap::from([("alice".into(), owner)]),
+                agents: HashMap::new(),
+            },
+            resource: b.resource(MailboxKind::Inbox),
+            write: false,
+        }));
+        assert!(center
+            .handle_get_next(
+                b.clone(),
+                MailboxKind::Inbox,
+                None,
+                Some(false),
+                None,
+                user_ctx("alice")
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert!(is_denied(
+            center
+                .handle_get_next(
+                    b,
+                    MailboxKind::Inbox,
+                    None,
+                    Some(true),
+                    None,
+                    user_ctx("alice")
+                )
+                .await
+        ));
+    }
+
+    #[tokio::test]
+    async fn delegated_agent_session_is_consumable_through_the_rpc_boundary() {
+        use kRPC::{RPCHandler, RPCRequest, RPCResult};
+        let (center, _tmp) = new_center("delegated-agent").await;
+        let user = DID::new("bns", "alice");
+        let agent = DID::new("web", "agent.zone.example");
+        center.register_local_recipients([agent.clone()]);
+        let address =
+            buckyos_api::MailboxAddress::new(agent.clone(), Some("approval/1".into())).unwrap();
+        grant(&center, &user, &agent, "delegate").await;
+        let mut msg = make_msg(user.clone(), vec![agent.clone()], MsgObjKind::Chat);
+        msg.to_session = Some("approval/1".into());
+        inbound(&center, msg, "delegate", "delegate").await;
+        let install_grant = |write| {
+            center.set_token_verifier(Arc::new(ScopedVerifier {
+                inner: StaticKeyVerifier {
+                    key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+                    users: HashMap::from([("alice".into(), user.clone())]),
+                    agents: HashMap::from([(agent.clone(), user.clone())]),
+                },
+                resource: address.resource(MailboxKind::Inbox),
+                write,
+            }))
+        };
+        let server = buckyos_api::MsgCenterServerHandler::new(center.clone());
+        let request = || {
+            let mut req = RPCRequest::new(
+                "msg.get_next",
+                json!({"mailbox": address.to_string(), "box_kind": "INBOX", "lock_on_take": true}),
+            );
+            req.token = user_ctx("alice").token;
+            req
+        };
+        let ip = "127.0.0.1".parse().unwrap();
+        install_grant(false);
+        assert!(is_denied(server.handle_rpc_call(request(), ip).await));
+        install_grant(true);
+        let response = server.handle_rpc_call(request(), ip).await.unwrap();
+        match response.result {
+            RPCResult::Success(value) => {
+                assert_eq!(
+                    value["record"]["mailbox"],
+                    json!("did:web:agent.zone.example/approval%2F1")
+                );
+                assert_eq!(value["record"]["session_id"], json!("approval/1"));
+                assert_eq!(value["record"]["state"], json!("READING"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let mut anonymous = request();
+        anonymous.token = None;
+        assert!(is_denied(server.handle_rpc_call(anonymous, ip).await));
+    }
+
+    fn signed_token(user_id: &str, principal_kind: TokenPrincipalKind) -> String {
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
+        let mut token = RPCSessionToken {
+            token_type: RPCSessionTokenType::JWT,
+            token: None,
+            aud: None,
+            exp: Some(now + 3600),
+            iss: Some(VERIFY_HUB_UNIQUE_ID.to_string()),
+            jti: None,
+            sub: Some(user_id.to_string()),
+            appid: None,
+            sudo: false,
+            extra: HashMap::new(),
+        };
+        bind_token_principal_kind(&mut token, principal_kind);
+        bind_token_target(
+            &mut token,
+            &AuthTarget::system(SystemServiceId::parse("control-panel").unwrap()),
+            TokenUse::Session,
+        )
+        .unwrap();
+        token
+            .generate_jwt(
+                None,
+                &EncodingKey::from_ed_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn user_ctx(user_id: &str) -> RPCContext {
+        RPCContext {
+            token: Some(signed_token(user_id, TokenPrincipalKind::User)),
+            ..Default::default()
+        }
+    }
+
+    fn is_denied<T: std::fmt::Debug>(result: std::result::Result<T, RPCErrors>) -> bool {
+        matches!(result, Err(RPCErrors::NoPermission(_)))
+    }
+
+    #[tokio::test]
+    async fn web_did_user_can_read_existing_requests_mark_read_and_reply_as_self() {
+        let (center, _tmp) = new_center("web-user-auth").await;
+        let devtest = DID::new("bns", "devtest");
+        let lucy = DID::new("web", "lucy.test.buckyos.io");
+        let wrong_lucy = DID::new("bns", "lucy");
+        let group = DID::new("web", "team.test.buckyos.io");
+        center.set_token_verifier(Arc::new(StaticKeyVerifier {
+            key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+            users: HashMap::from([
+                ("devtest".into(), devtest.clone()),
+                ("lucy".into(), lucy.clone()),
+            ]),
+            agents: HashMap::new(),
+        }));
+        center.register_local_recipients([devtest.clone(), lucy.clone(), group.clone()]);
+        center.set_message_hub_did(DID::new("web", "msg-hub.test.buckyos.io"));
+        let mut message = chat_at(&devtest, vec![lucy.clone()], "Hello Lucy", 7_000_000);
+        message.to_session = Some("lucy-session".into());
+        let message_id = message.gen_obj_id().0;
+        inbound(&center, message, "lucy-session", "hello-lucy").await;
+
+        let page = center
+            .handle_list_sessions(
+                lucy.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                user_ctx("lucy"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].request_count, 1);
+        let session_id = page.items[0].session_id.clone();
+        let timeline = center
+            .handle_list_session(
+                lucy.clone(),
+                session_id.clone(),
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                user_ctx("lucy"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline.items.len(), 1);
+        assert_eq!(timeline.items[0].msg_id, message_id);
+        assert_eq!(timeline.items[0].from, devtest);
+        let record_id = timeline.items[0].record_id.clone();
+        assert!(is_denied(
+            center
+                .handle_update_record_state(
+                    record_id.clone(),
+                    RecipientState::Read,
+                    user_ctx("devtest")
+                )
+                .await
+        ));
+        let record = center
+            .handle_update_record_state(record_id, RecipientState::Read, user_ctx("lucy"))
+            .await
+            .unwrap();
+        assert_eq!(record.state, RecipientState::Read);
+        assert_eq!(record.owner, lucy);
+
+        assert!(is_denied(
+            center
+                .handle_list_sessions(
+                    lucy.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    user_ctx("devtest")
+                )
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_sessions(
+                    wrong_lucy.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    user_ctx("lucy")
+                )
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_sessions(group, None, None, None, None, None, None, user_ctx("lucy"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_sessions(
+                    lucy.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    user_ctx("missing-profile")
+                )
+                .await
+        ));
+
+        let mut reply = chat_at(&lucy, vec![devtest.clone()], "Hello devtest", 7_000_100);
+        reply.to_session = Some(session_id.clone());
+        assert!(
+            center
+                .handle_post_send(reply.clone(), None, user_ctx("lucy"))
+                .await
+                .unwrap()
+                .ok
+        );
+        reply.from = wrong_lucy;
+        assert!(is_denied(
+            center.handle_post_send(reply, None, user_ctx("lucy")).await
+        ));
+        let timeline = center
+            .handle_list_session(
+                lucy.clone(),
+                session_id,
+                None,
+                None,
+                None,
+                None,
+                Some(false),
+                user_ctx("lucy"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeline.items.len(), 2);
+        assert!(timeline
+            .items
+            .iter()
+            .any(|item| item.direction == SessionMessageDirection::Out && item.from == lucy));
+    }
+
+    #[tokio::test]
+    async fn zone_user_sync_delivers_to_user_inbox_and_preserves_blocks() {
+        let (center, _tmp) = new_center("zone-user-sync").await;
+        let devtest = DID::new("bns", "devtest");
+        let lucy = DID::new("web", "lucy.test.buckyos.io");
+        let directory = crate::test_zone_directory(
+            &[
+                (&devtest, buckyos_api::UserType::Admin, &[]),
+                (&lucy, buckyos_api::UserType::User, &[]),
+            ],
+            Default::default(),
+        );
+        crate::apply_zone_directory(&center, &directory)
+            .await
+            .unwrap();
+        inbound(
+            &center,
+            chat_at(&devtest, vec![lucy.clone()], "New message", 8_000_000),
+            "sync",
+            "sync-1",
+        )
+        .await;
+        let inbox = center
+            .handle_peek_box(
+                buckyos_api::MailboxAddress::new(
+                    lucy.clone(),
+                    Some(format!("dm:{}", devtest.to_string())),
+                )
+                .unwrap(),
+                MailboxKind::Inbox,
+                None,
+                None,
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+        let contact = center
+            .handle_get_contact(lucy.clone(), Some(devtest.clone()), ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(contact.access_level, buckyos_api::AccessGroupLevel::Allow);
+
+        center
+            .handle_block_contact(devtest.clone(), None, Some(lucy.clone()), ctx())
+            .await
+            .unwrap();
+        crate::apply_zone_directory(&center, &directory)
+            .await
+            .unwrap();
+        let result = center
+            .handle_dispatch(
+                chat_at(&devtest, vec![lucy.clone()], "Blocked message", 8_000_100),
+                None,
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.dropped_recipients, vec![lucy.clone()]);
+        let inbox = center
+            .handle_peek_box(
+                buckyos_api::MailboxAddress::new(lucy, Some(format!("dm:{}", devtest.to_string())))
+                    .unwrap(),
+                MailboxKind::Inbox,
+                None,
+                None,
+                None,
+                ctx(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inbox.len(), 1);
+    }
+
+    fn zone_agent_of(owner: &DID, profile: serde_json::Value) -> crate::zone_agent::ZoneAgent {
+        let did = DID::new("web", "xiaobai.test.buckyos.io");
+        crate::zone_agent::ZoneAgent {
+            agent_id: buckyos_api::AgentId::from_agent_did(&did).unwrap(),
+            doc: crate::zone_agent::test_support::agent_document(&did, owner),
+            settings: Default::default(),
+            profile: serde_json::from_value(profile).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_agent_sync_establishes_mutual_friendship_without_a_tunnel() {
+        let (center, _tmp) = new_center("zone-agent-sync").await;
+        let owner = DID::new("web", "alice.test.buckyos.io");
+        let agent = zone_agent_of(&owner, json!({"display_name": "Xiaobai"}));
+        let users = vec![crate::contact_mgr::ZoneUserContactSeed {
+            avatar: None,
+            did: owner.clone(),
+            name: "Alice".into(),
+            note: None,
+            bindings: vec![],
+            tags: vec![],
+        }];
+        crate::sync_zone_agent_contacts(&center, &users, &[agent.clone()])
+            .await
+            .unwrap();
+        let agent_did = agent.did().clone();
+
+        for (sender, recipient, name, tag) in [
+            (&owner, &agent_did, "Alice", "zone_user"),
+            (&agent_did, &owner, "Xiaobai", "zone_agent"),
+        ] {
+            let contact = center
+                .handle_get_contact(sender.clone(), Some(recipient.clone()), ctx())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(contact.access_level, buckyos_api::AccessGroupLevel::Allow);
+            assert_eq!(contact.name, name);
+            assert!(contact.tags.iter().any(|value| value == tag));
+            inbound(
+                &center,
+                chat_at(sender, vec![recipient.clone()], "Hello", 8_100_000),
+                "agent-sync",
+                &sender.to_string(),
+            )
+            .await;
+            let mailbox = buckyos_api::MailboxAddress::new(
+                recipient.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap();
+            for (kind, count) in [(MailboxKind::Inbox, 1), (MailboxKind::RequestBox, 0)] {
+                let records = center
+                    .handle_peek_box(mailbox.clone(), kind, None, None, None, ctx())
+                    .await
+                    .unwrap();
+                assert_eq!(records.len(), count);
+            }
+        }
+        assert!(center
+            .handle_get_contact(agent_did.clone(), Some(DID::new("bns", "bob")), ctx())
+            .await
+            .unwrap()
+            .is_none());
+
+        center
+            .handle_block_contact(agent_did.clone(), None, Some(owner.clone()), ctx())
+            .await
+            .unwrap();
+        center
+            .handle_update_contact(
+                owner.clone(),
+                buckyos_api::ContactPatch {
+                    access_level: Some(buckyos_api::AccessGroupLevel::Stranger),
+                    ..Default::default()
+                },
+                Some(agent_did.clone()),
+                ctx(),
+            )
+            .await
+            .unwrap();
+        crate::sync_zone_agent_contacts(&center, &users, &[agent.clone()])
+            .await
+            .unwrap();
+        for (sender, recipient, level) in [
+            (&owner, &agent_did, buckyos_api::AccessGroupLevel::Stranger),
+            (&agent_did, &owner, buckyos_api::AccessGroupLevel::Block),
+        ] {
+            let contact = center
+                .handle_get_contact(sender.clone(), Some(recipient.clone()), ctx())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(contact.access_level, level);
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_agent_sync_preserves_an_existing_block_on_first_sync() {
+        let (center, _tmp) = new_center("zone-agent-block").await;
+        let owner = DID::new("bns", "alice");
+        let agent = zone_agent_of(&owner, json!({}));
+        let agent_did = agent.did().clone();
+        for (sender, recipient) in [(&agent_did, &owner), (&owner, &agent_did)] {
+            center
+                .handle_block_contact(sender.clone(), None, Some(recipient.clone()), ctx())
+                .await
+                .unwrap();
+        }
+        crate::sync_zone_agent_contacts(&center, &[], &[agent.clone()])
+            .await
+            .unwrap();
+        for (sender, recipient) in [(&agent_did, &owner), (&owner, &agent_did)] {
+            let result = center
+                .handle_dispatch(
+                    chat_at(sender, vec![recipient.clone()], "Blocked", 8_200_000),
+                    None,
+                    None,
+                    ctx(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.dropped_recipients, vec![recipient.clone()]);
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_user_tokens_scope_reads_and_writes_to_the_owner() {
+        let (center, _tmp) = new_center("auth").await;
+        let alice = DID::new("bns", "alice");
+        let bob = DID::new("bns", "bob");
+        let agent = DID::new("web", "xiaobai.zone.example");
+        center.set_token_verifier(Arc::new(StaticKeyVerifier {
+            key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+            users: HashMap::from([("alice".into(), alice.clone()), ("bob".into(), bob.clone())]),
+            agents: HashMap::from([(agent.clone(), alice.clone())]),
+        }));
+        center.register_local_recipients([alice.clone(), bob.clone(), agent.clone()]);
+        let peer = DID::new("bns", "auth-peer");
+        for owner in [&alice, &bob, &agent] {
+            grant(&center, &peer, owner, "auth").await;
+        }
+        inbound(
+            &center,
+            chat_at(
+                &peer,
+                vec![alice.clone(), bob.clone(), agent.clone()],
+                "hi",
+                6_000_000,
+            ),
+            "auth",
+            "auth-1",
+        )
+        .await;
+        let session_id = format!("dm:{}", peer.to_string());
+
+        let list_as = |owner: DID, ctx: RPCContext| {
+            let center = center.clone();
+            async move {
+                center
+                    .handle_list_sessions(owner, None, None, None, None, None, None, ctx)
+                    .await
+            }
+        };
+        // Self and one's own zone-hosted agent are readable; another user
+        // and another user's agent are not.
+        assert_eq!(
+            list_as(alice.clone(), user_ctx("alice"))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_as(agent.clone(), user_ctx("alice"))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert!(is_denied(list_as(bob.clone(), user_ctx("alice")).await));
+        assert!(is_denied(list_as(agent.clone(), user_ctx("bob")).await));
+        assert!(is_denied(
+            center
+                .handle_list_session(
+                    bob.clone(),
+                    session_id.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        // Observation is read-only: no writes as the agent or as another user.
+        assert!(is_denied(
+            center
+                .handle_archive_session(agent.clone(), session_id.clone(), user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_update_owner_ui_session_state(
+                    agent.clone(),
+                    session_id.clone(),
+                    "ui.title".into(),
+                    json!("x"),
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        let bob_record = center
+            .handle_list_session(
+                bob.clone(),
+                session_id.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                user_ctx("bob"),
+            )
+            .await
+            .unwrap()
+            .items[0]
+            .record_id
+            .clone();
+        assert!(is_denied(
+            center
+                .handle_update_record_state(
+                    bob_record.clone(),
+                    RecipientState::Read,
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        assert!(center
+            .handle_update_record_state(bob_record, RecipientState::Read, user_ctx("bob"))
+            .await
+            .is_ok());
+        assert!(is_denied(
+            center
+                .handle_post_send(
+                    chat_at(&bob, vec![peer.clone()], "as bob", 6_000_100),
+                    None,
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        // Own writes succeed; a forged token is rejected; no token keeps the
+        // legacy in-process behaviour.
+        assert!(center
+            .handle_archive_session(alice.clone(), session_id.clone(), user_ctx("alice"))
+            .await
+            .is_ok());
+        let forged = RPCContext {
+            token: Some("eyJhbGciOiJFZERTQSJ9.e30.invalid".to_string()),
+            ..Default::default()
+        };
+        assert!(is_denied(list_as(alice.clone(), forged).await));
+        assert_eq!(list_as(bob.clone(), ctx()).await.unwrap().items.len(), 1);
+        // System principals keep their service-level access.
+        let system = RPCContext {
+            token: Some(signed_token("msg-center", TokenPrincipalKind::System)),
+            ..Default::default()
+        };
+        assert_eq!(list_as(bob.clone(), system).await.unwrap().items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingress_principal_decides_the_inbox_only_for_in_process_tunnels() {
+        let (center, _tmp) = new_center("ingress-principal").await;
+        let alice = DID::new("bns", "alice");
+        let bob = DID::new("bns", "bob");
+        let agent = DID::new("web", "xiaobai.zone.example");
+        center.set_token_verifier(Arc::new(StaticKeyVerifier {
+            key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+            users: HashMap::from([("alice".into(), alice.clone()), ("bob".into(), bob.clone())]),
+            agents: HashMap::from([(agent.clone(), alice.clone())]),
+        }));
+        center.register_local_recipients([alice.clone(), bob.clone(), agent.clone()]);
+        center
+            .upsert_zone_user_contacts(
+                vec![crate::contact_mgr::ZoneUserContactSeed {
+                    avatar: None,
+                    did: alice.clone(),
+                    name: "Alice".into(),
+                    note: None,
+                    bindings: vec![],
+                    tags: vec![],
+                }],
+                Some(agent.clone()),
+            )
+            .await
+            .unwrap();
+        let for_alice = || IngressContext {
+            platform: Some("telegram".into()),
+            extra: Some(json!({"chat_type": "user", "principal_did": alice.to_string()})),
+            ..Default::default()
+        };
+        let owner_endpoint = DID::new("msgtunnel", "10001.user.tg-main");
+        let stranger_endpoint = DID::new("msgtunnel", "20002.user.tg-main");
+        for (sender, ingress, key, caller) in [
+            (&owner_endpoint, for_alice(), "owner", ctx()),
+            (
+                &stranger_endpoint,
+                IngressContext {
+                    platform: Some("telegram".into()),
+                    ..Default::default()
+                },
+                "stranger",
+                ctx(),
+            ),
+            (&bob, for_alice(), "forged", user_ctx("bob")),
+        ] {
+            center
+                .handle_dispatch(
+                    chat_at(sender, vec![agent.clone()], key, 9_000_000),
+                    Some(ingress),
+                    Some(key.into()),
+                    caller,
+                )
+                .await
+                .unwrap();
+        }
+
+        let peek = |sender: &DID, kind: MailboxKind| {
+            let center = center.clone();
+            let mailbox = buckyos_api::MailboxAddress::new(
+                agent.clone(),
+                Some(format!("dm:{}", sender.to_string())),
+            )
+            .unwrap();
+            async move {
+                center
+                    .handle_peek_box(mailbox, kind, None, None, None, ctx())
+                    .await
+                    .unwrap()
+            }
+        };
+        let owner_inbox = peek(&owner_endpoint, MailboxKind::Inbox).await;
+        assert_eq!(owner_inbox.len(), 1);
+        assert_eq!(owner_inbox[0].record.from, owner_endpoint);
+        assert_eq!(
+            owner_inbox[0]
+                .record
+                .ingress
+                .as_ref()
+                .unwrap()
+                .extra
+                .as_ref()
+                .unwrap()["principal_did"],
+            json!(alice.to_string())
+        );
+        for sender in [&stranger_endpoint, &bob] {
+            assert!(peek(sender, MailboxKind::Inbox).await.is_empty());
+            let requests = peek(sender, MailboxKind::RequestBox).await;
+            assert_eq!(requests.len(), 1);
+            let principal = requests[0]
+                .record
+                .ingress
+                .as_ref()
+                .and_then(|ingress| ingress.extra.as_ref())
+                .and_then(|extra| extra.get("principal_did"));
+            assert!(principal.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn contact_admission_is_owner_scoped_and_creates_missing_contacts() {
+        let (center, _tmp) = new_center("contact-auth").await;
+        let alice = DID::new("bns", "alice");
+        let bob = DID::new("bns", "bob");
+        center.set_token_verifier(Arc::new(StaticKeyVerifier {
+            key: DecodingKey::from_ed_components(TEST_PUBLIC_X).unwrap(),
+            users: HashMap::from([("alice".into(), alice.clone()), ("bob".into(), bob.clone())]),
+            agents: HashMap::new(),
+        }));
+        center.register_local_recipients([alice.clone(), bob.clone()]);
+        let sender = DID::new("web", "carol.zone.example");
+        let accept = buckyos_api::ContactPatch {
+            access_level: Some(buckyos_api::AccessGroupLevel::Allow),
+            ..Default::default()
+        };
+
+        // A sender that only reached the request box has no contact record;
+        // accepting it creates one and later messages are admitted.
+        let before = center
+            .handle_check_access_permission(
+                sender.clone(),
+                None,
+                Some(alice.clone()),
+                user_ctx("alice"),
+            )
+            .await
+            .unwrap();
+        assert!(!before.allow_delivery || before.level != buckyos_api::AccessGroupLevel::Allow);
+        let contact = center
+            .handle_update_contact(
+                sender.clone(),
+                accept.clone(),
+                Some(alice.clone()),
+                user_ctx("alice"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(contact.access_level, buckyos_api::AccessGroupLevel::Allow);
+        let after = center
+            .handle_check_access_permission(
+                sender.clone(),
+                None,
+                Some(alice.clone()),
+                user_ctx("alice"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after.level, buckyos_api::AccessGroupLevel::Allow);
+        assert!(after.allow_delivery);
+
+        // Other edits still need an existing contact.
+        let rename = buckyos_api::ContactPatch {
+            name: Some("Dave".into()),
+            ..Default::default()
+        };
+        assert!(center
+            .handle_update_contact(
+                DID::new("web", "dave.zone.example"),
+                rename,
+                Some(alice.clone()),
+                user_ctx("alice")
+            )
+            .await
+            .is_err());
+
+        // A user changes only their own store; the system scope is service only.
+        assert!(is_denied(
+            center
+                .handle_update_contact(
+                    sender.clone(),
+                    accept.clone(),
+                    Some(bob.clone()),
+                    user_ctx("alice")
+                )
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_block_contact(sender.clone(), None, Some(bob.clone()), user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_update_contact(sender.clone(), accept.clone(), None, user_ctx("alice"))
+                .await
+        ));
+        assert!(is_denied(
+            center
+                .handle_list_contacts(Default::default(), Some(bob.clone()), user_ctx("alice"))
+                .await
+        ));
+        assert!(center
+            .handle_list_contacts(Default::default(), None, user_ctx("alice"))
+            .await
+            .is_ok());
+        assert!(center
+            .handle_update_contact(sender, accept, Some(bob.clone()), user_ctx("bob"))
+            .await
+            .is_ok());
+    }
+}
+
+#[tokio::test]
+async fn concurrent_consumers_take_each_record_once_and_moves_survive_restart() {
+    let (center, tmp) = new_center("concurrent-mailbox").await;
+    let owner = DID::new("bns", "consumer");
+    let peer = DID::new("bns", "producer");
+    let address = buckyos_api::MailboxAddress::new(owner.clone(), Some("work".into())).unwrap();
+    center
+        .handle_grant_temporary_access(
+            vec![peer.clone()],
+            "work".into(),
+            60,
+            Some(owner.clone()),
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let mut msg = make_msg(peer, vec![owner.clone()], MsgObjKind::Chat);
+    msg.to_session = Some("work".into());
+    center
+        .handle_dispatch(
+            msg.clone(),
+            Some(IngressContext {
+                context_id: Some("work".into()),
+                ..Default::default()
+            }),
+            None,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        center.handle_get_next(address.clone(), MailboxKind::Inbox, None, None, None, ctx()),
+        center.handle_get_next(address.clone(), MailboxKind::Inbox, None, None, None, ctx()),
+    );
+    let records: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+    assert_eq!(records.len(), 1);
+    let record = &records[0].record;
+    let default = buckyos_api::MailboxAddress::new(owner.clone(), None).unwrap();
+    center
+        .handle_move_record(record.record_id.clone(), default.clone(), ctx())
+        .await
+        .unwrap();
+    center
+        .handle_dispatch(
+            msg,
+            Some(IngressContext {
+                context_id: Some("work".into()),
+                ..Default::default()
+            }),
+            None,
+            ctx(),
+        )
+        .await
+        .unwrap();
+    let conn = format!(
+        "sqlite:///{}?mode=rwc",
+        tmp.path().join("msg-center.db").display()
+    );
+    let reopened = open_center_at(&conn).await;
+    assert!(reopened
+        .handle_peek_box(address, MailboxKind::Inbox, None, None, None, ctx())
+        .await
+        .unwrap()
+        .is_empty());
+    let moved = reopened
+        .handle_peek_box(default, MailboxKind::Inbox, None, None, None, ctx())
+        .await
+        .unwrap();
+    assert_eq!(moved.len(), 1);
+    assert!(moved[0].record.session_id.is_none());
+    assert_eq!(moved[0].record.state, RecipientState::Reading);
+}
+
+#[tokio::test]
+async fn post_send_idempotency_key_is_scoped_to_the_sender_session() {
+    let (center, _tmp) = new_center("session-idempotency").await;
+    center.set_message_hub_did(DID::new("bns", "hub"));
+    let owner = DID::new("bns", "sender");
+    let peer = DID::new("bns", "recipient");
+    let mut results = Vec::new();
+    for session in ["session-a", "session-b"] {
+        let mut msg = make_msg(owner.clone(), vec![peer.clone()], MsgObjKind::Chat);
+        msg.to_session = Some(session.into());
+        let expected = msg.gen_obj_id().0;
+        let first = center
+            .handle_post_send(msg.clone(), Some("same-key".into()), ctx())
+            .await
+            .unwrap();
+        let replay = center
+            .handle_post_send(msg, Some("same-key".into()), ctx())
+            .await
+            .unwrap();
+        assert!(first.ok);
+        assert_eq!(first.msg_id, expected);
+        assert_eq!(first.msg_id, replay.msg_id);
+        results.push(first.msg_id);
+    }
+    assert_ne!(results[0], results[1]);
+}
+
+#[test]
+fn malformed_record_owners_are_rejected_without_panicking() {
+    for record_id in [
+        "",
+        "did",
+        "did:",
+        "did:bns:",
+        "alice|INBOX|msg|v",
+        "did:bns:alice/session|INBOX|msg|v",
+    ] {
+        assert!(MessageCenter::owner_from_record_id(record_id).is_err());
+    }
+}
+
+fn edit_capable(text_only: bool) -> crate::msg_tunnel::EditCapability {
+    crate::msg_tunnel::EditCapability {
+        supported: true,
+        edit_window_ms: None,
+        text_only,
+    }
+}
+
+#[tokio::test]
+async fn edit_capability_follows_the_post_send_route_of_every_target() {
+    let (center, _tmp) = new_center("edit_capability").await;
+    let hub = DID::new("bns", "hub");
+    center.set_message_hub_did(hub.clone());
+    center.declare_edit_capability(&hub, edit_capable(false));
+    let tg = DID::new("bns", "tg-tunnel");
+    center
+        .register_tunnel("tg-main".to_string(), tg.clone(), "telegram".to_string())
+        .unwrap();
+    let mail = DID::new("bns", "mail-tunnel");
+    center
+        .register_tunnel("mail-main".to_string(), mail.clone(), "email".to_string())
+        .unwrap();
+    center.declare_edit_capability(&mail, Default::default());
+
+    let author = DID::new("bns", "agent");
+    let native = DID::new("bns", "bob");
+    let tg_user = DID::new("msgtunnel", "12345.user.tg-main");
+    let mail_user = DID::new("msgtunnel", "42.user.mail-main");
+    let capability = |to: Vec<DID>| {
+        let center = center.clone();
+        let msg = make_msg(author.clone(), to, MsgObjKind::Chat);
+        async move { center.handle_get_edit_capability(msg, ctx()).await.unwrap() }
+    };
+
+    let native_chat = capability(vec![native.clone()]).await;
+    assert!(native_chat.editable);
+    assert_eq!(native_chat.reason, None);
+    assert!(!native_chat.text_only);
+
+    // A registered tunnel that declared nothing is unknown, not editable.
+    let undeclared = capability(vec![tg_user.clone()]).await;
+    assert!(!undeclared.editable);
+    assert_eq!(undeclared.reason.as_deref(), Some("unknown"));
+
+    center.declare_edit_capability(&tg, edit_capable(true));
+    let telegram = capability(vec![tg_user.clone()]).await;
+    assert!(telegram.editable);
+    assert!(telegram.text_only);
+
+    let email = capability(vec![mail_user.clone()]).await;
+    assert!(!email.editable);
+    assert_eq!(email.reason.as_deref(), Some("tunnel:email unsupported"));
+
+    // Several targets: editable only if all of them are.
+    let mixed_ok = capability(vec![native.clone(), tg_user.clone()]).await;
+    assert!(mixed_ok.editable);
+    assert!(mixed_ok.text_only);
+    let mixed = capability(vec![native.clone(), mail_user]).await;
+    assert!(!mixed.editable);
+    assert_eq!(mixed.reason.as_deref(), Some("tunnel:email unsupported"));
+
+    let unroutable = capability(vec![DID::new("msgtunnel", "1.user.no-such-tunnel")]).await;
+    assert!(!unroutable.editable);
+    assert!(unroutable.reason.unwrap().contains("no-such-tunnel"));
+
+    // The query neither sends nor persists anything.
+    for transport in [hub, tg, mail] {
+        assert!(center
+            .handle_get_next_delivery(transport, Some(true), None, ctx())
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert!(center
+        .handle_list_mailboxes(author, MailboxKind::Sent, ctx())
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn reactions_and_their_redactions_arrive_read_and_never_count_as_unread() {
+    use ndn_lib::{MsgRelType, MsgRelation, ObjId};
+
+    let (center, _tmp) = new_center("reaction_unread").await;
+    let author = DID::new("bns", "author");
+    let alice = DID::new("bns", "alice");
+    let relation = |rel: MsgRelType, target: &ObjId, key: Option<&str>| {
+        let mut msg = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+        msg.relates_to = Some(MsgRelation { rel, target: target.clone(), key: key.map(str::to_string) });
+        msg
+    };
+    let unread = || {
+        let center = center.clone();
+        let alice = alice.clone();
+        async move {
+            let sessions = center
+                .handle_list_sessions(alice, None, None, None, None, None, None, ctx())
+                .await
+                .unwrap();
+            assert_eq!(sessions.items.len(), 1);
+            sessions.items[0].unread_count
+        }
+    };
+
+    let original = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    let original_id = original.gen_obj_id().0;
+    center.handle_dispatch(original, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 1);
+
+    // A quick reaction is folded into its target by every client and has no
+    // row of its own to be read with, so it must not raise the unread count.
+    let reaction = relation(MsgRelType::Reaction, &original_id, Some("👍"));
+    let reaction_id = reaction.gen_obj_id().0;
+    center.handle_dispatch(reaction, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 1);
+    // Cancelling the reaction is a redaction of the reaction message.
+    center
+        .handle_dispatch(relation(MsgRelType::Redact, &reaction_id, None), None, None, ctx())
+        .await
+        .unwrap();
+    assert_eq!(unread().await, 1);
+
+    // An edit is still read with the bubble that shows it, so it counts.
+    let mut edit = relation(MsgRelType::Edit, &original_id, None);
+    edit.content.content = "edited".to_string();
+    center.handle_dispatch(edit, None, None, ctx()).await.unwrap();
+    assert_eq!(unread().await, 2);
+
+    let session_id = format!("dm:{}", author.to_string());
+    let timeline = center
+        .handle_list_session(alice.clone(), session_id, None, None, None, Some(false), None, ctx())
+        .await
+        .unwrap();
+    let state_of = |id: &ObjId| timeline.items.iter().find(|item| item.msg_id == *id).unwrap().recipient_state.clone();
+    assert_eq!(state_of(&original_id), Some(RecipientState::Unread));
+    assert_eq!(state_of(&reaction_id), Some(RecipientState::Read));
+}
+
+#[tokio::test]
+async fn private_edit_is_validated_on_the_receiving_side() {
+    use ndn_lib::{MsgRelType, MsgRelation, ObjId};
+
+    let (center, _tmp) = new_center("private_edit").await;
+    let author = DID::new("bns", "author");
+    let other = DID::new("bns", "mallory");
+    let alice = DID::new("bns", "alice");
+    let relation = |from: &DID, rel: MsgRelType, target: &ObjId, text: &str| {
+        let mut msg = make_msg(from.clone(), vec![alice.clone()], MsgObjKind::Chat);
+        msg.relates_to = Some(MsgRelation::new(rel, target.clone()));
+        msg.content.content = text.to_string();
+        msg
+    };
+    let dispatch = |msg: MsgObject| {
+        let center = center.clone();
+        async move { center.handle_dispatch(msg, None, None, ctx()).await }
+    };
+    let rejected = |result: Result<buckyos_api::DispatchResult, kRPC::RPCErrors>, reason: &str| {
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains(reason), "{error} should contain {reason}");
+    };
+
+    let original = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    let original_id = original.gen_obj_id().0;
+    let foreign = make_msg(other.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    let foreign_id = foreign.gen_obj_id().0;
+    for msg in [original.clone(), foreign] {
+        assert_eq!(dispatch(msg).await.unwrap().delivered_recipients.len(), 1);
+    }
+
+    let edit = relation(&author, MsgRelType::Edit, &original_id, "edited");
+    let edit_id = edit.gen_obj_id().0;
+    let accepted = dispatch(edit).await.unwrap();
+    assert_eq!(accepted.delivered_recipients, vec![alice.clone()]);
+
+    // Someone else's message, in the same recipient's inbox.
+    rejected(
+        dispatch(relation(&author, MsgRelType::Edit, &foreign_id, "hijack")).await,
+        "edit-not-allowed",
+    );
+    // The target is itself a relation message.
+    rejected(
+        dispatch(relation(
+            &author,
+            MsgRelType::Edit,
+            &edit_id,
+            "edit of edit",
+        ))
+        .await,
+        "edit-not-allowed",
+    );
+    // The recipient never received the target.
+    let unseen = make_msg(author.clone(), vec![alice.clone()], MsgObjKind::Chat);
+    rejected(
+        dispatch(relation(
+            &author,
+            MsgRelType::Edit,
+            &unseen.gen_obj_id().0,
+            "unseen",
+        ))
+        .await,
+        "not-found",
+    );
+    // The original lives in another conversation.
+    let mut elsewhere = relation(&author, MsgRelType::Edit, &original_id, "elsewhere");
+    elsewhere.to_session = Some("other-session".to_string());
+    rejected(dispatch(elsewhere).await, "not-found");
+
+    // Once the author redacted the original it can no longer be edited.
+    dispatch(relation(&author, MsgRelType::Redact, &original_id, ""))
+        .await
+        .unwrap();
+    rejected(
+        dispatch(relation(
+            &author,
+            MsgRelType::Edit,
+            &original_id,
+            "too late",
+        ))
+        .await,
+        "not-found",
+    );
 }

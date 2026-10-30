@@ -3,14 +3,14 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::kRPC::Result;
 use ::kRPC::*;
 use buckyos_kit::*;
-use jsonwebtoken::{decode, DecodingKey, EncodingKey, Validation};
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::*;
 use ndn_lib::{load_named_object_from_obj_str, ChunkId, ObjId};
 use rand::Rng;
@@ -18,13 +18,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use name_client::*;
 use name_lib::*;
 use named_store::NamedDataMgr;
 
 use crate::aicc_client::*;
+use crate::NFS_SERVER_SERVICE_NAME;
 use crate::app_mgr::*;
 use crate::control_panel::*;
 use crate::kevent_client::{
@@ -40,14 +41,17 @@ use crate::task_dispatcher::{TaskDispatcherClient, TASK_DISPATCHER_SERVICE_NAME}
 use crate::task_mgr::*;
 use crate::verify_hub_client::*;
 use crate::workflow_service::{WorkflowServiceClient, WORKFLOW_SERVICE_NAME};
+use crate::{commit_notify_answer, wait_notify_loop, NotifyAnswer, NotifyKind, NotifyView};
 use crate::{
-    get_buckyos_api_runtime, get_full_appid, get_session_token_env_key, load_local_device_config,
-    load_local_device_private_key, load_local_node_identity_config, RbacConfig,
-    OPENDAN_SERVICE_NAME,
+    get_buckyos_api_runtime, get_service_session_token_env_key, load_local_device_config,
+    load_local_device_private_key, load_local_node_identity_config,
+    validate_verify_hub_token_claims, AccessDenial, AppId, AppInstanceId, AuthTarget, DenyReason,
+    RbacConfig, SystemServiceId, TokenUse, BUCKYOS_APP_TOKEN_ENV, OPENDAN_SERVICE_NAME,
+    VERIFY_HUB_TOKEN_ISSUER,
 };
 
-const DEFAULT_NODE_GATEWAY_PORT: u16 = 3180;
-const DEFAULT_AICC_KRPC_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_NODE_GATEWAY_PORT: u16 = 3180;
+const DEFAULT_AICC_KRPC_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_KRPC_TIMEOUT_SECS: u64 = 15;
 const BUCKYOS_KRPC_TIMEOUT_SECS_ENV: &str = "BUCKYOS_KRPC_TIMEOUT_SECS";
 const BUCKYOS_KRPC_TIMEOUT_SECS_PREFIX: &str = "BUCKYOS_KRPC_TIMEOUT_SECS_";
@@ -57,7 +61,7 @@ pub const BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV: &str = "BUCKYOS_APPCLIENT_SESSION
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuckyOSRuntimeType {
-    AppClient,     //运行在所有设备上，通常不在容器里（唯一可能加载user private key的类型)
+    AppClient,     //运行在所有设备上，也可以在容器里（唯一可能加载user private key的类型)
     AppService,    //R3 运行在Node上，指定用户，可能在容器里
     FrameService,  //R2 运行在Node上，通常在容器里（未启用）
     KernelService, //R1 由node-daemon启动的的系统基础服务
@@ -116,7 +120,64 @@ impl RuntimeBackgroundTaskStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeHealthSnapshot {
+    pub authentication: RuntimeAuthStatus,
     pub tasks: Vec<RuntimeBackgroundTaskStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAuthState {
+    Ready,
+    RetryPending,
+    Unavailable,
+    ReauthorizationRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeAuthStatus {
+    pub state: RuntimeAuthState,
+    pub last_error: Option<String>,
+    pub error_code: Option<String>,
+    pub denial: Option<AccessDenial>,
+    pub since: Option<u64>,
+    pub next_retry_time: Option<u64>,
+}
+
+impl Default for RuntimeAuthStatus {
+    fn default() -> Self {
+        Self {
+            state: RuntimeAuthState::Ready,
+            last_error: None,
+            error_code: None,
+            denial: None,
+            since: None,
+            next_retry_time: None,
+        }
+    }
+}
+
+impl RuntimeAuthStatus {
+    fn error(&self) -> RPCErrors {
+        if let Some(denial) = &self.denial {
+            return denial.clone().into_rpc_error();
+        }
+        RPCErrors::Detailed(RPCErrorDetail::new(
+            self.error_code
+                .as_deref()
+                .unwrap_or("runtime_auth_unavailable"),
+            self.last_error
+                .as_deref()
+                .unwrap_or("runtime authentication unavailable"),
+            None,
+        ))
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            RuntimeAuthState::Unavailable | RuntimeAuthState::ReauthorizationRequired
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,11 +224,25 @@ impl BackgroundTaskPolicy {
     }
 }
 
+/// Denied `enforce` calls may force one uncached policy read per interval.
+const RBAC_FORCED_REFRESH_INTERVAL_MS: u64 = 1_000;
+static LAST_RBAC_FORCED_REFRESH_MS: AtomicU64 = AtomicU64::new(0);
+
+fn claim_rbac_forced_refresh() -> bool {
+    let now_ms = buckyos_get_unix_timestamp() * 1000;
+    let last = LAST_RBAC_FORCED_REFRESH_MS.load(Ordering::Relaxed);
+    now_ms.saturating_sub(last) >= RBAC_FORCED_REFRESH_INTERVAL_MS
+        && LAST_RBAC_FORCED_REFRESH_MS
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
 pub struct BuckyOSRuntime {
     pub app_owner_id: Option<String>,
     pub app_id: String,
     pub app_host_perfix: String,
     pub runtime_type: BuckyOSRuntimeType,
+    appclient_auth_target: Option<AuthTarget>,
     pub main_service_port: RwLock<u16>,
 
     pub user_id: Option<String>,
@@ -185,6 +260,9 @@ pub struct BuckyOSRuntime {
     pub zone_config: Option<ZoneConfig>,
     pub session_token: Arc<RwLock<String>>,
     pub refresh_token: Arc<RwLock<String>>,
+    token_renewal: Mutex<()>,
+    pending_refresh: std::sync::Mutex<Option<Instant>>,
+    authentication: RwLock<RuntimeAuthStatus>,
     trust_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
     last_update_service_info_time: RwLock<u64>,
     named_store_mgr: OnceCell<NamedDataMgr>,
@@ -228,8 +306,12 @@ impl BuckyOSRuntime {
             user_id,
             authenticated_user_id: None,
             runtime_type,
+            appclient_auth_target: None,
             session_token: Arc::new(RwLock::new("".to_string())),
             refresh_token: Arc::new(RwLock::new("".to_string())),
+            token_renewal: Mutex::new(()),
+            pending_refresh: std::sync::Mutex::new(None),
+            authentication: RwLock::new(RuntimeAuthStatus::default()),
             buckyos_root_dir: get_buckyos_root_dir(),
             zone_config: None,
             device_config: None,
@@ -271,11 +353,46 @@ impl BuckyOSRuntime {
         *main_service_port = port;
     }
 
-    pub async fn get_named_store(&self) -> Result<NamedDataMgr> {
+    pub async fn get_named_store(&self) -> Result<crate::RuntimeNamedStore<'_>> {
+        match self.runtime_type {
+            BuckyOSRuntimeType::Kernel | BuckyOSRuntimeType::KernelService => {
+                Ok(crate::RuntimeNamedStore::local(
+                    self.get_local_named_store().await?,
+                ))
+            }
+            _ => Ok(crate::RuntimeNamedStore::remote(self)),
+        }
+    }
+
+    pub(crate) fn named_store_base_url(&self) -> String {
+        match self.runtime_type {
+            BuckyOSRuntimeType::AppClient => {
+                let url = self.get_appclient_service_url(NFS_SERVER_SERVICE_NAME, self.force_https);
+                url.trim_end_matches(&format!("/kapi/{NFS_SERVER_SERVICE_NAME}"))
+                    .to_string()
+            }
+            _ => format!(
+                "http://{}:{}",
+                self.resolve_local_service_host(),
+                self.node_gateway_port
+            ),
+        }
+    }
+
+    pub async fn get_local_named_store(&self) -> Result<NamedDataMgr> {
+        if !matches!(
+            self.runtime_type,
+            BuckyOSRuntimeType::Kernel | BuckyOSRuntimeType::KernelService
+        ) {
+            return Err(RPCErrors::NoPermission(
+                "this runtime must access named storage through get_named_store".into(),
+            ));
+        }
         let store_mgr: &NamedDataMgr = self
             .named_store_mgr
             .get_or_try_init(|| async {
-                let config_path = get_buckyos_root_dir()
+                let config_path = self
+                    .buckyos_root_dir
                     .join("storage")
                     .join("named_store.json");
                 let http_backend_links = HashMap::new();
@@ -332,25 +449,13 @@ impl BuckyOSRuntime {
         let mut session_token_keys = Vec::new();
         match self.runtime_type {
             BuckyOSRuntimeType::KernelService => {
-                session_token_keys.push(get_session_token_env_key(&self.get_full_appid(), false));
+                session_token_keys.push(get_service_session_token_env_key(self.app_id.as_str()));
             }
             BuckyOSRuntimeType::FrameService => {
-                if let Some(owner_id) = self.app_owner_id.as_deref() {
-                    session_token_keys.push(get_session_token_env_key(
-                        &get_full_appid(self.app_id.as_str(), owner_id),
-                        true,
-                    ));
-                }
-                session_token_keys.push(get_session_token_env_key(&self.get_full_appid(), false));
+                session_token_keys.push(get_service_session_token_env_key(self.app_id.as_str()));
             }
             BuckyOSRuntimeType::AppService => {
-                if let Some(owner_id) = self.app_owner_id.as_deref() {
-                    session_token_keys.push(get_session_token_env_key(
-                        &get_full_appid(self.app_id.as_str(), owner_id),
-                        true,
-                    ));
-                }
-                session_token_keys.push(get_session_token_env_key(self.app_id.as_str(), true));
+                session_token_keys.push(BUCKYOS_APP_TOKEN_ENV.to_string());
             }
             BuckyOSRuntimeType::AppClient => match env::var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV) {
                 Ok(session_token) => {
@@ -360,6 +465,9 @@ impl BuckyOSRuntime {
                             BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
                         );
                     } else {
+                        let token = RPCSessionToken::from_string(session_token.as_str())?;
+                        let claims = validate_verify_hub_token_claims(&token, TokenUse::Session)?;
+                        self.resolve_appclient_identity(&claims.target)?;
                         info!(
                             "load AppClient session_token from env var success: {}",
                             BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV
@@ -423,11 +531,6 @@ impl BuckyOSRuntime {
     }
 
     pub async fn fill_policy_by_load_config(&mut self) -> Result<()> {
-        if self.runtime_type == BuckyOSRuntimeType::AppService {
-            info!("AppService runtime skips system config root bootstrap");
-            return Ok(());
-        }
-
         let mut config_root_dir = None;
         if self.runtime_type == BuckyOSRuntimeType::AppClient {
             let bucky_dev_user_home_dir = get_buckyos_dev_user_home();
@@ -456,7 +559,7 @@ impl BuckyOSRuntime {
             ));
         }
         let config_root_dir = config_root_dir.unwrap();
-        if !config_root_dir.exists() {
+        if !config_root_dir.exists() && self.runtime_type != BuckyOSRuntimeType::AppService {
             error!(
                 "config_root_dir not exists: {}, init buckyos runtime config would failed!",
                 config_root_dir.to_string_lossy()
@@ -583,13 +686,7 @@ impl BuckyOSRuntime {
                     self.app_owner_id = Some(owner_config.name.clone());
                 }
                 if !self.zone_id.is_valid() {
-                    if let Some(zone_did) = owner_config.get_default_zone_did() {
-                        self.zone_id = zone_did.clone();
-                    } else {
-                        return Err(RPCErrors::ReasonError(
-                            "default_zone_did is not set".to_string(),
-                        ));
-                    }
+                    self.zone_id = crate::owner_canonical_zone(&owner_config);
                 }
 
                 self.user_config = Some(owner_config);
@@ -654,7 +751,24 @@ impl BuckyOSRuntime {
     }
 
     pub fn classify_error(error: &RPCErrors) -> RuntimeErrorClass {
+        if let Some(denial) = AccessDenial::from_rpc_error(error) {
+            return if denial.reason == DenyReason::AuthorizationUnavailable {
+                RuntimeErrorClass::Retryable
+            } else {
+                RuntimeErrorClass::NonRetryable
+            };
+        }
         match error {
+            RPCErrors::HttpTransportError(_) => {
+                if error.is_retryable_transport() {
+                    RuntimeErrorClass::Retryable
+                } else {
+                    RuntimeErrorClass::NonRetryable
+                }
+            }
+            RPCErrors::Detailed(detail) if detail.code == "runtime_auth_retry_pending" => {
+                RuntimeErrorClass::Retryable
+            }
             RPCErrors::InvalidToken(_)
             | RPCErrors::ParseRequestError(_)
             | RPCErrors::ParserResponseError(_)
@@ -663,6 +777,7 @@ impl BuckyOSRuntime {
             | RPCErrors::UserNotFound(_)
             | RPCErrors::KeyNotExist(_)
             | RPCErrors::UnknownMethod(_)
+            | RPCErrors::Detailed(_)
             | RPCErrors::S2sPermanentError(_) => RuntimeErrorClass::NonRetryable,
             RPCErrors::TokenExpired(_)
             | RPCErrors::ServiceNotValid(_)
@@ -727,7 +842,14 @@ impl BuckyOSRuntime {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        RuntimeHealthSnapshot { tasks }
+        RuntimeHealthSnapshot {
+            authentication: self.get_authentication_status().await,
+            tasks,
+        }
+    }
+
+    pub async fn get_authentication_status(&self) -> RuntimeAuthStatus {
+        self.authentication.read().await.clone()
     }
 
     pub async fn set_background_task_enabled(
@@ -812,6 +934,7 @@ impl BuckyOSRuntime {
             .get(&task)
             .map(|status| {
                 status.enabled
+                    && status.error_class != Some(RuntimeErrorClass::NonRetryable)
                     && status
                         .next_retry_time
                         .map(|retry_at| retry_at <= now)
@@ -853,14 +976,16 @@ impl BuckyOSRuntime {
         status.last_failure_time = Some(now);
         status.last_error = Some(error.to_string());
         let error_class = forced_class.unwrap_or_else(|| Self::classify_error(error));
-        let should_degrade = matches!(error_class, RuntimeErrorClass::Degraded)
-            || status.consecutive_failures >= policy.degraded_after_failures;
+        let should_degrade = error_class != RuntimeErrorClass::NonRetryable
+            && (matches!(error_class, RuntimeErrorClass::Degraded)
+                || status.consecutive_failures >= policy.degraded_after_failures);
         status.error_class = Some(if should_degrade {
             RuntimeErrorClass::Degraded
         } else {
             error_class
         });
-        status.next_retry_time = Some(policy.next_retry_time(status.consecutive_failures, now));
+        status.next_retry_time = (error_class != RuntimeErrorClass::NonRetryable)
+            .then(|| policy.next_retry_time(status.consecutive_failures, now));
         if should_degrade && status.degraded_since.is_none() {
             status.degraded_since = Some(now);
         }
@@ -880,22 +1005,23 @@ impl BuckyOSRuntime {
         }
     }
 
-    async fn execute_retryable_operation<F, Fut>(
+    async fn execute_retryable_operation<F, Fut, T>(
         &self,
         operation_name: &str,
         policy: RetryPolicy,
         mut operation: F,
-    ) -> Result<()>
+    ) -> Result<T>
     where
         F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<()>>,
+        Fut: std::future::Future<Output = Result<T>>,
     {
         let mut last_error = None;
         for attempt in 1..=policy.max_attempts {
             match operation().await {
-                Ok(()) => return Ok(()),
+                Ok(value) => return Ok(value),
                 Err(error) => {
-                    let retryable = Self::is_retryable_error(&error);
+                    let retryable = !matches!(error, RPCErrors::TokenExpired(_))
+                        && Self::is_retryable_error(&error);
                     if !retryable || attempt == policy.max_attempts {
                         return Err(error);
                     }
@@ -920,6 +1046,10 @@ impl BuckyOSRuntime {
     }
 
     pub async fn update_service_instance_info(&self) -> Result<()> {
+        let authentication = self.get_authentication_status().await;
+        if authentication.state != RuntimeAuthState::Ready {
+            return Err(authentication.error());
+        }
         if !self.is_service() {
             return Ok(());
         }
@@ -941,111 +1071,267 @@ impl BuckyOSRuntime {
         })?;
         let node_did = device_config.id.clone();
         let node_id = device_config.name.clone();
-        let instance_id = format!("{}-{}", self.app_id, device_config.name);
+        let instance_config = env::var("app_instance_config")
+            .ok()
+            .and_then(|raw| serde_json::from_str::<AppServiceInstanceConfig>(&raw).ok());
         let main_port = *self.main_service_port.read().await;
         let mut service_ports = HashMap::new();
         if main_port > 0 {
             service_ports.insert("www".to_string(), main_port);
         }
+        let deployment = instance_config.map(|config| config.deployment);
+        let instance_epoch = env::var("BUCKYOS_INSTANCE_EPOCH")
+            .unwrap_or_else(|_| format!("process:{}", std::process::id()));
+        let node_session_id = env::var("BUCKYOS_NODE_SESSION_ID")
+            .unwrap_or_else(|_| format!("device:{}", device_config.id.to_string()));
         let service_instance_info = ServiceInstanceReportInfo {
-            instance_id,
             node_id: node_id.clone(),
             node_did,
             state: ServiceInstanceState::Started,
             service_ports: service_ports,
-            last_update_time: buckyos_get_unix_timestamp(),
-            start_time: 0,
+            last_update_time: now,
+            start_time: now,
             pid: std::process::id(),
+            deployment,
+            instance_epoch,
+            node_session_id,
+            observed_at: now,
+            expires_at: now.saturating_add(SERVICE_INSTANCE_INFO_UPDATE_INTERVAL * 3),
+            health: DeploymentHealth::Healthy,
+            deployment_error: None,
         };
 
+        let service_id = self.get_auth_target()?.canonical_id();
         let control_panel_client = self.get_control_panel_client().await?;
         control_panel_client
-            .update_service_instance_info(&self.app_id, &node_id, &service_instance_info)
+            .update_service_instance_info(&service_id, &node_id, &service_instance_info)
             .await?;
         let mut last_update_service_info_time = self.last_update_service_info_time.write().await;
         *last_update_service_info_time = now;
-        info!("update service instance info,app_id:{}", self.app_id);
+        info!("update service instance info,service_id:{}", service_id);
         Ok(())
     }
 
     pub async fn renew_token_from_verify_hub(&self) -> Result<()> {
-        self.execute_retryable_operation(
-            "renew_token_from_verify_hub",
-            Self::renew_token_retry_policy(),
-            || self.renew_token_from_verify_hub_once(),
-        )
-        .await
+        let _renewal = self.token_renewal.lock().await;
+        let status = self.get_authentication_status().await;
+        let now = buckyos_get_unix_timestamp();
+        if status.is_terminal()
+            || status
+                .next_retry_time
+                .map(|retry| now < retry)
+                .unwrap_or(false)
+        {
+            return Err(status.error());
+        }
+        let result = self
+            .execute_retryable_operation(
+                "renew_token_from_verify_hub",
+                Self::renew_token_retry_policy(),
+                || self.renew_token_from_verify_hub_once(),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let now = buckyos_get_unix_timestamp();
+                let retryable = !matches!(error, RPCErrors::TokenExpired(_))
+                    && Self::is_retryable_error(&error);
+                let denial = AccessDenial::from_rpc_error(&error);
+                let denied = matches!(error, RPCErrors::NoPermission(_)) || denial.is_some();
+                let class = if retryable {
+                    RuntimeErrorClass::Retryable
+                } else {
+                    RuntimeErrorClass::NonRetryable
+                };
+                self.record_background_task_failure(
+                    RuntimeBackgroundTaskKind::RenewToken,
+                    now,
+                    &error,
+                    Some(class),
+                )
+                .await;
+                let next_retry_time = self
+                    .background_task_status
+                    .read()
+                    .await
+                    .get(&RuntimeBackgroundTaskKind::RenewToken)
+                    .and_then(|status| status.next_retry_time);
+                *self.authentication.write().await = RuntimeAuthStatus {
+                    state: if retryable {
+                        RuntimeAuthState::RetryPending
+                    } else if denied {
+                        RuntimeAuthState::ReauthorizationRequired
+                    } else {
+                        RuntimeAuthState::Unavailable
+                    },
+                    last_error: Some(error.to_string()),
+                    error_code: Some(if retryable {
+                        "runtime_auth_retry_pending".to_string()
+                    } else {
+                        error
+                            .detail()
+                            .map(|detail| detail.code.clone())
+                            .unwrap_or_else(|| "runtime_auth_unavailable".into())
+                    }),
+                    denial,
+                    since: status.since.or(Some(now)),
+                    next_retry_time,
+                };
+                Err(error)
+            }
+        }
     }
 
-    async fn renew_token_from_verify_hub_once(&self) -> Result<()> {
-        let session_token = self.session_token.write().await;
-        if session_token.is_empty() {
-            debug!("session_token is empty,skip refresh token");
-            return Ok(());
+    async fn renew_token_from_verify_hub_once(&self) -> Result<bool> {
+        let auth_target = self.get_auth_target()?;
+        let session_token_str = self.session_token.read().await.clone();
+        if session_token_str.is_empty() {
+            return Err(RPCErrors::InvalidToken("session token is missing".into()));
         }
-        let session_token_str = session_token.clone();
-        let real_session_token = RPCSessionToken::from_string(session_token_str.as_str())?;
-        drop(session_token);
-        if real_session_token.exp.is_none() {
-            info!("session_token is none,skip refresh token");
-            return Ok(());
+        let real_session_token = RPCSessionToken::from_string(&session_token_str)?;
+        let Some(expires) = real_session_token.exp else {
+            return Ok(false);
+        };
+        let from_verify_hub = real_session_token.iss.as_deref() == Some(VERIFY_HUB_TOKEN_ISSUER);
+        if from_verify_hub && buckyos_get_unix_timestamp() < expires.saturating_sub(30) {
+            return Ok(false);
         }
-
-        let mut need_refresh = false;
-        if let Some(iss) = real_session_token.iss.as_deref() {
-            if iss != "verify-hub" {
-                need_refresh = true;
-            }
+        let refresh_token = self.refresh_token.read().await.clone();
+        if from_verify_hub && refresh_token.is_empty() {
+            return Err(RPCErrors::InvalidToken(
+                "refresh token is missing; a new authorized login is required".into(),
+            ));
         }
-
-        if !need_refresh {
-            let expired_time = real_session_token.exp.unwrap();
-            let now = buckyos_get_unix_timestamp();
-            if now < expired_time.saturating_sub(30) {
-                debug!("session_token is not expired,skip renew token");
-                return Ok(());
-            }
-        }
-
-        info!("session_token is close to expired,try to renew token");
         let verify_hub_client = self.get_verify_hub_client().await?;
-
-        // Prefer refresh-token rotation when current session is issued by verify-hub.
-        let token_pair = if real_session_token.iss.as_deref() == Some("verify-hub") {
-            info!("use refresh-token to renew session-token from verify-hub...");
-            let refresh_token = self.refresh_token.read().await;
-            if !refresh_token.is_empty() {
-                verify_hub_client
-                    .refresh_token(refresh_token.as_str())
-                    .await?
-            } else {
-                info!("refresh-token is empty, re-login by a locally generated device/user JWT...");
-                // Fallback: if refresh token is missing, re-login by a locally generated device/user JWT.
-                // This keeps the runtime functional but is less standard than refresh rotation.
-                drop(refresh_token);
-                let (fallback_jwt, _) = self.create_local_login_jwt().await?;
-                verify_hub_client
-                    .login_by_jwt(fallback_jwt.as_str(), None)
-                    .await?
+        let token_pair = if from_verify_hub {
+            let was_pending = {
+                let mut pending = self.pending_refresh.lock().unwrap();
+                if pending
+                    .map(|started| started.elapsed() >= Duration::from_secs(8))
+                    .unwrap_or(false)
+                {
+                    return Err(RPCErrors::InvalidToken("refresh outcome is unknown and the recovery window elapsed; host authorization is required".into()));
+                }
+                let was_pending = pending.is_some();
+                pending.get_or_insert_with(Instant::now);
+                was_pending
+            };
+            let response = tokio::time::timeout(
+                Duration::from_secs(2),
+                verify_hub_client.refresh_token(&refresh_token),
+            )
+            .await
+            .map_err(|_| {
+                RPCErrors::ReasonError(
+                    "token renewal timed out; server rotation outcome is unknown".into(),
+                )
+            })?;
+            if !was_pending
+                && matches!(
+                    &response,
+                    Err(RPCErrors::Detailed(_))
+                        | Err(RPCErrors::NoPermission(_))
+                        | Err(RPCErrors::InvalidToken(_))
+                        | Err(RPCErrors::TokenExpired(_))
+                )
+            {
+                *self.pending_refresh.lock().unwrap() = None;
             }
+            response?
         } else {
-            // First login / exchange: accept trusted JWT (device/root/etc)
-            info!("use session-token to renew session-token from verify-hub...");
+            let assertion = if expires <= buckyos_get_unix_timestamp() {
+                self.create_local_login_jwt().await?.0
+            } else {
+                session_token_str
+            };
             verify_hub_client
-                .login_by_jwt(session_token_str.as_str(), None)
+                .login_by_jwt(&assertion, auth_target)
                 .await?
         };
+        self.validate_token_pair(&token_pair)?;
+        self.commit_token_pair(token_pair).await?;
+        info!("renew session-token success");
+        Ok(true)
+    }
 
-        info!("renew session-token success, token_pair: {:?}", token_pair);
-        {
-            let mut session_token = self.session_token.write().await;
-            *session_token = token_pair.session_token.clone();
+    fn validate_token_pair(&self, pair: &TokenPair) -> Result<()> {
+        let target = self.get_auth_target()?;
+        let session = RPCSessionToken::from_string(&pair.session_token)?;
+        let refresh = RPCSessionToken::from_string(&pair.refresh_token)?;
+        let session_claims = validate_verify_hub_token_claims(&session, TokenUse::Session)?;
+        let refresh_claims = validate_verify_hub_token_claims(&refresh, TokenUse::Refresh)?;
+        if session_claims.target != target || refresh_claims.target != target {
+            return Err(RPCErrors::InvalidToken(
+                "renewed token target does not match runtime identity".into(),
+            ));
         }
+        if session.sub != refresh.sub
+            || session_claims.principal_kind != refresh_claims.principal_kind
+            || session.extra.get("session") != refresh.extra.get("session")
+            || (self.runtime_type == BuckyOSRuntimeType::AppService
+                && session.sub.as_deref() != self.app_owner_id.as_deref())
         {
-            let mut refresh_token = self.refresh_token.write().await;
-            *refresh_token = token_pair.refresh_token.clone();
+            return Err(RPCErrors::InvalidToken(
+                "renewed token pair does not preserve the authenticated identity".into(),
+            ));
+        }
+        if [session.exp, refresh.exp].iter().any(|expires| {
+            expires
+                .map(|expires| expires <= buckyos_get_unix_timestamp())
+                .unwrap_or(true)
+        }) {
+            return Err(RPCErrors::InvalidToken(
+                "renewed token pair is expired or has no expiration".into(),
+            ));
         }
         Ok(())
+    }
+
+    async fn commit_token_pair(&self, pair: TokenPair) -> Result<()> {
+        let mut session = self.session_token.clone().write_owned().await;
+        let mut refresh = self.refresh_token.write().await;
+        let mut authentication = self.authentication.write().await;
+        let mut background = self.background_task_status.write().await;
+        let status = background
+            .entry(RuntimeBackgroundTaskKind::RenewToken)
+            .or_insert_with(|| {
+                RuntimeBackgroundTaskStatus::new(RuntimeBackgroundTaskKind::RenewToken)
+            });
+        let recovered = status.consecutive_failures > 0;
+        *session = pair.session_token;
+        *refresh = pair.refresh_token;
+        *authentication = RuntimeAuthStatus::default();
+        *self.pending_refresh.lock().unwrap() = None;
+        status.error_class = None;
+        status.consecutive_failures = 0;
+        status.last_error = None;
+        status.last_success_time = Some(buckyos_get_unix_timestamp());
+        status.next_retry_time = None;
+        status.degraded_since = None;
+        if recovered {
+            info!("runtime authentication recovered after token exchange");
+        }
+        drop(authentication);
+        drop(background);
+        if let Some(client) = self.system_config_client.get() {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .sync_session_token(Some(session.as_str()))
+                    .await
+                    .map_err(|error| RPCErrors::ReasonError(error.to_string()))
+            })
+            .await
+            .map_err(|error| RPCErrors::ReasonError(format!("cached session token update failed: {error}")))??;
+        }
+        Ok(())
+    }
+
+    pub async fn replace_token_pair(&mut self, pair: TokenPair) -> Result<()> {
+        self.validate_token_pair(&pair)?;
+        let _renewal = self.token_renewal.lock().await;
+        self.commit_token_pair(pair).await
     }
 
     async fn create_local_login_jwt(&self) -> Result<(String, RPCSessionToken)> {
@@ -1055,10 +1341,9 @@ impl BuckyOSRuntime {
 
         if self.runtime_type == BuckyOSRuntimeType::AppClient {
             if self.user_private_key.is_some() && self.user_id.is_some() {
-                let (jwt, token) = RPCSessionToken::generate_jwt_token(
+                let (jwt, token) = generate_user_login_assertion(
                     self.user_id.as_ref().unwrap(),
                     self.app_id.as_str(),
-                    None,
                     self.user_private_key.as_ref().unwrap(),
                 )?;
                 return Ok((jwt, token));
@@ -1069,7 +1354,7 @@ impl BuckyOSRuntime {
             let device_private_key = self.device_private_key.as_ref().unwrap();
             let device_config = self.device_config.as_ref().unwrap();
             let subject_id = self.device_signed_login_subject(device_config.name.as_str())?;
-            let (jwt, token) = generate_service_login_jwt(
+            let (jwt, token) = generate_service_login_assertion(
                 subject_id,
                 self.app_id.as_str(),
                 device_config.name.as_str(),
@@ -1078,8 +1363,8 @@ impl BuckyOSRuntime {
             return Ok((jwt, token));
         }
 
-        Err(RPCErrors::ReasonError(
-            "Missing local private key for login; call load_device_private_key() only for components that require device signing".to_string(),
+        Err(RPCErrors::InvalidToken(
+            "LoginAssertion expired and no local signing key is available; host authorization is required".to_string(),
         ))
     }
 
@@ -1100,23 +1385,7 @@ impl BuckyOSRuntime {
             .should_run_background_task(RuntimeBackgroundTaskKind::RenewToken, now)
             .await
         {
-            match buckyos_api_runtime.renew_token_from_verify_hub().await {
-                Ok(()) => {
-                    buckyos_api_runtime
-                        .record_background_task_success(RuntimeBackgroundTaskKind::RenewToken, now)
-                        .await;
-                }
-                Err(error) => {
-                    buckyos_api_runtime
-                        .record_background_task_failure(
-                            RuntimeBackgroundTaskKind::RenewToken,
-                            now,
-                            &error,
-                            None,
-                        )
-                        .await;
-                }
-            }
+            let _ = buckyos_api_runtime.renew_token_from_verify_hub().await;
         }
 
         if buckyos_api_runtime
@@ -1223,7 +1492,11 @@ impl BuckyOSRuntime {
     }
 
     async fn login_once(&mut self) -> Result<()> {
-        if !self.zone_id.is_valid() {
+        if !self.zone_id.is_valid()
+            && !(self.runtime_type == BuckyOSRuntimeType::AppClient
+                && self.resolve_appclient_gateway_host().is_some()
+                && !self.session_token.read().await.trim().is_empty())
+        {
             return Err(RPCErrors::ReasonError(
                 "Zone id is not valid,api-runtime.login failed".to_string(),
             ));
@@ -1247,6 +1520,14 @@ impl BuckyOSRuntime {
 
         init_name_lib(&self.web3_bridges).await;
 
+        // AppService processes receive a device-signed LoginAssertion from
+        // node-daemon. Exchange it before the first system-config request;
+        // system-config accepts only Verify Hub sessions (apart from the
+        // narrowly scoped kernel bootstrap assertion).
+        if self.runtime_type == BuckyOSRuntimeType::AppService {
+            self.renew_token_from_verify_hub().await?;
+        }
+
         authenticated_session_token = {
             let mut session_token = self.session_token.write().await;
             if session_token.is_empty() {
@@ -1256,10 +1537,9 @@ impl BuckyOSRuntime {
                     if self.user_private_key.is_some() && self.user_config.is_some() {
                         info!("api-runtime: session token is empty,runtime_type:{:?},try to create session token by user_private_key",self.runtime_type);
                         let (session_token_str, real_session_token) =
-                            RPCSessionToken::generate_jwt_token(
+                            generate_user_login_assertion(
                                 self.user_id.as_ref().unwrap(),
                                 self.app_id.as_str(),
-                                None,
                                 self.user_private_key.as_ref().unwrap(),
                             )?;
                         *session_token = session_token_str;
@@ -1276,7 +1556,7 @@ impl BuckyOSRuntime {
                     let device_config = self.device_config.as_ref().unwrap();
                     let subject_id =
                         self.device_signed_login_subject(device_config.name.as_str())?;
-                    let (session_token_str, real_session_token) = generate_service_login_jwt(
+                    let (session_token_str, real_session_token) = generate_service_login_assertion(
                         subject_id,
                         self.app_id.as_str(),
                         device_config.name.as_str(),
@@ -1317,6 +1597,23 @@ impl BuckyOSRuntime {
                     return Err(RPCErrors::ReasonError(
                         "Session token is not valid".to_string(),
                     ));
+                }
+                if authenticated_session_token.iss.as_deref() == Some(VERIFY_HUB_TOKEN_ISSUER) {
+                    let claims = validate_verify_hub_token_claims(
+                        &authenticated_session_token,
+                        TokenUse::Session,
+                    )?;
+                    if self.runtime_type == BuckyOSRuntimeType::AppClient {
+                        self.resolve_appclient_identity(&claims.target)?;
+                    }
+                    let expected = self.get_auth_target()?;
+                    if claims.target != expected {
+                        return Err(RPCErrors::InvalidToken(format!(
+                            "session token target {} does not match runtime target {}",
+                            claims.target.canonical_key(),
+                            expected.canonical_key(),
+                        )));
+                    }
                 }
                 authenticated_session_token
             }
@@ -1486,7 +1783,57 @@ impl BuckyOSRuntime {
         Ok(())
     }
 
+    /// Verify an ordinary session token. Restricted sessions (Limited,
+    /// External, sessions derived from them) are refused here unless the token
+    /// targets this App runtime itself: a service opens a method to them with
+    /// [`Self::verify_session_token_opened`] instead.
     pub async fn verify_trusted_session_token(&self, token_str: &str) -> Result<RPCSessionToken> {
+        let token = self.verify_session_signature(token_str).await?;
+        let ceiling = crate::token_session_ceiling(&token)?;
+        if ceiling.restricted && !self.targets_this_app(&token)? {
+            return Err(
+                crate::AccessDenial::new(crate::DenyReason::SessionKindNotAllowed)
+                    .at(self.app_id.clone(), "*")
+                    .into_rpc_error(),
+            );
+        }
+        Ok(token)
+    }
+
+    /// Verify a session token for a method opened to restricted sessions of
+    /// `scope`; unrestricted sessions pass as with
+    /// [`Self::verify_trusted_session_token`].
+    pub async fn verify_session_token_opened(
+        &self,
+        token_str: &str,
+        scope: crate::SessionScope,
+    ) -> Result<RPCSessionToken> {
+        let token = self.verify_session_signature(token_str).await?;
+        let ceiling = crate::token_session_ceiling(&token)?;
+        if !ceiling.allows(scope) {
+            return Err(
+                crate::AccessDenial::new(crate::DenyReason::SessionCeilingExceeded)
+                    .at(self.app_id.clone(), scope.as_str())
+                    .into_rpc_error(),
+            );
+        }
+        Ok(token)
+    }
+
+    /// A restricted session reaches an App runtime when it targets exactly
+    /// this App instance: App availability was decided when it was issued.
+    fn targets_this_app(&self, token: &RPCSessionToken) -> Result<bool> {
+        if self.runtime_type != BuckyOSRuntimeType::AppService {
+            return Ok(false);
+        }
+        let claims = validate_verify_hub_token_claims(token, TokenUse::Session)?;
+        Ok(match (&claims.target, self.get_app_instance_id()) {
+            (AuthTarget::App { app_instance_id }, Ok(own)) => *app_instance_id == own,
+            _ => false,
+        })
+    }
+
+    async fn verify_session_signature(&self, token_str: &str) -> Result<RPCSessionToken> {
         let mut rpc_token = RPCSessionToken::from_string(token_str).map_err(|error| {
             RPCErrors::InvalidToken(format!("Invalid session token: {}", error))
         })?;
@@ -1502,28 +1849,20 @@ impl BuckyOSRuntime {
         let header = jsonwebtoken::decode_header(raw_jwt).map_err(|error| {
             RPCErrors::InvalidToken(format!("JWT decode header error: {}", error))
         })?;
-        let claims = decode_jwt_claim_without_verify(raw_jwt).ok();
-
-        let mut kid = header
-            .kid
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                claims.as_ref().and_then(|value| {
-                    value
-                        .get("iss")
-                        .and_then(|iss| iss.as_str())
-                        .and_then(|iss| {
-                            let trimmed = iss.trim();
-                            if trimmed.is_empty() {
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            }
-                        })
-                })
-            })
-            .unwrap_or_else(|| "root".to_string());
+        let claims = decode_jwt_claim_without_verify(raw_jwt).map_err(|error| {
+            RPCErrors::InvalidToken(format!("JWT claims decode error: {error}"))
+        })?;
+        if claims.get("iss").and_then(Value::as_str) != Some(VERIFY_HUB_TOKEN_ISSUER) {
+            return Err(RPCErrors::InvalidToken(
+                "ordinary session tokens must be issued by verify-hub".to_string(),
+            ));
+        }
+        if header.kid.as_deref() != Some(VERIFY_HUB_TOKEN_ISSUER) {
+            return Err(RPCErrors::InvalidToken(
+                "verify-hub session token has an invalid kid".to_string(),
+            ));
+        }
+        let kid = VERIFY_HUB_TOKEN_ISSUER.to_string();
 
         let mut decoding_key = {
             let key_map = self.trust_keys.read().await;
@@ -1538,20 +1877,13 @@ impl BuckyOSRuntime {
             };
         }
 
-        if decoding_key.is_none() && kid != "root" {
-            kid = "root".to_string();
-            decoding_key = {
-                let key_map = self.trust_keys.read().await;
-                key_map.get(&kid).cloned()
-            };
-        }
-
         let decoding_key =
             decoding_key.ok_or(RPCErrors::NoPermission(format!("kid {} not found", kid)))?;
 
         rpc_token
             .verify_by_key(&decoding_key)
             .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error: {}", error)))?;
+        validate_verify_hub_token_claims(&rpc_token, TokenUse::Session)?;
 
         Ok(rpc_token)
     }
@@ -1571,80 +1903,98 @@ impl BuckyOSRuntime {
         let token_str = req.token.as_deref().ok_or(RPCErrors::ParseRequestError(
             "Invalid params, session_token is none".to_string(),
         ))?;
-        let token = RPCSessionToken::from_string(token_str).map_err(|error| {
-            RPCErrors::InvalidToken(format!("Invalid session token: {}", error))
-        })?;
-        if !token.is_self_verify() {
-            return Err(RPCErrors::InvalidToken(
-                "Session token is not valid".to_string(),
-            ));
-        }
-        let token_str = token.token.as_deref().ok_or(RPCErrors::InvalidToken(
-            "Session token is missing raw JWT".to_string(),
+        let token = self.verify_trusted_session_token(token_str).await?;
+        self.enforce_verified(&token, action, resource_path).await
+    }
+
+    /// RBAC for a principal authenticated without a session token (S3 access
+    /// keys of the bucket service): `userid` and its `app:<id>` / `system:<id>` key.
+    pub async fn enforce_principal(
+        &self,
+        userid: &str,
+        authorization_key: &str,
+        resource_path: &str,
+        action: &str,
+    ) -> Result<bool> {
+        let system_config_client = self.get_system_config_client().await?;
+        crate::rbac_config::sync_rbac_enforcer(
+            || crate::load_current_rbac_config(system_config_client.as_ref()),
+            true,
+        )
+        .await?;
+        Ok(rbac::enforce(userid, authorization_key, resource_path, action, None).await)
+    }
+
+    /// RBAC for a method opened to restricted sessions of `scope`.
+    pub async fn enforce_opened(
+        &self,
+        req: &RPCRequest,
+        action: &str,
+        resource_path: &str,
+        scope: crate::SessionScope,
+    ) -> Result<(String, String)> {
+        let token_str = req.token.as_deref().ok_or(RPCErrors::ParseRequestError(
+            "Invalid params, session_token is none".to_string(),
         ))?;
-        let header: jsonwebtoken::Header =
-            jsonwebtoken::decode_header(token_str).map_err(|error| {
-                RPCErrors::InvalidToken(format!("JWT decode header error : {}", error))
-            })?;
+        let token = self.verify_session_token_opened(token_str, scope).await?;
+        self.enforce_verified(&token, action, resource_path).await
+    }
 
-        let key_map = self.trust_keys.read().await;
-        let kid = header.kid.unwrap_or("root".to_string());
-        let decoding_key = key_map.get(&kid);
-        if decoding_key.is_none() {
-            warn!("kid {} not found,Session token is not valid", kid.as_str());
-            return Err(RPCErrors::NoPermission(format!(
-                "kid {} not found",
-                kid.as_str()
-            )));
-        }
-        let decoding_key = decoding_key.unwrap();
-
-        let validation = Validation::new(header.alg);
-        //exp always checked
-        let decoded_token = decode::<serde_json::Value>(token_str, &decoding_key, &validation)
-            .map_err(|error| RPCErrors::InvalidToken(format!("JWT decode error:{}", error)))?;
-        let decoded_json = decoded_token
-            .claims
-            .as_object()
-            .ok_or(RPCErrors::InvalidToken("Invalid token".to_string()))?;
-
-        let userid = decoded_json
-            .get("userid")
-            .or_else(|| decoded_json.get("sub"))
-            .ok_or(RPCErrors::InvalidToken("Missing userid".to_string()))?;
-        let userid = userid
-            .as_str()
-            .ok_or(RPCErrors::InvalidToken("Invalid userid".to_string()))?;
-        let appid = decoded_json
-            .get("appid")
-            .and_then(|appid| appid.as_str())
-            .or_else(|| decoded_json.get("aud").and_then(|aud| aud.as_str()))
-            .unwrap_or("kernel");
+    async fn enforce_verified(
+        &self,
+        token: &RPCSessionToken,
+        action: &str,
+        resource_path: &str,
+    ) -> Result<(String, String)> {
+        let userid = token
+            .sub
+            .as_deref()
+            .ok_or_else(|| RPCErrors::InvalidToken("missing session subject".to_string()))?;
+        let claims = validate_verify_hub_token_claims(&token, TokenUse::Session)?;
+        let authorization_key = claims.target.authorization_key();
+        let canonical_target = claims.target.canonical_key();
 
         let system_config_client = self.get_system_config_client().await?;
-        let rbac_config = crate::load_current_rbac_config(system_config_client.as_ref()).await?;
-        if rbac_config.is_changed {
-            rbac::update_enforcer(rbac_config.model.as_str(), rbac_config.policy.as_str())
-                .await
-                .map_err(|error| {
-                    RPCErrors::ReasonError(format!("update rbac enforcer failed: {}", error))
-                })?;
+        crate::rbac_config::sync_rbac_enforcer(
+            || crate::load_current_rbac_config(system_config_client.as_ref()),
+            true,
+        )
+        .await?;
+
+        let sudo = || {
+            token
+                .sudo
+                .then(|| rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(userid)))
+        };
+
+        let mut result =
+            rbac::enforce(userid, &authorization_key, resource_path, action, sudo()).await;
+        if !result && claim_rbac_forced_refresh() {
+            // The policy is cached for a few seconds; a grant written just
+            // before this call (a new user, a changed role) is re-read once
+            // before the request is denied.
+            let rebuilt = crate::rbac_config::sync_rbac_enforcer(
+                || async {
+                    system_config_client
+                        .invalidate_cache(crate::RBAC_POLICY_KEY)
+                        .await;
+                    crate::load_current_rbac_config(system_config_client.as_ref()).await
+                },
+                false,
+            )
+            .await?;
+            if rebuilt {
+                result =
+                    rbac::enforce(userid, &authorization_key, resource_path, action, sudo()).await;
+            }
         }
-
-        let sudo = decoded_json
-            .get("sudo")
-            .and_then(|sudo| sudo.as_bool())
-            .unwrap_or(false)
-            .then(|| rbac::SudoMode::Sudo(RPCSessionToken::get_default_sudo_userid(userid)));
-
-        let result = rbac::enforce(userid, appid, resource_path, action, sudo).await;
         if !result {
             return Err(RPCErrors::NoPermission(format!(
                 "enforce failed,userid:{},appid:{},resource:{},action:{}",
-                userid, appid, resource_path, action
+                userid, authorization_key, resource_path, action
             )));
         }
-        Ok((userid.to_string(), appid.to_string()))
+        Ok((userid.to_string(), canonical_target))
     }
 
     //     pub async fn enable_zone_provider (_is_gateway: bool) -> Result<()> {
@@ -1693,22 +2043,85 @@ impl BuckyOSRuntime {
         self.zone_config.as_ref()
     }
 
-    //use https://full_appid.zonehost/ to access the app
-    pub fn get_full_appid(&self) -> String {
+    pub fn get_app_instance_id(&self) -> Result<AppInstanceId> {
+        let app_id = AppId::parse(self.app_id.as_str()).map_err(RPCErrors::ReasonError)?;
+        let owner_user_id = self.app_owner_id.clone().ok_or_else(|| {
+            RPCErrors::ReasonError("owner_user_id is required for AppInstanceId".to_string())
+        })?;
+        AppInstanceId::new(app_id, owner_user_id).map_err(RPCErrors::ReasonError)
+    }
+
+    fn resolve_appclient_identity(&mut self, target: &AuthTarget) -> Result<()> {
+        if target.appid_claim() != self.app_id {
+            return Err(RPCErrors::InvalidToken(format!(
+                "session token appid {} does not match runtime app_id {}",
+                target.appid_claim(),
+                self.app_id
+            )));
+        }
+        if let Some(expected) = self.appclient_auth_target.as_ref() {
+            if expected != target {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "session token target {} does not match runtime target {}",
+                    target.canonical_key(),
+                    expected.canonical_key()
+                )));
+            }
+        }
+        if let AuthTarget::App { app_instance_id } = target {
+            let owner = app_instance_id.owner_user_id();
+            if self
+                .app_owner_id
+                .as_deref()
+                .is_some_and(|expected| expected != owner)
+            {
+                return Err(RPCErrors::InvalidToken(format!(
+                    "session token owner_user_id {} does not match runtime owner_user_id {}",
+                    owner,
+                    self.app_owner_id.as_deref().unwrap_or_default()
+                )));
+            }
+            self.app_owner_id = Some(owner.to_string());
+            if self.user_id.is_none() {
+                self.user_id = self.app_owner_id.clone();
+            }
+            self.app_host_perfix = format!("{}-{}", self.app_id, owner);
+        } else if self.app_owner_id.is_some() {
+            return Err(RPCErrors::InvalidToken(
+                "system session token does not match runtime application owner".to_string(),
+            ));
+        }
+        self.appclient_auth_target = Some(target.clone());
+        Ok(())
+    }
+
+    pub fn get_auth_target(&self) -> Result<AuthTarget> {
         if self.runtime_type == BuckyOSRuntimeType::AppClient {
-            let root_id = "root".to_string();
-            let owner_id = self.app_owner_id.as_ref().unwrap_or(&root_id);
-            return get_full_appid(self.app_id.as_str(), owner_id);
-        } else {
-            return self.app_id.clone();
+            if let Some(target) = self.appclient_auth_target.as_ref() {
+                return Ok(target.clone());
+            }
+        }
+        match self.runtime_type {
+            BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::AppClient => {
+                Ok(AuthTarget::app(self.get_app_instance_id()?))
+            }
+            BuckyOSRuntimeType::FrameService
+            | BuckyOSRuntimeType::KernelService
+            | BuckyOSRuntimeType::Kernel => Ok(AuthTarget::system(
+                SystemServiceId::parse(self.app_id.as_str()).map_err(RPCErrors::ReasonError)?,
+            )),
         }
     }
 
     pub async fn get_session_token(&self) -> String {
+        if self.authentication.read().await.is_terminal() {
+            return String::new();
+        }
         let session_token = self.session_token.read().await;
-        let session_token_str = session_token.clone();
-        drop(session_token);
+        self.usable_session_token(session_token.clone())
+    }
 
+    fn usable_session_token(&self, session_token_str: String) -> String {
         let session_token = match RPCSessionToken::from_string(&session_token_str) {
             Ok(token) => token,
             Err(error) => {
@@ -1725,32 +2138,32 @@ impl BuckyOSRuntime {
             if now < exp.saturating_sub(10) {
                 return session_token_str;
             } else {
-                if let (Some(device_private_key), Some(device_config)) = (
-                    self.device_private_key.as_ref(),
-                    self.device_config.as_ref(),
-                ) {
-                    let subject_id =
-                        match self.device_signed_login_subject(device_config.name.as_str()) {
-                            Ok(subject_id) => subject_id,
-                            Err(error) => {
-                                warn!("resolve device-signed login subject failed: {}", error);
-                                return "".to_string();
-                            }
-                        };
-                    let jwt_result = generate_service_login_jwt(
-                        subject_id,
-                        self.app_id.as_str(),
-                        device_config.name.as_str(),
-                        device_private_key,
-                    )
-                    .map_err(|e| {
-                        error!("generate session token failed! {}", e);
-                    });
-                    if jwt_result.is_ok() {
-                        let (new_session_token_str, _new_session_token) = jwt_result.unwrap();
-                        let mut session_token_guard = self.session_token.write().await;
-                        *session_token_guard = new_session_token_str.clone();
-                        return new_session_token_str;
+                if session_token.iss.as_deref() != Some(VERIFY_HUB_TOKEN_ISSUER) {
+                    if let (Some(device_private_key), Some(device_config)) = (
+                        self.device_private_key.as_ref(),
+                        self.device_config.as_ref(),
+                    ) {
+                        let subject_id =
+                            match self.device_signed_login_subject(device_config.name.as_str()) {
+                                Ok(subject_id) => subject_id,
+                                Err(error) => {
+                                    warn!("resolve device-signed login subject failed: {}", error);
+                                    return "".to_string();
+                                }
+                            };
+                        let jwt_result = generate_service_login_assertion(
+                            subject_id,
+                            self.app_id.as_str(),
+                            device_config.name.as_str(),
+                            device_private_key,
+                        )
+                        .map_err(|e| {
+                            error!("generate session token failed! {}", e);
+                        });
+                        if jwt_result.is_ok() {
+                            let (new_session_token_str, _new_session_token) = jwt_result.unwrap();
+                            return new_session_token_str;
+                        }
                     }
                 }
                 warn!("session-token expired!");
@@ -1961,8 +2374,17 @@ impl BuckyOSRuntime {
         Ok(client)
     }
 
+    /// Host of this runtime's node gateway (loopback, or the docker host
+    /// gateway inside a container).
+    pub fn get_local_gateway_host(&self) -> String {
+        self.resolve_local_service_host()
+    }
+
     fn resolve_local_service_host(&self) -> String {
         match self.runtime_type {
+            BuckyOSRuntimeType::AppClient => self
+                .resolve_appclient_gateway_host()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
             BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
                 let configured_host = env::var(BUCKYOS_HOST_GATEWAY_ENV).ok();
                 resolve_container_gateway_host(configured_host.as_deref())
@@ -1971,53 +2393,72 @@ impl BuckyOSRuntime {
         }
     }
 
+    fn resolve_appclient_gateway_host(&self) -> Option<String> {
+        env::var(BUCKYOS_HOST_GATEWAY_ENV)
+            .ok()
+            .filter(|host| !host.trim().is_empty())
+            .map(|host| resolve_container_gateway_host(Some(host.as_str())))
+    }
+
+    fn get_appclient_service_url(&self, service_name: &str, https_only: bool) -> String {
+        if let Some(host) = self.resolve_appclient_gateway_host() {
+            return format!(
+                "http://{}:{}/kapi/{}",
+                host, self.node_gateway_port, service_name
+            );
+        }
+        format!(
+            "{}://{}/kapi/{}",
+            if https_only { "https" } else { "http" },
+            self.zone_id.to_host_name(),
+            service_name
+        )
+    }
+
     /// Compute the URL used to reach the zone's `system_config` service for
     /// the current runtime type. Exposed so that callers (e.g. control_panel
     /// handlers that want to forward the caller's RPC session token) can
     /// construct a fresh `SystemConfigClient` with their own auth token.
     pub fn get_system_config_url(&self) -> String {
-        let mut url = format!(
-            "http://{}:3200/kapi/system_config",
-            self.resolve_local_service_host()
-        );
-        let mut schema = "http";
-        if self.force_https {
-            schema = "https";
-        }
-        let zone_host = self.zone_id.to_host_name();
         match self.runtime_type {
             BuckyOSRuntimeType::AppClient => {
-                if !self.is_ood() {
-                    url = format!("{}://{}/kapi/system_config", schema, zone_host);
-                }
+                self.get_appclient_service_url("system_config", self.force_https)
             }
             BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
-                url = format!(
+                format!(
                     "http://{}:{}/kapi/system_config",
                     self.resolve_local_service_host(),
                     DEFAULT_NODE_GATEWAY_PORT
-                );
+                )
             }
             BuckyOSRuntimeType::Kernel | BuckyOSRuntimeType::KernelService => {
                 // 非 OOD Kernel（ZoneGateway / 普通 Node）本机不跑 system_config 服务，
                 // 必须通过本机 cyfs-gateway 转发到 OOD。
-                if !self.is_ood() {
-                    url = format!(
-                        "http://{}:{}/kapi/system_config",
-                        self.resolve_local_service_host(),
-                        DEFAULT_NODE_GATEWAY_PORT
-                    );
-                }
+                let port = if self.is_ood() {
+                    3200
+                } else {
+                    DEFAULT_NODE_GATEWAY_PORT
+                };
+                format!(
+                    "http://{}:{}/kapi/system_config",
+                    self.resolve_local_service_host(),
+                    port
+                )
             }
         }
-        url
     }
 
     pub async fn get_system_config_client(&self) -> Result<Arc<SystemConfigClient>> {
         let url = self.get_system_config_url();
 
         //let url = self.get_zone_service_url("system_config",self.force_https)?;
-        let session_token = self.get_session_token().await;
+        let authentication = self.authentication.read().await;
+        if authentication.is_terminal() {
+            return Err(authentication.error());
+        }
+        drop(authentication);
+        let current_token = self.session_token.read().await;
+        let session_token = self.usable_session_token(current_token.clone());
         let client = self
             .system_config_client
             .get_or_try_init(|| async {
@@ -2033,6 +2474,15 @@ impl BuckyOSRuntime {
             .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
         debug!("get system config client OK,url:{}", url);
         Ok(client.clone())
+    }
+
+    /// Returns whether the Zone-wide BuckyOS developer mode is currently enabled.
+    pub async fn is_buckyos_dev_mode_enabled(&self) -> Result<bool> {
+        self.get_system_config_client()
+            .await?
+            .is_buckyos_dev_mode_enabled()
+            .await
+            .map_err(|error| RPCErrors::ReasonError(error.to_string()))
     }
 
     /// Returns a short-session client bound to the runtime session token that is
@@ -2099,6 +2549,92 @@ impl BuckyOSRuntime {
             } else {
                 FIRST_SWEEP_INTERVAL
             };
+        }
+    }
+
+    /// Wait until the notification `notify_id` is closed (answered,
+    /// dismissed, expired, canceled) or `deadline_ms` passes, and return its
+    /// latest view either way. An `input` is followed through its task's
+    /// kevent; polling backs it up.
+    pub async fn wait_notify(&self, notify_id: &str, deadline_ms: u64) -> Result<NotifyView> {
+        let first = self
+            .get_msg_center_client()
+            .await?
+            .notify_get(notify_id)
+            .await?;
+        let reader = match first.task_id.as_deref() {
+            Some(task_id) => match self.get_kevent_client().await {
+                Ok(client) => client
+                    .create_event_reader(vec![task_mgr_task_event_path(task_id)])
+                    .await
+                    .ok()
+                    .map(|reader| (client, reader)),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        wait_notify_loop(
+            || async {
+                self.get_msg_center_client()
+                    .await?
+                    .notify_get(notify_id)
+                    .await
+            },
+            deadline_ms,
+            |d| {
+                let reader = reader.as_ref();
+                async move {
+                    match reader {
+                        Some((_client, reader)) => {
+                            let _ = reader.pull_event(Some(d.as_millis() as u64)).await;
+                        }
+                        None => tokio::time::sleep(d).await,
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// Answer an `input` as this runtime's user (or dismiss it); for a
+    /// `notice` acknowledge or dismiss it. Returns the final view: when
+    /// someone else answered first, theirs.
+    pub async fn answer_notify(&self, notify_id: &str, answer: NotifyAnswer) -> Result<NotifyView> {
+        let msg_center = self.get_msg_center_client().await?;
+        let view = msg_center.notify_get(notify_id).await?;
+        match view.kind {
+            NotifyKind::Notice => {
+                if answer.dismiss {
+                    msg_center.notify_dismiss(notify_id).await
+                } else {
+                    msg_center.notify_ack(notify_id, None).await
+                }
+            }
+            NotifyKind::Input => {
+                let task_id = view.task_id.clone().ok_or_else(|| {
+                    RPCErrors::ReasonError(format!("notification {notify_id} has no task"))
+                })?;
+                if view.status.is_closed() {
+                    return Ok(view);
+                }
+                answer
+                    .validate(&view.prompt)
+                    .map_err(RPCErrors::ParseRequestError)?;
+                let submitted_by = self
+                    .user_id
+                    .clone()
+                    .or_else(|| self.app_owner_id.clone())
+                    .unwrap_or_default();
+                commit_notify_answer(
+                    &self.get_task_mgr_client().await?,
+                    &task_id,
+                    &answer,
+                    &submitted_by,
+                    buckyos_get_unix_timestamp() * 1000,
+                )
+                .await?;
+                msg_center.notify_get(notify_id).await
+            }
         }
     }
 
@@ -2187,6 +2723,14 @@ impl BuckyOSRuntime {
         Ok(client)
     }
 
+    /// Returns a short-session client of the bucket service (nfs-server).
+    pub async fn get_bucket_client(&self) -> Result<crate::BucketClient> {
+        let krpc_client = self
+            .get_zone_service_krpc_client(NFS_SERVER_SERVICE_NAME)
+            .await?;
+        Ok(crate::BucketClient::new(krpc_client))
+    }
+
     /// Returns a short-session client. Acquire it again from the runtime for
     /// each operation instead of keeping it in long-lived state.
     pub async fn get_msg_center_client(&self) -> Result<MsgCenterClient> {
@@ -2230,9 +2774,28 @@ impl BuckyOSRuntime {
     /// Returns a short-session client. Acquire it again from the runtime for
     /// each operation instead of keeping it in long-lived state.
     pub async fn get_verify_hub_client(&self) -> Result<VerifyHubClient> {
-        let krpc_client = self.get_zone_service_krpc_client("verify-hub").await?;
+        let krpc_client = if let Some(url) = self.verify_hub_bootstrap_url() {
+            // AppService authentication must not depend on service discovery:
+            // node-daemon may inject ZoneConfig before the LoginAssertion has
+            // been exchanged for a Verify Hub session. Node Gateway exposes
+            // Verify Hub on this canonical route, and login_by_jwt clears any
+            // client session before sending the signed assertion.
+            kRPC::new_with_timeout_secs(&url, None, DEFAULT_KRPC_TIMEOUT_SECS)
+        } else {
+            self.get_zone_service_krpc_client("verify-hub").await?
+        };
         let client = VerifyHubClient::new(krpc_client);
         Ok(client)
+    }
+
+    fn verify_hub_bootstrap_url(&self) -> Option<String> {
+        (self.runtime_type == BuckyOSRuntimeType::AppService).then(|| {
+            format!(
+                "http://{}:{}/kapi/verify-hub",
+                self.resolve_local_service_host(),
+                self.node_gateway_port
+            )
+        })
     }
 
     /// Returns a short-session client. Acquire it again from the runtime for
@@ -2380,24 +2943,19 @@ impl BuckyOSRuntime {
         service_name: &str,
         https_only: bool,
     ) -> Result<String> {
-        let mut schema = "http";
-        if https_only {
-            schema = "https";
-        }
-
         match self.runtime_type {
             BuckyOSRuntimeType::AppClient => {
-                //通过Zone Host Name 访问Service总是可以成功的，理论上有SDK的环境不应该使用这种方式。
-                //TODO：如果约束为有SDK的环境，必然有node_gateway,那么这个分支就不必要存在
-                //
-                // kRPC `/kapi/<service>` 一律打到 zone 的裸 host —— `app_host_perfix.<zone_host>`
-                // 这种二级域名只属于 WebUI 静态资源路由，service 维度的 RPC 不走那条路径。
-                // (例：DV test 环境里 `test.buckyos.io` 有 DNS / cert，
-                // `buckycli.test.buckyos.io` 没有。)
-                let host_name = self.zone_id.to_host_name();
-                return Ok(format!("{}://{}/kapi/{}", schema, host_name, service_name));
+                return Ok(self.get_appclient_service_url(service_name, https_only));
             }
             BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
+                if service_name == NFS_SERVER_SERVICE_NAME {
+                    return Ok(format!(
+                        "http://{}:{}/kapi/{}",
+                        self.resolve_local_service_host(),
+                        self.node_gateway_port,
+                        service_name
+                    ));
+                }
                 let (result_url, _is_local) = self.get_kernel_service_url(service_name).await?;
                 return Ok(result_url);
 
@@ -2439,6 +2997,10 @@ impl BuckyOSRuntime {
         service_name: &str,
         default_timeout_secs: Option<u64>,
     ) -> Result<kRPC> {
+        let authentication = self.get_authentication_status().await;
+        if authentication.is_terminal() && service_name != VERIFY_HUB_SERVICE_NAME {
+            return Err(authentication.error());
+        }
         let url = self
             .get_zone_service_url(service_name, self.force_https)
             .await?;
@@ -2559,6 +3121,906 @@ fn resolve_host_to_ipv4_literal(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn appclient_config_uses_the_owner_canonical_zone() {
+        let _lock = crate::tests::test_env_lock().lock().unwrap();
+        let config_dir = std::env::temp_dir().join(format!(
+            "buckyos-owner-zone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let previous_home =
+            crate::tests::set_env_var("BUCKYOS_DEV_HOME", &config_dir.to_string_lossy());
+        let key = serde_json::from_value(serde_json::json!({
+            "kty": "OKP", "crv": "Ed25519", "x": "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"
+        }))
+        .unwrap();
+        let alice = DID::new("bns", "alice");
+        let mut owner = OwnerDocument::new(alice.clone(), "alice".into(), "Alice".into(), key);
+        let mut results = Vec::new();
+        for zone in [alice.clone(), DID::new("web", "charlie.me")] {
+            if zone != alice {
+                owner.set_default_zone_did(zone.clone());
+            }
+            std::fs::write(
+                config_dir.join("user_config.json"),
+                serde_json::to_vec(&owner).unwrap(),
+            )
+            .unwrap();
+            let mut runtime = BuckyOSRuntime::new("notes.example", None, BuckyOSRuntimeType::AppClient);
+            let result = runtime.fill_by_load_config().await;
+            results.push((result, runtime.zone_id, zone, runtime.user_id));
+        }
+        crate::tests::restore_env_var("BUCKYOS_DEV_HOME", previous_home);
+        std::fs::remove_dir_all(config_dir).unwrap();
+        for (result, actual_zone, expected_zone, user) in results {
+            result.unwrap();
+            assert_eq!(actual_zone, expected_zone);
+            assert_eq!(user.as_deref(), Some("alice"));
+        }
+    }
+
+    fn appclient_session_token(target: &AuthTarget, token_use: TokenUse) -> String {
+        let (private_pem, _) = generate_ed25519_key_pair();
+        let key = EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+        let (_, mut token) =
+            RPCSessionToken::generate_jwt_token("bob", target.appid_claim(), None, &key).unwrap();
+        token.iss = Some(VERIFY_HUB_TOKEN_ISSUER.to_string());
+        token
+            .extra
+            .insert("principal_kind".into(), Value::String("user".into()));
+        crate::bind_token_target(&mut token, target, token_use).unwrap();
+        token
+            .generate_jwt(Some(VERIFY_HUB_TOKEN_ISSUER.to_string()), &key)
+            .unwrap()
+    }
+
+    struct RefreshTestEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        gateway: Option<String>,
+    }
+
+    impl RefreshTestEnv {
+        fn new() -> Self {
+            let lock = crate::tests::test_env_lock().lock().unwrap();
+            let gateway = crate::tests::set_env_var(BUCKYOS_HOST_GATEWAY_ENV, "127.0.0.1");
+            Self {
+                _lock: lock,
+                gateway,
+            }
+        }
+    }
+
+    impl Drop for RefreshTestEnv {
+        fn drop(&mut self) {
+            crate::tests::restore_env_var(BUCKYOS_HOST_GATEWAY_ENV, self.gateway.take());
+        }
+    }
+
+    fn refresh_test_pair(generation: &str, expires: u64) -> TokenPair {
+        let target = AuthTarget::app("notes.example.com@alice".parse().unwrap());
+        let make_token = |token_use| {
+            let mut token =
+                RPCSessionToken::from_string(&appclient_session_token(&target, token_use)).unwrap();
+            token.exp = Some(expires);
+            token.sub = Some("alice".into());
+            token.extra.insert("session".into(), serde_json::json!(42));
+            token.jti = Some(generation.into());
+            serde_json::to_string(&token).unwrap()
+        };
+        TokenPair {
+            session_token: make_token(TokenUse::Session),
+            refresh_token: make_token(TokenUse::Refresh),
+        }
+    }
+
+    type RefreshRequest = (Value, tokio::sync::oneshot::Sender<Option<Value>>);
+
+    async fn refresh_test_runtime() -> (
+        BuckyOSRuntime,
+        tokio::sync::mpsc::UnboundedReceiver<RefreshRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut stream = BufReader::new(stream);
+                    let mut content_length = 0;
+                    loop {
+                        let mut line = String::new();
+                        if stream.read_line(&mut line).await.unwrap_or_default() == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                content_length = value.trim().parse().unwrap();
+                            }
+                        }
+                    }
+                    let mut body = vec![0; content_length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let sequence = request["sys"][0].clone();
+                    let (send_response, response) =
+                        tokio::sync::oneshot::channel::<Option<Value>>();
+                    if requests.send((request, send_response)).is_err() {
+                        return;
+                    }
+                    let Ok(Some(mut response)) = response.await else {
+                        return;
+                    };
+                    response["sys"] = serde_json::json!([sequence]);
+                    let response = response.to_string();
+                    let _ = stream.write_all(format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response
+                    ).as_bytes()).await;
+                });
+            }
+        });
+        let mut runtime = BuckyOSRuntime::new(
+            "notes.example.com",
+            Some("alice".into()),
+            BuckyOSRuntimeType::AppService,
+        );
+        runtime.node_gateway_port = port;
+        runtime
+            .replace_token_pair(refresh_test_pair("old", buckyos_get_unix_timestamp() + 10))
+            .await
+            .unwrap();
+        (runtime, receiver, server)
+    }
+
+    async fn next_refresh(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<RefreshRequest>,
+    ) -> RefreshRequest {
+        tokio::time::timeout(Duration::from_secs(8), requests.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bucket_clients_use_gateway_and_preserve_token_lifecycle() {
+        let _env = RefreshTestEnv::new();
+        let (mut runtime, mut requests, server) = refresh_test_runtime().await;
+        runtime
+            .replace_token_pair(refresh_test_pair("old", buckyos_get_unix_timestamp() + 600))
+            .await
+            .unwrap();
+        let old_token = runtime.get_session_token().await;
+        let old_client = runtime.get_bucket_client().await.unwrap();
+        runtime
+            .replace_token_pair(refresh_test_pair("new", buckyos_get_unix_timestamp() + 600))
+            .await
+            .unwrap();
+        let new_token = runtime.get_session_token().await;
+        assert_ne!(old_token, new_token);
+        let new_client = runtime.get_bucket_client().await.unwrap();
+        for (client, token) in [(old_client, old_token), (new_client, new_token)] {
+            let call = tokio::spawn(async move { client.list(None, None).await });
+            let (request, response) = next_refresh(&mut requests).await;
+            assert_eq!(request["method"], "bucket.list");
+            assert_eq!(request["sys"][1], token);
+            response.send(Some(serde_json::json!({ "result": [] }))).unwrap();
+            assert!(call.await.unwrap().unwrap().is_empty());
+        }
+        for state in [RuntimeAuthState::ReauthorizationRequired, RuntimeAuthState::Unavailable] {
+            runtime.authentication.write().await.state = state;
+            assert!(runtime.get_bucket_client().await.is_err());
+            assert!(requests.try_recv().is_err());
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn container_nfs_rpc_uses_the_named_store_gateway() {
+        let _env = RefreshTestEnv::new();
+        env::set_var(BUCKYOS_HOST_GATEWAY_ENV, "192.0.2.20");
+        for runtime_type in [BuckyOSRuntimeType::AppService, BuckyOSRuntimeType::FrameService] {
+            for gateway_port in [DEFAULT_NODE_GATEWAY_PORT, 43180] {
+                let mut runtime = BuckyOSRuntime::new("notes.example.com", Some("alice".into()), runtime_type.clone());
+                runtime.node_gateway_port = gateway_port;
+                runtime.device_config = Some(DeviceDocument::new("ood1", "test-key".into()));
+                let expected = format!("http://192.0.2.20:{gateway_port}");
+                assert_eq!(runtime.named_store_base_url(), expected);
+                assert_eq!(
+                    runtime.get_zone_service_url(NFS_SERVER_SERVICE_NAME, false).await.unwrap(),
+                    format!("{expected}/kapi/nfs-server")
+                );
+                assert!(runtime.system_config_client.get().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_waiters_share_one_pair_and_next_rotation() {
+        let _env = RefreshTestEnv::new();
+        let (runtime, mut requests, server) = refresh_test_runtime().await;
+        let shared_client = runtime.get_system_config_client().await.unwrap();
+        let old_refresh = runtime.refresh_token.read().await.clone();
+        let runtime = Arc::new(runtime);
+        let barrier = Arc::new(tokio::sync::Barrier::new(17));
+        let mut waiters = Vec::new();
+        for _ in 0..16 {
+            let runtime = runtime.clone();
+            let barrier = barrier.clone();
+            waiters.push(tokio::spawn(async move {
+                barrier.wait().await;
+                runtime.renew_token_from_verify_hub().await.unwrap();
+                (
+                    runtime.get_session_token().await,
+                    runtime.refresh_token.read().await.clone(),
+                )
+            }));
+        }
+        barrier.wait().await;
+        let (request, respond) = next_refresh(&mut requests).await;
+        assert_eq!(request["method"], "refresh_token");
+        assert_eq!(request["params"]["refresh_token"], old_refresh);
+        let pair = refresh_test_pair("new", buckyos_get_unix_timestamp() + 600);
+        respond
+            .send(Some(serde_json::json!({ "result": pair })))
+            .unwrap();
+        for waiter in waiters {
+            let observed = waiter.await.unwrap();
+            assert_eq!(
+                observed,
+                (pair.session_token.clone(), pair.refresh_token.clone())
+            );
+        }
+        assert!(requests.try_recv().is_err());
+        assert_eq!(
+            shared_client.get_session_token().await.as_deref(),
+            Some(pair.session_token.as_str())
+        );
+        let expiring = refresh_test_pair("new", buckyos_get_unix_timestamp() + 10);
+        *runtime.session_token.write().await = expiring.session_token;
+        let next_runtime = runtime.clone();
+        let next = tokio::spawn(async move { next_runtime.renew_token_from_verify_hub().await });
+        let (request, respond) = next_refresh(&mut requests).await;
+        assert_eq!(request["params"]["refresh_token"], pair.refresh_token);
+        let second_pair = refresh_test_pair("second", buckyos_get_unix_timestamp() + 600);
+        respond
+            .send(Some(serde_json::json!({ "result": second_pair })))
+            .unwrap();
+        next.await.unwrap().unwrap();
+        assert_eq!(runtime.get_session_token().await, second_pair.session_token);
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            RuntimeAuthState::Ready
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lost_refresh_response_retries_the_same_credential_within_grace() {
+        let _env = RefreshTestEnv::new();
+        let (runtime, mut requests, server) = refresh_test_runtime().await;
+        let old = runtime.refresh_token.read().await.clone();
+        let runtime = Arc::new(runtime);
+        let operation_runtime = runtime.clone();
+        let operation =
+            tokio::spawn(async move { operation_runtime.renew_token_from_verify_hub().await });
+        let started = std::time::Instant::now();
+        let (request, response) = next_refresh(&mut requests).await;
+        assert_eq!(request["params"]["refresh_token"], old);
+        response.send(None).unwrap();
+        let (retry, response) = next_refresh(&mut requests).await;
+        assert_eq!(retry["params"]["refresh_token"], old);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let pair = refresh_test_pair(
+            "rotated-on-first-request",
+            buckyos_get_unix_timestamp() + 600,
+        );
+        response
+            .send(Some(serde_json::json!({ "result": pair })))
+            .unwrap();
+        operation.await.unwrap().unwrap();
+        assert_eq!(
+            runtime.refresh_token.read().await.as_str(),
+            pair.refresh_token
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_releases_lock_and_preserves_pair() {
+        let _env = RefreshTestEnv::new();
+        let (runtime, mut requests, server) = refresh_test_runtime().await;
+        let old_session = runtime.session_token.read().await.clone();
+        let old_refresh = runtime.refresh_token.read().await.clone();
+        let runtime = Arc::new(runtime);
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move { first_runtime.renew_token_from_verify_hub().await });
+        let (_, stalled) = next_refresh(&mut requests).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(*runtime.session_token.read().await, old_session);
+        assert_eq!(*runtime.refresh_token.read().await, old_refresh);
+        drop(stalled);
+        let second_runtime = runtime.clone();
+        let second =
+            tokio::spawn(async move { second_runtime.renew_token_from_verify_hub().await });
+        let (request, response) = next_refresh(&mut requests).await;
+        assert_eq!(request["params"]["refresh_token"], old_refresh);
+        let pair = refresh_test_pair("recovered", buckyos_get_unix_timestamp() + 600);
+        response
+            .send(Some(serde_json::json!({ "result": pair })))
+            .unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(runtime.get_session_token().await, pair.session_token);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_outside_grace_never_replays_old_credential() {
+        let _env = RefreshTestEnv::new();
+        let (runtime, mut requests, server) = refresh_test_runtime().await;
+        let runtime = Arc::new(runtime);
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move { first_runtime.renew_token_from_verify_hub().await });
+        let (_, stalled) = next_refresh(&mut requests).await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        *runtime.pending_refresh.lock().unwrap() = Some(Instant::now() - Duration::from_secs(11));
+        assert!(runtime.renew_token_from_verify_hub().await.is_err());
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            RuntimeAuthState::Unavailable
+        );
+        assert!(requests.try_recv().is_err());
+        assert!(runtime.renew_token_from_verify_hub().await.is_err());
+        drop(stalled);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_pair_commit_never_publishes_half_a_pair() {
+        let mut runtime = BuckyOSRuntime::new(
+            "notes.example.com",
+            Some("alice".into()),
+            BuckyOSRuntimeType::AppService,
+        );
+        let old = refresh_test_pair("old", buckyos_get_unix_timestamp() + 600);
+        runtime.replace_token_pair(old.clone()).await.unwrap();
+        let refresh = runtime.refresh_token.write().await;
+        let mut commit = Box::pin(
+            runtime.commit_token_pair(refresh_test_pair("new", buckyos_get_unix_timestamp() + 600)),
+        );
+        assert!(futures_util::poll!(&mut commit).is_pending());
+        assert!(runtime.session_token.try_read().is_err());
+        drop(commit);
+        assert_eq!(*runtime.session_token.read().await, old.session_token);
+        assert_eq!(*refresh, old.refresh_token);
+    }
+
+    #[tokio::test]
+    async fn cancelled_commit_finishes_cached_client_sync_and_auth_recovery() {
+        let mut runtime = BuckyOSRuntime::new(
+            "notes.example.com",
+            Some("alice".into()),
+            BuckyOSRuntimeType::AppService,
+        );
+        let old = refresh_test_pair("old", buckyos_get_unix_timestamp() + 600);
+        runtime.replace_token_pair(old).await.unwrap();
+        let client = runtime.get_system_config_client().await.unwrap();
+        runtime.authentication.write().await.state = RuntimeAuthState::RetryPending;
+        *runtime.pending_refresh.lock().unwrap() = Some(Instant::now());
+        let pair = refresh_test_pair("recovered", buckyos_get_unix_timestamp() + 600);
+        let mut commit = Box::pin(runtime.commit_token_pair(pair.clone()));
+        assert!(futures_util::poll!(&mut commit).is_pending());
+        assert!(runtime.session_token.try_read().is_err());
+        drop(commit);
+        assert_eq!(runtime.get_authentication_status().await.state, RuntimeAuthState::Ready);
+        assert!(runtime.pending_refresh.lock().unwrap().is_none());
+        let session = tokio::time::timeout(Duration::from_secs(5), runtime.get_session_token()).await.unwrap();
+        assert_eq!(session, pair.session_token);
+        assert_eq!(*runtime.refresh_token.read().await, pair.refresh_token);
+        assert_eq!(client.get_session_token().await.as_deref(), Some(pair.session_token.as_str()));
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_has_bounded_retries_and_shared_backoff() {
+        let _env = RefreshTestEnv::new();
+        let (runtime, mut requests, server) = refresh_test_runtime().await;
+        let original = runtime.session_token.read().await.clone();
+        let runtime = Arc::new(runtime);
+        let operation_runtime = runtime.clone();
+        let operation =
+            tokio::spawn(async move { operation_runtime.renew_token_from_verify_hub().await });
+        let mut pending = Vec::new();
+        for _ in 0..3 {
+            let (_, response) = next_refresh(&mut requests).await;
+            pending.push(response);
+        }
+        assert!(operation.await.unwrap().is_err());
+        assert_eq!(*runtime.session_token.read().await, original);
+        let status = runtime.get_authentication_status().await;
+        assert_eq!(status.state, RuntimeAuthState::RetryPending);
+        assert!(status.next_retry_time.is_some());
+        assert!(runtime.renew_token_from_verify_hub().await.is_err());
+        assert!(requests.try_recv().is_err());
+        let mut fresh = RPCSessionToken::from_string(&original).unwrap();
+        fresh.exp = Some(buckyos_get_unix_timestamp() + 600);
+        *runtime.session_token.write().await = serde_json::to_string(&fresh).unwrap();
+        runtime.authentication.write().await.next_retry_time = None;
+        runtime.renew_token_from_verify_hub().await.unwrap();
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            RuntimeAuthState::RetryPending
+        );
+        let health = runtime.get_runtime_health_snapshot().await;
+        assert_eq!(
+            health
+                .tasks
+                .iter()
+                .find(|task| task.task == RuntimeBackgroundTaskKind::RenewToken)
+                .unwrap()
+                .consecutive_failures,
+            1
+        );
+        drop(pending);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_denial_is_terminal_and_preserves_authorization_reason() {
+        let _env = RefreshTestEnv::new();
+        for reason in [
+            DenyReason::CredentialState,
+            DenyReason::AccountState,
+            DenyReason::SourceRevoked,
+            DenyReason::EntryUnavailable,
+        ] {
+            let (runtime, mut requests, server) = refresh_test_runtime().await;
+            let runtime = Arc::new(runtime);
+            let operation_runtime = runtime.clone();
+            let operation =
+                tokio::spawn(async move { operation_runtime.renew_token_from_verify_hub().await });
+            let (_, response) = next_refresh(&mut requests).await;
+            let denial = AccessDenial::new(reason).with_detail("refresh_session_invalidated");
+            let error = denial.clone().into_rpc_error();
+            let detail = error.detail().unwrap();
+            response.send(Some(serde_json::json!({ "error": detail.message, "code": detail.code, "data": detail.data }))).unwrap();
+            assert!(operation.await.unwrap().is_err());
+            for _ in 0..4 {
+                let error = runtime.renew_token_from_verify_hub().await.unwrap_err();
+                assert_eq!(AccessDenial::from_rpc_error(&error), Some(denial.clone()));
+            }
+            assert!(requests.try_recv().is_err());
+            assert_eq!(
+                runtime.get_authentication_status().await.state,
+                RuntimeAuthState::ReauthorizationRequired
+            );
+            assert!(runtime.get_session_token().await.is_empty());
+            assert!(
+                !runtime
+                    .should_run_background_task(RuntimeBackgroundTaskKind::RenewToken, u64::MAX)
+                    .await
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_refresh_marks_auth_unavailable_without_reusing_login_assertion() {
+        let mut runtime = BuckyOSRuntime::new(
+            "notes.example.com",
+            Some("alice".into()),
+            BuckyOSRuntimeType::AppService,
+        );
+        let pair = refresh_test_pair("expired", buckyos_get_unix_timestamp() - 1);
+        *runtime.session_token.write().await = pair.session_token;
+        assert!(matches!(
+            runtime.renew_token_from_verify_hub().await,
+            Err(RPCErrors::InvalidToken(_))
+        ));
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            RuntimeAuthState::Unavailable
+        );
+        let pair = refresh_test_pair("authorized-new-login", buckyos_get_unix_timestamp() + 600);
+        runtime.replace_token_pair(pair.clone()).await.unwrap();
+        assert_eq!(
+            runtime.get_authentication_status().await.state,
+            RuntimeAuthState::Ready
+        );
+        assert_eq!(runtime.get_session_token().await, pair.session_token);
+    }
+
+    #[tokio::test]
+    async fn appclient_session_login_bootstraps_identity_from_token() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (target, supplied_zone) in [
+            (AuthTarget::app("notes.example.com@alice".parse().unwrap()), true),
+            (AuthTarget::system("control-panel".parse().unwrap()), true),
+            (AuthTarget::app("notes.example.com@alice".parse().unwrap()), false),
+            (AuthTarget::system("control-panel".parse().unwrap()), false),
+        ] {
+            let (_, public_key) = generate_ed25519_key_pair();
+            let zone_doc = ZoneDocument::new(
+                DID::new("web", "review.invalid"),
+                DID::new("web", "alice.invalid"),
+                serde_json::from_value(public_key).unwrap(),
+            );
+            let zone_config = ZoneConfig::from_zone_document(&zone_doc, None).unwrap();
+            let response_config = serde_json::to_string(&zone_config).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let gateway_port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request_line = String::new();
+                stream.read_line(&mut request_line).await.unwrap();
+                assert!(request_line.starts_with("POST /kapi/system_config "));
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length.unwrap()];
+                stream.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let response = serde_json::json!({
+                    "sys": [request["sys"][0]],
+                    "result": {"value": response_config, "version": 1},
+                })
+                .to_string();
+                stream.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(), response
+                ).as_bytes()).await.unwrap();
+                request
+            });
+            let session_token = appclient_session_token(&target, TokenUse::Session);
+            let _lock = crate::tests::test_env_lock().lock().unwrap();
+            let previous_gateway =
+                crate::tests::set_env_var(BUCKYOS_HOST_GATEWAY_ENV, " localhost ");
+            let mut runtime = {
+                let previous_token =
+                    crate::tests::set_env_var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, &session_token);
+                let previous_zone = env::var("BUCKYOS_ZONE_CONFIG").ok();
+                if supplied_zone {
+                    env::set_var("BUCKYOS_ZONE_CONFIG", serde_json::to_string(&zone_config).unwrap());
+                } else {
+                    env::remove_var("BUCKYOS_ZONE_CONFIG");
+                }
+                let mut device_doc = DeviceDocument::new("ood1", "test-key".to_string());
+                device_doc.device_type = "ood".to_string();
+                let previous_device = env::var("BUCKYOS_THIS_DEVICE").ok();
+                if supplied_zone {
+                    env::set_var("BUCKYOS_THIS_DEVICE", serde_json::to_string(&device_doc).unwrap());
+                } else {
+                    env::remove_var("BUCKYOS_THIS_DEVICE");
+                }
+                let result = crate::init_buckyos_api_runtime(
+                    target.appid_claim(),
+                    None,
+                    BuckyOSRuntimeType::AppClient,
+                )
+                .await;
+                crate::tests::restore_env_var(BUCKYOS_APPCLIENT_SESSION_TOKEN_ENV, previous_token);
+                crate::tests::restore_env_var("BUCKYOS_ZONE_CONFIG", previous_zone);
+                crate::tests::restore_env_var("BUCKYOS_THIS_DEVICE", previous_device);
+                result.unwrap()
+            };
+            runtime.node_gateway_port = gateway_port;
+            assert_eq!(runtime.get_auth_target().unwrap(), target);
+            assert!(runtime.get_authenticated_user_id().is_none());
+            assert_eq!(runtime.is_ood(), supplied_zone);
+            assert_eq!(runtime.zone_id.is_valid(), supplied_zone);
+            assert!(runtime.system_config_client.get().is_none());
+
+            let login = tokio::time::timeout(Duration::from_secs(5), runtime.login()).await;
+            crate::tests::restore_env_var(BUCKYOS_HOST_GATEWAY_ENV, previous_gateway);
+            if !matches!(&login, Ok(Ok(()))) {
+                server.abort();
+            }
+            login.unwrap().unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["method"], "sys_config_get");
+            assert_eq!(request["params"]["key"], "boot/config");
+            assert_eq!(request["sys"][1], session_token);
+            assert_eq!(runtime.get_auth_target().unwrap(), target);
+            assert_eq!(runtime.zone_id, zone_doc.id);
+            assert_eq!(runtime.zone_config.as_ref(), Some(&zone_config));
+            assert_eq!(runtime.get_authenticated_user_id().as_deref(), Some("bob"));
+            match &target {
+                AuthTarget::App { .. } => {
+                    assert_eq!(runtime.app_owner_id.as_deref(), Some("alice"));
+                    assert_eq!(runtime.user_id.as_deref(), Some("alice"));
+                    assert_eq!(runtime.app_host_perfix, "notes.example.com-alice");
+                }
+                AuthTarget::System { .. } => assert!(runtime.app_owner_id.is_none()),
+            }
+            assert!(runtime.device_private_key.is_none());
+            assert!(runtime.user_private_key.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn appclient_session_login_without_zone_requires_a_gateway_and_valid_identity() {
+        let _env = RefreshTestEnv::new();
+        let target = AuthTarget::app("notes.example.com@alice".parse().unwrap());
+        let token = appclient_session_token(&target, TokenUse::Session);
+        for (runtime_type, gateway, session_token) in [
+            (BuckyOSRuntimeType::AppClient, None, token.as_str()),
+            (BuckyOSRuntimeType::AppClient, Some(" "), token.as_str()),
+            (BuckyOSRuntimeType::AppClient, Some("127.0.0.1"), ""),
+            (BuckyOSRuntimeType::AppService, Some("127.0.0.1"), token.as_str()),
+        ] {
+            match gateway {
+                Some(host) => env::set_var(BUCKYOS_HOST_GATEWAY_ENV, host),
+                None => env::remove_var(BUCKYOS_HOST_GATEWAY_ENV),
+            }
+            let mut runtime = BuckyOSRuntime::new("notes.example.com", None, runtime_type);
+            *runtime.session_token.write().await = session_token.to_string();
+            let error = runtime.login_once().await.unwrap_err();
+            assert!(error.to_string().contains("Zone id is not valid"), "{error}");
+            assert!(runtime.system_config_client.get().is_none());
+        }
+
+        env::set_var(BUCKYOS_HOST_GATEWAY_ENV, "127.0.0.1");
+        for (app_id, session_token, expected_error) in [
+            ("other.example.com", token, "Session token is not valid"),
+            (
+                "notes.example.com",
+                appclient_session_token(&target, TokenUse::Refresh),
+                "token_use mismatch",
+            ),
+        ] {
+            let mut runtime = BuckyOSRuntime::new(app_id, None, BuckyOSRuntimeType::AppClient);
+            *runtime.session_token.write().await = session_token;
+            let error = runtime.login_once().await.unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert!(runtime.system_config_client.get().is_none());
+            assert!(runtime.get_authenticated_user_id().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn appclient_session_login_rejects_identity_conflicts_and_refresh_tokens() {
+        let target = AuthTarget::app("notes.example.com@alice".parse().unwrap());
+        for (app_id, owner, token_use, expected_error) in [
+            (
+                "other.example.com",
+                None,
+                TokenUse::Session,
+                "Session token is not valid",
+            ),
+            (
+                "notes.example.com",
+                Some("mallory"),
+                TokenUse::Session,
+                "owner_user_id",
+            ),
+            (
+                "notes.example.com",
+                None,
+                TokenUse::Refresh,
+                "token_use mismatch",
+            ),
+        ] {
+            let mut runtime = BuckyOSRuntime::new(
+                app_id,
+                owner.map(str::to_string),
+                BuckyOSRuntimeType::AppClient,
+            );
+            runtime.zone_id = DID::new("web", "review.invalid");
+            *runtime.session_token.write().await = appclient_session_token(&target, token_use);
+            let error = runtime.login().await.unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert!(runtime.system_config_client.get().is_none());
+            assert!(runtime.get_authenticated_user_id().is_none());
+            assert_eq!(runtime.app_owner_id.as_deref(), owner);
+        }
+    }
+
+    #[tokio::test]
+    async fn appclient_session_login_rejects_inconsistent_instance_claims() {
+        let target = AuthTarget::app("notes.example.com@alice".parse().unwrap());
+        let mut token =
+            RPCSessionToken::from_string(&appclient_session_token(&target, TokenUse::Session))
+                .unwrap();
+        token
+            .extra
+            .insert("app_owner_user_id".into(), Value::String("mallory".into()));
+        let mut runtime =
+            BuckyOSRuntime::new("notes.example.com", None, BuckyOSRuntimeType::AppClient);
+        runtime.zone_id = DID::new("web", "review.invalid");
+        *runtime.session_token.write().await = serde_json::to_string(&token).unwrap();
+
+        let error = runtime.login().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("app_owner_user_id and app_instance_id claims do not match"));
+        assert!(runtime.app_owner_id.is_none());
+        assert!(runtime.system_config_client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn appclient_session_login_preserves_bound_target() {
+        for (initial, replacement) in [
+            (
+                AuthTarget::app("notes.example.com@alice".parse().unwrap()),
+                AuthTarget::app("notes.example.com@mallory".parse().unwrap()),
+            ),
+            (
+                AuthTarget::system("control-panel".parse().unwrap()),
+                AuthTarget::app("control-panel@alice".parse().unwrap()),
+            ),
+        ] {
+            let mut runtime =
+                BuckyOSRuntime::new(initial.appid_claim(), None, BuckyOSRuntimeType::AppClient);
+            runtime.resolve_appclient_identity(&initial).unwrap();
+            runtime.zone_id = DID::new("web", "review.invalid");
+            *runtime.session_token.write().await =
+                appclient_session_token(&replacement, TokenUse::Session);
+
+            let error = runtime.login().await.unwrap_err();
+            assert!(error.to_string().contains("does not match runtime target"));
+            assert_eq!(runtime.get_auth_target().unwrap(), initial);
+            assert!(runtime.system_config_client.get().is_none());
+        }
+        let mut runtime = BuckyOSRuntime::new(
+            "control-panel",
+            Some("alice".to_string()),
+            BuckyOSRuntimeType::AppClient,
+        );
+        runtime.zone_id = DID::new("web", "review.invalid");
+        *runtime.session_token.write().await = appclient_session_token(
+            &AuthTarget::system("control-panel".parse().unwrap()),
+            TokenUse::Session,
+        );
+        let error = runtime.login().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match runtime application owner"));
+        assert_eq!(runtime.app_owner_id.as_deref(), Some("alice"));
+        assert!(runtime.system_config_client.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn service_instance_reports_use_canonical_runtime_identity() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (app_id, owner, runtime_type, expected_service_id) in [
+            (
+                "jarvis.buckyos.bns.did",
+                Some("devtest"),
+                BuckyOSRuntimeType::AppService,
+                "jarvis.buckyos.bns.did@devtest",
+            ),
+            (
+                "jarvis.buckyos.bns.did",
+                Some("alice"),
+                BuckyOSRuntimeType::AppService,
+                "jarvis.buckyos.bns.did@alice",
+            ),
+            ("aicc", None, BuckyOSRuntimeType::FrameService, "aicc"),
+            (
+                "scheduler",
+                None,
+                BuckyOSRuntimeType::KernelService,
+                "scheduler",
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/kapi/system_config",
+                listener.local_addr().unwrap()
+            );
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut content_length = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length.unwrap()];
+                stream.read_exact(&mut body).await.unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let response = serde_json::json!({
+                    "sys": [request["sys"][0]],
+                    "result": 0,
+                })
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(), response
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                request
+            });
+            let mut runtime = BuckyOSRuntime::new(app_id, owner.map(str::to_string), runtime_type);
+            runtime.device_config = Some(DeviceDocument::new("ood1", "test-key".to_string()));
+            *runtime.main_service_port.write().await = 10032;
+            assert!(runtime
+                .system_config_client
+                .set(Arc::new(SystemConfigClient::new(Some(&url), None)))
+                .is_ok());
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime.update_service_instance_info(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request["method"], "sys_config_set");
+            assert_eq!(
+                request["params"]["key"],
+                format!("services/{expected_service_id}/instances/ood1")
+            );
+            let report: ServiceInstanceReportInfo =
+                serde_json::from_str(request["params"]["value"].as_str().unwrap()).unwrap();
+            assert_eq!(report.node_id, "ood1");
+            assert_eq!(report.service_ports["www"], 10032);
+            assert!(*runtime.last_update_service_info_time.read().await > 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn app_service_instance_report_requires_owner() {
+        let mut runtime = BuckyOSRuntime::new(
+            "jarvis.buckyos.bns.did",
+            None,
+            BuckyOSRuntimeType::AppService,
+        );
+        runtime.device_config = Some(DeviceDocument::new("ood1", "test-key".to_string()));
+
+        let error = runtime.update_service_instance_info().await.unwrap_err();
+        assert!(error.to_string().contains("owner_user_id is required"));
+        assert!(runtime.system_config_client.get().is_none());
+        assert_eq!(*runtime.last_update_service_info_time.read().await, 0);
+    }
 
     #[test]
     fn device_signed_login_subject_depends_on_runtime_type() {
@@ -2702,6 +4164,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn appclient_service_urls_use_explicit_gateway_or_zone() {
+        let _lock = crate::tests::test_env_lock().lock().unwrap();
+        for (configured_host, expected_host) in [
+            (None, None),
+            (Some(""), None),
+            (Some(" \t "), None),
+            (Some(" 192.0.2.20 "), Some("192.0.2.20")),
+            (Some("localhost"), Some("127.0.0.1")),
+        ] {
+            let previous_gateway = env::var(BUCKYOS_HOST_GATEWAY_ENV).ok();
+            match configured_host {
+                Some(host) => env::set_var(BUCKYOS_HOST_GATEWAY_ENV, host),
+                None => env::remove_var(BUCKYOS_HOST_GATEWAY_ENV),
+            }
+            for device_type in [None, Some("ood"), Some("node")] {
+                for https_only in [false, true] {
+                    for gateway_port in [DEFAULT_NODE_GATEWAY_PORT, 43180] {
+                        let mut runtime = BuckyOSRuntime::new(
+                            "notes.example.com",
+                            Some("alice".to_string()),
+                            BuckyOSRuntimeType::AppClient,
+                        );
+                        runtime.zone_id = DID::new("web", "review.invalid");
+                        runtime.force_https = https_only;
+                        runtime.node_gateway_port = gateway_port;
+                        runtime.device_config = device_type.map(|device_type| {
+                            let mut device_doc =
+                                DeviceDocument::new("node1", "test-key".to_string());
+                            device_doc.device_type = device_type.to_string();
+                            device_doc
+                        });
+                        assert_eq!(
+                            runtime.resolve_local_service_host(),
+                            expected_host.unwrap_or("127.0.0.1")
+                        );
+                        for service_name in ["system_config", "aicc", "verify-hub", NFS_SERVER_SERVICE_NAME] {
+                            let expected_url = match expected_host {
+                                Some(host) => format!(
+                                    "http://{}:{}/kapi/{}",
+                                    host, gateway_port, service_name
+                                ),
+                                None => format!(
+                                    "{}://review.invalid/kapi/{}",
+                                    if https_only { "https" } else { "http" },
+                                    service_name
+                                ),
+                            };
+                            assert_eq!(
+                                runtime
+                                    .get_zone_service_url(service_name, https_only)
+                                    .await
+                                    .unwrap(),
+                                expected_url,
+                                "gateway={configured_host:?}, device={device_type:?}"
+                            );
+                            if service_name == "system_config" {
+                                assert_eq!(runtime.get_system_config_url(), expected_url);
+                            }
+                        }
+                    }
+                }
+            }
+            crate::tests::restore_env_var(BUCKYOS_HOST_GATEWAY_ENV, previous_gateway);
+        }
+    }
+
+    #[test]
+    fn service_runtime_system_config_routes_are_unchanged() {
+        let _lock = crate::tests::test_env_lock().lock().unwrap();
+        let previous_gateway = crate::tests::set_env_var(BUCKYOS_HOST_GATEWAY_ENV, "192.0.2.20");
+        for runtime_type in [
+            BuckyOSRuntimeType::AppService,
+            BuckyOSRuntimeType::FrameService,
+            BuckyOSRuntimeType::Kernel,
+            BuckyOSRuntimeType::KernelService,
+        ] {
+            for device_type in ["ood", "node"] {
+                let mut runtime = BuckyOSRuntime::new("demo", None, runtime_type.clone());
+                let mut device_doc = DeviceDocument::new("node1", "test-key".to_string());
+                device_doc.device_type = device_type.to_string();
+                runtime.device_config = Some(device_doc);
+                let expected_url = match runtime_type {
+                    BuckyOSRuntimeType::AppService | BuckyOSRuntimeType::FrameService => {
+                        "http://192.0.2.20:3180/kapi/system_config"
+                    }
+                    _ if device_type == "ood" => "http://127.0.0.1:3200/kapi/system_config",
+                    _ => "http://127.0.0.1:3180/kapi/system_config",
+                };
+                assert_eq!(runtime.get_system_config_url(), expected_url);
+            }
+        }
+        crate::tests::restore_env_var(BUCKYOS_HOST_GATEWAY_ENV, previous_gateway);
+    }
+
+    #[test]
+    fn app_service_uses_node_gateway_for_verify_hub_before_zone_bootstrap() {
+        let app = BuckyOSRuntime::new(
+            "jarvis.buckyos.bns.did",
+            Some("devtest".to_string()),
+            BuckyOSRuntimeType::AppService,
+        );
+        let expected_url = format!(
+            "http://{}:{}/kapi/verify-hub",
+            app.resolve_local_service_host(),
+            DEFAULT_NODE_GATEWAY_PORT
+        );
+        assert_eq!(
+            app.verify_hub_bootstrap_url().as_deref(),
+            Some(expected_url.as_str())
+        );
+
+        let kernel = BuckyOSRuntime::new("node-daemon", None, BuckyOSRuntimeType::Kernel);
+        assert_eq!(kernel.verify_hub_bootstrap_url(), None);
+    }
+
     #[test]
     fn kevent_daemon_endpoint_prefers_explicit_deployment_value() {
         assert_eq!(
@@ -2714,3 +4292,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "named_store_tests.rs"]
+mod named_store_tests;

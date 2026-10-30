@@ -1,0 +1,149 @@
+# AICC acceptance tests
+
+本目录实现 T1/T1.5/T2 的验收基础设施。分层边界如下：
+
+- T1 只验证路由、调度、fallback、任务与系统行为，使用通用确定性 Mock，不把 Provider 专属 wire 字段作为通过证据。
+- T1.5 经 Zone Gateway 调用真实 AICC typed method 和 Protocol Adapter，再连接按 Provider 官方资料独立实现的高保真 Mock；它验证请求、正常响应、streaming、异步状态和官方错误，不验证推理语义。
+- T2 对每个获准 Provider instance 的全部 active 基础物理模型生成 `ProviderInstance × model × API-Type` 矩阵，每个单元只运行一个最小正确性请求。metadata variant、输入排列、资源表示、文档格式和错误注入不生成 T2 单元。
+
+T2 的模型库存基准来自 Runner 直接调用 `provider_capability_baseline.json` 配置的 Provider 官方目录接口。Provider 没有可用的 API Key 目录、但有明确且当前有效的官方模型文档时，baseline 可使用 `format = frozen` 的固定模型清单，并必须记录 `checked_at` 和未实时确认的 `risk`；Runner 不会在目录失败时自动回退到冻结清单。Runner 先取得这份独立官方库存，再确定本轮每个 Provider instance，对每个选中 instance 调用 `provider.refresh_models` 直到首次成功，之后读取刷新后的 AICC `models.list` 参与双向 diff。不同 Provider 并行刷新；单个 Provider 串行有限重试并指数退避，间隔不小于该 Provider 的 `min_interval_ms`，首次成功后本轮不再主动刷新。最大尝试次数和基础间隔由 `runner.inventory_refresh_max_attempts`、`runner.inventory_refresh_retry_delay_ms` 配置；最终失败会在执行 case 前终止。官方目录抓取失败或为空时不会回退到 AICC inventory。目录请求默认复用本地 TOML 的 Provider 凭据，也可用 `official_catalog_credentials.<provider>.api_token`（或 `AICC_<PROVIDER>_CATALOG_TOKEN`）单独覆盖，凭据不会写入报告；SN 当前目录同时接受 Provider API Key 与 SSO session token；使用 API Key 时复用本地 TOML 的 Provider 凭据即可，需要独立目录身份时再配置覆盖。`provider_credentials.apply_to_aicc_settings` 只控制 Provider API token 是否同时临时注入 AICC，不影响目录认证。
+
+这组测试对应 `doc/aicc/aicc_e2e_test_requirements.md`：
+
+- `preflight.ts`：从规范文档校验 24 个 canonical API，并检查静态 T1 case、T1.5 官方协议契约、Provider 能力基线和 fixture 完整性；不读取 AICC 实现代码或实现 metadata。
+- `mock_provider.ts`：T1 使用的通用确定性 Mock。
+- `mock_provider_contract.ts`：T1 Mock 的版本化 scenario 与管理接口契约；Mock 实现直接消费该契约，preflight 检查其完整性。
+- `provider_protocol_contracts.json`：T1.5 独立协议契约、官方证据 revision、测试用 Provider Profile/模型映射、请求字段类型、正常响应、异步 lifecycle、Provider 专属错误 fixture，以及同一 session `<source provider, source model> x <target provider, target model>` 切换矩阵。Runner 不按模型名或厂商名选择协议分支。
+- `t15_mock_provider.ts`：T1.5 高保真 Mock；按所选官方契约严格校验 method、path、认证、content type、必需字段、字段类型、未知字段、provider_state namespace、tool call/result 关系和 streaming/async 事件顺序，并独立记录 submit、poll、result、cancel wire，然后返回对应 Provider 的正常、stream、异步或错误响应。
+- `run_t15_gateway.ts`：临时注册目标 Provider instance，用精确模型固定 adapter，经 Gateway 执行 T1.5 并审计 Mock capture；每个运行时可独立调用的 variant 形成独立协议单元，并执行同一对话内跨 Provider/model 切换矩阵。
+- `cloud_update_fixture_service.ts`：启动独立 `cyfs-gateway` `cyfs-dir` NDN 服务，以 process chain 将协议路径绑定到 Named Object，并为 T1/T1.5 发布 index、manifest、catalog 与 tombstone。
+- `run_gateway.ts`：经 Zone Gateway 登录真实 AICC；默认只生成 T2 计划，只有显式允许时才调用真实 Provider。
+- `provider_capability_baseline.json`：按 Provider 参数化的版本化能力证据基线。
+- `logical_entrypoint_baseline.json`：依据冻结逻辑目录契约独立维护的公开逻辑入口基线，显式记录 canonical API type 的默认入口和每个入口声明的 API type；不从 AICC metadata、运行时 inventory 或路径前缀推导。
+- `route_exposure_contracts.json`：独立于 AICC metadata 的路由暴露契约。它逐一登记能力基线中的 Provider Profile 和 Model Rule，并把每个 API type 分类为 `logical_routable`、`exact_only`、`excluded` 或 `not_applicable`；缺少分类、未知规则、无理由例外和跨 API logical entrypoint 都会使 preflight 失败。
+
+Preflight 的路由覆盖粒度是 `Provider Profile × Model Rule × API type × Exposure Mode`，而不是“某个 API 在任意 Provider 出现过一次”。契约用 `capability_cells_sha256` 冻结完整 cell 集合，并用 `logical_entrypoint_baseline_revision` 绑定独立逻辑入口基线。`logical_routable` 的 profile 默认值通过 `logical_entrypoint_ref=api_type_default` 引用配置基线，真实例外仍显式写入具体路径；不再允许 `{api_type}` 字符串模板。Preflight 按基线中的 `path -> api_type` 关系做语义校验，T1 再与 `models.list.logical_definitions` 独立对比并验证入口闭环。`exact_only` 必须在契约中显式覆盖并给出原因，运行时按 logical definition 声明的 API type 确认模型没有同 API 的 logical mount；不能因为 metadata 缺少 mount 而自动推断为 exact-only。
+
+WP-01 至 WP-17 的模块单测入口与验收职责保持如下映射；T1/T1.5 只覆盖跨模块集成，不替代这些入口：
+
+| 工作包 | 模块单测入口 | 覆盖边界 |
+|---|---|---|
+| WP-01 | `cd src && cargo test -p buckyos-api`；`cargo test -p buckyos-api --test aicc_client_test` | Rust canonical DTO、Client/Handler dispatch、序列化与稳定错误映射 |
+| WP-01TS | WebSDK 上游的 canonical AICC 测试；本仓依赖 `buckyos/buckyos-websdk` 的 `main` 分支 | TypeScript method/DTO/export 与 Rust contract 对齐；本仓不复制 WebSDK 源码 |
+| WP-02 | `cd src && cargo test -p aicc matching` | MatchRule 编译、字段约束、组合与脱敏 trace |
+| WP-03 | `cd src && cargo test -p aicc catalog` | catalog 加载、编译、revision、冲突和 snapshot |
+| WP-04 | `cd src && cargo test -p aicc model` | model registry、logical directory、variant 与能力交集 |
+| WP-05 | `cd src && cargo test -p aicc protocol` | adapter registry、transport、codec limit 与错误边界 |
+| WP-06 | `cd src && cargo test -p aicc protocol` | OpenAI Responses、Claude Messages、Gemini Interactions、OpenAI Chat codec |
+| WP-07 | `cd src && cargo test -p aicc provider` | Provider core、discovery、inventory、LKGS 与 refresh/stop |
+| WP-08 | `cd src && cargo test -p aicc provider::builtin` | 11 家内置 Provider、SN、dialect 和 metadata 装配 |
+| WP-09 | `cd src && cargo test -p aicc admission`；`cargo test -p aicc routing` | quota、budget、privacy、trust 与 fail-closed policy |
+| WP-10 | `cd src && cargo test -p aicc routing`；`cargo test -p aicc scheduler` | deterministic routing、并发/间隔、公平性、fallback 与 trace |
+| WP-11 | `cd src && cargo test -p aicc call` | operation 选择、variant lowering、set/remove 和资源要求 |
+| WP-12 | `cd src && cargo test -p aicc execution` | immediate/stream/native task、cancel、幂等、恢复、竞态与 usage completion |
+| WP-13 | `cd src && cargo test -p aicc resource` | ResourceRef、权限、MIME、大小、压缩包安全、上传与 artifact |
+| WP-14 | `cd src && cargo test -p aicc storage`；`cargo test -p aicc usage` | 原子存储、去重、retention、usage/finance、trace 关联与脱敏 |
+| WP-15 | `cd src && cargo test -p aicc runtime`；`cargo test -p aicc metadata` | RuntimeSnapshot 原子发布、settings/metadata seq 收敛和失败保留 |
+| WP-16 | `cd src && cargo test -p aicc service`；`cargo test -p buckyos-api` | service 装配、管理 API、RBAC、reload/CAS 与 Client 映射 |
+| WP-17A | `cd src/frame/desktop && pnpm run check && pnpm run test:e2e` | AI Center DataModel、Provider Wizard、财务展示与交互 |
+| WP-17B | `cd src && cargo test -p workflow` | Workflow typed AICC adapter、任务进度与错误传播 |
+| WP-17C | `cd src && cargo test -p llm_context -p agent_tool -p opendan`；`cd src/tools/buckyos-agent && deno test --allow-read lib/aicc_test.ts` | OpenDAN/Jarvis/CLI canonical typed/helper 调用与 TaskMgr 轮询 |
+| WP-17D | `cd src && cargo test -p scheduler -p buckyos-api -p aicc` | rootfs/dev settings、首装/重装、locked credential、RBAC 与 reload |
+
+能力基线 schema v3 分别记录 `provider_driver`（公共 RPC 与报告分组）、
+`provider_profile_id`、`protocol_adapter_ids` 和 `model_driver_ids`。preflight 会独立校验
+canonical api_type 值域、typed method 值域及其显式关联，并检查能力基线与 T1.5
+协议契约中的 Profile/Adapter 身份一致；这些身份不会回退成 settings 中的
+`provider_driver`。
+
+T1.5 的 `official_variant_rules` 独立记录官方模型、variant 与预期下发参数。
+运行时 metadata 展开的每个 variant 都是独立协议单元；缺少官方期望、缺失或多出
+variant、没有对应 API contract、实际 wire 参数不一致都会使测试失败。
+T1.5 还必须覆盖同一 session 内 `<source provider, source model> x <target provider, target model>` 切换矩阵，用第一轮 source 产生可回放历史，再强制第二轮 target 调用，验证旧 provider_state 按目标 Provider 降级策略处理且 target Mock 严格协议校验通过。当前 runner 对 OpenAI、OpenRouter、Claude 和 Gemini 的 LLM 历史回放单元派生跨 Provider switch case；执行时会保留参与矩阵的临时 Provider instance，同时采集 source 与 target 两轮 mock wire audit。
+同 Provider 的原生历史由专项 cell 验证：OpenAI 与 OpenRouter 的 `native-history` 先消费 Mock 第一轮响应中的 typed assistant message，再把该 message 送入第二轮调用，断言完整 Responses output item 无损回放；Gemini `tool-history` 严格关联 `function_call` / `function_result` 的 `call_id`、函数名和顶层顺序；Claude `structured-output` 验证 canonical JSON Schema lowering。
+T1.5 对所有会产生 artifact 的 Provider success 单元派生 `task-result-artifact` 回归用例，覆盖 Gemini、OpenAI、Fal、MiniMax 等 Provider 的图片、音频、视频和视觉 artifact 输出。该用例必须经 TaskMgr 读取最终 task result，断言任务进入成功终态、result 中没有 inline `base64` 资源残留，并保留 `named_object` 或 URL 等稳定 artifact 引用。
+本轮线上暴露过的中文 tag/topic、Gemini 3 旧 `thinking_budget` 参数和媒体 inline base64 提交 TaskMgr 失败，都必须作为 T1.5 覆盖不足的回归信号写入 manifest 或派生矩阵。
+
+```bash
+cd test/aicc_test
+pnpm run acceptance:preflight
+deno check acceptance/*.ts
+pnpm run acceptance:self-test
+cp aicc_acceptance.example.toml aicc_acceptance.local.toml
+pnpm run acceptance:t1 -- --config aicc_acceptance.local.toml --allow-config-mutation
+pnpm run acceptance:t1.5-mock-provider -- --port 18081
+AICC_T15_ALLOW_CONFIG_MUTATION=true pnpm run acceptance:t1.5 -- \
+  --gateway-url https://test.buckyos.io \
+  --mock-base-url http://aicc-reachable-host:18081 \
+  --mock-control-url http://127.0.0.1:18081 \
+  --public-named-object-base-url https://test.buckyos.io/ndn \
+  --provider openai \
+  --allow-config-mutation
+pnpm run acceptance:gateway -- --config aicc_acceptance.local.toml
+```
+
+T1.5 可以用 `--start-local-mock` 启动本机 Mock；只有 AICC 服务也能访问 runner loopback 时才可将其作为 Provider endpoint。`UrlOnly` 输入用例需要通过 `--public-named-object-base-url` 显式传入 Provider 可访问的 Zone HTTPS Named Object 入口；runner 会临时写入该配置并在结束时原样恢复。所有返回 URL artifact 的 success fixture 都使用独立 artifact origin，runner 必须通过 `/kapi/aicc/artifact/open` 下载并验证非空内容，同时 Mock 会拒绝泄漏到跨域下载请求中的 Provider Authorization。独立 artifact origin 默认监听 Provider Mock 端口的下一个端口，单独启动 Mock 时可用 `--artifact-port` 覆盖。配置变更需要环境变量 `AICC_T15_ALLOW_CONFIG_MUTATION=true` 与命令行 `--allow-config-mutation` 同时授权。Runner 创建带 `run_id` 的临时 Provider instance，并在正常结束或异常退出时调用 `provider.delete`，等待运行时 inventory 中该实例消失，再重置 Mock。它顺序执行单元，固定全局和 Provider 并发为 1，并用 `--provider-min-interval-ms` 控制同 Provider 请求间隔。按 Provider 回归使用 `--provider <driver>`；目标重测可以重复传 `--case <case_id>`，未知或超出 Provider 范围的 case 会使执行失败。
+
+T1 的 `t1.config.cloud_update_dynamic_catalog` 通过 NDN 连续发布两个完整 cloud revision：修改已有 Model Driver 的逻辑挂载、删除并恢复已有模型项，并动态增加 Provider Rules 和 Known Provider 文件；断言 cache 原子提交、全局 metadata sequence 收敛、动态 Provider 路由和真实 Mock 访问。T1.5 的 `t1.5.openai.openai.responses.v1.llm.cloud-update` 覆盖云端 Provider Rules 更新，并从真实 Adapter 的捕获请求确认 `service_tier` 已生效。两者都在结束时发布更高 revision 的 tombstone、禁用更新并恢复原始 system-config。
+
+NDN fixture 默认使用 `/opt/buckyos`；临时 devtest root 可通过 `AICC_NDN_GATEWAY_BINARY`、`AICC_NDN_NAMED_STORE_CONFIG`、`AICC_NDN_GATEWAY_CONTROL_URL`、`AICC_NDN_SYSTEM_ROOT` 和 `AICC_CLOUD_CACHE_ROOT` 覆盖。T1 也可在 TOML `[fixtures]` 中配置对应的小写字段。fixture 使用当前 cyfs-gateway 文档定义的 `cyfs-dir` process chain 语义路径绑定，因此运行环境的 gateway binary 必须包含该契约。
+
+T1.5 与其它层共用 `schema_version=1` 的 acceptance report，输出到 `<report-dir>/<run-id>/`，包含 `summary.json`、Markdown 摘要、逐 case evidence 和零费用 finance 文件；即使初始化失败，也会记录 runner failure、未执行 manifest 单元和 cleanup 结果。
+
+T1.5 契约的 endpoint、header、body、response、stream event、异步状态和错误形态只允许依据 Provider 官方 API 文档、官方 schema/SDK 协议定义和官方错误文档更新。AICC 设计文档只用于确定 typed method、adapter/operation 边界、稳定错误码和 Provider instance 配置，不用于生成 Provider wire 期望。官方资料不明确的协议点不得从 AICC 实现、metadata、日志或旧 Mock 猜测。成功用例同时检查 Provider 响应被映射成对应 canonical typed 输出、usage 和异步 operation 归因；错误用例检查 `provider_start_failed`、Provider 原始错误码摘要和 canonical `retriable`。
+
+真实调用必须通过 `allow_real_model_calls = true` 或命令行 `--allow-real-model-calls` 显式开启，并受调用数、成本和 timeout 上限约束。需要安全审计计划时，`--no-real-model-calls` 可强制覆盖 TOML 中的开启值，仍读取真实 inventory、生成完整 skipped/N/A/基线差异与零成本报告。Provider 返回 `request not allowed` 时记录为 `provider_restricted` 和 `platform_limitation`，不计入 passed、failed 或 skipped。报告会把能力基线不一致、路由/资源/安全断言失败和成功调用后的 usage/trace 归因失败写入结构化 `product_defects`，记录预期、实际结果和证据路径；测试不会修改 AICC/Jarvis 实现。
+
+Runner 会并行执行不同 case/session。`global_concurrency` 控制整轮并发，`provider_concurrency` 和 `provider_min_interval_ms` 是默认 Provider 限制；可通过 `[limits.<provider_driver>]` 单独覆盖。每次 retry 也重新经过同一 Provider 的并发和请求间隔门禁，不会绕过限流。
+
+每轮会生成独立的 `finance.json`、`finance.csv` 和 `finance.md`。账本按 case/attempt 记录 token、request unit、调用前估算和 AICC 返回的 USD cost，并按 Provider、instance、精确模型、API、case 汇总。Provider 未返回费用时会计入“未知费用的估算敞口”，不会记成零成本；并发调用在发出前会先预留预算。
+
+开启真实模型调用后，runner 会先输出 case、最大调用次数和预计成本，再进入 10 秒确认倒计时；输入 `c` 取消，直接回车立即开始，超时视为确认。已经获得人工授权的自动化运行可传 `--yes` 跳过倒计时。`--yes` 只是 runner 的非交互开关，不代表 CodeAgent 已获得运行 T2/T3 的人工授权。
+
+T1 会临时写入带 `run_id` 的 Mock Provider instance，并在 `finally` 中原样恢复整个 `services/aicc/settings`。为避免误改环境，配置文件的 `mock.allow_config_mutation` 与命令行 `--allow-config-mutation` 必须同时开启。AICC 与 Mock 不在同一主机时，`mock.base_url` 必须填写 AICC 服务进程可访问的地址，不能使用 runner 自己的 loopback。
+
+第二租户隔离用例通过 `[auth].other_tenant_session_token` 或 `BUCKYOS_TEST_OTHER_TENANT_SESSION_TOKEN` 参数化，覆盖 task 查询/取消、usage、msg-center 消息、Named Object 和管理方法 RBAC。未配置时这些 case 保留在 manifest 和覆盖报告中并明确记为 `skipped`，不会伪造同租户结果或阻断其他 T1 用例。
+
+T2 会为 OpenAI、Claude、Google Gemini、Fal、MiniMax、OpenRouter、Kimi、GLM、DeepSeek、Doubao、Qwen、TypeSafe 和 SN 生成全部 active 基础物理模型的最小 `ProviderInstance × model × API-Type` 矩阵；是否实际执行由 `--provider`、凭据和真实调用开关共同决定。可用报告中的 `targeted_retest_command`，或重复传入 `--case <case_id>`，只重跑失败单元。没有账号或明确禁止执行的 Provider 仍保留基线和用例，但不应开启真实调用。
+
+普通 `chat.completions.create` 用例显式关闭 AICC 默认附加的 `web_search`，避免把基础聊天错误地限定为必须支持联网搜索；联网搜索作为独立 capability 分支验证。Provider 凭据临时写入后，runner 会等待 system-config 与 AICC runtime settings 收敛，再验证 settings 字节恢复、运行时 inventory、Named Data 和消息资源清理。
+
+T2 在提供用户名和密码时会提前续期 Gateway 登录，并在服务明确返回 token 过期时重新登录后重发同一请求，保留原 idempotency key；Provider 协议或推理错误不会触发此重发。RPC、任务查询和 NDN 下载使用同一份更新后的登录凭据。仅提供 session token 时无法自动重新登录，应确保其有效期覆盖整轮测试。计划调用数和费用包含按模型/源 API 去重的生成物前置调用。
+
+`agent.computer_use` 使用 `generate_fixtures.py` 生成的 1280×720 截图，其中只有一个蓝色按钮；请求要求单次左键点击，断言坐标位于按钮范围内且需要下一次观察。截图与 viewport 一致，不要求模型输出固定中心像素。该用例依据 [OpenAI computer-use 官方流程](https://developers.openai.com/api/docs/guides/tools-computer-use)：允许协议先请求截图，AICC 最多使用当前输入 observation 完成一次无副作用握手，业务动作白名单不放宽，也不在真实桌面执行点击。调用预算为每个 computer-use 单元最多两次上游请求，费用估算亦按两次预留；AICC usage.request_units 记录实际轮数。
+
+已确认的外部协议缺口可用 `--skip-case '完整case_id=证据与原因'` 显式登记；只能跳过本轮选定的单元，报告保留 `platform_limitation`、零调用和原因，不计为通过。SN 的 Responses 生图和 GPT OCR 使用独立的 `responses.background` NativeTask operation；不支持异步提交或查询时不回退同步协议。背景任务的 T1.5 依据 [Responses background 官方协议](https://developers.openai.com/api/docs/guides/background) 验证提交、查询、结果、取消、失败、超时和过期响应。
+
+需要人工语义复核时，传入 `--capture-artifacts` 将已下载并通过结构校验的制品保存到本轮报告目录的 `artifacts/`，避免远端清理后失去复核依据；不会新增模型调用。该目录只保留本地证据，不能提交 Git，逐 case audit 的 `metadata.local_review_file` 记录本地路径。
+
+进程中断且尚未生成 `summary.md` 时，可用相同配置、目标及预算加 `--resume-run <run-id>` 恢复。必须保留该轮目录；Runner 复用原幂等键、原任务和用量审计时间窗，由 AICC 的请求指纹拒绝内容不一致的重放，不覆盖已有完整报告。调用计数含恢复时的幂等 RPC 重放，不能直接当成新增上游推理次数；新增任务及实际上游请求应通过 TaskMgr 和用量证据核对。恢复不会把 SN 异步缺口改为同步调用。
+
+恢复时先按当前 owner 和原幂等键核对 TaskMgr。已成功任务仅进行幂等回读，不占真实 Provider 的启动间隔；未完成或未创建的任务仍经过完整调度门禁。图生图等前置生成的结果复用只接受带 `kind` 和对应地址字段的 canonical `ResourceRef`，不把 `materialized_artifacts` 中的 `{obj_id, mime}` 清单项当作输入引用。T1.5 与 T2 共用此引用选择规则。
+
+TypeSafe 的 T1.5 依据官方 System One 文档，固定混合 choice/score/noul fixture 在 `fixtures/typesafe-systemone.json`。T2 的 decision cell 先携带题型/容量要求调用 `route.resolve`，再向所选 exact model 发一批三题，验证完整概率、已知标记、优先级和 usage。`--provider typesafe` 只执行当前有限 Jev 物理模型集合；线上调用仍需已配置实例、凭据与明确授权。
+
+OpenRouter Decisions 的独立 wire/catalog/schema fixture 在 `fixtures/openrouter-*`，
+证据为 2026-09-25 官方 OpenAPI、教程与完整模型目录。T1.5 使用
+`openrouter.decisions.alpha`（`decisions.create`、`/api/alpha/decisions`），同实例仍覆盖
+Responses、embedding、rerank。T2 官方抓取校验 Jev dated build 与 alias target；
+`typesafe/jev-1.13` 和 `~typesafe/jev-latest` 合并为一个物理调用，未知 Jev 身份及
+`jev-router` 不进入 decision 验收范围。目录核验与 mock 通过不代表真实推理通过。
+
+一次 Jev 混合 smoke 使用专用受限验收入口（无 judge、无重试）：
+
+```bash
+node --experimental-strip-types acceptance/run_openrouter_decision_smoke.ts --config aicc_acceptance.local.toml
+node --experimental-strip-types acceptance/run_openrouter_decision_smoke.ts --config aicc_acceptance.local.toml --execute --allow-config-mutation
+```
+
+第一条只刷新、预览和解析路由；第二条须遵守 E2E skill 的本次 T2 授权，最多一次
+Provider attempt、60 秒、USD 0.01。它临时将已有实例的 timeout 设为 60 秒，并锁定
+实例、预算、禁止 fallback/failover；结束通过既有 settings transaction 恢复。
+凭据读取忽略的 TOML `[auth]`，结果写入忽略的 `reports/openrouter-jev-smoke.json`。
+DV 自签名证书需按本地测试证书配置运行环境，不改变生产 HTTP transport。
+
+SN 真实测试需要区分账户权限：OpenAI 模型使用设备身份动态登录的 `sn-ai-provider-main`；受限测试 key 使用独立实例。不得把测试 key 注入动态登录实例。两类凭据分别读取各自的官方模型目录并形成 T2 矩阵；动态登录实例的目录 token 只用于目录校验，真实推理由 AICC 自行登录。
+
+Native task 的 TaskMgr 暂时进度上报失败由执行器保持原远端任务继续轮询，不能重新提交模型任务；故障注入单测覆盖可重试及不可重试路径。
+
+定向验证某个物理模型的所有预设时，可用 `--model <provider-model-id>` 隔离库存；它要求同时指定一个 `--provider` 和明确的 `--case`。Runner 保留选中模型的官方预设契约，并通过临时实例规则排除其他模型，防止其他模型掩盖缺口或阻塞无关的定向回归。未知模型和未知 case 仍会失败。默认参数用途的网关回归以 `server_default_mode` 标记，验证高级配置回读、模型/预设发现、基础模型准入和最终请求不注入思考档位。

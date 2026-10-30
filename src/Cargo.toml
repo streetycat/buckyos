@@ -8,6 +8,9 @@ members = [
     "./kernel/sys_config_service",
     "./kernel/verify_hub",
     "./kernel/node_daemon",
+    "./kernel/node_executor",
+    "./kernel/computer_driver",
+    "./kernel/buckyos_agent_daemon",
     "./kernel/scheduler",
     "./kernel/task_manager",
     "./kernel/workflow",
@@ -16,9 +19,10 @@ members = [
     "./kernel/slog", 
     "./kernel/slog_daemon",
 
-    "./frame/slog_server", 
+    "./frame/slog_server",
     "./frame/repo_service",
     "./frame/smb_service",
+    "./frame/nfs_server",
     "./frame/aicc",
     "./frame/msg_center",
     "./frame/control_panel",
@@ -27,12 +31,18 @@ members = [
     "./frame/agent_tool_cli_dev",
     "./frame/llm_context",
     "./frame/opendan",
+    "./frame/lib_opendan",
+    "./frame/aiworkspace/core",
+    "./frame/aiworkspace/store",
+    "./frame/aiworkspace/server",
+    "./frame/aiworkspace/wasm",
+    "./frame/homestation",
 
-    "./tools/buckycli", 
     "./test/test_rbac"
 ]
 
 exclude = [
+    "./frame/opendan_legacy",
     "./tools/ns-tool",
     "./apps/tray-controller"
 ]
@@ -52,6 +62,8 @@ buckyos-http-server = { git = "https://github.com/buckyos/buckyos-base.git", pac
 
 ndn-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-lib", branch = "main" }
 named_store = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "named_store", branch = "main" }
+bucket_store = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "bucket_store", branch = "main" }
+s3_gateway = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "s3_gateway", branch = "main" }
 ndn-toolkit = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "ndn-toolkit", branch = "main" }
 package-lib = { git = "https://github.com/buckyos/cyfs-ndn.git", package = "package-lib", branch = "main" }
 
@@ -133,7 +145,6 @@ zip = "2.2.0"
 # Other
 upon = "0.10.0"
 async-recursion = "1.1.1"
-rustyline = "11.0.0"
 flate2 = "1.1.8"
 tar = "0.4.44"
 bincode = { version = "2", features = ["serde"] }
@@ -152,4 +163,4 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 debug = 0
-incremental = true
+incremental = false

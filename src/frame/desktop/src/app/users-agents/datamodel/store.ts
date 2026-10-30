@@ -5,14 +5,49 @@ import type {
   LocalUserEntity,
   SelfEntity,
   SocialAccount,
+  UserGroupsInfo,
   UsersAgentsSnapshot,
 } from './types'
 import {
   createEmptyUsersAgentsSnapshot,
   createMockUsersAgentsSnapshot,
+  fetchMockUsersAgentsSnapshot,
   fetchUsersAgentsSnapshot,
 } from './api'
+import { toAgentEntity, toSelfEntity, toSocialAccounts } from './transforms'
+import {
+  changeUserType,
+  createUserGroup,
+  deleteAgent,
+  deleteUser,
+  deleteUserGroup,
+  fetchUserDetail,
+  removeUserMsgTunnel,
+  resetContactProjections,
+  setContactProjections,
+  setUserAccountOptions,
+  setUserGroupMembers,
+  setUserMsgTunnel,
+  setUserProfile,
+  updateAgent,
+  updateUserGroup,
+} from '../../../api/user_mgr'
+import type { RpcCallOptions } from '../../../api/rpc'
+import type { AssignableUserType, ContactProjectionRule } from '../../../api/user_type'
 import { isMockRuntime } from '../../../runtime'
+import { notifyAgentsChanged, notifyOwnProfileChanged } from '../../agent-setup/events'
+
+const SELF_INFO_FIELDS: Record<string, keyof Parameters<typeof setUserProfile>[0]> = {
+  displayName: 'displayName',
+  title: 'title',
+  bio: 'bio',
+  location: 'location',
+  organization: 'organization',
+  website: 'website',
+  email: 'email',
+  phone: 'phone',
+}
+
 
 export interface UsersAgentsStoreOptions {
   useMock?: boolean
@@ -32,13 +67,16 @@ export class UsersAgentsStore {
   private readonly useMock: boolean
 
   private self: SelfEntity
-  private agent: AgentEntity
   private agents: AgentEntity[]
   private localUsers: LocalUserEntity[]
   private entityGroups: EntityGroupEntity[]
+  private canCreateAgents: boolean
+  private viewerIsAdmin: boolean
+  private userGroups: UserGroupsInfo | null
 
   private snapshot: UsersAgentsSnapshot
   private listeners = new Set<() => void>()
+  private reloadSeq = 0
 
   constructor(options: UsersAgentsStoreOptions = {}) {
     this.useMock = options.useMock ?? defaultUseMock()
@@ -46,17 +84,17 @@ export class UsersAgentsStore {
       ? createMockUsersAgentsSnapshot()
       : createEmptyUsersAgentsSnapshot()
     this.self = initial.self
-    this.agent = initial.agent
     this.agents = initial.agents
     this.localUsers = initial.localUsers
     this.entityGroups = initial.entityGroups
+    this.canCreateAgents = initial.canCreateAgents
+    this.viewerIsAdmin = initial.viewerIsAdmin
+    this.userGroups = initial.userGroups
     this.snapshot = this.buildSnapshot()
 
-    if (!this.useMock) {
-      void this.reload().catch((error) => {
-        console.warn('Failed to load users-agents datamodel from backend.', error)
-      })
-    }
+    void this.reload().catch((error) => {
+      console.warn('Failed to load users-agents datamodel.', error)
+    })
   }
 
   subscribe = (listener: () => void) => {
@@ -67,25 +105,24 @@ export class UsersAgentsStore {
   getSnapshot = (): UsersAgentsSnapshot => this.snapshot
 
   async reload(): Promise<UsersAgentsSnapshot> {
-    if (this.useMock) {
-      const snapshot = createMockUsersAgentsSnapshot()
+    const seq = ++this.reloadSeq
+    const snapshot = this.useMock ? await fetchMockUsersAgentsSnapshot() : await fetchUsersAgentsSnapshot()
+    // A newer reload has started meanwhile; keep its result instead of this stale one.
+    if (seq === this.reloadSeq) {
       this.applySnapshot(snapshot)
       this.notify()
-      return snapshot
     }
-
-    const snapshot = await fetchUsersAgentsSnapshot()
-    this.applySnapshot(snapshot)
-    this.notify()
     return snapshot
   }
 
   private applySnapshot(snapshot: UsersAgentsSnapshot) {
     this.self = snapshot.self
-    this.agent = snapshot.agent
     this.agents = snapshot.agents
     this.localUsers = snapshot.localUsers
     this.entityGroups = snapshot.entityGroups
+    this.canCreateAgents = snapshot.canCreateAgents
+    this.viewerIsAdmin = snapshot.viewerIsAdmin
+    this.userGroups = snapshot.userGroups
   }
 
   private notify() {
@@ -96,10 +133,12 @@ export class UsersAgentsStore {
   private buildSnapshot(): UsersAgentsSnapshot {
     return {
       self: this.self,
-      agent: this.agent,
       agents: this.agents,
       localUsers: this.localUsers,
       entityGroups: this.entityGroups,
+      canCreateAgents: this.canCreateAgents,
+      viewerIsAdmin: this.viewerIsAdmin,
+      userGroups: this.userGroups,
     }
   }
 
@@ -113,71 +152,147 @@ export class UsersAgentsStore {
     )
   }
 
-  removeLocalUser(id: string) {
-    this.localUsers = this.localUsers.filter((user) => user.id !== id)
-    this.notify()
+  removeLocalUser(id: string, options: RpcCallOptions = {}) {
+    return deleteUser(id, options)
   }
 
-  updateSelfAvatar(avatarUrl?: string) {
-    this.self = { ...this.self, avatarUrl }
-    this.notify()
+  // ── The signed-in user's own profile (`user.profile.set`, then read back) ──
+
+  /** `null` removes the local avatar so the DID document's one, if any, shows again. */
+  updateSelfAvatar(avatar: string | null): Promise<unknown> {
+    return this.saveSelfProfile({ avatar })
   }
 
-  updateSelfBio(bio: string) {
-    this.self = {
-      ...this.self,
-      bio,
-      info: {
-        ...this.self.info,
-        bio,
-      },
+  updateSelfBio(bio: string): Promise<unknown> {
+    return this.saveSelfProfile({ bio: bio.trim() || null })
+  }
+
+  /** Saves one of SELF_EDITABLE_INFO_KEYS; an empty value clears it. */
+  updateSelfInfo(key: string, value: string): Promise<unknown> {
+    const field = SELF_INFO_FIELDS[key]
+    if (!field) return Promise.resolve(new Error(`${key} cannot be edited`))
+    return this.saveSelfProfile({ [field]: value.trim() || null })
+  }
+
+  /** Resolves with an error, or null once the saved profile has been read back and shown. */
+  private async saveSelfProfile(patch: Parameters<typeof setUserProfile>[0]): Promise<unknown> {
+    const { data, error } = await setUserProfile(patch)
+    if (!data) return error ?? new Error('user.profile.set failed')
+    const { data: detail } = await fetchUserDetail(this.self.id === 'self' ? {} : { userId: this.self.id })
+    if (detail) {
+      // Only identity and account settings carry over; profile fields come from the read-back alone.
+      const base = { ...this.self, info: {}, bio: undefined, avatarUrl: undefined, email: undefined, phone: undefined }
+      const next = toSelfEntity(detail, [], base)
+      this.self = this.useMock ? { ...next, settings: this.self.settings } : next
+      this.notify()
     }
-    this.notify()
+    notifyOwnProfileChanged()
+    return null
   }
 
-  updateSelfInfo(key: string, value: string) {
-    this.self = {
-      ...this.self,
-      displayName: key === 'displayName' ? value : this.self.displayName,
-      bio: key === 'bio' ? value : this.self.bio,
-      info: {
-        ...this.self.info,
-        [key]: value,
-      },
+  // ── Accounts, system user groups and projection rules (admin; every change is read back) ──
+
+  /** Runs one admin call, then reloads; resolves with an error, or null once the reload shows the change. */
+  private async adminChange(call: Promise<{ data: unknown; error: unknown }>, method: string): Promise<unknown> {
+    const { data, error } = await call
+    if (!data) return error ?? new Error(`${method} failed`)
+    try {
+      await this.reload()
+    } catch (reloadError) {
+      return reloadError
     }
+    return null
+  }
+
+  changeUserType(userId: string, userType: AssignableUserType): Promise<unknown> {
+    return this.adminChange(changeUserType({ userId, userType }), 'user.change_type')
+  }
+
+  /** `null` restores the account type's default. */
+  setAccountOptions(
+    userId: string,
+    options: { allowPasswordChange?: boolean | null; allowContactEdit?: boolean | null },
+  ): Promise<unknown> {
+    return this.adminChange(setUserAccountOptions({ userId, ...options }), 'user.set_account_options')
+  }
+
+  createUserGroup(groupId: string, name: string, description?: string): Promise<unknown> {
+    return this.adminChange(createUserGroup({ groupId, name, description }), 'user_group.create')
+  }
+
+  updateUserGroup(groupId: string, patch: { name?: string; description?: string }): Promise<unknown> {
+    return this.adminChange(updateUserGroup({ groupId, ...patch }), 'user_group.update')
+  }
+
+  deleteUserGroup(groupId: string): Promise<unknown> {
+    return this.adminChange(deleteUserGroup(groupId), 'user_group.delete')
+  }
+
+  setUserGroupMembers(groupId: string, change: { add?: string[]; remove?: string[] }): Promise<unknown> {
+    return this.adminChange(setUserGroupMembers({ groupId, ...change }), 'user_group.set_members')
+  }
+
+  setProjectionRules(rules: ContactProjectionRule[]): Promise<unknown> {
+    return this.adminChange(setContactProjections(rules), 'user_group.set_projections')
+  }
+
+  resetProjectionRules(): Promise<unknown> {
+    return this.adminChange(resetContactProjections(), 'user_group.reset_projections')
+  }
+
+  // ── Agents ──
+
+  /** `agent.update`; resolves with an error message, or null on success. */
+  async setAgentAllowGroup(agentId: string, allowGroup: boolean): Promise<unknown> {
+    const { data, error } = await updateAgent({ agentId, allowGroup })
+    if (!data) return error ?? new Error('agent.update failed')
+    this.agents = this.agents.map((agent) => (agent.id === agentId ? toAgentEntity(data) : agent))
     this.notify()
+    notifyAgentsChanged()
+    return null
+  }
+
+  /** `agent.update` of the social switches; resolves with an error message, or null on success. */
+  async setAgentSocial(agentId: string, input: { homestation?: boolean; autoShareResults?: boolean }): Promise<unknown> {
+    const { data, error } = await updateAgent({ agentId, ...input })
+    if (!data) return error ?? new Error('agent.update failed')
+    this.agents = this.agents.map((agent) => (agent.id === agentId ? toAgentEntity(data) : agent))
+    this.notify()
+    notifyAgentsChanged()
+    return null
+  }
+
+  async deleteAgent(agentId: string): Promise<unknown> {
+    const { data, error } = await deleteAgent(agentId)
+    if (!data) return error ?? new Error('agent.delete failed')
+    this.agents = this.agents.filter((agent) => agent.id !== agentId)
+    this.notify()
+    notifyAgentsChanged()
+    return null
+  }
+
+  // ── The signed-in user's own message identities (Telegram is stored by the control panel) ──
+
+  async addOwnTelegram(accountId: string): Promise<unknown> {
+    const { data, error } = await setUserMsgTunnel({ platform: 'telegram', accountId: accountId.trim() })
+    if (!data) return error ?? new Error('user.set_msg_tunnel failed')
+    this.self = { ...this.self, socialAccounts: toSocialAccounts(data.contact?.bindings) }
+    this.notify()
+    notifyOwnProfileChanged()
+    return null
+  }
+
+  async removeOwnTelegram(): Promise<unknown> {
+    const { data, error } = await removeUserMsgTunnel({ platform: 'telegram' })
+    if (!data) return error ?? new Error('user.remove_msg_tunnel failed')
+    this.self = { ...this.self, socialAccounts: toSocialAccounts(data.contact?.bindings) }
+    this.notify()
+    notifyOwnProfileChanged()
+    return null
   }
 
   addSocialAccount(entityId: string, account: SocialAccount) {
-    if (this.self.id === entityId) {
-      this.self = { ...this.self, socialAccounts: [...this.self.socialAccounts, account] }
-      this.notify()
-      return
-    }
-
-    const targetAgent = this.agents.find((agent) => agent.id === entityId)
-    if (targetAgent) {
-      this.agents = this.agents.map((agent) =>
-        agent.id === entityId
-          ? { ...agent, socialAccounts: [...agent.socialAccounts, account] }
-          : agent,
-      )
-      this.agent = this.agents[0] ?? this.agent
-      this.notify()
-      return
-    }
-
-    this.localUsers = this.localUsers.map((user) =>
-      user.id === entityId
-        ? { ...user, socialAccounts: [...user.socialAccounts, account] }
-        : user,
-    )
-    this.entityGroups = this.entityGroups.map((group) =>
-      group.id === entityId
-        ? { ...group, socialAccounts: [...group.socialAccounts, account] }
-        : group,
-    )
-    this.notify()
+    this.updateSocialAccounts(entityId, (accounts) => [...accounts, account])
   }
 
   removeSocialAccount(entityId: string, accountId: string) {
@@ -202,18 +317,6 @@ export class UsersAgentsStore {
   ) {
     if (this.self.id === entityId) {
       this.self = { ...this.self, socialAccounts: updater(this.self.socialAccounts) }
-      this.notify()
-      return
-    }
-
-    const targetAgent = this.agents.find((agent) => agent.id === entityId)
-    if (targetAgent) {
-      this.agents = this.agents.map((agent) =>
-        agent.id === entityId
-          ? { ...agent, socialAccounts: updater(agent.socialAccounts) }
-          : agent,
-      )
-      this.agent = this.agents[0] ?? this.agent
       this.notify()
       return
     }

@@ -1,69 +1,45 @@
-// AICC + AgentToolResult shared types. Mirrors Rust definitions in
-// src/frame/agent_tool/src/lib.rs (AgentToolResult / AgentToolStatus /
-// AgentToolPendingReason) and aicc_client.rs (AiResponse / AiArtifact /
-// ResourceRef / AiccMethodResponse).
+// AgentToolResult wire types plus projections derived from the canonical
+// AICC client exported by the BuckyOS WebSDK.
+
+import type { buckyos } from "buckyos";
 
 export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | { [k: string]: JsonValue };
+export type JsonValue = JsonPrimitive | JsonValue[] | {
+  [k: string]: JsonValue;
+};
 
-export type ResourceRef =
-  | { kind: "url"; url: string; mime_hint?: string }
-  | { kind: "base64"; mime: string; data_base64: string }
-  | { kind: "named_object"; obj_id: string };
+type SdkAiccClient = ReturnType<typeof buckyos.getAiccClient>;
+
+export type ResourceRef = Parameters<
+  SdkAiccClient["imageToImage"]
+>[0]["images"][number];
+export type AiccInferenceResponse =
+  | Awaited<ReturnType<SdkAiccClient["decisionEvaluate"]>>
+  | Awaited<ReturnType<SdkAiccClient["helperLlmChat"]>>
+  | Awaited<ReturnType<SdkAiccClient["helperTextToImage"]>>
+  | Awaited<ReturnType<SdkAiccClient["imageToImage"]>>
+  | Awaited<ReturnType<SdkAiccClient["imageInpaint"]>>
+  | Awaited<ReturnType<SdkAiccClient["imageUpscale"]>>
+  | Awaited<ReturnType<SdkAiccClient["imageBackgroundRemove"]>>
+  | Awaited<ReturnType<SdkAiccClient["visionOcr"]>>
+  | Awaited<ReturnType<SdkAiccClient["visionCaption"]>>
+  | Awaited<ReturnType<SdkAiccClient["visionDetect"]>>
+  | Awaited<ReturnType<SdkAiccClient["visionSegment"]>>
+  | Awaited<ReturnType<SdkAiccClient["audioTextToSpeech"]>>
+  | Awaited<ReturnType<SdkAiccClient["audioSpeechRecognition"]>>
+  | Awaited<ReturnType<SdkAiccClient["audioMusic"]>>
+  | Awaited<ReturnType<SdkAiccClient["audioEnhance"]>>
+  | Awaited<ReturnType<SdkAiccClient["videoGenerate"]>>
+  | Awaited<ReturnType<SdkAiccClient["helperVideoGenerate"]>>
+  | Awaited<ReturnType<SdkAiccClient["videoEdit"]>>
+  | Awaited<ReturnType<SdkAiccClient["videoExtend"]>>
+  | Awaited<ReturnType<SdkAiccClient["videoUpscale"]>>;
 
 export type AiArtifact = {
   name: string;
-  resource: {
-    kind: string;
-    obj_id?: string;
-    url?: string;
-    mime?: string;
-    mime_hint?: string;
-    data_base64?: string;
-  };
+  resource: ResourceRef;
   mime?: string | null;
   metadata?: JsonValue | null;
-};
-
-export type AiRole = "system" | "user" | "assistant" | "tool" | "developer";
-
-export type AiToolCall = {
-  name: string;
-  args: { [k: string]: JsonValue };
-  call_id: string;
-};
-
-export type AiToolResultContent =
-  | { type: "text"; text: string }
-  | { type: "image"; source: ResourceRef }
-  | { type: "document"; source: ResourceRef; title?: string | null };
-
-export type AiContent =
-  | { type: "text"; text: string }
-  | { type: "image"; source: ResourceRef }
-  | { type: "document"; source: ResourceRef; title?: string | null }
-  | { type: "tool_use"; call_id: string; name: string; args?: { [k: string]: JsonValue } }
-  | { type: "tool_result"; call_id: string; content: AiToolResultContent[]; is_error?: boolean }
-  | {
-    type: "thinking";
-    summary?: string | null;
-    text?: string | null;
-    provider_metadata?: JsonValue | null;
-  }
-  | { type: "provider_state"; provider: string; value: JsonValue };
-
-export type AiMessage = {
-  role: AiRole;
-  content: AiContent[];
-};
-
-export type AiResponse = {
-  message: AiMessage;
-  usage?: JsonValue | null;
-  cost?: JsonValue | null;
-  finish_reason?: string | null;
-  provider_task_ref?: string | null;
-  extra?: JsonValue | null;
 };
 
 function resourceMime(resource: ResourceRef): string | undefined {
@@ -72,63 +48,179 @@ function resourceMime(resource: ResourceRef): string | undefined {
   return undefined;
 }
 
-export function aiResponseText(response: AiResponse): string {
-  return response.message.content
-    .filter((block): block is Extract<AiContent, { type: "text" }> => block.type === "text")
-    .map((block) => block.text)
-    .join("\n");
+function isResourceRef(value: unknown): value is ResourceRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const kind = (value as Record<string, unknown>).kind;
+  return kind === "url" || kind === "base64" || kind === "named_object";
 }
 
-export function aiResponseToolCalls(response: AiResponse): AiToolCall[] {
-  return response.message.content
-    .filter((block): block is Extract<AiContent, { type: "tool_use" }> => block.type === "tool_use")
-    .map((block) => ({
-      name: block.name,
-      args: block.args ?? {},
-      call_id: block.call_id,
-    }));
+function responseRecord(
+  response: AiccInferenceResponse,
+): Record<string, unknown> {
+  return response as unknown as Record<string, unknown>;
 }
 
-export function aiResponseArtifacts(response: AiResponse): AiArtifact[] {
-  return response.message.content.flatMap((block, index) => {
-    if (block.type === "image") {
-      return [{
-        name: `image_${index + 1}`,
-        resource: block.source,
-        mime: resourceMime(block.source),
+export function aiResponseText(response: AiccInferenceResponse): string {
+  const record = responseRecord(response);
+  if (typeof record.value === "string") return record.value;
+  if (
+    record.value && typeof record.value === "object" &&
+    !Array.isArray(record.value)
+  ) {
+    const nested = aiResponseText(record.value as AiccInferenceResponse);
+    if (nested) return nested;
+  }
+  if (typeof record.text === "string") return record.text;
+  if (Array.isArray(record.captions)) {
+    return record.captions.flatMap((caption) =>
+      caption && typeof caption === "object" &&
+        typeof (caption as Record<string, unknown>).text === "string"
+        ? [(caption as Record<string, unknown>).text as string]
+        : []
+    ).join("\n");
+  }
+  const message = record.message;
+  if (!message || typeof message !== "object" || Array.isArray(message)) {
+    return "";
+  }
+  const content = (message as Record<string, unknown>).content;
+  if (!Array.isArray(content)) return "";
+  return content.flatMap((block) =>
+    block && typeof block === "object" &&
+      (block as Record<string, unknown>).type === "text" &&
+      typeof (block as Record<string, unknown>).text === "string"
+      ? [(block as Record<string, unknown>).text as string]
+      : []
+  ).join("\n");
+}
+
+export function aiResponseArtifacts(
+  response: AiccInferenceResponse,
+): AiArtifact[] {
+  const record = responseRecord(response);
+  const artifacts: AiArtifact[] = [];
+  const append = (name: string, value: unknown) => {
+    if (isResourceRef(value)) {
+      artifacts.push({
+        name,
+        resource: value,
+        mime: resourceMime(value),
         metadata: null,
-      }];
+      });
     }
-    if (block.type === "document") {
-      return [{
-        name: block.title ?? `document_${index + 1}`,
-        resource: block.source,
-        mime: resourceMime(block.source),
-        metadata: null,
-      }];
+  };
+  if (Array.isArray(record.images)) {
+    record.images.forEach((value, index) =>
+      append(`image_${index + 1}`, value)
+    );
+  }
+  append("image", record.image);
+  append("audio", record.audio);
+  if (Array.isArray(record.videos)) {
+    record.videos.forEach((value, index) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      const video = value as Record<string, unknown>;
+      const before = artifacts.length;
+      append(`video_${index + 1}`, video.resource);
+      if (artifacts.length > before) {
+        const appended = artifacts[before];
+        if (typeof video.media_type === "string") {
+          appended.mime = video.media_type;
+        }
+        appended.metadata = videoMetadata(video);
+      }
+      append(`last_frame_${index + 1}`, video.last_frame);
+    });
+  }
+  if (Array.isArray(record.stems)) {
+    record.stems.forEach((value, index) => append(`stem_${index + 1}`, value));
+  }
+  if (Array.isArray(record.artifacts)) {
+    record.artifacts.forEach((artifact, index) => {
+      if (
+        !artifact || typeof artifact !== "object" || Array.isArray(artifact)
+      ) return;
+      const item = artifact as Record<string, unknown>;
+      append(
+        typeof item.name === "string" ? item.name : `artifact_${index + 1}`,
+        item.resource,
+      );
+      const appended = artifacts.at(-1);
+      if (appended && typeof item.mime === "string") appended.mime = item.mime;
+    });
+  } else if (record.artifacts && typeof record.artifacts === "object") {
+    for (
+      const [name, value] of Object.entries(
+        record.artifacts as Record<string, unknown>,
+      )
+    ) {
+      append(name, value);
     }
-    return [];
-  });
+  }
+  const message = record.message;
+  if (message && typeof message === "object" && !Array.isArray(message)) {
+    const content = (message as Record<string, unknown>).content;
+    if (Array.isArray(content)) {
+      content.forEach((block, index) => {
+        if (!block || typeof block !== "object" || Array.isArray(block)) return;
+        const item = block as Record<string, unknown>;
+        if (item.type === "image") append(`image_${index + 1}`, item.source);
+        if (item.type === "document") {
+          append(
+            typeof item.title === "string"
+              ? item.title
+              : `document_${index + 1}`,
+            item.source,
+          );
+        }
+      });
+    }
+  }
+  return artifacts;
 }
 
-export type AiccMethodResponse = {
-  task_id: string;
-  status: "succeeded" | "running" | "failed";
-  result?: AiResponse | null;
-  event_ref?: string | null;
-};
+// What AICC knows about a generated video besides its file: the Provider's
+// report, what AICC measured in the file, and how both differ from the request.
+function videoMetadata(video: Record<string, unknown>): JsonValue {
+  const { resource: _resource, last_frame: _lastFrame, ...metadata } = video;
+  return metadata as JsonValue;
+}
+
+export function aiResponseData(
+  response: AiccInferenceResponse,
+): JsonValue | null {
+  const record = responseRecord(response);
+  if (record.value !== undefined) return record.value as JsonValue;
+  const omitted = new Set([
+    "task_id",
+    "status",
+    "usage",
+    "cost",
+    "finish_reason",
+    "provider_task_ref",
+    "route_trace",
+    "event_ref",
+    "error",
+    "message",
+    "images",
+    "image",
+    "audio",
+    "videos",
+  ]);
+  const data: Record<string, unknown> = Object.fromEntries(
+    Object.entries(record).filter(([key]) => !omitted.has(key)),
+  );
+  if (Array.isArray(record.videos)) {
+    data.videos = record.videos.map((video) =>
+      video && typeof video === "object" && !Array.isArray(video)
+        ? videoMetadata(video as Record<string, unknown>)
+        : null
+    );
+  }
+  return Object.keys(data).length ? data as JsonValue : null;
+}
 
 export type Profile = "balanced" | "cheap" | "fast" | "quality";
-
-export type Capability =
-  | "llm"
-  | "embedding"
-  | "rerank"
-  | "image"
-  | "vision"
-  | "audio"
-  | "video"
-  | "agent";
 
 export type AgentToolStatus = "success" | "error" | "pending";
 

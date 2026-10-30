@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronUp, Filter, Route, Search } from 'lucide-react'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore, useRouteTraces } from '../../hooks/use-aicc-store'
+import { useDebouncedValue } from '../../hooks/use-debounced-value'
 import { StatusBadge } from '../shared/StatusBadge'
 import { PagedListFooter } from '../shared/paged-list'
 import { LongField } from '../shared/LongField'
@@ -17,8 +18,11 @@ type TraceFilters = {
   profile: string
 }
 type TimeRangeFilter = 'all' | '24h' | '7d' | '30d' | 'custom'
+type TFn = (key: string, fallback?: string, variables?: Record<string, string | number>) => string
 
 const ROUTE_TRACE_PAGE_SIZE = 20
+// Free text is debounced before it reaches trace.query so typing does not issue an RPC per keystroke.
+const TRACE_QUERY_DEBOUNCE_MS = 250
 
 type RouteTraceAuditPanelProps = {
   compact: boolean
@@ -40,20 +44,20 @@ function dateInputEnd(value: string): number | null {
   return Number.isNaN(date.getTime()) ? null : date.getTime()
 }
 
-function localTrailingDaysRange(days: number): { startTimeMs: number; endTimeMs: number } {
-  const start = new Date()
+function localTrailingDaysRange(days: number, nowMs: number): { startTimeMs: number; endTimeMs: number } {
+  const start = new Date(nowMs)
   start.setHours(0, 0, 0, 0)
   start.setDate(start.getDate() - Math.max(0, days - 1))
-  return { startTimeMs: start.getTime(), endTimeMs: Date.now() }
+  return { startTimeMs: start.getTime(), endTimeMs: nowMs }
 }
 
-function timeRangeToQuery(value: TimeRangeFilter, customStartDate: string, customEndDate: string): { startTimeMs: number; endTimeMs: number } | undefined {
-  if (value === 'all') return undefined
+function timeRangeToQuery(value: TimeRangeFilter, customStartDate: string, customEndDate: string, nowMs: number): { startTimeMs: number; endTimeMs: number } | undefined {
+  if (value === 'all') return { startTimeMs: 0, endTimeMs: nowMs }
   if (value === 'custom') {
-    const fallback = localTrailingDaysRange(30)
+    const fallback = localTrailingDaysRange(30, nowMs)
     return {
       startTimeMs: dateInputStart(customStartDate) ?? fallback.startTimeMs,
-      endTimeMs: dateInputEnd(customEndDate) ?? Date.now(),
+      endTimeMs: dateInputEnd(customEndDate) ?? nowMs,
     }
   }
   const duration = value === '24h'
@@ -61,7 +65,26 @@ function timeRangeToQuery(value: TimeRangeFilter, customStartDate: string, custo
     : value === '7d'
       ? 7 * 24 * 60 * 60 * 1000
       : 30 * 24 * 60 * 60 * 1000
-  return { startTimeMs: Date.now() - duration, endTimeMs: Date.now() }
+  return { startTimeMs: nowMs - duration, endTimeMs: nowMs }
+}
+
+type TraceQueryFilters = {
+  query?: string
+  outcome?: 'fallback' | 'failed' | 'warning'
+  apiTypes?: string[]
+  providerInstanceNames?: string[]
+  selectedExactModels?: string[]
+  schedulerProfiles?: string[]
+}
+
+function buildTraceQueryParams(
+  filters: TraceQueryFilters,
+  timeRange: TimeRangeFilter,
+  customStartDate: string,
+  customEndDate: string,
+  nowMs: number,
+): TraceQueryFilters & { timeRange?: { startTimeMs: number; endTimeMs: number } } {
+  return { ...filters, timeRange: timeRangeToQuery(timeRange, customStartDate, customEndDate, nowMs) }
 }
 
 export function RouteTraceAuditPanel({
@@ -85,23 +108,27 @@ export function RouteTraceAuditPanel({
   const [traceNextCursor, setTraceNextCursor] = useState<string | undefined>()
   const [traceTotalCount, setTraceTotalCount] = useState(snapshotTraces.length)
   const [tracePageIndex, setTracePageIndex] = useState(0)
+  const [tracePageCursors, setTracePageCursors] = useState<Array<string | undefined>>([undefined])
   const [traceLoading, setTraceLoading] = useState(false)
   const [traceError, setTraceError] = useState<'initial' | 'more' | null>(null)
+  const [traceRetryKey, setTraceRetryKey] = useState(0)
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
+  const debouncedQuery = useDebouncedValue(query, TRACE_QUERY_DEBOUNCE_MS)
+  // Upper bound of the query window: refreshed when a new query series starts (filter change, retry),
+  // stable while paging within that series.
+  const queryEndMsRef = useRef(0)
+  // Sequence of the latest trace request; responses from older requests are dropped instead of
+  // overwriting a newer result.
+  const traceRequestSeqRef = useRef(0)
 
-  const traceQueryRange = useMemo(
-    () => timeRangeToQuery(timeRange, customStartDate, customEndDate),
-    [customEndDate, customStartDate, timeRange],
-  )
-  const traceQueryParams = useMemo(() => ({
-    timeRange: traceQueryRange,
-    query: query.trim() || undefined,
+  const traceQueryFilters = useMemo<TraceQueryFilters>(() => ({
+    query: debouncedQuery.trim() || undefined,
     outcome: outcomeFilter === 'all' ? undefined : outcomeFilter,
     apiTypes: traceFilters.apiType ? [traceFilters.apiType] : undefined,
     providerInstanceNames: traceFilters.provider ? [traceFilters.provider] : undefined,
     selectedExactModels: traceFilters.model ? [traceFilters.model] : undefined,
     schedulerProfiles: traceFilters.profile ? [traceFilters.profile] : undefined,
-  }), [outcomeFilter, query, traceFilters, traceQueryRange])
+  }), [debouncedQuery, outcomeFilter, traceFilters])
   const timeRangeOptions: Array<[TimeRangeFilter, string]> = useMemo(() => [
     ['all', t('aiCenter.home.allTime', 'All time')],
     ['24h', t('aiCenter.home.last24Hours', 'Last 24 hours')],
@@ -111,36 +138,37 @@ export function RouteTraceAuditPanel({
   ], [t])
 
   useEffect(() => {
-    let cancelled = false
+    const seq = ++traceRequestSeqRef.current
+    queryEndMsRef.current = Date.now()
+    const params = buildTraceQueryParams(traceQueryFilters, timeRange, customStartDate, customEndDate, queryEndMsRef.current)
     async function loadInitialTraces() {
       setTraceLoading(true)
       try {
-        const page = await store.queryRouteTraces({ limit: ROUTE_TRACE_PAGE_SIZE, ...traceQueryParams })
-        if (!cancelled) {
+        const page = await store.queryRouteTraces({ limit: ROUTE_TRACE_PAGE_SIZE, ...params })
+        if (seq === traceRequestSeqRef.current) {
           setTraces(page.traces)
           setTraceNextCursor(page.nextCursor)
           setTraceTotalCount(page.totalCount ?? page.traces.length)
           setTracePageIndex(0)
+          setTracePageCursors([undefined, page.nextCursor])
           setTraceError(null)
         }
       } catch (error) {
         console.error('aicc.trace.query usage audit failed', error)
-        if (!cancelled) {
+        if (seq === traceRequestSeqRef.current) {
           setTraces(snapshotTraces)
           setTraceNextCursor(snapshotTraces.length >= ROUTE_TRACE_PAGE_SIZE ? String(ROUTE_TRACE_PAGE_SIZE) : undefined)
           setTraceTotalCount(snapshotTraces.length)
           setTracePageIndex(0)
+          setTracePageCursors([undefined])
           setTraceError('initial')
         }
       } finally {
-        if (!cancelled) setTraceLoading(false)
+        if (seq === traceRequestSeqRef.current) setTraceLoading(false)
       }
     }
     void loadInitialTraces()
-    return () => {
-      cancelled = true
-    }
-  }, [snapshotTraces, store, traceQueryParams])
+  }, [customEndDate, customStartDate, snapshotTraces, store, timeRange, traceQueryFilters, traceRetryKey])
 
   const visibleTraces = useMemo(
     () => traces.filter((trace) => !logicalPathFilter || traceLogicalPath(trace) === logicalPathFilter),
@@ -150,53 +178,72 @@ export function RouteTraceAuditPanel({
   const traceFiltersActive = Object.values(traceFilters).some(Boolean)
   const emptyState = traceEmptyStateKind(traces.length, visibleTraces.length, traceError, query.trim().length > 0 || timeRange !== 'all' || traceFiltersActive, outcomeFilter)
 
+  const currentTraceQueryParams = () =>
+    buildTraceQueryParams(traceQueryFilters, timeRange, customStartDate, customEndDate, queryEndMsRef.current)
+
   const loadTracePage = async (pageIndex: number) => {
     if (traceLoading) return
+    const seq = ++traceRequestSeqRef.current
     const nextPageIndex = Math.max(0, pageIndex)
+    const cursor = tracePageCursors[nextPageIndex]
+    if (nextPageIndex > 0 && !cursor) return
     setTraceLoading(true)
     setTraceError(null)
     try {
       const page = await store.queryRouteTraces({
         limit: ROUTE_TRACE_PAGE_SIZE,
-        cursor: nextPageIndex > 0 ? String(nextPageIndex * ROUTE_TRACE_PAGE_SIZE) : undefined,
-        ...traceQueryParams,
+        cursor,
+        ...currentTraceQueryParams(),
       })
+      if (seq !== traceRequestSeqRef.current) return
       setTraces(page.traces)
       setTraceNextCursor(page.nextCursor)
       setTraceTotalCount(page.totalCount ?? page.traces.length)
       setTracePageIndex(nextPageIndex)
+      setTracePageCursors((current) => {
+        const next = current.slice(0, nextPageIndex + 1)
+        next[nextPageIndex + 1] = page.nextCursor
+        return next
+      })
     } catch (error) {
       console.error('aicc.trace.query usage audit page failed', error)
+      if (seq !== traceRequestSeqRef.current) return
       setTraceError('initial')
     } finally {
-      setTraceLoading(false)
+      if (seq === traceRequestSeqRef.current) setTraceLoading(false)
     }
   }
 
   const loadMoreTraces = async () => {
     if (!traceNextCursor || traceLoading) return
+    const seq = ++traceRequestSeqRef.current
     setTraceLoading(true)
     setTraceError(null)
     try {
       const page = await store.queryRouteTraces({
         limit: ROUTE_TRACE_PAGE_SIZE,
         cursor: traceNextCursor,
-        ...traceQueryParams,
+        ...currentTraceQueryParams(),
       })
+      if (seq !== traceRequestSeqRef.current) return
       setTraces((current) => mergeRouteTraces(current, page.traces))
       setTraceNextCursor(page.nextCursor)
       setTraceTotalCount((current) => page.totalCount ?? Math.max(current, traces.length + page.traces.length))
     } catch (error) {
       console.error('aicc.trace.query usage audit more failed', error)
+      if (seq !== traceRequestSeqRef.current) return
       setTraceError('more')
     } finally {
-      setTraceLoading(false)
+      if (seq === traceRequestSeqRef.current) setTraceLoading(false)
     }
   }
 
   const retryTraceLoad = () => {
-    if (traceError === 'initial') void loadTracePage(tracePageIndex)
-    else void loadMoreTraces()
+    if (traceError === 'initial') {
+      setTraceRetryKey((value) => value + 1)
+    } else {
+      void loadMoreTraces()
+    }
   }
 
   const segmentOptions: Array<{ key: TraceOutcomeFilter; label: string }> = [
@@ -319,11 +366,11 @@ export function RouteTraceAuditPanel({
         loadedCount={visibleTraces.length}
         totalCount={traceTotalCount}
         labels={{
-          previous: t('aiCenter.routing.tracePreviousPage', 'Previous'),
-          next: t('aiCenter.routing.traceNextPage', 'Next'),
-          page: t('aiCenter.routing.tracePage', 'Page {{page}}'),
-          loading: t('aiCenter.routing.traceLoading', 'Loading...'),
-          loadMore: t('aiCenter.routing.traceLoadMore', 'Load more'),
+          previous: t('common.previous', 'Previous'),
+          next: t('common.next', 'Next'),
+          page: t('aiCenter.home.pageNumber', 'Page {{page}}'),
+          loading: t('common.loading', 'Loading...'),
+          loadMore: t('common.loadMore', 'Load more'),
           retry: t('common.retry', 'Retry'),
           error: t('aiCenter.routing.traceLoadFailed', 'Failed to load route traces'),
           loaded: t('aiCenter.routing.tracePageLoaded', 'Page {{page}} / loaded {{count}} traces', { page: tracePageIndex + 1, count: traceTotalCount }),
@@ -342,7 +389,7 @@ function TraceAuditCard({
   active: boolean
   onSelect: () => void
 }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [candidateSection, setCandidateSection] = useState<TraceCandidateSection>('none')
   const [scoreExpanded, setScoreExpanded] = useState(false)
   const [titleExpanded, setTitleExpanded] = useState(false)
@@ -353,7 +400,7 @@ function TraceAuditCard({
     trace.selected_provider_instance_name ? `${t('aiCenter.routing.provider', 'Provider')}: ${trace.selected_provider_instance_name}` : '',
     trace.selected_provider_model_id ? `${t('aiCenter.routing.providerModel', 'Provider model')}: ${trace.selected_provider_model_id}` : '',
     `${t('aiCenter.routing.profile', 'Profile')}: ${trace.scheduler_profile}`,
-    trace.created_at_ms ? formatTraceTime(trace.created_at_ms) : '',
+    trace.created_at_ms ? formatTraceTime(trace.created_at_ms, locale) : '',
     formatTraceDuration(trace),
   ].filter(Boolean)
   const hiddenTraceFields = [
@@ -364,7 +411,7 @@ function TraceAuditCard({
   const traceTitle = metaItems.join(' / ')
   const scoreHint = t(
     'aiCenter.routing.scoreHint',
-    'Score is the weighted sum of normalized cost, latency, reliability risk, quality penalty, preference, cache, and local factors for the active scheduler profile. Lower scores rank first.',
+    'Score is the weighted sum of normalized cost, quality penalty, preference, cache, and local factors for the active scheduler profile. Volatile latency and error observations do not affect ranking. Lower scores rank first; ties keep the configured order.',
   )
 
   return (
@@ -412,7 +459,7 @@ function TraceAuditCard({
             {trace.warnings.length > 0 && (
               <StatusBadge status="warning" label={t('aiCenter.routing.traceWarnings', '{{count}} warnings', { count: trace.warnings.length })} />
             )}
-            <StatusBadge status={status === 'selected' ? 'ok' : status === 'fallback' ? 'warning' : 'error'} label={status} />
+            <StatusBadge status={status === 'selected' ? 'ok' : status === 'fallback' ? 'warning' : 'error'} label={traceStatusLabel(status, t)} />
           </div>
         </div>
         {titleExpanded && (
@@ -437,7 +484,7 @@ function TraceAuditCard({
       {selectedCandidate && (
         <div className="mt-2 rounded-md p-2 text-xs" style={{ color: 'var(--cp-muted)', background: 'var(--cp-surface)' }}>
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span>{candidateWeightSummary(selectedCandidate)}</span>
+            <span>{candidateWeightSummary(selectedCandidate, t)}</span>
             <ScoreButton
               score={selectedCandidate.final_score}
               expanded={scoreExpanded}
@@ -554,8 +601,9 @@ function TraceCandidateRow({
   candidate: RouteTrace['ranked_candidates'][number]
   rank: number
   selected: boolean
-  reason: string
+  reason: 'selected' | 'fallback' | 'ranked'
 }) {
+  const { t } = useI18n()
   const [scoreExpanded, setScoreExpanded] = useState(false)
   return (
     <div
@@ -570,7 +618,7 @@ function TraceCandidateRow({
           <LongField value={`#${rank} ${candidate.exact_model}`} copyable={false} />
         </span>
         <span className="block" style={{ color: 'var(--cp-muted)' }}>
-          {candidateWeightSummary(candidate)}
+          {candidateWeightSummary(candidate, t)}
         </span>
         {scoreExpanded && (
           <ScoreDetails candidate={candidate} estimatedCost={formatPreCallEstimate(candidate.pricing_snapshot)} />
@@ -582,7 +630,7 @@ function TraceCandidateRow({
           expanded={scoreExpanded}
           onClick={() => setScoreExpanded((value) => !value)}
         />
-        <span className="block">{reason}</span>
+        <span className="block">{candidateReasonLabel(reason, t)}</span>
       </span>
     </div>
   )
@@ -637,16 +685,6 @@ function ScoreDetails({
       t('aiCenter.routing.scoreCostHint', 'Estimated pre-call cost for this candidate, shown with currency.'),
     ],
     [
-      t('aiCenter.routing.scoreLatency', 'latency'),
-      scoreInputs?.latency,
-      t('aiCenter.routing.scoreLatencyHint', 'Normalized latency factor. Lower values mean faster expected response.'),
-    ],
-    [
-      t('aiCenter.routing.scoreReliability', 'reliability'),
-      scoreInputs?.reliability,
-      t('aiCenter.routing.scoreReliabilityHint', 'Normalized reliability risk from recent health data. Lower values mean lower error risk.'),
-    ],
-    [
       t('aiCenter.routing.scoreQuality', 'quality'),
       scoreInputs?.quality,
       t('aiCenter.routing.scoreQualityHint', 'Normalized quality penalty. Lower values mean higher expected model quality.'),
@@ -682,13 +720,14 @@ function ScoreDetails({
 }
 
 function TraceFilteredCandidateRow({ candidate }: { candidate: RouteTrace['filtered_candidates'][number] }) {
+  const { t } = useI18n()
   return (
     <div className="flex justify-between gap-3 rounded-md px-2 py-1.5 text-xs">
       <span className="min-w-0">
         <LongField value={candidate.exact_model} tone="warning" />
         <span className="block" style={{ color: 'var(--cp-muted)' }}>{candidate.reason}</span>
       </span>
-      <span className="shrink-0" style={{ color: 'var(--cp-muted)' }}>filtered</span>
+      <span className="shrink-0" style={{ color: 'var(--cp-muted)' }}>{t('aiCenter.routing.candidateFiltered', 'Filtered')}</span>
     </div>
   )
 }
@@ -845,6 +884,7 @@ function selectedTraceCandidate(trace: RouteTrace): RouteTrace['ranked_candidate
 }
 
 function traceStatus(trace: RouteTrace): 'selected' | 'fallback' | 'failed' {
+  if (trace.outcome === 'failed' || trace.outcome === 'cancelled') return 'failed'
   if (!trace.selected_exact_model) return 'failed'
   return trace.fallback_applied ? 'fallback' : 'selected'
 }
@@ -868,8 +908,8 @@ function traceEmptyStateKind(
   return 'no-matches'
 }
 
-function traceEmptyStateLabel(kind: TraceEmptyStateKind, t: (key: string, fallback: string) => string): string {
-  if (kind === 'load-failed') return t('aiCenter.routing.traceLoadFailed', 'Failed to load traces')
+function traceEmptyStateLabel(kind: TraceEmptyStateKind, t: TFn): string {
+  if (kind === 'load-failed') return t('aiCenter.routing.traceLoadFailed', 'Failed to load route traces')
   if (kind === 'none-yet') return t('aiCenter.routing.traceNoneYet', 'No route traces yet')
   return t('aiCenter.routing.traceNoMatches', 'No traces match current filters')
 }
@@ -886,10 +926,10 @@ function mergeRouteTraces(current: RouteTrace[], next: RouteTrace[]): RouteTrace
   return merged
 }
 
-function formatTraceTime(createdAtMs: number): string {
+function formatTraceTime(createdAtMs: number, locale: string): string {
   const date = new Date(createdAtMs)
   if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleString()
+  return date.toLocaleString(locale)
 }
 
 function formatTraceDuration(trace: RouteTrace): string {
@@ -898,13 +938,37 @@ function formatTraceDuration(trace: RouteTrace): string {
   return `${value}ms`
 }
 
-function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number]): string {
+function traceStatusLabel(status: 'selected' | 'fallback' | 'failed', t: TFn): string {
+  if (status === 'selected') return t('aiCenter.routing.traceStatusSelected', 'Selected')
+  if (status === 'fallback') return t('aiCenter.routing.traceStatusFallback', 'Fallback')
+  return t('aiCenter.routing.traceStatusFailed', 'Failed')
+}
+
+function candidateReasonLabel(reason: 'selected' | 'fallback' | 'ranked', t: TFn): string {
+  if (reason === 'selected') return t('aiCenter.routing.candidateSelected', 'Selected')
+  if (reason === 'fallback') return t('aiCenter.routing.candidateFallback', 'Fallback')
+  return t('aiCenter.routing.candidateRanked', 'Ranked')
+}
+
+function weightEffectLabel(effect: string, t: TFn): string {
+  if (effect === 'boost') return t('aiCenter.routing.weightEffectBoost', 'boost')
+  if (effect === 'down') return t('aiCenter.routing.weightEffectDown', 'down')
+  if (effect === 'neutral') return t('aiCenter.routing.weightEffectNeutral', 'neutral')
+  return effect
+}
+
+function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number], t: TFn): string {
   const inputs = candidate.preference_score_inputs
   const exact = inputs?.exact_model_weight ?? candidate.exact_model_weight ?? 1
   const provider = inputs?.provider_weight ?? candidate.provider_weight ?? 1
   const combined = inputs?.combined_weight ?? exact * provider
   const providerEffect = inputs?.provider_weight_effect ?? weightEffect(provider)
-  return `exact ${formatWeight(exact)} / provider ${formatWeight(provider)} ${providerEffect} / combined ${formatWeight(combined)}`
+  return t('aiCenter.routing.weightSummary', 'exact {{exact}} / provider {{provider}} {{effect}} / combined {{combined}}', {
+    exact: formatWeight(exact),
+    provider: formatWeight(provider),
+    effect: weightEffectLabel(providerEffect, t),
+    combined: formatWeight(combined),
+  })
 }
 
 function weightEffect(weight: number): string {

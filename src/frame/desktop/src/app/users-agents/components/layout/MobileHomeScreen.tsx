@@ -2,25 +2,30 @@
 
 import { useMemo, useState } from 'react'
 import { Bot, Search, UserPlus, Server, MessageSquare, Crown, User } from 'lucide-react'
-import { Chip, IconButton } from '@mui/material'
+import { Button, Chip, IconButton } from '@mui/material'
 import { EntityAvatar } from '../shared/EntityAvatar'
 import { SearchFilterBar } from '../shared/SearchFilterBar'
-import { filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
+import { entityFilterOptions, filterInternalEntities, getInternalEntities, type InternalEntityFilter } from '../shared/entityFilters'
 import {
   useSelf,
   useAgents,
   useLocalUsers,
   useEntityGroups,
+  useViewerIsAdmin,
 } from '../../hooks/use-users-agents-store'
 import type { SidebarSelection } from '../../datamodel/types'
+import { UserGroupsNavItem } from '../groups/UserGroupsNavItem'
+import { ExclusiveInvitesNavItem } from '../invites/ExclusiveInvitesNavItem'
 import type { AnyEntity, LocalUserEntity, AgentEntity, SelfEntity, EntityGroupEntity } from '../../datamodel/types'
+import { useI18n } from '../../../../i18n/provider'
+import { agentStatusLabelKey } from '../shared/agentLabels'
 
 /* ── Role icons & colors ── */
 
-const roleConfig: Record<string, { icon: typeof Crown; label: string; color: string }> = {
-  admin: { icon: Crown, label: 'Admin', color: 'var(--cp-warning)' },
-  user: { icon: User, label: 'User', color: 'var(--cp-accent)' },
-  limited: { icon: User, label: 'Limited', color: 'var(--cp-muted)' },
+const roleConfig: Record<string, { icon: typeof Crown; labelKey: string; color: string }> = {
+  admin: { icon: Crown, labelKey: 'usersAgents.role.admin', color: 'var(--cp-warning)' },
+  user: { icon: User, labelKey: 'usersAgents.role.user', color: 'var(--cp-accent)' },
+  limited: { icon: User, labelKey: 'usersAgents.role.limited', color: 'var(--cp-muted)' },
 }
 
 /* ── ID Badge Card (for self / local-user / agent) ── */
@@ -34,6 +39,7 @@ function BadgeCard({
   isActive: boolean
   onClick: () => void
 }) {
+  const { t } = useI18n()
   const isSelf = entity.kind === 'self'
   const isAgent = entity.kind === 'agent'
   const isLocalUser = entity.kind === 'local-user'
@@ -52,9 +58,9 @@ function BadgeCard({
 
   // Badge label
   const badgeLabel =
-    isSelf ? 'Owner' :
-    isAgent ? (entity as AgentEntity).agentType :
-    roleConfig[(entity as LocalUserEntity).role]?.label ?? 'User'
+    isSelf ? t(`usersAgents.role.${entity.role}`) :
+    isAgent ? t('usersAgents.kind.agent') :
+    t(roleConfig[(entity as LocalUserEntity).role]?.labelKey ?? 'usersAgents.role.user')
 
   const badgeColor =
     isSelf ? 'var(--cp-accent)' :
@@ -64,8 +70,8 @@ function BadgeCard({
   // Subtitle
   const subtitle =
     isSelf ? (entity as SelfEntity).bio ?? '' :
-    isAgent ? `v${(entity as AgentEntity).version} · ${(entity as AgentEntity).status}` :
-    `${(entity as LocalUserEntity).source === 'primary-did' ? 'BNS / DID' : 'Local'} · ${(entity as LocalUserEntity).status}`
+    isAgent ? `@${(entity as AgentEntity).name} · ${t(agentStatusLabelKey((entity as AgentEntity).status))}` :
+    `${(entity as LocalUserEntity).source === 'primary-did' ? 'BNS / DID' : t('usersAgents.source.local')} · ${t(`usersAgents.userStatus.${(entity as LocalUserEntity).status}`)}`
 
   return (
     <button
@@ -156,6 +162,7 @@ function ServerCard({
   isActive: boolean
   onClick: () => void
 }) {
+  const { t } = useI18n()
   return (
     <button
       type="button"
@@ -232,7 +239,7 @@ function ServerCard({
             className="text-[10px] font-medium"
             style={{ color: 'var(--cp-muted)' }}
           >
-            {group.memberCount} members
+            {t('usersAgents.group.members', undefined, { count: group.memberCount })}
           </span>
 
           {/* badges */}
@@ -245,7 +252,7 @@ function ServerCard({
                   color: 'var(--cp-success)',
                 }}
               >
-                Hosted
+                {t('usersAgents.group.hosted')}
               </span>
             )}
             {group.canMessage && (
@@ -268,22 +275,17 @@ interface MobileHomeScreenProps {
   onSelect: (sel: SidebarSelection) => void
   onAddUser?: () => void
   onAddAgent?: () => void
+  canCreateAgents?: boolean
 }
-
-const filters: Array<{ value: InternalEntityFilter; label: string }> = [
-  { value: 'all', label: 'All' },
-  { value: 'users', label: 'User' },
-  { value: 'agents', label: 'Agent' },
-  { value: 'groups', label: 'Group' },
-  { value: 'online', label: 'Online' },
-]
 
 export function MobileHomeScreen({
   selection,
   onSelect,
   onAddUser,
   onAddAgent,
+  canCreateAgents = true,
 }: MobileHomeScreenProps) {
+  const { t } = useI18n()
   const [showSearch, setShowSearch] = useState(false)
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<InternalEntityFilter>('all')
@@ -291,9 +293,10 @@ export function MobileHomeScreen({
   const agents = useAgents()
   const localUsers = useLocalUsers()
   const entityGroups = useEntityGroups()
+  const isAdmin = useViewerIsAdmin()
 
   const isEntityActive = (id: string) =>
-    selection?.kind === 'entity' && selection.entityId === id
+    selection?.kind === 'entity' ? selection.entityId === id : selection?.kind === 'self' && id === self.id
 
   const filteredEntities = useMemo(
     () => filterInternalEntities(getInternalEntities(self, agents, localUsers, entityGroups), query, filter),
@@ -315,37 +318,44 @@ export function MobileHomeScreen({
               className="text-[11px] font-semibold uppercase tracking-[0.18em]"
               style={{ color: 'var(--cp-muted)' }}
             >
-              Internal Entities
+              {t('usersAgents.internalEntities')}
             </span>
             <div className="flex items-center gap-1">
-              <IconButton size="small" onClick={() => setShowSearch((value) => !value)} aria-label="Search or filter">
+              <IconButton size="small" onClick={() => setShowSearch((value) => !value)} aria-label={t('usersAgents.searchOrFilter')}>
                 <Search size={14} />
               </IconButton>
               {onAddAgent && (
-                <IconButton size="small" onClick={onAddAgent} aria-label="Add Agent">
+                <IconButton
+                  size="small"
+                  onClick={onAddAgent}
+                  aria-label={t('usersAgents.addAgent')}
+                  aria-disabled={!canCreateAgents || undefined}
+                  data-testid="users-agents-add-agent"
+                  style={canCreateAgents ? undefined : { opacity: 0.45 }}
+                >
                   <Bot size={14} />
                 </IconButton>
               )}
               {onAddUser && (
-                <IconButton size="small" onClick={onAddUser} aria-label="Add User">
+                <IconButton size="small" onClick={onAddUser} aria-label={t('usersAgents.addUser')}>
                   <UserPlus size={14} />
                 </IconButton>
               )}
             </div>
           </div>
 
-          {(showSearch || query) && (
+          {(showSearch || query || filter !== 'all') && (
             <>
               <SearchFilterBar
                 query={query}
                 onQueryChange={setQuery}
-                placeholder="Search name, DID, role, tag, status..."
+                placeholder={t('usersAgents.searchPlaceholder')}
               />
               <div className="mb-3 mt-1 flex flex-wrap gap-1">
-                {filters.map((item) => (
+                {entityFilterOptions.map((item) => (
                   <Chip
                     key={item.value}
-                    label={item.label}
+                    label={t(item.labelKey)}
                     size="small"
                     variant={filter === item.value ? 'filled' : 'outlined'}
                     onClick={() => setFilter(item.value)}
@@ -373,10 +383,26 @@ export function MobileHomeScreen({
               color: 'var(--cp-muted)',
               border: '1px solid color-mix(in srgb, var(--cp-border) 50%, transparent)',
             }}>
-              No internal entities match.
+              {t('usersAgents.noMatch')}
             </div>
           )}
         </div>
+
+        {isAdmin ? <Button
+          fullWidth
+          size="small"
+          data-testid="users-agents-deleted-users"
+          aria-current={selection?.kind === 'deleted-users' ? 'page' : undefined}
+          onClick={() => onSelect({ kind: 'deleted-users' })}
+        >{t('usersAgents.deleted.title')}</Button> : null}
+        <UserGroupsNavItem
+          isActive={selection?.kind === 'user-groups'}
+          onClick={() => onSelect({ kind: 'user-groups' })}
+        />
+        <ExclusiveInvitesNavItem
+          isActive={selection?.kind === 'exclusive-invites'}
+          onClick={() => onSelect({ kind: 'exclusive-invites' })}
+        />
 
         {hostedGroups.length > 0 && (
           <div>
@@ -385,7 +411,7 @@ export function MobileHomeScreen({
                 className="text-[11px] font-semibold uppercase tracking-[0.18em]"
                 style={{ color: 'var(--cp-muted)' }}
               >
-                Self-hosted Groups
+                {t('usersAgents.selfHostedGroups')}
               </span>
             </div>
 

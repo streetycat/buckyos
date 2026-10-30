@@ -1,0 +1,272 @@
+#[cfg(test)]
+use super::super::{
+    DiscoveryMode, ProviderConnectionContract, ProviderConnectionInput, ProviderProfile,
+    ProviderResult,
+};
+use super::anthropic_models::{AnthropicModelsDiscovery, AnthropicModelsSpec};
+#[cfg(test)]
+use crate::catalog::{CurrentCatalogFile, ModelDriverCatalog, ProviderRulesCatalog};
+#[cfg(test)]
+use crate::protocol::CredentialKind;
+use crate::protocol::HttpTransport;
+
+pub(crate) const MINIMAX_PROVIDER_PROFILE_ID: &str = "minimax";
+
+pub(super) const MINIMAX_SPEC: AnthropicModelsSpec = AnthropicModelsSpec {
+    provider_profile_id: MINIMAX_PROVIDER_PROFILE_ID,
+    version_header: false,
+    label: "MiniMax",
+};
+
+#[cfg(test)]
+pub(crate) fn minimax_profile() -> ProviderProfile {
+    super::builtin_profile(MINIMAX_PROVIDER_PROFILE_ID, DiscoveryMode::MachineApi)
+}
+
+#[cfg(test)]
+pub(crate) fn minimax_known_provider() -> crate::catalog::KnownProvider {
+    super::builtin_known_provider(MINIMAX_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn minimax_connection_contract() -> ProviderConnectionContract {
+    super::builtin_connection_contract(MINIMAX_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_minimax_connection(
+    input: ProviderConnectionInput<'_>,
+) -> ProviderResult<super::super::ResolvedProviderConnection> {
+    minimax_connection_contract().resolve(input)
+}
+
+#[cfg(test)]
+pub(crate) fn minimax_provider_rules(_revision_seq: u64) -> ProviderRulesCatalog {
+    super::builtin_provider_rules(MINIMAX_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn minimax_model_driver() -> ModelDriverCatalog {
+    super::builtin_model_driver(MINIMAX_PROVIDER_PROFILE_ID)
+}
+
+#[cfg(test)]
+pub(crate) fn minimax_catalog_files() -> Vec<CurrentCatalogFile> {
+    super::builtin_catalog_files(&[MINIMAX_PROVIDER_PROFILE_ID])
+}
+
+pub(crate) fn minimax_discovery(transport: HttpTransport) -> AnthropicModelsDiscovery {
+    AnthropicModelsDiscovery::new(MINIMAX_SPEC, transport)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::CatalogBuildOptions;
+    use crate::protocol::{
+        claude_messages_adapter, minimax_messages_adapter, minimax_messages_dialect_contract,
+        CodecRegistry, CLAUDE_MESSAGES_ADAPTER_ID, CLAUDE_MESSAGES_OPERATION_ID,
+        MINIMAX_MESSAGES_ADAPTER_ID,
+    };
+    use crate::settings::{MetadataFile, MetadataSource, MetadataSources};
+
+    #[test]
+    fn embedded_catalogs_drive_identity_regions_rules_and_models() {
+        let profile = minimax_profile();
+        let known = minimax_known_provider();
+        let rules = minimax_provider_rules(9);
+        let models = minimax_model_driver();
+        let contract = minimax_messages_dialect_contract();
+        let (adapter, registration) = minimax_messages_adapter();
+
+        assert_eq!(profile.provider_profile_id, MINIMAX_PROVIDER_PROFILE_ID);
+        assert_eq!(
+            profile.default_protocol_adapter_id,
+            MINIMAX_MESSAGES_ADAPTER_ID
+        );
+        assert_eq!(profile.credential.kind, CredentialKind::NamedHeader);
+        assert_eq!(
+            known.ui_hints["instance_fields"]["region"]["mode"],
+            "required"
+        );
+        assert!(known.ui_hints["instance_fields"]["region"]
+            .get("default_value")
+            .is_none());
+        assert_eq!(
+            known.ui_hints["access_endpoints"]["china"]["label"],
+            "China"
+        );
+        assert_eq!(
+            resolve_minimax_connection(Default::default())
+                .unwrap()
+                .base_url,
+            known.base_url
+        );
+        assert_eq!(
+            resolve_minimax_connection(ProviderConnectionInput {
+                region: Some("china"),
+                ..Default::default()
+            })
+            .unwrap()
+            .base_url,
+            known.connection.region_base_urls["china"]
+        );
+        let unknown = resolve_minimax_connection(ProviderConnectionInput {
+            region: Some("unknown"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(unknown.base_url, known.base_url);
+        assert_eq!(unknown.region.as_deref(), Some("unknown"));
+        assert_eq!(
+            known.provider_rules_id.as_deref(),
+            Some(MINIMAX_PROVIDER_PROFILE_ID)
+        );
+        assert_eq!(
+            rules.patterns[1].operations["llm"],
+            CLAUDE_MESSAGES_OPERATION_ID
+        );
+        assert_eq!(rules.patterns[0].request_rules[0].defaults["top_p"], 0.95);
+        assert!(rules.patterns[0].request_rules[0]
+            .remove
+            .contains(&"/stop".to_owned()));
+        assert_eq!(rules.patterns[1].request_rules[0].defaults["top_p"], 0.9);
+        assert!(rules.patterns[1].request_rules[0]
+            .remove
+            .contains(&"/stop".to_owned()));
+        assert_eq!(models.model_driver_id, MINIMAX_PROVIDER_PROFILE_ID);
+        assert!(models
+            .models
+            .iter()
+            .any(|model| model.id == "MiniMax-M3.1-Flash-Preview"));
+        assert!(models.models.iter().any(|model| model.id == "MiniMax-M2.7"));
+        assert!(models.models.iter().any(|model| model.id == "music-3.0"));
+        assert!(rules.models.iter().any(|model| model.id == "music-3.0"));
+        assert!(rules.variants.iter().any(|variant| {
+            variant.variant == "reasoning-max"
+                && variant.provider_options["output_config"]["effort"] == "max"
+        }));
+        for (model, operation) in [
+            ("MiniMax-H3", "video_generation.v2.create"),
+            ("MiniMax-H3-Max", "video_generation.v2.create"),
+        ] {
+            let rule = rules.models.iter().find(|rule| rule.id == model).unwrap();
+            assert_eq!(rule.operations["video.generate"], operation);
+            assert!(rule.provider_options.is_empty());
+            assert!(rule.request_rules.is_empty());
+        }
+        let h3 = crate::video::test_support::model_contract("minimax", "MiniMax-H3");
+        let h3_max = crate::video::test_support::model_contract("minimax", "MiniMax-H3-Max");
+        assert_eq!(
+            h3.output
+                .durations
+                .as_ref()
+                .map(|durations| (durations.min, durations.max)),
+            Some((Some(4.0), Some(15.0)))
+        );
+        assert_eq!(
+            h3_max
+                .output
+                .durations
+                .as_ref()
+                .map(|durations| (durations.min, durations.max)),
+            Some((Some(5.0), Some(15.0)))
+        );
+        assert_eq!(
+            h3.output
+                .resolutions
+                .iter()
+                .map(|tier| tier.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["768P", "2K"]
+        );
+        assert_eq!(
+            h3_max
+                .output
+                .resolutions
+                .iter()
+                .map(|tier| tier.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["480P", "768P"]
+        );
+        assert_eq!(
+            rules.static_inventory_models,
+            vec![
+                "asr-1.0",
+                "speech-2.8-hd",
+                "speech-2.8-turbo",
+                "image-01",
+                "MiniMax-H3",
+                "MiniMax-H3-Max",
+            ]
+        );
+        assert!(!rules
+            .static_inventory_models
+            .contains(&"image-01-live".to_owned()));
+        assert!(!rules
+            .static_inventory_models
+            .contains(&"music-3.0".to_owned()));
+        assert_eq!(
+            known.ui_hints["selectable_inventory_models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            rules.static_inventory_models.len()
+        );
+        assert_eq!(contract.base_adapter_id, CLAUDE_MESSAGES_ADAPTER_ID);
+        assert_eq!(
+            adapter.base_adapter_id.as_deref(),
+            Some(CLAUDE_MESSAGES_ADAPTER_ID)
+        );
+        assert_eq!(registration.operation_codecs.len(), 8);
+        assert_eq!(registration.native_task_codecs.len(), 2);
+        let builtin = minimax_catalog_files()
+            .into_iter()
+            .map(|file| MetadataFile::parse(MetadataSource::Builtin, file.kind, file.contents))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let catalog = MetadataSources {
+            builtin,
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        assert!(catalog
+            .known_provider(MINIMAX_PROVIDER_PROFILE_ID)
+            .is_some());
+        assert!(catalog
+            .provider_rules(MINIMAX_PROVIDER_PROFILE_ID)
+            .is_some());
+        assert!(catalog.model_driver(MINIMAX_PROVIDER_PROFILE_ID).is_some());
+    }
+
+    #[test]
+    fn derived_registration_depends_one_way_on_the_unchanged_base_adapter() {
+        let (base_descriptor, base_registration) = claude_messages_adapter();
+        let mut registry = CodecRegistry::default();
+        registry
+            .register_codecs(base_descriptor, base_registration)
+            .unwrap();
+        let (media_descriptor, media_registration) = crate::protocol::minimax_media_adapter();
+        registry
+            .register_codecs(media_descriptor, media_registration)
+            .unwrap();
+        let (derived_descriptor, derived_registration) = minimax_messages_adapter();
+        registry
+            .register_codecs(derived_descriptor, derived_registration)
+            .unwrap();
+
+        assert!(registry.adapter(CLAUDE_MESSAGES_ADAPTER_ID).is_some());
+        assert!(registry.adapter(MINIMAX_MESSAGES_ADAPTER_ID).is_some());
+
+        let (base_descriptor, base_registration) = claude_messages_adapter();
+        let mut base_only = CodecRegistry::default();
+        base_only
+            .register_codecs(base_descriptor, base_registration)
+            .unwrap();
+        assert!(base_only.adapter(CLAUDE_MESSAGES_ADAPTER_ID).is_some());
+    }
+}

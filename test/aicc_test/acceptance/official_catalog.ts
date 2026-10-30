@@ -1,0 +1,448 @@
+import type {
+  OfficialCatalogConfig,
+  ProviderBaseline,
+  ProviderInventory,
+} from "./types.ts";
+
+type CatalogProfile = ProviderBaseline["providers"][number];
+type Fetcher = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
+function curlConfigValue(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+async function fetchAnthropicCatalogWithCurl(url: URL, init: RequestInit): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const config = [
+    "silent",
+    "show-error",
+    `url = "${curlConfigValue(url.toString())}"`,
+    `request = "${curlConfigValue(init.method ?? "GET")}"`,
+    ...[...headers.entries()].map(([name, value]) =>
+      `header = "${curlConfigValue(`${name}: ${value}`)}"`
+    ),
+    'write-out = "\\n%{http_code}"',
+    "",
+  ].join("\n");
+  const child = new Deno.Command("curl", {
+    args: ["--config", "-"],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(config));
+  await writer.close();
+  const output = await child.output();
+  if (!output.success) throw new Error("Anthropic catalog curl transport failed");
+  const text = new TextDecoder().decode(output.stdout);
+  const separator = text.lastIndexOf("\n");
+  const status = Number(text.slice(separator + 1));
+  if (separator < 0 || !Number.isInteger(status)) {
+    throw new Error("Anthropic catalog curl transport returned invalid status");
+  }
+  return new Response(text.slice(0, separator), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function object(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function stringField(value: unknown, field: string): string | undefined {
+  const result = object(value)?.[field];
+  return typeof result === "string" && result.trim() ? result.trim() : undefined;
+}
+
+/**
+ * Task types `openRouterTaskTypes` may emit.
+ *
+ * Each one must be a `task_type_api_types` key in the OpenRouter capability
+ * baseline: `manifest.ts` maps official task types onto API types through that
+ * table, so a task type without an entry silently yields zero acceptance cases
+ * instead of failing.
+ */
+export const OPENROUTER_CATALOG_TASK_TYPES = [
+  "decision",
+  "rerank",
+  "embedding.text",
+  "audio.tts",
+  "audio.asr",
+  "audio.music",
+  "video.generate",
+  "llm",
+  "vision.ocr",
+  "vision.caption",
+  "image.txt2img",
+  "image.img2img",
+] as const;
+
+export type OpenRouterCatalogTaskType = (typeof OPENROUTER_CATALOG_TASK_TYPES)[number];
+
+export function openRouterTaskTypes(
+  entry: unknown,
+): OpenRouterCatalogTaskType[] | undefined {
+  const architecture = object(object(entry)?.architecture);
+  const input = Array.isArray(architecture?.input_modalities)
+    ? architecture.input_modalities.filter((value): value is string => typeof value === "string")
+    : [];
+  const output = Array.isArray(architecture?.output_modalities)
+    ? architecture.output_modalities.filter((value): value is string => typeof value === "string")
+    : [];
+  const result: OpenRouterCatalogTaskType[] = [];
+  const push = (taskType: OpenRouterCatalogTaskType) => result.push(taskType);
+  if (output.length === 1 && output[0] === "decisions") push("decision");
+  else if (output.length === 1 && output[0] === "rerank") push("rerank");
+  else if (output.length === 1 && output[0] === "embeddings") push("embedding.text");
+  else if (output.length === 1 && output[0] === "speech") push("audio.tts");
+  else if (output.length === 1 && output[0] === "transcription") push("audio.asr");
+  else if (output.length === 1 && output[0] === "video") {
+    // AICC exposes a single canonical video entry point; text prompts, keyframes
+    // and reference images all lower onto `video.generate`, so the legacy
+    // `video.txt2video` / `video.img2video` names must not be emitted here.
+    push("video.generate");
+  } else if (
+    output.includes("audio") &&
+    output.every((value) => ["text", "image", "audio"].includes(value))
+  ) {
+    push("audio.music");
+  } else if (output.every((value) => ["text", "image"].includes(value))) {
+    if (output.includes("text")) {
+      push("llm");
+      if (input.includes("image")) {
+        push("vision.ocr");
+        push("vision.caption");
+      }
+    }
+    if (output.includes("image")) {
+      if (input.includes("text")) push("image.txt2img");
+      if (input.includes("image")) push("image.img2img");
+    }
+  }
+  return result.length > 0 ? result : undefined;
+}
+
+function requireToken(profile: CatalogProfile, token: string | undefined): string {
+  if (profile.official_catalog.authentication === "none") return "";
+  if (!token?.trim()) {
+    throw new Error(`official catalog credential is required for ${profile.provider_driver}`);
+  }
+  return token.trim();
+}
+
+function configureRequest(
+  profile: CatalogProfile,
+  token: string,
+  cursor: string | undefined,
+): { url: URL; init: RequestInit } {
+  const catalog = profile.official_catalog;
+  const url = new URL(catalog.endpoint);
+  const headers = new Headers({ accept: "application/json" });
+  const pageSize = String(catalog.page_size ?? 1000);
+  if (catalog.format === "anthropic") {
+    url.searchParams.set("limit", pageSize);
+    if (cursor) url.searchParams.set("after_id", cursor);
+    if (catalog.anthropic_version_header !== false) {
+      headers.set("anthropic-version", "2023-06-01");
+    }
+    headers.set("user-agent", "aicc-acceptance/1.0");
+  } else if (catalog.format === "gemini") {
+    url.searchParams.set("pageSize", pageSize);
+    if (cursor) url.searchParams.set("pageToken", cursor);
+  } else if (catalog.format === "fal") {
+    const endpointIds = catalog.endpoint_ids ?? [];
+    url.searchParams.set("limit", String(endpointIds.length || pageSize));
+    url.searchParams.set("status", "active");
+    for (const endpointId of endpointIds) {
+      url.searchParams.append("endpoint_id", endpointId);
+    }
+    if (cursor) url.searchParams.set("cursor", cursor);
+  }
+  if (catalog.authentication === "bearer") headers.set("authorization", `Bearer ${token}`);
+  else if (catalog.authentication === "x-api-key") headers.set("x-api-key", token);
+  else if (catalog.authentication === "query-key") url.searchParams.set("key", token);
+  else if (catalog.authentication === "fal-key") headers.set("authorization", `Key ${token}`);
+  return { url, init: { method: "GET", headers } };
+}
+
+function parsePage(
+  config: OfficialCatalogConfig,
+  body: unknown,
+): {
+  models: Array<{ id: string; lifecycleStatus?: string; taskTypes?: string[] }>;
+  cursor?: string;
+} {
+  const root = object(body);
+  if (!root) throw new Error("official catalog returned a non-object response");
+  if (config.format === "typesafe") {
+    if (!Array.isArray(root.models)) throw new Error("TypeSafe models list is missing");
+    return { models: root.models.map(entry => { const id = stringField(entry, "name"); if (!id) throw new Error("TypeSafe model name is missing"); return { id }; }) };
+  }
+  if (config.format === "gemini") {
+    const models = Array.isArray(root.models) ? root.models : [];
+    return {
+      models: models.flatMap((entry) => {
+        const name = stringField(entry, "name");
+        return name ? [{ id: name.replace(/^models\//, "") }] : [];
+      }),
+      cursor: stringField(root, "nextPageToken"),
+    };
+  }
+  if (config.format === "fal") {
+    const models = Array.isArray(root.models) ? root.models : [];
+    return {
+      models: models.flatMap((entry) => {
+        const id = stringField(entry, "endpoint_id");
+        return id ? [{ id }] : [];
+      }),
+      cursor: root.has_more === true ? stringField(root, "next_cursor") : undefined,
+    };
+  }
+  if (config.format === "sn" && Array.isArray(root.models)) {
+    return {
+      models: root.models.flatMap((entry) => {
+        const id = stringField(entry, "provider_actual_model_id") ?? stringField(entry, "provider_model_id");
+        return id ? [{ id }] : [];
+      }),
+    };
+  }
+  if (config.format === "sn" && Array.isArray(root.items)) {
+    return {
+      models: root.items.flatMap((entry) => {
+        const id = stringField(entry, "model") ?? stringField(entry, "id");
+        return id ? [{ id }] : [];
+      }),
+    };
+  }
+  const data = Array.isArray(root.data) ? root.data : [];
+  if (new URL(config.endpoint).hostname === "openrouter.ai") {
+    const target = data.find(entry => stringField(entry, "id") === "typesafe/jev-1.13");
+    const verified = (entry: unknown) => stringField(entry, "canonical_slug") === "typesafe/jev-1.13-20260917"
+      && object(entry)?.context_length === 32000
+      && JSON.stringify(object(object(entry)?.architecture)?.output_modalities) === '["decisions"]';
+    if (target && !verified(target)) throw new Error("OpenRouter Jev build or capability drift; reverify baseline");
+    const alias = data.find(entry => stringField(entry, "id") === "~typesafe/jev-latest");
+    if (alias && (!target || !verified(target) || stringField(object(alias)?.alias_target, "slug") !== "typesafe/jev-1.13")) {
+      throw new Error("OpenRouter Jev alias drift; reverify baseline");
+    }
+  }
+  const result = {
+    models: data.flatMap((entry) => {
+      const id = stringField(entry, "id") ?? stringField(entry, "model");
+      if (!id) return [];
+      const record = object(entry);
+      const taskTypes = new URL(config.endpoint).hostname === "openrouter.ai"
+        ? openRouterTaskTypes(entry)
+        : Array.isArray(record?.task_type)
+        ? record.task_type.filter((value): value is string => typeof value === "string" && value.length > 0)
+        : undefined;
+      return [{
+        id,
+        lifecycleStatus: stringField(entry, "status"),
+        taskTypes: taskTypes?.length ? taskTypes : undefined,
+      }];
+    }),
+    cursor: undefined as string | undefined,
+  };
+  if (config.format === "anthropic" && root.has_more === true) {
+    result.cursor = stringField(root, "last_id");
+  }
+  return result;
+}
+
+type OfficialCatalogModel = {
+  id: string;
+  lifecycleStatus?: string;
+  taskTypes?: string[];
+};
+
+async function fetchOfficialModels(input: {
+  profile: CatalogProfile;
+  token?: string;
+  timeoutMs: number;
+  fetcher?: Fetcher;
+}): Promise<OfficialCatalogModel[]> {
+  if (input.profile.official_catalog.format === "frozen") {
+    return [...(input.profile.official_catalog.model_ids ?? []), ...(input.profile.official_catalog.supplemental_model_ids ?? [])]
+      .sort((left, right) => left.localeCompare(right))
+      .map((id) => ({ id }));
+  }
+  const token = requireToken(input.profile, input.token);
+  const fetcher = input.fetcher ?? fetch;
+  const models = new Map<string, OfficialCatalogModel>();
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < 100; page += 1) {
+    const request = configureRequest(input.profile, token, cursor);
+    let response: Response | undefined;
+    const maxAttempts = input.fetcher ? 1 : 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        response = input.profile.official_catalog.format === "anthropic" && !input.fetcher
+          ? await fetchAnthropicCatalogWithCurl(request.url, request.init)
+          : await fetcher(request.url, {
+            ...request.init,
+            signal: AbortSignal.timeout(input.timeoutMs),
+          });
+      } catch {
+        if (attempt === maxAttempts) {
+          throw new Error(`official catalog request failed for ${input.profile.provider_driver}: network error`);
+        }
+      }
+      if (response && (response.ok || ![403, 429].includes(response.status) && response.status < 500)) break;
+      if (attempt < maxAttempts) await new Promise((resolve) => setTimeout(resolve, attempt * 500));
+    }
+    if (!response) throw new Error(`official catalog request failed for ${input.profile.provider_driver}: network error`);
+    if (!response.ok) {
+      throw new Error(`official catalog request failed for ${input.profile.provider_driver}: HTTP ${response.status}`);
+    }
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new Error(`official catalog returned invalid JSON for ${input.profile.provider_driver}`);
+    }
+    const parsed = parsePage(input.profile.official_catalog, body);
+    for (const model of parsed.models) {
+      const id = model.id.trim();
+      if (id) models.set(id.toLowerCase(), { ...model, id });
+    }
+    if (!parsed.cursor) break;
+    if (seenCursors.has(parsed.cursor)) {
+      throw new Error(`official catalog pagination loop for ${input.profile.provider_driver}`);
+    }
+    seenCursors.add(parsed.cursor);
+    cursor = parsed.cursor;
+    if (page === 99) throw new Error(`official catalog pagination exceeded 100 pages for ${input.profile.provider_driver}`);
+  }
+  if (models.size === 0) throw new Error(`official catalog returned no models for ${input.profile.provider_driver}`);
+  const includeModelIds = input.profile.official_catalog.include_model_ids ?? [];
+  if (includeModelIds.length > 0) {
+    const expected = new Map(includeModelIds.map((id) => [id.toLowerCase(), id]));
+    const missing = [...expected.keys()].filter((id) => !models.has(id));
+    if (missing.length > 0) {
+      throw new Error(`official catalog scope mismatch for ${input.profile.provider_driver}: missing=${missing.join(",")}`);
+    }
+    for (const id of [...models.keys()]) {
+      if (!expected.has(id)) models.delete(id);
+    }
+  }
+  const endpointIds = input.profile.official_catalog.endpoint_ids ?? [];
+  if (endpointIds.length > 0) {
+    const expected = new Set(endpointIds.map((id) => id.toLowerCase()));
+    const missing = [...expected].filter((id) => !models.has(id));
+    const unexpected = [...models.keys()].filter((id) => !expected.has(id));
+    if (missing.length > 0 || unexpected.length > 0) {
+      throw new Error(`official catalog scope mismatch for ${input.profile.provider_driver}: missing=${missing.join(",") || "none"} unexpected=${unexpected.join(",") || "none"}`);
+    }
+  }
+  for (const id of input.profile.official_catalog.supplemental_model_ids ?? []) {
+    const normalized = id.trim();
+    if (normalized) models.set(normalized.toLowerCase(), { id: normalized });
+  }
+  return [...models.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+export async function fetchOfficialModelIds(input: {
+  profile: CatalogProfile;
+  token?: string;
+  timeoutMs: number;
+  fetcher?: Fetcher;
+}): Promise<string[]> {
+  return (await fetchOfficialModels(input)).map((model) => model.id);
+}
+
+export async function fetchOfficialCatalogs(input: {
+  baseline: ProviderBaseline;
+  drivers: string[];
+  instanceNames: Record<string, string>;
+  tokens: Record<string, string | undefined>;
+  endpointOverrides?: Record<string, string | undefined>;
+  timeoutMs: number;
+  fetcher?: Fetcher;
+}): Promise<ProviderInventory[]> {
+  const profiles = new Map(input.baseline.providers.map((profile) => [profile.provider_driver, profile]));
+  const fetchedAt = new Date().toISOString();
+  const catalogs: ProviderInventory[] = [];
+  for (const driver of input.drivers) {
+    const baselineProfile = profiles.get(driver);
+    if (!baselineProfile) throw new Error(`missing provider baseline for ${driver}`);
+    const endpoint = input.endpointOverrides?.[driver];
+    const profile = endpoint
+      ? {
+        ...baselineProfile,
+        official_catalog: { ...baselineProfile.official_catalog, endpoint },
+      }
+      : baselineProfile;
+    const instance = input.instanceNames[driver] || `${driver}-unresolved`;
+    const models = await fetchOfficialModels({
+      profile,
+      token: input.tokens[driver],
+      timeoutMs: input.timeoutMs,
+      fetcher: input.fetcher,
+    });
+    catalogs.push({
+      provider_driver: driver,
+      provider_instance_name: instance,
+      inventory_revision: profile.official_catalog.format === "frozen"
+        ? `official-frozen-${profile.official_catalog.checked_at}`
+        : `official-snapshot-${fetchedAt}`,
+      models: models.map((model) => ({
+        exact_model: `${model.id}@${instance}`,
+        provider_model_id: model.id,
+        api_types: [],
+        logical_mounts: [],
+        official_lifecycle_status: model.lifecycleStatus,
+        official_task_types: model.taskTypes,
+      })),
+    });
+  }
+  return catalogs;
+}
+
+export function bindOfficialCatalogInstances(
+  catalogs: ProviderInventory[],
+  selectedInventories: ProviderInventory[],
+): ProviderInventory[] {
+  const instances = new Map(
+    selectedInventories.map((inventory) => [inventory.provider_driver, inventory.provider_instance_name]),
+  );
+  return catalogs.map((catalog) => {
+    const instance = instances.get(catalog.provider_driver) ?? catalog.provider_instance_name;
+    return {
+      ...catalog,
+      provider_instance_name: instance,
+      models: catalog.models.map((model) => ({
+        ...model,
+        exact_model: `${model.provider_model_id}@${instance}`,
+      })),
+    };
+  });
+}
+
+function caseModelSegment(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+}
+
+export function scopeInventoriesToRequestedCases(
+  inventories: ProviderInventory[],
+  caseIds: string[],
+): ProviderInventory[] {
+  if (caseIds.length === 0) return inventories;
+  const requested = caseIds.map((caseId) => caseId.toLowerCase());
+  return inventories.map((inventory) => ({
+    ...inventory,
+    models: inventory.models.filter((model) => {
+      const identities = [model.provider_model_id, model.provider_actual_model_id]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .map(caseModelSegment);
+      return identities.some((identity) =>
+        requested.some((caseId) => caseId.includes(`.${identity}.`))
+      );
+    }),
+  }));
+}

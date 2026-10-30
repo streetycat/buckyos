@@ -1,0 +1,3080 @@
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { AcceptanceCase, ProviderModel } from "./types.ts";
+import { methodsForApiType } from "./canonical.ts";
+
+export const REQUIRED_T15_PROVIDER_DRIVERS = [
+  "openai",
+  "claude",
+  "google-gemini",
+  "fal",
+  "minimax",
+  "openrouter",
+  "kimi",
+  "glm",
+  "deepseek",
+  "doubao",
+  "qwen",
+  "sn-ai-provider",
+  "typesafe",
+] as const;
+
+const GLM_VIDEO_EXAMPLE_URL =
+  "https://raw.githubusercontent.com/MetaGLM/glm-cookbook/main/vision/cogvideox_pysdk.ipynb";
+
+const OFFICIAL_PROTOCOL_SOURCE_HOSTS: Record<string, Set<string>> = {
+  typesafe: new Set(["docs.typesafe.ai"]),
+  openai: new Set(["platform.openai.com", "developers.openai.com"]),
+  claude: new Set(["platform.claude.com", "docs.anthropic.com"]),
+  "google-gemini": new Set(["ai.google.dev"]),
+  fal: new Set(["fal.ai"]),
+  minimax: new Set(["platform.minimax.io"]),
+  openrouter: new Set(["openrouter.ai", "ai.google.dev", "platform.minimax.io", "developers.openai.com"]),
+  kimi: new Set(["platform.kimi.com"]),
+  glm: new Set(["docs.z.ai", "docs.bigmodel.cn"]),
+  deepseek: new Set(["api-docs.deepseek.com"]),
+  doubao: new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  "doubao-agent-plan": new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  "doubao-tts": new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  "doubao-speech": new Set(["www.volcengine.com", "docs.volcengine.com"]),
+  qwen: new Set(["www.alibabacloud.com", "help.aliyun.com"]),
+  "sn-ai-provider": new Set([
+    "developers.openai.com",
+    "github.com",
+    "openrouter.ai",
+    "platform.kimi.com",
+    "docs.z.ai",
+    "www.alibabacloud.com",
+    "help.aliyun.com",
+  ]),
+};
+
+export type ProtocolErrorFixture = {
+  scenario: string;
+  status: number;
+  body: Record<string, unknown>;
+  headers?: Record<string, string>;
+};
+
+export type ProviderProtocolContract = {
+  aicc_error_code_by_scenario?: Record<string, string>;
+  id: string;
+  protocol_adapter_id: string;
+  error_fixture_key?: string;
+  base_contract_id?: string;
+  api_version: string;
+  api_types: string[];
+  test_model_ids?: Record<string, string>;
+  conformance_test_model_ids?: Record<string, string[]>;
+  native_history_matrix?: boolean;
+  provider_switch_matrix?: boolean;
+  model_ids_by_api_type?: Record<string, string[]>;
+  variant_api_types?: string[];
+  operation: string;
+  http_method: string;
+  path: string;
+  auth: { kind: "header" | "query"; name: string; prefix: string };
+  required_headers?: Record<string, string>;
+  content_type: string;
+  alternative_content_types?: string[];
+  required_body_fields: string[];
+  required_body_fields_by_api_type?: Record<string, string[]>;
+  /** video.generate condition scenarios the official contract documents, beyond text only. */
+  video_generate_scenarios?: VideoScenario[];
+  allowed_body_fields: string[];
+  body_field_types: Record<
+    string,
+    Array<"string" | "number" | "integer" | "boolean" | "array" | "object">
+  >;
+  body_field_formats?: Record<string, "http_url" | "http_url_or_data_uri">;
+  required_body_values?: Record<string, unknown>;
+  required_body_values_by_model?: Record<string, Record<string, unknown>>;
+  json_string_body_values?: Record<string, Record<string, unknown>>;
+  required_body_paths?: string[];
+  forbidden_body_paths?: string[];
+  forbidden_body_paths_by_model?: Record<string, string[]>;
+  canonical_request_overrides?: Record<string, unknown>;
+  generation_config?: {
+    allowed_fields: string[];
+    thinking_level_values?: string[];
+  };
+  thinking?: {
+    allowed_types: string[];
+  };
+  minimax_music?: {
+    cover_model_ids: string[];
+    cover_reference_fields: string[];
+    non_instrumental_requires_lyrics_or_optimizer: boolean;
+  };
+  stream_protocol?:
+    | "openai_responses"
+    | "openai_chat"
+    | "claude_messages"
+    | "gemini_interactions";
+  async_protocol?:
+    | "openai_responses"
+    | "fal_queue"
+    | "gemini_interactions"
+    | "minimax_video"
+    | "minimax_video_v2"
+    | "google_lro"
+    | "openai_video"
+    | "openrouter_video"
+    | "glm_video"
+    | "doubao_video"
+    | "qwen_media"
+    | "doubao_asr";
+  async_steps?: Array<{
+    name: "poll" | "result" | "cancel";
+    http_method: string;
+    path: string;
+    required_query_fields?: string[];
+  }>;
+  success_content_type?: string;
+  success_fixture?: Record<string, unknown>;
+  inline_artifact_success_fixture?: Record<string, unknown>;
+  inline_artifact_payload_paths?: string[];
+  success_chunk_fixtures?: Array<Record<string, unknown>>;
+  success_chunk_string_expansions?: Array<{
+    chunk_index: number;
+    path: Array<string | number>;
+    value: string;
+    repeat: number;
+  }>;
+  async_result_fixture?: Record<string, unknown>;
+  computer_screenshot_handshake?: boolean;
+  success_fixture_base64?: string;
+  provider_artifact_identity?: {
+    fixture_artifact_id: string;
+    returns_api_types: string[];
+    accepts_api_types: string[];
+    id_fields: string[];
+    same_provider_reuse: "required";
+    cross_provider_reuse: "forbidden";
+  };
+  official_sources: string[];
+  evidence_summary: string;
+};
+
+export type ProviderProtocolCatalog = {
+  schema_version: number;
+  revision: string;
+  checked_at: string;
+  providers: Array<{
+    provider_driver: string;
+    server_default_test?: { model_id: string; model_driver: string; protocol_adapter_id: string; contract_id: string };
+    provider_profile_id: string;
+    endpoint_path: string;
+    operation_endpoint_paths?: Record<string, string>;
+    credential_type: "api_key" | "bearer";
+    instance_fields?: { region?: string; workspace?: string; account?: string };
+    official_first_party_model_ids?: Record<string, string[]>;
+    official_aggregated_model_ids?: Record<string, string[]>;
+    wire_distinct_model_ids?: Record<string, string[]>;
+    official_variant_sources?: string[];
+    official_variant_rules?: Array<{
+      model_ids: string[];
+      variants: Record<string, Record<string, unknown>>;
+    }>;
+    test_model_ids: Record<string, string>;
+    contracts: ProviderProtocolContract[];
+  }>;
+  error_evidence: Record<string, {
+    applicable_api_versions: string[];
+    official_sources: string[];
+    evidence_summary: string;
+  }>;
+  error_fixtures: Record<string, ProtocolErrorFixture[]>;
+};
+
+export type CapturedProviderRequest = {
+  method: string;
+  pathname: string;
+  query: URLSearchParams;
+  headers: Headers;
+  body: unknown;
+};
+
+const here = dirname(fileURLToPath(import.meta.url));
+
+function object(value: unknown, field: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+function nonEmptyString(value: unknown, field: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+function stringArray(value: unknown, field: string): string[] {
+  if (
+    !Array.isArray(value) || value.length === 0 ||
+    value.some((item) => typeof item !== "string" || !item)
+  ) {
+    throw new Error(`${field} must be a non-empty string array`);
+  }
+  return value as string[];
+}
+
+export function validateProviderProtocolCatalog(
+  value: unknown,
+): ProviderProtocolCatalog {
+  const root = object(value, "protocol catalog");
+  if (root.schema_version !== 1) {
+    throw new Error("unsupported provider protocol contract schema");
+  }
+  nonEmptyString(root.revision, "revision");
+  nonEmptyString(root.checked_at, "checked_at");
+  if (!Array.isArray(root.providers)) {
+    throw new Error("providers must be an array");
+  }
+  const providers = new Set<string>();
+  const ids = new Set<string>();
+  for (const rawProvider of root.providers) {
+    const provider = object(rawProvider, "provider");
+    const driver = nonEmptyString(provider.provider_driver, "provider_driver");
+    if (providers.has(driver)) {
+      throw new Error(`duplicate protocol provider ${driver}`);
+    }
+    providers.add(driver);
+    nonEmptyString(
+      provider.provider_profile_id,
+      `${driver}.provider_profile_id`,
+    );
+    if (
+      typeof provider.endpoint_path !== "string" ||
+      (provider.endpoint_path !== "" && !provider.endpoint_path.startsWith("/"))
+    ) {
+      throw new Error(`${driver}.endpoint_path must be empty or start with /`);
+    }
+    if (provider.operation_endpoint_paths !== undefined) {
+      const paths = object(
+        provider.operation_endpoint_paths,
+        `${driver}.operation_endpoint_paths`,
+      );
+      for (const [operation, path] of Object.entries(paths)) {
+        nonEmptyString(
+          operation,
+          `${driver}.operation_endpoint_paths operation`,
+        );
+        if (typeof path !== "string" || !path.startsWith("/")) {
+          throw new Error(
+            `${driver}.operation_endpoint_paths.${operation} must start with /`,
+          );
+        }
+      }
+    }
+    if (!["api_key", "bearer"].includes(String(provider.credential_type))) {
+      throw new Error(`${driver}.credential_type is invalid`);
+    }
+    if (provider.instance_fields !== undefined) {
+      const fields = object(
+        provider.instance_fields,
+        `${driver}.instance_fields`,
+      );
+      for (const [name, fieldValue] of Object.entries(fields)) {
+        if (!["region", "workspace", "account"].includes(name)) {
+          throw new Error(`${driver}.instance_fields.${name} is invalid`);
+        }
+        nonEmptyString(fieldValue, `${driver}.instance_fields.${name}`);
+      }
+    }
+    if (provider.server_default_test !== undefined) {
+      const test = object(provider.server_default_test, `${driver}.server_default_test`);
+      for (const field of ["model_id", "model_driver", "protocol_adapter_id", "contract_id"]) nonEmptyString(test[field], `${driver}.server_default_test.${field}`);
+    }
+    const testModelIds = object(
+      provider.test_model_ids,
+      `${driver}.test_model_ids`,
+    );
+    for (const [apiType, modelId] of Object.entries(testModelIds)) {
+      nonEmptyString(apiType, `${driver}.test_model_ids key`);
+      nonEmptyString(modelId, `${driver}.test_model_ids.${apiType}`);
+    }
+    if (provider.official_first_party_model_ids !== undefined) {
+      const officialModelIds = object(
+        provider.official_first_party_model_ids,
+        `${driver}.official_first_party_model_ids`,
+      );
+      for (const [apiType, modelId] of Object.entries(testModelIds)) {
+        const pool = stringArray(
+          officialModelIds[apiType],
+          `${driver}.official_first_party_model_ids.${apiType}`,
+        );
+        if (!pool.includes(String(modelId))) {
+          throw new Error(
+            `${driver}.test_model_ids.${apiType} is absent from its official model pool`,
+          );
+        }
+      }
+    }
+    if (provider.official_aggregated_model_ids !== undefined) {
+      const aggregatedModelIds = object(
+        provider.official_aggregated_model_ids,
+        `${driver}.official_aggregated_model_ids`,
+      );
+      for (const [apiType, modelIds] of Object.entries(aggregatedModelIds)) {
+        stringArray(
+          modelIds,
+          `${driver}.official_aggregated_model_ids.${apiType}`,
+        );
+      }
+    }
+    if (provider.wire_distinct_model_ids !== undefined) {
+      const distinctModels = object(
+        provider.wire_distinct_model_ids,
+        `${driver}.wire_distinct_model_ids`,
+      );
+      for (const [apiType, rawModelIds] of Object.entries(distinctModels)) {
+        const modelIds = stringArray(
+          rawModelIds,
+          `${driver}.wire_distinct_model_ids.${apiType}`,
+        );
+        const officialPool = (provider.official_first_party_model_ids as
+          | Record<string, string[]>
+          | undefined)?.[apiType];
+        for (const modelId of modelIds) {
+          if (officialPool && !officialPool.includes(modelId)) {
+            throw new Error(
+              `${driver}.wire_distinct_model_ids.${apiType} contains ${modelId} outside its official model pool`,
+            );
+          }
+          if (
+            !(provider.contracts as ProviderProtocolContract[]).some((
+              contract,
+            ) =>
+              contract.api_types.includes(apiType) &&
+              contract.test_model_ids?.[apiType] === modelId
+            )
+          ) {
+            throw new Error(
+              `${driver} has no distinct wire contract for ${apiType}/${modelId}`,
+            );
+          }
+        }
+      }
+    }
+    if (provider.official_variant_rules !== undefined) {
+      const sources = stringArray(
+        provider.official_variant_sources,
+        `${driver}.official_variant_sources`,
+      );
+      if (
+        sources.some((source) =>
+          !/^https:\/\//.test(source) ||
+          !(driver === "glm" && source === GLM_VIDEO_EXAMPLE_URL) &&
+            !OFFICIAL_PROTOCOL_SOURCE_HOSTS[driver]?.has(
+              new URL(source).hostname,
+            )
+        )
+      ) {
+        throw new Error(
+          `${driver}.official_variant_sources must use the Provider official domain`,
+        );
+      }
+      if (
+        !Array.isArray(provider.official_variant_rules) ||
+        provider.official_variant_rules.length === 0
+      ) {
+        throw new Error(
+          `${driver}.official_variant_rules must be a non-empty array`,
+        );
+      }
+      for (
+        const [index, rawRule] of (provider.official_variant_rules as unknown[])
+          .entries()
+      ) {
+        const rule = object(
+          rawRule,
+          `${driver}.official_variant_rules[${index}]`,
+        );
+        stringArray(
+          rule.model_ids,
+          `${driver}.official_variant_rules[${index}].model_ids`,
+        );
+        const variants = object(
+          rule.variants,
+          `${driver}.official_variant_rules[${index}].variants`,
+        );
+        if (Object.keys(variants).length === 0) {
+          throw new Error(
+            `${driver}.official_variant_rules[${index}].variants must not be empty`,
+          );
+        }
+        for (const [variant, options] of Object.entries(variants)) {
+          nonEmptyString(
+            variant,
+            `${driver}.official_variant_rules[${index}].variants key`,
+          );
+          object(
+            options,
+            `${driver}.official_variant_rules[${index}].variants.${variant}`,
+          );
+        }
+      }
+    }
+    if (!Array.isArray(provider.contracts) || provider.contracts.length === 0) {
+      throw new Error(`${driver}.contracts must not be empty`);
+    }
+    for (const rawContract of provider.contracts) {
+      const contract = object(rawContract, `${driver}.contract`);
+      const id = nonEmptyString(contract.id, `${driver}.contract.id`);
+      if (ids.has(id)) throw new Error(`duplicate protocol contract ${id}`);
+      ids.add(id);
+      for (
+        const field of [
+          "protocol_adapter_id",
+          "api_version",
+          "operation",
+          "http_method",
+          "path",
+          "content_type",
+          "evidence_summary",
+        ]
+      ) {
+        nonEmptyString(contract[field], `${id}.${field}`);
+      }
+      stringArray(contract.api_types, `${id}.api_types`);
+      if (contract.alternative_content_types !== undefined) {
+        stringArray(contract.alternative_content_types, `${id}.alternative_content_types`);
+      }
+      const contractTestModelIds = contract.test_model_ids === undefined
+        ? {}
+        : object(contract.test_model_ids, `${id}.test_model_ids`);
+      for (const [apiType, modelId] of Object.entries(contractTestModelIds)) {
+        if (!(contract.api_types as string[]).includes(apiType)) {
+          throw new Error(
+            `${id}.test_model_ids.${apiType} is not declared by the contract`,
+          );
+        }
+        nonEmptyString(modelId, `${id}.test_model_ids.${apiType}`);
+        const hasOfficialPool =
+          provider.official_first_party_model_ids !== undefined ||
+          provider.official_aggregated_model_ids !== undefined;
+        const officialPool = [
+          ...((provider.official_first_party_model_ids as
+            | Record<string, string[]>
+            | undefined)?.[apiType] ?? []),
+          ...((provider.official_aggregated_model_ids as
+            | Record<string, string[]>
+            | undefined)?.[apiType] ?? []),
+        ];
+        if (hasOfficialPool && !officialPool.includes(String(modelId))) {
+          throw new Error(
+            `${id}.test_model_ids.${apiType} is absent from its official model pool`,
+          );
+        }
+      }
+      for (const apiType of contract.api_types as string[]) {
+        if (!contractTestModelIds[apiType] && !testModelIds[apiType]) {
+          throw new Error(`${id} has no ${driver}.test_model_ids.${apiType}`);
+        }
+      }
+      if (contract.conformance_test_model_ids !== undefined) {
+        const conformanceModels = object(
+          contract.conformance_test_model_ids,
+          `${id}.conformance_test_model_ids`,
+        );
+        for (const [apiType, rawModelIds] of Object.entries(conformanceModels)) {
+          if (!(contract.api_types as string[]).includes(apiType)) {
+            throw new Error(
+              `${id}.conformance_test_model_ids.${apiType} is not declared by the contract`,
+            );
+          }
+          const modelIds = stringArray(
+            rawModelIds,
+            `${id}.conformance_test_model_ids.${apiType}`,
+          );
+          const officialPool = [
+            ...((provider.official_first_party_model_ids as
+              | Record<string, string[]>
+              | undefined)?.[apiType] ?? []),
+            ...((provider.official_aggregated_model_ids as
+              | Record<string, string[]>
+              | undefined)?.[apiType] ?? []),
+          ];
+          for (const modelId of modelIds) {
+            if (!officialPool.includes(modelId)) {
+              throw new Error(
+                `${id}.conformance_test_model_ids.${apiType} contains ${modelId} outside its official model pool`,
+              );
+            }
+          }
+        }
+      }
+      for (const field of ["native_history_matrix", "provider_switch_matrix"] as const) {
+        if (contract[field] !== undefined && typeof contract[field] !== "boolean") {
+          throw new Error(`${id}.${field} must be a boolean`);
+        }
+      }
+      if (contract.variant_api_types !== undefined) {
+        stringArray(contract.variant_api_types, `${id}.variant_api_types`);
+      }
+      stringArray(contract.allowed_body_fields, `${id}.allowed_body_fields`);
+      if (
+        !Array.isArray(contract.required_body_fields) ||
+        contract.required_body_fields.some((field) => typeof field !== "string")
+      ) {
+        throw new Error(`${id}.required_body_fields must be a string array`);
+      }
+      const allowed = new Set(contract.allowed_body_fields as string[]);
+      const bodyFieldTypes = object(
+        contract.body_field_types,
+        `${id}.body_field_types`,
+      );
+      if (contract.required_body_values !== undefined) {
+        const requiredBodyValues = object(
+          contract.required_body_values,
+          `${id}.required_body_values`,
+        );
+        for (const pointer of Object.keys(requiredBodyValues)) {
+          if (!pointer.startsWith("/")) {
+            throw new Error(
+              `${id}.required_body_values keys must be JSON pointers`,
+            );
+          }
+        }
+      }
+      if (contract.required_body_values_by_model !== undefined) {
+        const byModel = object(
+          contract.required_body_values_by_model,
+          `${id}.required_body_values_by_model`,
+        );
+        for (const [modelId, rawValues] of Object.entries(byModel)) {
+          nonEmptyString(modelId, `${id}.required_body_values_by_model key`);
+          const values = object(
+            rawValues,
+            `${id}.required_body_values_by_model.${modelId}`,
+          );
+          for (const pointer of Object.keys(values)) {
+            if (!pointer.startsWith("/")) {
+              throw new Error(
+                `${id}.required_body_values_by_model.${modelId} keys must be JSON pointers`,
+              );
+            }
+          }
+        }
+      }
+      if (contract.json_string_body_values !== undefined) {
+        const values = object(
+          contract.json_string_body_values,
+          `${id}.json_string_body_values`,
+        );
+        for (const [pointer, expected] of Object.entries(values)) {
+          if (!pointer.startsWith("/")) {
+            throw new Error(
+              `${id}.json_string_body_values keys must be JSON pointers`,
+            );
+          }
+          object(expected, `${id}.json_string_body_values.${pointer}`);
+        }
+      }
+      if (contract.canonical_request_overrides !== undefined) {
+        object(
+          contract.canonical_request_overrides,
+          `${id}.canonical_request_overrides`,
+        );
+      }
+      for (
+        const field of ["required_body_paths", "forbidden_body_paths"] as const
+      ) {
+        if (contract[field] === undefined) continue;
+        const pointers = stringArray(contract[field], `${id}.${field}`);
+        if (pointers.some((pointer) => !pointer.startsWith("/"))) {
+          throw new Error(`${id}.${field} entries must be JSON pointers`);
+        }
+      }
+      if (contract.forbidden_body_paths_by_model !== undefined) {
+        const byModel = object(
+          contract.forbidden_body_paths_by_model,
+          `${id}.forbidden_body_paths_by_model`,
+        );
+        for (const [modelId, rawPointers] of Object.entries(byModel)) {
+          nonEmptyString(modelId, `${id}.forbidden_body_paths_by_model key`);
+          const pointers = stringArray(
+            rawPointers,
+            `${id}.forbidden_body_paths_by_model.${modelId}`,
+          );
+          if (pointers.some((pointer) => !pointer.startsWith("/"))) {
+            throw new Error(
+              `${id}.forbidden_body_paths_by_model.${modelId} entries must be JSON pointers`,
+            );
+          }
+        }
+        const knownModels = new Set([
+          ...Object.values(
+            (provider.official_first_party_model_ids ?? {}) as Record<
+              string,
+              string[]
+            >,
+          ).flat(),
+          ...Object.values(
+            (provider.official_aggregated_model_ids ?? {}) as Record<
+              string,
+              string[]
+            >,
+          ).flat(),
+          ...Object.values(testModelIds as Record<string, string>),
+          ...Object.values(contractTestModelIds as Record<string, string>),
+        ]);
+        for (const modelId of Object.keys(byModel)) {
+          if (!knownModels.has(modelId)) {
+            throw new Error(
+              `${id}.forbidden_body_paths_by_model.${modelId} is not a documented model of ${provider.provider_driver}`,
+            );
+          }
+        }
+      }
+      for (const required of contract.required_body_fields as string[]) {
+        if (!allowed.has(required)) {
+          throw new Error(`${id} required field ${required} is not allowed`);
+        }
+        if (!bodyFieldTypes[required]) {
+          throw new Error(
+            `${id} required field ${required} has no type schema`,
+          );
+        }
+      }
+      if (contract.video_generate_scenarios !== undefined) {
+        const scenarios = stringArray(
+          contract.video_generate_scenarios,
+          `${id}.video_generate_scenarios`,
+        );
+        if (!(contract.api_types as string[]).includes("video.generate")) {
+          throw new Error(`${id}.video_generate_scenarios requires video.generate`);
+        }
+        for (const scenario of scenarios) {
+          if (!VIDEO_SCENARIOS.includes(scenario as VideoScenario)) {
+            throw new Error(`${id}.video_generate_scenarios has unknown scenario ${scenario}`);
+          }
+        }
+      }
+      if (contract.required_body_fields_by_api_type !== undefined) {
+        const conditional = object(
+          contract.required_body_fields_by_api_type,
+          `${id}.required_body_fields_by_api_type`,
+        );
+        for (const [apiType, rawFields] of Object.entries(conditional)) {
+          if (!(contract.api_types as string[]).includes(apiType)) {
+            throw new Error(
+              `${id}.required_body_fields_by_api_type.${apiType} is not declared by the contract`,
+            );
+          }
+          const fields = stringArray(
+            rawFields,
+            `${id}.required_body_fields_by_api_type.${apiType}`,
+          );
+          for (const field of fields) {
+            if (!allowed.has(field)) {
+              throw new Error(
+                `${id} conditional required field ${field} is not allowed`,
+              );
+            }
+            if (!bodyFieldTypes[field]) {
+              throw new Error(
+                `${id} conditional required field ${field} has no type schema`,
+              );
+            }
+          }
+        }
+      }
+      if (contract.model_ids_by_api_type !== undefined) {
+        const scopes = object(contract.model_ids_by_api_type, `${id}.model_ids_by_api_type`);
+        for (const [apiType, values] of Object.entries(scopes)) {
+          if (![...(contract.api_types as string[]), ...((contract.variant_api_types as string[] | undefined) ?? [])].includes(apiType)) {
+            throw new Error(`${id}.model_ids_by_api_type has undeclared API ${apiType}`);
+          }
+          const models = stringArray(values, `${id}.model_ids_by_api_type.${apiType}`);
+          const pool = [...((provider.official_first_party_model_ids as Record<string,string[]> | undefined)?.[apiType] ?? []),
+            ...((provider.official_aggregated_model_ids as Record<string,string[]> | undefined)?.[apiType] ?? [])];
+          if (models.some((model) => !pool.includes(model))) throw new Error(`${id} model scope contains an undocumented model`);
+        }
+      }
+      for (const [field, rawTypes] of Object.entries(bodyFieldTypes)) {
+        if (!allowed.has(field)) {
+          throw new Error(`${id} type schema field ${field} is not allowed`);
+        }
+        const types = stringArray(rawTypes, `${id}.body_field_types.${field}`);
+        if (
+          types.some((type) =>
+            !["string", "number", "integer", "boolean", "array", "object"]
+              .includes(type)
+          )
+        ) {
+          throw new Error(
+            `${id}.body_field_types.${field} contains invalid type`,
+          );
+        }
+      }
+      if (contract.body_field_formats !== undefined) {
+        const formats = object(
+          contract.body_field_formats,
+          `${id}.body_field_formats`,
+        );
+        for (const [field, format] of Object.entries(formats)) {
+          if (!allowed.has(field)) {
+            throw new Error(`${id} format field ${field} is not allowed`);
+          }
+          if (!(bodyFieldTypes[field] as unknown[] | undefined)?.includes("string")) {
+            throw new Error(`${id} format field ${field} must accept strings`);
+          }
+          if (format !== "http_url" && format !== "http_url_or_data_uri") {
+            throw new Error(`${id}.body_field_formats.${field} is invalid`);
+          }
+        }
+      }
+      if (contract.generation_config !== undefined) {
+        if (!allowed.has("generation_config")) {
+          throw new Error(
+            `${id}.generation_config is declared but generation_config is not an allowed body field`,
+          );
+        }
+        const generationConfig = object(
+          contract.generation_config,
+          `${id}.generation_config`,
+        );
+        stringArray(
+          generationConfig.allowed_fields,
+          `${id}.generation_config.allowed_fields`,
+        );
+        if (generationConfig.thinking_level_values !== undefined) {
+          stringArray(
+            generationConfig.thinking_level_values,
+            `${id}.generation_config.thinking_level_values`,
+          );
+        }
+      }
+      if (contract.thinking !== undefined) {
+        if (!allowed.has("thinking")) {
+          throw new Error(
+            `${id}.thinking is declared but thinking is not an allowed body field`,
+          );
+        }
+        const thinking = object(contract.thinking, `${id}.thinking`);
+        stringArray(thinking.allowed_types, `${id}.thinking.allowed_types`);
+      }
+      if (contract.minimax_music !== undefined) {
+        const music = object(contract.minimax_music, `${id}.minimax_music`);
+        stringArray(
+          music.cover_model_ids,
+          `${id}.minimax_music.cover_model_ids`,
+        );
+        const referenceFields = stringArray(
+          music.cover_reference_fields,
+          `${id}.minimax_music.cover_reference_fields`,
+        );
+        for (const field of referenceFields) {
+          if (!allowed.has(field)) {
+            throw new Error(
+              `${id}.minimax_music cover reference field ${field} is not allowed`,
+            );
+          }
+        }
+        if (
+          typeof music.non_instrumental_requires_lyrics_or_optimizer !==
+            "boolean"
+        ) {
+          throw new Error(
+            `${id}.minimax_music.non_instrumental_requires_lyrics_or_optimizer must be a boolean`,
+          );
+        }
+      }
+      if (contract.provider_artifact_identity !== undefined) {
+        const identity = object(
+          contract.provider_artifact_identity,
+          `${id}.provider_artifact_identity`,
+        );
+        const fixtureId = nonEmptyString(identity.fixture_artifact_id, `${id}.provider_artifact_identity.fixture_artifact_id`);
+        if (!JSON.stringify(contract.success_fixture).includes(JSON.stringify(fixtureId))) {
+          throw new Error(`${id}.fixture_artifact_id is absent from its success fixture`);
+        }
+        const returnsApiTypes = stringArray(
+          identity.returns_api_types,
+          `${id}.provider_artifact_identity.returns_api_types`,
+        );
+        const acceptsApiTypes = stringArray(
+          identity.accepts_api_types,
+          `${id}.provider_artifact_identity.accepts_api_types`,
+        );
+        stringArray(
+          identity.id_fields,
+          `${id}.provider_artifact_identity.id_fields`,
+        );
+        if (
+          returnsApiTypes.some((apiType) =>
+            !(contract.api_types as string[]).includes(apiType)
+          ) ||
+          acceptsApiTypes.some((apiType) =>
+            !(contract.api_types as string[]).includes(apiType)
+          )
+        ) {
+          throw new Error(
+            `${id}.provider_artifact_identity api types must be declared by the contract`,
+          );
+        }
+        if (identity.same_provider_reuse !== "required") {
+          throw new Error(
+            `${id}.provider_artifact_identity.same_provider_reuse is invalid`,
+          );
+        }
+        if (identity.cross_provider_reuse !== "forbidden") {
+          throw new Error(
+            `${id}.provider_artifact_identity.cross_provider_reuse is invalid`,
+          );
+        }
+      }
+      const sources = stringArray(
+        contract.official_sources,
+        `${id}.official_sources`,
+      );
+      if (sources.some((source) => !/^https:\/\//.test(source))) {
+        throw new Error(`${id}.official_sources must use HTTPS`);
+      }
+      if (
+        sources.some((source) =>
+          !(driver === "glm" && source === GLM_VIDEO_EXAMPLE_URL) &&
+          !OFFICIAL_PROTOCOL_SOURCE_HOSTS[driver]?.has(new URL(source).hostname)
+        )
+      ) {
+        throw new Error(
+          `${id}.official_sources must use the Provider official domain`,
+        );
+      }
+      const auth = object(contract.auth, `${id}.auth`);
+      if (!["header", "query"].includes(String(auth.kind))) {
+        throw new Error(`${id}.auth.kind is invalid`);
+      }
+      nonEmptyString(auth.name, `${id}.auth.name`);
+      if (typeof auth.prefix !== "string") {
+        throw new Error(`${id}.auth.prefix must be a string`);
+      }
+      if (contract.async_protocol) {
+        if (
+          !Array.isArray(contract.async_steps) ||
+          !contract.async_steps.some((step) =>
+            object(step, `${id}.async_step`).name === "poll"
+          )
+        ) {
+          throw new Error(
+            `${id}.async_steps must include poll for async protocols`,
+          );
+        }
+        for (
+          const [index, rawStep] of (contract.async_steps as unknown[])
+            .entries()
+        ) {
+          const step = object(rawStep, `${id}.async_steps[${index}]`);
+          if (!["poll", "result", "cancel"].includes(String(step.name))) {
+            throw new Error(`${id}.async_steps[${index}].name is invalid`);
+          }
+          nonEmptyString(
+            step.http_method,
+            `${id}.async_steps[${index}].http_method`,
+          );
+          nonEmptyString(step.path, `${id}.async_steps[${index}].path`);
+          if (step.required_query_fields !== undefined) {
+            stringArray(
+              step.required_query_fields,
+              `${id}.async_steps[${index}].required_query_fields`,
+            );
+          }
+        }
+      } else if (contract.async_steps !== undefined) {
+        throw new Error(`${id}.async_steps requires async_protocol`);
+      }
+      const fixtureErrors = validateProviderSuccessFixture(
+        contract as unknown as ProviderProtocolContract,
+      );
+      if (fixtureErrors.length > 0) {
+        throw new Error(
+          `${id}.success_fixture is invalid: ${fixtureErrors.join("; ")}`,
+        );
+      }
+      if (contract.inline_artifact_success_fixture !== undefined) {
+        object(
+          contract.inline_artifact_success_fixture,
+          `${id}.inline_artifact_success_fixture`,
+        );
+        const paths = stringArray(
+          contract.inline_artifact_payload_paths,
+          `${id}.inline_artifact_payload_paths`,
+        );
+        if (paths.length === 0 || paths.some((path) => !path.startsWith("/"))) {
+          throw new Error(
+            `${id}.inline_artifact_payload_paths must contain JSON pointers`,
+          );
+        }
+        for (const path of paths) {
+          const payload = contract.inline_artifact_success_fixture as Record<
+            string,
+            unknown
+          >;
+          const value = path.split("/").slice(1).reduce<unknown>(
+            (current, segment) => {
+              if (Array.isArray(current)) return current[Number(segment)];
+              if (current && typeof current === "object") {
+                return (current as Record<string, unknown>)[segment];
+              }
+              return undefined;
+            },
+            payload,
+          );
+          if (typeof value !== "string" || value.length === 0) {
+            throw new Error(
+              `${id}.inline_artifact_payload_paths entry ${path} is not a string`,
+            );
+          }
+        }
+      } else if (contract.inline_artifact_payload_paths !== undefined) {
+        throw new Error(
+          `${id}.inline_artifact_payload_paths requires a fixture`,
+        );
+      }
+    }
+  }
+  for (const required of REQUIRED_T15_PROVIDER_DRIVERS) {
+    if (!providers.has(required)) {
+      throw new Error(`protocol catalog missing Provider ${required}`);
+    }
+  }
+  const errors = object(root.error_fixtures, "error_fixtures");
+  const errorEvidence = object(root.error_evidence, "error_evidence");
+  for (const driver of providers) {
+    const evidence = object(errorEvidence[driver], `${driver}.error_evidence`);
+    stringArray(
+      evidence.applicable_api_versions,
+      `${driver}.error_evidence.applicable_api_versions`,
+    );
+    const evidenceSources = stringArray(
+      evidence.official_sources,
+      `${driver}.error_evidence.official_sources`,
+    );
+    if (evidenceSources.some((source) => !/^https:\/\//.test(source))) {
+      throw new Error(
+        `${driver}.error_evidence.official_sources must use HTTPS`,
+      );
+    }
+    if (
+      evidenceSources.some((source) =>
+        !(driver === "glm" && source === GLM_VIDEO_EXAMPLE_URL) &&
+        !OFFICIAL_PROTOCOL_SOURCE_HOSTS[driver]?.has(new URL(source).hostname)
+      )
+    ) {
+      throw new Error(
+        `${driver}.error_evidence.official_sources must use the Provider official domain`,
+      );
+    }
+    nonEmptyString(
+      evidence.evidence_summary,
+      `${driver}.error_evidence.evidence_summary`,
+    );
+    const fixtures = errors[driver];
+    if (!Array.isArray(fixtures) || fixtures.length < 3) {
+      throw new Error(
+        `${driver} must define at least three official error fixtures`,
+      );
+    }
+    for (const rawFixture of fixtures) {
+      const fixture = object(rawFixture, `${driver}.error_fixture`);
+      nonEmptyString(fixture.scenario, `${driver}.error_fixture.scenario`);
+      const body = object(fixture.body, `${driver}.error_fixture.body`);
+      const baseResponse = body.base_resp && typeof body.base_resp === "object"
+        ? body.base_resp as Record<string, unknown>
+        : undefined;
+      const nativeApplicationError = fixture.status === 200 &&
+        (Number(baseResponse?.status_code) > 0 ||
+          Object.entries(fixture.headers ?? {}).some(([name, value]) =>
+            name.toLowerCase() === "x-api-status-code" &&
+            !["0", "20000000", "20000001", "20000002"].includes(value)
+          ));
+      if (
+        !Number.isInteger(fixture.status) ||
+        (Number(fixture.status) < 400 && !nativeApplicationError)
+      ) {
+        throw new Error(
+          `${driver}.error_fixture.status must be HTTP error or documented Provider application error`,
+        );
+      }
+    }
+  }
+  return value as ProviderProtocolCatalog;
+}
+
+export async function loadProviderProtocolCatalog(): Promise<
+  ProviderProtocolCatalog
+> {
+  return validateProviderProtocolCatalog(JSON.parse(
+    await readFile(join(here, "provider_protocol_contracts.json"), "utf8"),
+  ));
+}
+
+function seededIndex(seed: string, length: number): number {
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(seed)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash % length;
+}
+
+export function selectOfficialModels(
+  catalog: ProviderProtocolCatalog,
+  providerDriver: string,
+  seed: string,
+): Record<string, string> {
+  const provider = catalog.providers.find((candidate) =>
+    candidate.provider_driver === providerDriver
+  );
+  if (!provider?.official_first_party_model_ids) {
+    throw new Error(`${providerDriver} has no official first-party model pool`);
+  }
+  return Object.fromEntries(
+    Object.entries(provider.official_first_party_model_ids).map((
+      [apiType, pool],
+    ) => [
+      apiType,
+      pool[seededIndex(`${seed}\0${providerDriver}\0${apiType}`, pool.length)],
+    ]),
+  );
+}
+
+export function protocolContracts(
+  catalog: ProviderProtocolCatalog,
+): Array<ProviderProtocolContract & { provider_driver: string }> {
+  return catalog.providers.flatMap((provider) =>
+    provider.contracts.map((contract) => ({
+      ...contract,
+      provider_driver: provider.provider_driver,
+    }))
+  );
+}
+
+export function protocolContract(
+  catalog: ProviderProtocolCatalog,
+  providerDriver: string,
+  contractId: string,
+): ProviderProtocolContract {
+  const contract = catalog.providers.find((provider) =>
+    provider.provider_driver === providerDriver
+  )
+    ?.contracts.find((candidate) => candidate.id === contractId);
+  if (!contract) {
+    throw new Error(
+      `unknown protocol contract ${providerDriver}/${contractId}`,
+    );
+  }
+  return contract;
+}
+
+export function contractTestModelId(
+  provider: ProviderProtocolCatalog["providers"][number],
+  contract: ProviderProtocolContract,
+  apiType: string,
+): string {
+  const model = contract.test_model_ids?.[apiType] ??
+    provider.test_model_ids[apiType];
+  if (!model) {
+    throw new Error(`${contract.id} has no test model for ${apiType}`);
+  }
+  return model;
+}
+
+function pathPattern(template: string): RegExp {
+  const escaped = template.replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\\\{[^}]+\\\}/g, "[^/]+");
+  return new RegExp(`^${escaped}$`);
+}
+
+export function validateProviderAuxiliaryRequest(
+  contract: ProviderProtocolContract,
+  request: Pick<
+    CapturedProviderRequest,
+    "method" | "pathname" | "query" | "headers"
+  >,
+): {
+  step?: NonNullable<ProviderProtocolContract["async_steps"]>[number];
+  errors: string[];
+} {
+  const step = contract.async_steps?.find((candidate) =>
+    candidate.http_method.toUpperCase() === request.method.toUpperCase() &&
+    pathPattern(candidate.path).test(request.pathname)
+  );
+  const errors: string[] = [];
+  if (!step) {
+    return {
+      errors: [
+        `unexpected async request ${request.method} ${request.pathname}`,
+      ],
+    };
+  }
+  const authValue = contract.auth.kind === "header"
+    ? request.headers.get(contract.auth.name)
+    : request.query.get(contract.auth.name);
+  if (
+    !authValue || !authValue.startsWith(contract.auth.prefix) ||
+    authValue.length <= contract.auth.prefix.length
+  ) {
+    errors.push(
+      `missing or invalid ${contract.auth.kind} authentication ${contract.auth.name}`,
+    );
+  }
+  for (const field of step.required_query_fields ?? []) {
+    if (!request.query.get(field)) errors.push(`missing query field ${field}`);
+  }
+  return { step, errors };
+}
+
+export function validateProviderRequest(
+  contract: ProviderProtocolContract,
+  request: CapturedProviderRequest,
+  apiType = contract.api_types[0],
+  videoScenario?: VideoScenario,
+): string[] {
+  const errors: string[] = [];
+  if (request.method.toUpperCase() !== contract.http_method.toUpperCase()) {
+    errors.push(`method=${request.method}; expected=${contract.http_method}`);
+  }
+  if (!pathPattern(contract.path).test(request.pathname)) {
+    errors.push(`path=${request.pathname}; expected=${contract.path}`);
+  }
+  const authValue = contract.auth.kind === "header"
+    ? request.headers.get(contract.auth.name)
+    : request.query.get(contract.auth.name);
+  if (
+    !authValue || !authValue.startsWith(contract.auth.prefix) ||
+    authValue.length <= contract.auth.prefix.length
+  ) {
+    errors.push(
+      `missing or invalid ${contract.auth.kind} authentication ${contract.auth.name}`,
+    );
+  }
+  for (
+    const [name, expected] of Object.entries(contract.required_headers ?? {})
+  ) {
+    const actual = request.headers.get(name);
+    if (
+      expected === "<uuid>"
+        ? !actual ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+            .test(actual)
+        : actual !== expected
+    ) {
+      errors.push(`header ${name} must equal ${expected}`);
+    }
+  }
+  const actualContentType = request.headers.get("content-type")?.split(
+    ";",
+    1,
+  )[0].trim().toLowerCase();
+  if (![contract.content_type, ...(contract.alternative_content_types ?? [])].map((type) => type.toLowerCase()).includes(actualContentType ?? "")) {
+    errors.push(
+      `content-type=${
+        actualContentType ?? "<missing>"
+      }; expected=${contract.content_type}`,
+    );
+  }
+  if (
+    !request.body || typeof request.body !== "object" ||
+    Array.isArray(request.body)
+  ) {
+    errors.push("request body must be a JSON object");
+    return errors;
+  }
+  const body = request.body as Record<string, unknown>;
+  const pointerValue = (pointer: string): unknown =>
+    pointer.split("/").slice(1).reduce<unknown>((value, token) => {
+      const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
+      if (Array.isArray(value)) return /^(0|[1-9][0-9]*)$/.test(key) ? value[Number(key)] : undefined;
+      return value !== null && typeof value === "object"
+        ? (value as Record<string, unknown>)[key]
+        : undefined;
+    }, body);
+  for (
+    const [pointer, expected] of Object.entries(
+      contract.required_body_values ?? {},
+    )
+  ) {
+    const actual = pointerValue(pointer);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      errors.push(`body ${pointer} must equal ${JSON.stringify(expected)}`);
+    }
+  }
+  const modelValues = typeof body.model === "string"
+    ? contract.required_body_values_by_model?.[body.model] ?? {}
+    : {};
+  for (const [pointer, expected] of Object.entries(modelValues)) {
+    const actual = pointerValue(pointer);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      errors.push(`body ${pointer} must equal ${JSON.stringify(expected)}`);
+    }
+  }
+  for (const [pointer, expected] of Object.entries(contract.json_string_body_values ?? {})) {
+    const actual = pointerValue(pointer);
+    if (typeof actual !== "string") {
+      errors.push(`body ${pointer} must be a JSON string`);
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(actual);
+      if (JSON.stringify(parsed) !== JSON.stringify(expected)) {
+        errors.push(
+          `body ${pointer} JSON must equal ${JSON.stringify(expected)}`,
+        );
+      }
+    } catch {
+      errors.push(`body ${pointer} must contain valid JSON`);
+    }
+  }
+  for (const pointer of contract.required_body_paths ?? []) {
+    const actual = pointerValue(pointer);
+    if (actual === undefined || actual === null || actual === "") {
+      errors.push(`body ${pointer} is required`);
+    }
+  }
+  const forbiddenPointers = [
+    ...(contract.forbidden_body_paths ?? []),
+    ...(typeof body.model === "string"
+      ? contract.forbidden_body_paths_by_model?.[body.model] ?? []
+      : []),
+  ];
+  for (const pointer of forbiddenPointers) {
+    if (pointerValue(pointer) !== undefined) {
+      errors.push(`body ${pointer} is forbidden`);
+    }
+  }
+  const requiredFields = [
+    ...contract.required_body_fields,
+    ...(contract.required_body_fields_by_api_type?.[apiType] ?? []),
+  ];
+  for (const field of requiredFields) {
+    if (body[field] === undefined || body[field] === null) {
+      errors.push(`missing body field ${field}`);
+    }
+  }
+  const allowed = new Set(contract.allowed_body_fields);
+  for (const field of Object.keys(body)) {
+    if (!allowed.has(field)) errors.push(`unknown body field ${field}`);
+    const expectedTypes = contract.body_field_types[field];
+    const actualType = Array.isArray(body[field])
+      ? "array"
+      : body[field] !== null && typeof body[field] === "object"
+      ? "object"
+      : typeof body[field];
+    if (
+      expectedTypes && !(
+        expectedTypes.includes(actualType as never) ||
+        actualType === "number" && expectedTypes.includes("integer") &&
+          Number.isInteger(body[field])
+      )
+    ) {
+      errors.push(`body field ${field} has invalid type`);
+    }
+  }
+  for (const [field, format] of Object.entries(contract.body_field_formats ?? {})) {
+    const value = body[field];
+    if (value === undefined || value === null) continue;
+    if (format === "http_url" || format === "http_url_or_data_uri") {
+      const dataUri = typeof value === "string" &&
+        /^data:[^;,\s]+;base64,[A-Za-z0-9+/]+={0,2}$/.test(value);
+      try {
+        const url = new URL(String(value));
+        if (
+          typeof value !== "string" ||
+          (!["http:", "https:"].includes(url.protocol) &&
+            !(format === "http_url_or_data_uri" && dataUri))
+        ) {
+          errors.push(
+            format === "http_url"
+              ? `body field ${field} must be an HTTP(S) URL`
+              : `body field ${field} must be an HTTP(S) URL or Base64 data URI`,
+          );
+        }
+      } catch {
+        if (!(format === "http_url_or_data_uri" && dataUri)) {
+          errors.push(
+            format === "http_url"
+              ? `body field ${field} must be an HTTP(S) URL`
+              : `body field ${field} must be an HTTP(S) URL or Base64 data URI`,
+          );
+        }
+      }
+    }
+  }
+  if (contract.id === "doubao.translation.responses.v3") {
+    const input = body.input;
+    const userTextBlocks = Array.isArray(input)
+      ? input.flatMap((item) => {
+        const record = recordValue(item);
+        if (record?.role !== "user" || !Array.isArray(record.content)) {
+          return [];
+        }
+        return record.content.filter((block) =>
+          recordValue(block)?.type === "input_text"
+        );
+      })
+      : [];
+    const options = userTextBlocks.length === 1
+      ? recordValue(recordValue(userTextBlocks[0])?.translation_options)
+      : undefined;
+    if (
+      !options || typeof options.target_language !== "string" ||
+      !options.target_language.trim()
+    ) {
+      errors.push(
+        "Doubao translation requests require one user input_text translation_options.target_language",
+      );
+    } else if (
+      Object.keys(options).some((name) =>
+        !["source_language", "target_language"].includes(name)
+      ) ||
+      options.source_language !== undefined &&
+        (typeof options.source_language !== "string" ||
+          !options.source_language.trim())
+    ) {
+      errors.push("Doubao translation_options contains invalid fields");
+    }
+  }
+  if (contract.api_types.includes("decision")) {
+    const text = (v: unknown) =>
+      typeof v === "string" || (v !== null && typeof v === "object");
+    const questions = recordValue(body.questions);
+    if (!questions || !Object.keys(questions).length) {
+      errors.push("System One questions must be a nonempty map");
+    }
+    for (const [id, value] of Object.entries(questions ?? {})) {
+      const question = recordValue(value);
+      if (
+        !id || !question || !text(question.instructions) ||
+        Object.keys(question).some((key) =>
+          !["type", "instructions", "criteria"].includes(key)
+        )
+      ) {
+        errors.push("invalid System One question");
+        continue;
+      }
+      if (question.type === "choice") {
+        const criteria = recordValue(question.criteria);
+        if (
+          !criteria || !Object.keys(criteria).length ||
+          Object.keys(criteria).length > 255 ||
+          Object.values(criteria).some((v) => v !== null && !text(v))
+        ) errors.push("invalid System One choice criteria");
+      } else if (question.type === "score") {
+        if (
+          !Array.isArray(question.criteria) || question.criteria.length < 2 ||
+          question.criteria.length > 10 || question.criteria.some((v) =>
+            !text(v)
+          )
+        ) errors.push("invalid System One score criteria");
+      } else if (question.type === "noul") {
+        if (question.criteria !== undefined) {
+          const criteria = recordValue(question.criteria);
+          if (
+            contract.operation === "decisions.create" &&
+            (!criteria || criteria.true === undefined ||
+              criteria.false === undefined)
+          ) errors.push("OpenRouter noul criteria require true and false");
+          if (
+            !criteria || Object.keys(criteria).some((key) =>
+              !["true", "false"].includes(key)
+            ) || Object.values(criteria).some((v) =>
+              !text(v)
+            )
+          ) errors.push("invalid System One noul criteria");
+        }
+      } else errors.push("invalid System One question type");
+    }
+  }
+  validateNestedProviderBody(contract, body, errors, requiredFields, apiType, videoScenario);
+  return errors;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function validateNestedProviderBody(
+  contract: ProviderProtocolContract,
+  body: Record<string, unknown>,
+  errors: string[],
+  requiredFields = contract.required_body_fields,
+  apiType?: string,
+  videoScenario?: VideoScenario,
+): void {
+  for (const field of requiredFields) {
+    if (typeof body[field] === "string" && !(body[field] as string).trim()) {
+      errors.push(`body field ${field} must be a non-empty string`);
+    }
+    if (Array.isArray(body[field]) && body[field].length === 0) {
+      errors.push(`body field ${field} must be a non-empty array`);
+    }
+  }
+  for (const [field, value] of Object.entries(body)) {
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      errors.push(`body field ${field} must be a finite number`);
+    }
+  }
+
+  if (body.messages !== undefined) {
+    if (Array.isArray(body.messages) && body.messages.length > 0) {
+      body.messages.forEach((value, index) => {
+        const message = recordValue(value);
+        if (!message) {
+          errors.push(`body field messages[${index}] must be an object`);
+          return;
+        }
+        if (typeof message.role !== "string" || !message.role) {
+          errors.push(
+            `body field messages[${index}].role must be a non-empty string`,
+          );
+        }
+        if (
+          message.content === undefined && message.tool_calls === undefined &&
+          message.tool_call_id === undefined
+        ) {
+          errors.push(
+            `body field messages[${index}] must include content or tool call data`,
+          );
+        }
+        if (Array.isArray(message.content)) {
+          if (
+            message.content.length === 0 ||
+            message.content.some((part) => !recordValue(part))
+          ) {
+            errors.push(
+              `body field messages[${index}].content must contain content block objects`,
+            );
+          }
+        } else if (
+          message.content !== undefined && message.content !== null &&
+          typeof message.content !== "string"
+        ) {
+          errors.push(`body field messages[${index}].content has invalid type`);
+        }
+      });
+    }
+  }
+
+  if (
+    body.tools !== undefined &&
+    (!Array.isArray(body.tools) ||
+      body.tools.some((tool) => !recordValue(tool)))
+  ) {
+    errors.push("body field tools must be an array of objects");
+  }
+  if (body.documents !== undefined) {
+    if (
+      !Array.isArray(body.documents) || body.documents.length === 0 ||
+      body.documents.some((document) =>
+        typeof document !== "string" && !recordValue(document)
+      )
+    ) {
+      errors.push(
+        "body field documents must be a non-empty array of strings or objects",
+      );
+    }
+  }
+  if (
+    body.instances !== undefined &&
+    (!Array.isArray(body.instances) || body.instances.length === 0 ||
+      body.instances.some((instance) => !recordValue(instance)))
+  ) {
+    errors.push("body field instances must be a non-empty array of objects");
+  }
+  if (
+    contract.operation === "models.embedContent" && body.content !== undefined
+  ) {
+    const content = recordValue(body.content);
+    if (
+      !content || !Array.isArray(content.parts) || content.parts.length === 0 ||
+      content.parts.some((part) => !recordValue(part))
+    ) {
+      errors.push(
+        "body field content.parts must be a non-empty array of objects",
+      );
+    }
+  }
+  if (contract.operation === "video_generation.v2.create") {
+    const content = Array.isArray(body.content) ? body.content : [];
+    const blocks = content.map(recordValue).filter(Boolean) as Array<
+      Record<string, unknown>
+    >;
+    if (
+      blocks.length !== content.length ||
+      !blocks.some((block) =>
+        block.type === "text" && typeof block.text === "string" &&
+        block.text.trim()
+      )
+    ) {
+      errors.push("MiniMax V2 video content requires a non-empty text block");
+    }
+  }
+  if (apiType === "video.generate") {
+    errors.push(...videoScenarioErrors(contract, body, videoScenario));
+  }
+  if (
+    ["interactions.create", "interactions.background"].includes(
+      contract.operation,
+    ) && Array.isArray(body.input) &&
+    (body.input.length === 0 ||
+      body.input.some((item) => typeof item !== "string" && !recordValue(item)))
+  ) {
+    errors.push(
+      "body field input must be a non-empty array of strings or objects",
+    );
+  }
+  if (["responses.create", "responses.background"].includes(contract.operation) && Array.isArray(body.input)) {
+    validateOpenAiResponsesInput(
+      body.input,
+      errors,
+      contract.id === "qwen.responses.compatible-v1",
+    );
+  }
+  if (contract.computer_screenshot_handshake) {
+    const tools = Array.isArray(body.tools) ? body.tools : [];
+    if (tools.length !== 1 || recordValue(tools[0])?.type !== "computer") {
+      errors.push("computer-use requires exactly the computer tool");
+    }
+    const input = Array.isArray(body.input) ? body.input : [];
+    if (input.length !== 1) errors.push("computer-use requires one observation input");
+    const item = recordValue(input[0]);
+    if (body.previous_response_id !== undefined) {
+      const output = recordValue(item?.output);
+      if (typeof body.previous_response_id !== "string" || !body.previous_response_id ||
+          item?.type !== "computer_call_output" || typeof item.call_id !== "string" || !item.call_id ||
+          output?.type !== "computer_screenshot" || typeof output.image_url !== "string" ||
+          output.detail !== "original") {
+        errors.push("invalid computer_call_output screenshot observation");
+      }
+    } else {
+      const content = Array.isArray(item?.content) ? item.content : [];
+      if (item?.role !== "user" || content.length !== 2 || recordValue(content[0])?.type !== "input_text" ||
+          recordValue(content[1])?.type !== "input_image" || typeof recordValue(content[1])?.image_url !== "string") {
+        errors.push("computer-use requires task text and initial screenshot");
+      }
+    }
+  }
+  if (
+    contract.operation === "chat.completions.create" &&
+    Array.isArray(body.messages)
+  ) {
+    validateOpenAiChatMessages(body.messages, errors);
+    if (
+      contract.id === "openrouter.chat-completions.v1" &&
+      apiType !== undefined &&
+      ["vision.ocr", "vision.caption"].includes(apiType)
+    ) {
+      const hasTextOnlyInstruction = body.messages.some((rawMessage) => {
+        const message = recordValue(rawMessage);
+        return Array.isArray(message?.content) && message.content.some((rawPart) => {
+          const part = recordValue(rawPart);
+          return part?.type === "text" &&
+            typeof part.text === "string" &&
+            part.text.includes("Return text only and do not generate an image.");
+        });
+      });
+      if (!hasTextOnlyInstruction) {
+        errors.push(
+          "OpenRouter image-model vision requests require an explicit text-only instruction",
+        );
+      }
+    }
+    if (contract.api_types.includes("audio.asr")) {
+      const message = recordValue(body.messages[0]);
+      const content = Array.isArray(message?.content) ? message.content : [];
+      const audioBlock = recordValue(content[0]);
+      const audio = recordValue(audioBlock?.input_audio);
+      const textBlock = recordValue(content[1]);
+      if (body.messages.length !== 1 || message?.role !== "user" ||
+          Object.keys(message).some((key) => !["role", "content"].includes(key)) || content.length !== 2 ||
+          audioBlock?.type !== "input_audio" || !audio ||
+          Object.keys(audioBlock).some((key) => !["type", "input_audio"].includes(key)) ||
+          Object.keys(audio).some((key) => !["data", "format"].includes(key)) ||
+          typeof audio.data !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(audio.data) ||
+          audio.data.length === 0 || !["wav", "mp3", "flac", "ogg", "aac", "m4a", "webm"].includes(String(audio.format)) ||
+          textBlock?.type !== "text" || typeof textBlock.text !== "string" || !textBlock.text.trim() ||
+          Object.keys(textBlock).some((key) => !["type", "text"].includes(key))) {
+        errors.push("audio transcription chat requires one user message with inline input_audio and a text instruction");
+      }
+    }
+  }
+  if (
+    contract.operation === "messages.create" && Array.isArray(body.messages)
+  ) {
+    validateClaudeMessages(contract, body, errors);
+  }
+  if (
+    ["interactions.create", "interactions.background"].includes(
+      contract.operation,
+    )
+  ) {
+    if (Array.isArray(body.input)) {
+      validateGeminiInteractionInput(body.input, errors);
+    }
+    validateGeminiInteractionConfig(contract, body, errors);
+  }
+
+  for (
+    const field of [
+      "max_tokens",
+      "max_completion_tokens",
+      "max_output_tokens",
+      "dimensions",
+      "n",
+      "top_n",
+    ]
+  ) {
+    if (
+      typeof body[field] === "number" &&
+      (!Number.isInteger(body[field]) || body[field] <= 0)
+    ) {
+      errors.push(`body field ${field} must be a positive integer`);
+    }
+  }
+  if (
+    ["ark.contents.generate", "videos.generate", "video_generation.v2.create"]
+      .includes(contract.operation) &&
+    body.duration !== undefined &&
+    (!Number.isInteger(body.duration) || Number(body.duration) <= 0)
+  ) {
+    errors.push("duration must be a positive integer");
+  }
+  if (
+    contract.operation === "ark.images.generate" && body.size !== undefined &&
+    !/^(1K|2K|4K|[0-9]+x[0-9]+)$/.test(String(body.size))
+  ) errors.push("Seedream size must be a resolution or WxH");
+  if (contract.operation.startsWith("dashscope.")) {
+    const input = recordValue(body.input) ?? {};
+    const parameters = recordValue(body.parameters) ?? {};
+    if (
+      ["dashscope.image_generation", "dashscope.image_edit"].includes(
+        contract.operation,
+      )
+    ) {
+      const messages = input.messages;
+      if (!Array.isArray(messages) || messages.length === 0) {
+        errors.push("DashScope image generation requires input.messages");
+      } else {for (const raw of messages) {
+          const message = recordValue(raw);
+          const content = message?.content;
+          if (
+            message?.role !== "user" || !Array.isArray(content) ||
+            content.length === 0
+          ) errors.push("DashScope image generation requires user content");
+          else {
+            for (const rawPart of content) {
+              const part = recordValue(rawPart);
+              if (
+                !part || Object.keys(part).length !== 1 ||
+                !["image", "text"].some((key) =>
+                  typeof part[key] === "string" && String(part[key]).length > 0
+                )
+              ) errors.push("invalid DashScope image edit content");
+            }
+            if (
+              !content.some((part) =>
+                typeof recordValue(part)?.text === "string"
+              )
+            ) errors.push("DashScope image generation requires text");
+            if (
+              contract.operation === "dashscope.image_edit" &&
+              !content.some((part) =>
+                typeof recordValue(part)?.image === "string"
+              )
+            ) errors.push("DashScope image edit requires image");
+          }
+        }}
+    } else if (typeof input.prompt !== "string" || !input.prompt.trim()) {
+      errors.push("DashScope requires input.prompt");
+    }
+    const allowedInput =
+      ["dashscope.image_generation", "dashscope.image_edit"].includes(
+          contract.operation,
+        )
+        ? ["messages"]
+        : ["prompt", "negative_prompt", "img_url"];
+    const allowedParameters = contract.operation === "dashscope.video_synthesis"
+      ? (String(body.model).startsWith("wan2.7")
+        ? ["duration", "resolution", "ratio", "seed", "audio"]
+        : ["duration", "size", "resolution", "seed", "audio"])
+      : ["size", "n", "seed", "negative_prompt"];
+    for (const field of Object.keys(input)) {
+      if (!allowedInput.includes(field)) {
+        errors.push(`unsupported DashScope input.${field}`);
+      }
+    }
+    for (const field of Object.keys(parameters)) {
+      if (!allowedParameters.includes(field)) {
+        errors.push(`unsupported DashScope parameters.${field}`);
+      }
+    }
+    if (
+      parameters.size !== undefined &&
+      !/^[0-9]+\*[0-9]+$/.test(String(parameters.size))
+    ) errors.push("DashScope size must be W*H");
+    if (
+      parameters.duration !== undefined &&
+      (!Number.isInteger(parameters.duration) ||
+        Number(parameters.duration) <= 0)
+    ) errors.push("duration must be a positive integer");
+  }
+  if (contract.minimax_music) {
+    const model = String(body.model ?? "");
+    const isCover = contract.minimax_music.cover_model_ids.includes(model);
+    if (isCover) {
+      const references = contract.minimax_music.cover_reference_fields
+        .map((field) => body[field])
+        .filter((value) => typeof value === "string" && value.length > 0);
+      if (references.length !== 1) {
+        errors.push("MiniMax cover music requires exactly one audio reference");
+      }
+    } else if (
+      contract.minimax_music.non_instrumental_requires_lyrics_or_optimizer &&
+      body.is_instrumental !== true && body.lyrics_optimizer !== true &&
+      (typeof body.lyrics !== "string" || !body.lyrics.trim())
+    ) {
+      errors.push(
+        "MiniMax non-instrumental music requires lyrics or lyrics_optimizer=true",
+      );
+    }
+  }
+}
+
+function validateOpenAiResponsesInput(
+  input: unknown[],
+  errors: string[],
+  allowInputVideo = false,
+): void {
+  input.forEach((item, index) => {
+    const message = recordValue(item);
+    if (!message) return;
+    if (message.type === "function_call") {
+      for (const field of ["call_id", "name", "arguments"]) {
+        if (
+          typeof message[field] !== "string" ||
+          !(message[field] as string).trim()
+        ) {
+          errors.push(
+            `body field input[${index}].${field} must be a non-empty string`,
+          );
+        }
+      }
+      return;
+    }
+    if (message.type === "function_call_output") {
+      if (typeof message.call_id !== "string" || !message.call_id.trim()) {
+        errors.push(
+          `body field input[${index}].call_id must be a non-empty string`,
+        );
+      }
+      if (
+        typeof message.output !== "string" && !Array.isArray(message.output)
+      ) {
+        errors.push(
+          `body field input[${index}].output must be a string or content array`,
+        );
+      }
+      return;
+    }
+    if (message.type !== "message") return;
+    const role = typeof message.role === "string" ? message.role : "";
+    if (!["user", "assistant", "system", "developer"].includes(role)) {
+      errors.push(
+        `body field input[${index}].role is invalid for OpenAI Responses`,
+      );
+      return;
+    }
+    const content = Array.isArray(message.content) ? message.content : [];
+    if (typeof message.content === "string" && role !== "assistant") return;
+    if (content.length === 0) {
+      errors.push(
+        `body field input[${index}].content must be a non-empty array`,
+      );
+    }
+    content.forEach((part, partIndex) => {
+      const block = recordValue(part);
+      if (!block || typeof block.type !== "string") {
+        errors.push(
+          `body field input[${index}].content[${partIndex}] must be a typed object`,
+        );
+        return;
+      }
+      const type = block.type;
+      if (role === "assistant" && !["output_text", "refusal"].includes(type)) {
+        errors.push(
+          `body field input[${index}].content[${partIndex}].type=${type}; assistant messages require output_text or refusal`,
+        );
+      }
+      if (role !== "assistant" && type === "output_text") {
+        errors.push(
+          `body field input[${index}].content[${partIndex}].type=output_text; ${role} messages require input content`,
+        );
+      }
+      if (
+        role !== "assistant" &&
+        ![
+          "input_text",
+          "input_image",
+          "input_file",
+          ...(allowInputVideo ? ["input_video"] : []),
+        ].includes(type)
+      ) {
+        errors.push(
+          `body field input[${index}].content[${partIndex}].type=${type}; ${role} message content is invalid`,
+        );
+      }
+    });
+  });
+}
+
+function validateOpenAiChatMessages(
+  messages: unknown[],
+  errors: string[],
+): void {
+  messages.forEach((value, index) => {
+    const message = recordValue(value);
+    if (!message) return;
+    const role = String(message.role ?? "");
+    if (
+      !["developer", "system", "user", "assistant", "tool", "function"]
+        .includes(role)
+    ) {
+      errors.push(
+        `body field messages[${index}].role is invalid for Chat Completions`,
+      );
+      return;
+    }
+    if (
+      role === "tool" &&
+      (typeof message.tool_call_id !== "string" || !message.tool_call_id.trim())
+    ) {
+      errors.push(
+        `body field messages[${index}].tool_call_id must be a non-empty string`,
+      );
+    }
+    if (role !== "tool" && message.tool_call_id !== undefined) {
+      errors.push(
+        `body field messages[${index}].tool_call_id is only valid for tool messages`,
+      );
+    }
+    if (message.tool_calls !== undefined) {
+      if (
+        role !== "assistant" || !Array.isArray(message.tool_calls) ||
+        message.tool_calls.length === 0
+      ) {
+        errors.push(
+          `body field messages[${index}].tool_calls must be a non-empty assistant array`,
+        );
+        return;
+      }
+      message.tool_calls.forEach((value, toolIndex) => {
+        const toolCall = recordValue(value);
+        const fn = recordValue(toolCall?.function);
+        if (
+          !toolCall || typeof toolCall.id !== "string" ||
+          toolCall.type !== "function" || !fn || typeof fn.name !== "string" ||
+          typeof fn.arguments !== "string"
+        ) {
+          errors.push(
+            `body field messages[${index}].tool_calls[${toolIndex}] is invalid`,
+          );
+        }
+      });
+    }
+    if (message.reasoning_details !== undefined) {
+      if (
+        role !== "assistant" || !Array.isArray(message.reasoning_details) ||
+        message.reasoning_details.length === 0 ||
+        message.reasoning_details.some((detail) => !recordValue(detail))
+      ) {
+        errors.push(
+          `body field messages[${index}].reasoning_details must be a non-empty assistant array`,
+        );
+      }
+    }
+  });
+}
+
+function validateClaudeMessages(
+  contract: ProviderProtocolContract,
+  body: Record<string, unknown>,
+  errors: string[],
+): void {
+  if (Array.isArray(body.system)) {
+    body.system.forEach((value, index) => {
+      const block = recordValue(value);
+      if (
+        !block || block.type !== "text" || typeof block.text !== "string"
+      ) errors.push(`body field system[${index}] must be a text block`);
+    });
+  }
+  const messages = body.messages as unknown[];
+  let pendingToolUses = new Set<string>();
+  messages.forEach((value, index) => {
+    const message = recordValue(value);
+    if (!message) return;
+    const role = String(message.role ?? "");
+    if (!["user", "assistant"].includes(role)) {
+      errors.push(
+        `body field messages[${index}].role is invalid for Claude Messages`,
+      );
+      return;
+    }
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    if (pendingToolUses.size > 0) {
+      const resultIds = blocks.map(recordValue).filter((
+        block,
+      ): block is Record<string, unknown> =>
+        Boolean(block) && block!.type === "tool_result"
+      ).map((block) => String(block.tool_use_id ?? ""));
+      const leadingResults = blocks.slice(0, resultIds.length).every((block) =>
+        recordValue(block)?.type === "tool_result"
+      );
+      if (
+        role !== "user" || !leadingResults ||
+        new Set(resultIds).size !== resultIds.length ||
+        resultIds.length !== pendingToolUses.size || resultIds.some((id) =>
+          !pendingToolUses.has(id)
+        )
+      ) {
+        errors.push(
+          `body field messages[${index}] must immediately return every preceding Claude tool_use`,
+        );
+      }
+      pendingToolUses = new Set();
+    }
+    blocks.forEach((value, blockIndex) => {
+      const block = recordValue(value);
+      if (!block) return;
+      const source = recordValue(block.source);
+      const mediaType = source?.media_type;
+      if (block.type === "document" && typeof mediaType === "string" &&
+          !["application/pdf", "text/plain"].includes(mediaType)) {
+        errors.push(`body field messages[${index}].content[${blockIndex}] document media_type is invalid for Claude Messages`);
+      }
+      if (block.type === "image" && typeof mediaType === "string" &&
+          !["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mediaType)) {
+        errors.push(`body field messages[${index}].content[${blockIndex}] image media_type is invalid for Claude Messages`);
+      }
+      if (block.type === "tool_use") {
+        if (
+          role !== "assistant" || typeof block.id !== "string" ||
+          typeof block.name !== "string" || !recordValue(block.input)
+        ) {
+          errors.push(
+            `body field messages[${index}].content[${blockIndex}] is an invalid Claude tool_use`,
+          );
+        } else if (pendingToolUses.has(block.id)) {
+          errors.push(
+            `body field messages[${index}].content[${blockIndex}] has a duplicate Claude tool_use id`,
+          );
+        } else pendingToolUses.add(block.id);
+      }
+      if (
+        block.type === "tool_result" &&
+        (role !== "user" || typeof block.tool_use_id !== "string")
+      ) {
+        errors.push(
+          `body field messages[${index}].content[${blockIndex}] is an invalid Claude tool_result`,
+        );
+      }
+    });
+  });
+  if (pendingToolUses.size > 0) {
+    errors.push(
+      "Claude tool_use blocks are missing an immediate tool_result message",
+    );
+  }
+  const outputConfig = recordValue(body.output_config);
+  const format = recordValue(outputConfig?.format);
+  if (
+    format &&
+    (format.type !== "json_schema" || !recordValue(format.schema))
+  ) {
+    errors.push(
+      "body field output_config.format must contain type=json_schema and an object schema",
+    );
+  }
+  if (format?.type === "json_schema" && recordValue(format.schema)) {
+    const unsupported = new Set([
+      "minimum", "maximum", "multipleOf", "minLength", "maxLength",
+      "maxItems", "uniqueItems", "contains", "minContains", "maxContains",
+    ]);
+    const schemaMaps = new Set([
+      "properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+    ]);
+    const schemaValues = new Set([
+      "items", "additionalProperties", "propertyNames", "not", "if", "then", "else",
+      "unevaluatedProperties", "unevaluatedItems",
+    ]);
+    const schemaArrays = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+    const visit = (value: unknown, path: string): void => {
+      const record = recordValue(value);
+      if (!record) return;
+      for (const [key, child] of Object.entries(record)) {
+        if (unsupported.has(key) || key === "minItems" && child !== 0 && child !== 1) {
+          errors.push(`${path}.${key} is not supported by Claude structured outputs`);
+        }
+        if (schemaMaps.has(key)) {
+          const children = recordValue(child);
+          if (children) {
+            for (const [name, schema] of Object.entries(children)) {
+              visit(schema, `${path}.${key}.${name}`);
+            }
+          }
+        } else if (schemaValues.has(key)) {
+          visit(child, `${path}.${key}`);
+        } else if (schemaArrays.has(key) && Array.isArray(child)) {
+          child.forEach((schema, index) => visit(schema, `${path}.${key}[${index}]`));
+        }
+      }
+    };
+    visit(format.schema, "body field output_config.format.schema");
+  }
+  const thinking = recordValue(body.thinking);
+  const allowedThinkingTypes = contract.thinking?.allowed_types;
+  if (
+    thinking?.type !== undefined &&
+    allowedThinkingTypes !== undefined &&
+    !allowedThinkingTypes.includes(String(thinking.type))
+  ) {
+    errors.push(
+      `body field thinking.type=${thinking.type} is invalid for ${contract.id}; expected ${
+        allowedThinkingTypes.join("|")
+      }`,
+    );
+  }
+}
+
+function validateGeminiInteractionInput(
+  input: unknown[],
+  errors: string[],
+): void {
+  const pendingCalls = new Map<string, string>();
+  input.forEach((value, index) => {
+    const step = recordValue(value);
+    if (!step || typeof step.type !== "string") return;
+    const path = `body field input[${index}]`;
+    if (step.type === "user_input" || step.type === "model_output") {
+      if (
+        !Array.isArray(step.content) || step.content.length === 0 ||
+        step.content.some((part) => !recordValue(part))
+      ) errors.push(`${path}.content must be a non-empty content array`);
+      if (
+        step.type === "model_output" && Array.isArray(step.content) &&
+        step.content.some((part) =>
+          ["function_call", "function_result", "thought"].includes(
+            String(recordValue(part)?.type ?? ""),
+          )
+        )
+      ) errors.push(`${path}.content cannot contain Gemini interaction steps`);
+      return;
+    }
+    if (step.type === "function_call") {
+      if (
+        typeof step.id !== "string" || typeof step.name !== "string" ||
+        !recordValue(step.arguments)
+      ) errors.push(`${path} is an invalid Gemini function_call step`);
+      else if (pendingCalls.has(step.id)) {
+        errors.push(`${path}.id duplicates a preceding Gemini function_call`);
+      } else pendingCalls.set(step.id, step.name);
+      return;
+    }
+    if (step.type === "function_result") {
+      if (
+        typeof step.call_id !== "string" || !step.call_id ||
+        typeof step.name !== "string" || !step.name ||
+        step.result === undefined
+      ) errors.push(`${path} is an invalid Gemini function_result step`);
+      if (step.id !== undefined) {
+        errors.push(`${path}.id is invalid; function_result requires call_id`);
+      }
+      if (
+        typeof step.call_id === "string" && !pendingCalls.has(step.call_id)
+      ) {
+        errors.push(
+          `${path}.call_id does not match a preceding Gemini function_call`,
+        );
+      }
+      if (
+        typeof step.call_id === "string" && pendingCalls.has(step.call_id) &&
+        pendingCalls.get(step.call_id) !== step.name
+      ) {
+        errors.push(
+          `${path}.name does not match the preceding Gemini function_call`,
+        );
+      }
+      if (typeof step.call_id === "string") pendingCalls.delete(step.call_id);
+      return;
+    }
+    if (
+      step.type === "thought" && step.summary !== undefined &&
+      (!Array.isArray(step.summary) ||
+        step.summary.some((part) => recordValue(part)?.type !== "text"))
+    ) errors.push(`${path}.summary must be an array of text content`);
+  });
+  if (pendingCalls.size > 0) {
+    errors.push(
+      "Gemini function_call steps are missing matching function_result steps",
+    );
+  }
+}
+
+function validateGeminiInteractionConfig(
+  contract: ProviderProtocolContract,
+  body: Record<string, unknown>,
+  errors: string[],
+): void {
+  const generation = recordValue(body.generation_config);
+  if (body.generation_config !== undefined && !generation) {
+    errors.push("body field generation_config must be an object");
+  }
+  const generationKeys = new Set(contract.generation_config?.allowed_fields);
+  for (const key of Object.keys(generation ?? {})) {
+    if (!generationKeys.has(key)) {
+      errors.push(
+        `body field generation_config.${key} is not defined by Gemini v1beta`,
+      );
+    }
+  }
+  if (generation?.thinking_level !== undefined) {
+    const allowed = new Set(contract.generation_config?.thinking_level_values);
+    if (!allowed.has(String(generation.thinking_level))) {
+      errors.push(
+        `body field generation_config.thinking_level=${generation.thinking_level}; contract ${contract.id} supports ${
+          [...allowed].join("|")
+        }`,
+      );
+    }
+  }
+  const formats = Array.isArray(body.response_format)
+    ? body.response_format
+    : [body.response_format];
+  formats.filter((format) => format !== undefined).forEach((value, index) => {
+    const format = recordValue(value);
+    const path = Array.isArray(body.response_format)
+      ? `body field response_format[${index}]`
+      : "body field response_format";
+    if (
+      !format ||
+      !["text", "image", "audio", "video"].includes(String(format.type ?? ""))
+    ) {
+      errors.push(`${path} must be a typed Gemini response format object`);
+      return;
+    }
+    const keys: Record<string, Set<string>> = {
+      text: new Set(["type", "mime_type", "schema"]),
+      image: new Set([
+        "type",
+        "aspect_ratio",
+        "delivery",
+        "image_size",
+        "mime_type",
+      ]),
+      audio: new Set([
+        "type",
+        "bit_rate",
+        "delivery",
+        "mime_type",
+        "sample_rate",
+      ]),
+      video: new Set([
+        "type",
+        "aspect_ratio",
+        "delivery",
+        "duration",
+        "resolution",
+      ]),
+    };
+    for (const key of Object.keys(format)) {
+      if (!keys[String(format.type)].has(key)) {
+        errors.push(
+          `${path}.${key} is not defined for Gemini ${format.type} output`,
+        );
+      }
+    }
+    if (
+      format.type === "text" && format.mime_type !== undefined &&
+      !["text/plain", "application/json"].includes(String(format.mime_type))
+    ) errors.push(`${path}.mime_type is invalid for Gemini text output`);
+    if (
+      format.type === "image" && format.mime_type !== undefined &&
+      format.mime_type !== "image/jpeg"
+    ) errors.push(`${path}.mime_type is invalid for Gemini image output`);
+    if (
+      format.type === "audio" && format.mime_type !== undefined &&
+      ![
+        "audio/mp3",
+        "audio/ogg_opus",
+        "audio/l16",
+        "audio/wav",
+        "audio/alaw",
+        "audio/mulaw",
+      ].includes(String(format.mime_type))
+    ) errors.push(`${path}.mime_type is invalid for Gemini audio output`);
+  });
+}
+
+export function validateProviderSuccessFixture(
+  contract: ProviderProtocolContract,
+): string[] {
+  if (contract.success_fixture_base64) return [];
+  if (contract.success_chunk_fixtures?.length) return [];
+  const fixture = recordValue(contract.success_fixture);
+  if (!fixture) return ["fixture must be an object"];
+  const errors: string[] = [];
+  const requireArray = (field: string) => {
+    if (
+      !Array.isArray(fixture[field]) ||
+      (fixture[field] as unknown[]).length === 0
+    ) {
+      errors.push(`${field} must be a non-empty array`);
+    }
+  };
+  switch (contract.operation) {
+    case "messages.create":
+      requireArray("content");
+      break;
+    case "chat.completions.create":
+      requireArray("choices");
+      break;
+    case "responses.create":
+      requireArray("output");
+      break;
+    case "embeddings.create":
+      requireArray("data");
+      break;
+    case "rerank.create":
+      requireArray("results");
+      break;
+    case "models.embedContent": {
+      const embedding = recordValue(fixture.embedding);
+      if (
+        !embedding || !Array.isArray(embedding.values) ||
+        embedding.values.length === 0
+      ) {
+        errors.push("embedding.values must be a non-empty array");
+      }
+      break;
+    }
+    case "interactions.create": {
+      if (fixture.outputs !== undefined) {
+        errors.push("outputs is not an Interactions response field");
+      }
+      if (!Array.isArray(fixture.steps) || fixture.steps.length === 0) {
+        errors.push("steps must be a non-empty array");
+        break;
+      }
+      fixture.steps.forEach((value, index) => {
+        const step = recordValue(value);
+        if (
+          !step || step.type !== "model_output" ||
+          !Array.isArray(step.content) || step.content.length === 0
+        ) {
+          errors.push(`steps[${index}] must be a model_output with content`);
+        }
+      });
+      break;
+    }
+    case "interactions.background":
+      if (typeof fixture.id !== "string" || !fixture.id) {
+        errors.push("id is required");
+      }
+      if (!["queued", "in_progress"].includes(String(fixture.status))) {
+        errors.push("status must be queued or in_progress");
+      }
+      break;
+    case "queue.submit":
+      if (typeof fixture.request_id !== "string" || !fixture.request_id) {
+        errors.push("request_id is required");
+      }
+      if (
+        typeof fixture.response_url !== "string" ||
+        !fixture.response_url.endsWith("/response")
+      ) {
+        errors.push("response_url must end with /response");
+      }
+      break;
+  }
+  if (contract.id === "fal.deepfilternet3.queue-v1") {
+    const timings = recordValue(contract.async_result_fixture?.timings);
+    for (const field of ["preprocess", "inference", "postprocess"]) {
+      if (typeof timings?.[field] !== "number") {
+        errors.push(`async_result_fixture.timings.${field} is required`);
+      }
+    }
+  }
+  return errors;
+}
+
+function caseId(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+}
+
+function providerErrorCode(fixture: ProtocolErrorFixture): string {
+  const body = fixture.body;
+  const error = body.error && typeof body.error === "object"
+    ? body.error as Record<string, unknown>
+    : undefined;
+  const baseResponse = body.base_resp && typeof body.base_resp === "object"
+    ? body.base_resp as Record<string, unknown>
+    : undefined;
+  const header = body.header && typeof body.header === "object"
+    ? body.header as Record<string, unknown>
+    : undefined;
+  for (
+    const value of [
+      error?.code,
+      error?.status,
+      error?.type,
+      body.code,
+      body.error_type,
+      baseResponse?.status_code,
+      header?.code,
+      Object.entries(fixture.headers ?? {}).find(([name]) =>
+        name.toLowerCase() === "x-api-status-code"
+      )?.[1],
+    ]
+  ) {
+    if (value !== undefined && value !== null && String(value)) {
+      return String(value);
+    }
+  }
+  return String(fixture.status);
+}
+
+function providerErrorRetriable(fixture: ProtocolErrorFixture): boolean {
+  const explicit = Object.entries(fixture.headers ?? {}).find(([name]) =>
+    name.toLowerCase() === "x-fal-retryable"
+  )?.[1];
+  if (explicit) return explicit.toLowerCase() === "true";
+  const businessCode = Object.entries(fixture.headers ?? {}).find(([name]) =>
+    name.toLowerCase() === "x-api-status-code"
+  )?.[1];
+  if (businessCode === "45000131" || businessCode?.startsWith("550")) {
+    return true;
+  }
+  return fixture.status === 429 || fixture.status >= 500 ||
+    [
+      "rate_limit",
+      "quota",
+      "timeout",
+      "unavailable",
+      "overloaded",
+      "server_error",
+      "provider_error",
+    ]
+      .includes(fixture.scenario);
+}
+
+export const VIDEO_SCENARIOS = ["keyframe", "keyframes", "reference-images"] as const;
+export type VideoScenario = typeof VIDEO_SCENARIOS[number];
+
+/** The video.generate condition scenario a case id (or mock selection seed) names. */
+export function videoScenarioOf(key: string): VideoScenario | undefined {
+  const match = /\.video-(keyframes|keyframe|reference-images)$/.exec(key);
+  return match ? match[1] as VideoScenario : undefined;
+}
+
+/**
+ * What each official contract requires on the wire for a condition scenario:
+ * the start/end frames and reference images reach the provider in the
+ * documented field and role, and nothing image-shaped is sent for text only.
+ */
+function videoScenarioErrors(
+  contract: ProviderProtocolContract,
+  body: Record<string, unknown>,
+  scenario: VideoScenario | undefined,
+): string[] {
+  const urlOf = (value: unknown) => {
+    const url = recordValue(recordValue(value)?.image_url)?.url;
+    return typeof url === "string" && url.trim() ? url : undefined;
+  };
+  const expected = {
+    first: scenario === "keyframe" || scenario === "keyframes",
+    last: scenario === "keyframes",
+    references: scenario === "reference-images" ? 2 : 0,
+  };
+  let found: { first: boolean; last: boolean; references: number } | undefined;
+  if (contract.async_protocol === "minimax_video_v2" || contract.async_protocol === "doubao_video") {
+    const blocks = (Array.isArray(body.content) ? body.content : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    const role = (name: string) => blocks.filter((block) => block.type === "image_url" && block.role === name && urlOf(block));
+    found = { first: role("first_frame").length === 1, last: role("last_frame").length === 1, references: role("reference_image").length };
+  } else if (contract.async_protocol === "openrouter_video") {
+    const frames = (Array.isArray(body.frame_images) ? body.frame_images : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    const references = (Array.isArray(body.input_references) ? body.input_references : [])
+      .map(recordValue).filter(Boolean) as Array<Record<string, unknown>>;
+    found = {
+      first: frames.some((frame) => frame.frame_type === "first_frame" && urlOf(frame)),
+      last: frames.some((frame) => frame.frame_type === "last_frame" && urlOf(frame)),
+      references: references.filter((reference) => reference.type === "image_url" && urlOf(reference)).length,
+    };
+  } else if (contract.async_protocol === "google_lro") {
+    const instance = recordValue(Array.isArray(body.instances) ? body.instances[0] : undefined) ?? {};
+    found = {
+      first: recordValue(instance.image) !== undefined,
+      last: recordValue(instance.lastFrame) !== undefined,
+      references: Array.isArray(instance.referenceImages) ? instance.referenceImages.length : 0,
+    };
+  } else if (contract.async_protocol === "openai_video") {
+    found = { first: body.input_reference !== undefined, last: false, references: 0 };
+  } else if (contract.async_protocol === "glm_video") {
+    const images = Array.isArray(body.image_url) ? body.image_url : body.image_url === undefined ? [] : [body.image_url];
+    found = { first: images.length >= 1, last: images.length === 2, references: 0 };
+  }
+  if (!found) return [];
+  const errors: string[] = [];
+  if (found.first !== expected.first) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario ${expected.first ? "requires" : "must not send"} a start keyframe`);
+  }
+  if (found.last !== expected.last) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario ${expected.last ? "requires" : "must not send"} an end keyframe`);
+  }
+  if (found.references !== expected.references) {
+    errors.push(`video.generate ${scenario ?? "text"} scenario requires ${expected.references} reference images; found ${found.references}`);
+  }
+  return errors;
+}
+
+const TASK_RESULT_ARTIFACT_API_TYPES = new Set([
+  "image.txt2img",
+  "image.img2img",
+  "image.inpaint",
+  "image.upscale",
+  "image.bg_remove",
+  "audio.tts",
+  "audio.music",
+  "audio.enhance",
+  "video.generate",
+  "video.edit",
+  "video.extend",
+  "video.upscale",
+]);
+
+type VariantCell = {
+  provider_driver: string;
+  contract_id: string;
+  api_type: string;
+  model: ProviderModel;
+  expected_provider_options?: Record<string, unknown>;
+};
+
+export function buildT15Manifest(
+  catalog: ProviderProtocolCatalog,
+  variants: VariantCell[] = [],
+): AcceptanceCase[] {
+  const cases: AcceptanceCase[] = [];
+  for (const provider of catalog.providers) {
+    for (const contract of provider.contracts) {
+      for (const apiType of contract.api_types) {
+        const contractModel = contract.test_model_ids?.[apiType];
+        const common: Partial<AcceptanceCase> = {
+          layer: "T1.5",
+          priority: "P0",
+          tags: [
+            "provider_protocol",
+            provider.provider_driver,
+            contract.protocol_adapter_id,
+            apiType,
+            ...(contract.native_history_matrix === false
+              ? ["native_history_matrix_disabled"]
+              : []),
+            ...(contract.provider_switch_matrix === false
+              ? ["provider_switch_matrix_disabled"]
+              : []),
+          ],
+          input_entry: "zone_gateway",
+          user: "acceptance-user-a",
+          session: "isolated-per-case",
+          provider_driver: provider.provider_driver,
+          provider_instance: `t15-${provider.provider_driver}`,
+          model_selector: contractModel
+            ? { kind: "exact", value: contractModel }
+            : null,
+          api_type: apiType,
+          method: methodsForApiType(apiType)[0] ?? apiType,
+          execution_mode: "immediate",
+          required_capabilities: [],
+          disabled_capabilities: [],
+          fixtures: [],
+          expected_exact_model: null,
+          expected_provider_instance: `t15-${provider.provider_driver}`,
+          expected_task_status: "succeeded",
+          expected_error_class: null,
+          expected_output: {
+            kinds: [],
+            attachment_count: { min: 0, max: 0 },
+            mime_types: [],
+          },
+          semantic_rubric: [],
+          timeout_ms: 30_000,
+          max_attempts: 1,
+          estimated_cost_usd: 0,
+          cleanup: ["reset_provider_mock", "remove_t15_provider_instance"],
+          protocol_contract_id: contract.id,
+          protocol_evidence_revision: catalog.revision,
+          protocol_adapter_id: contract.protocol_adapter_id,
+          provider_api_version: contract.api_version,
+          expected_wire_fixture: `${contract.id}.request`,
+          response_fixture: `${contract.id}.success`,
+        };
+        if (apiType === "llm" && provider.server_default_test?.contract_id === contract.id) {
+          cases.push({ ...common,
+            case_id: caseId(`t1.5.${provider.provider_driver}.${contract.id}.llm.server-default-route`),
+            tags: [...common.tags!, "server_default_mode"],
+            model_selector: { kind: "exact", value: provider.server_default_test.model_id },
+            mock_scenario: "success",
+          } as AcceptanceCase);
+        }
+        cases.push({
+          ...common,
+          case_id: caseId(
+            `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.success`,
+          ),
+          mock_scenario: "success",
+        } as AcceptanceCase);
+        for (
+          const modelId of contract.conformance_test_model_ids?.[apiType] ?? []
+        ) {
+          if (modelId === contractModel) continue;
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.model.${modelId}.success`,
+            ),
+            tags: [...common.tags!, "model_api_conformance"],
+            model_selector: { kind: "exact", value: modelId },
+            mock_scenario: "success",
+          } as AcceptanceCase);
+        }
+        if (TASK_RESULT_ARTIFACT_API_TYPES.has(apiType)) {
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.task-result-artifact`,
+            ),
+            tags: [...common.tags!, "task_result_artifact"],
+            mock_scenario: "success",
+            expected_wire_fixture:
+              `${contract.id}.request.task-result-artifact`,
+            response_fixture: `${contract.id}.success`,
+          } as AcceptanceCase);
+        }
+        if (apiType === "video.generate") {
+          for (const scenario of contract.video_generate_scenarios ?? []) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.video-${scenario}`,
+              ),
+              tags: [...common.tags!, "video_scenario", scenario],
+              mock_scenario: "success",
+              expected_wire_fixture: `${contract.id}.request.video-${scenario}`,
+              response_fixture: `${contract.id}.success`,
+            } as AcceptanceCase);
+          }
+        }
+        if (apiType === "llm" && contract.inline_artifact_success_fixture) {
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.inline-artifact-provider-state`,
+            ),
+            tags: [
+              ...common.tags!,
+              "task_result_artifact",
+              "inline_artifact_provider_state",
+            ],
+            mock_scenario: "inline_artifact_success",
+            expected_wire_fixture:
+              `${contract.id}.request.inline-artifact-provider-state`,
+            response_fixture: `${contract.id}.inline-artifact-success`,
+          } as AcceptanceCase);
+        }
+        const artifactIdentity = contract.provider_artifact_identity;
+        if (
+          artifactIdentity?.accepts_api_types.includes(apiType) &&
+          artifactIdentity.returns_api_types.length > 0
+        ) {
+          const sourceApiType = artifactIdentity.returns_api_types[0];
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.generated-artifact-id.same-provider`,
+            ),
+            tags: [
+              ...common.tags!,
+              "generated_artifact_id",
+              "same_provider_artifact_id",
+            ],
+            mock_scenario: "success",
+            expected_wire_fixture:
+              `${contract.id}.request.generated-artifact-id.same-provider`,
+            response_fixture: `${contract.id}.success`,
+            artifact_source_provider_driver: provider.provider_driver,
+            artifact_source_contract_id: contract.id,
+            artifact_source_api_type: sourceApiType,
+            artifact_source_model_id: provider.test_model_ids[sourceApiType],
+            artifact_target_expect_provider_id: true,
+          } as AcceptanceCase);
+          const crossProvider = catalog.providers.find((candidate) =>
+            candidate.provider_driver !== provider.provider_driver &&
+            candidate.contracts.some((candidateContract) =>
+              candidateContract.api_types.includes(apiType)
+            )
+          );
+          const crossContract = crossProvider?.contracts.find((
+            candidateContract,
+          ) => candidateContract.api_types.includes(apiType));
+          if (crossProvider && crossContract) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.artifact-id.${provider.provider_driver}.${contract.id}.${sourceApiType}.to.${crossProvider.provider_driver}.${crossContract.id}.${apiType}.cross-provider`,
+              ),
+              tags: [
+                "provider_protocol",
+                crossProvider.provider_driver,
+                crossContract.protocol_adapter_id,
+                apiType,
+                "generated_artifact_id",
+                "cross_provider_artifact_id",
+              ],
+              provider_driver: crossProvider.provider_driver,
+              provider_instance: `t15-${crossProvider.provider_driver}`,
+              expected_provider_instance:
+                `t15-${crossProvider.provider_driver}`,
+              protocol_contract_id: crossContract.id,
+              protocol_adapter_id: crossContract.protocol_adapter_id,
+              provider_api_version: crossContract.api_version,
+              mock_scenario: "success",
+              expected_wire_fixture:
+                `${crossContract.id}.request.generated-artifact-id.cross-provider`,
+              response_fixture: `${crossContract.id}.success`,
+              artifact_source_provider_driver: provider.provider_driver,
+              artifact_source_contract_id: contract.id,
+              artifact_source_api_type: sourceApiType,
+              artifact_source_model_id: provider.test_model_ids[sourceApiType],
+              artifact_target_expect_provider_id: false,
+            } as AcceptanceCase);
+          }
+        }
+        const primaryApiType = contract.api_types[0];
+        if (apiType === primaryApiType && contract.stream_protocol) {
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.stream`,
+            ),
+            mock_scenario: "stream_success",
+            execution_mode: "stream",
+            expected_wire_fixture: `${contract.id}.request.stream`,
+            response_fixture: `${contract.id}.stream`,
+          } as AcceptanceCase);
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.stream-interrupted`,
+            ),
+            priority: "P1",
+            mock_scenario: "stream_interrupted",
+            execution_mode: "stream",
+            expected_task_status: "failed",
+            expected_error_class: "provider_protocol_failed",
+            expected_wire_fixture: `${contract.id}.request.stream`,
+            response_fixture: `${contract.id}.stream.interrupted`,
+          } as AcceptanceCase);
+        }
+        if (apiType === primaryApiType && contract.async_protocol) {
+          if (contract.async_protocol === "openai_responses") {
+            cases.push({...common,
+              case_id:caseId(`t1.5.${provider.provider_driver}.${contract.id}.${apiType}.background-ignored`),
+              mock_scenario:"background_ignored",expected_task_status:"failed",
+              expected_error_class:"provider_protocol_failed",
+              expected_wire_fixture:`${contract.id}.request.async`,response_fixture:`${contract.id}.background.ignored`,
+            } as AcceptanceCase);
+          }
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.async`,
+            ),
+            mock_scenario: "async_success",
+            expected_wire_fixture: `${contract.id}.request.async`,
+            response_fixture: `${contract.id}.async`,
+          } as AcceptanceCase);
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.async-failed`,
+            ),
+            priority: "P1",
+            mock_scenario: "async_failed",
+            expected_task_status: "failed",
+            expected_error_class: "provider_protocol_failed",
+            expected_wire_fixture: `${contract.id}.request.async`,
+            response_fixture: `${contract.id}.async.failed`,
+          } as AcceptanceCase);
+          const terminalFailureScenarios =
+              contract.async_protocol === "google_lro" ||
+              contract.async_protocol === "gemini_interactions" ||
+              contract.async_protocol === "minimax_video" ||
+              contract.async_protocol === "minimax_video_v2" ||
+              contract.async_protocol === "glm_video" ||
+              contract.async_protocol === "doubao_video" ||
+              contract.async_protocol === "doubao_asr"
+              ? ["async_poll_timeout"] as const
+              : ["async_poll_timeout", "async_artifact_unavailable"] as const;
+          for (const scenario of terminalFailureScenarios) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.${scenario}`,
+              ),
+              priority: "P1",
+              mock_scenario: scenario,
+              expected_task_status: "failed",
+              expected_error_class: "provider_protocol_failed",
+              expected_wire_fixture: `${contract.id}.request.async`,
+              response_fixture: `${contract.id}.${scenario}`,
+              timeout_ms: scenario === "async_poll_timeout"
+                ? 5_000
+                : common.timeout_ms,
+            } as AcceptanceCase);
+          }
+          if (contract.async_steps?.some((step) => step.name === "cancel")) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.async-cancel`,
+              ),
+              priority: "P1",
+              mock_scenario: "async_cancel",
+              expected_task_status: "failed",
+              expected_wire_fixture: `${contract.id}.request.async.cancel`,
+              response_fixture: `${contract.id}.async.cancelled`,
+            } as AcceptanceCase);
+          }
+        }
+        for (
+          const error of apiType === primaryApiType
+            ? catalog.error_fixtures[
+              contract.error_fixture_key ?? provider.provider_driver
+            ]
+            : []
+        ) {
+          cases.push({
+            ...common,
+            case_id: caseId(
+              `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.error.${error.scenario}`,
+            ),
+            priority: "P1",
+            tags: [...common.tags!, "official_error"],
+            mock_scenario: error.scenario,
+            expected_task_status: "failed",
+            expected_error_class: "provider_protocol_failed",
+            response_fixture: `${
+              contract.error_fixture_key ?? provider.provider_driver
+            }.error.${error.scenario}`,
+            expected_aicc_error_code: contract.aicc_error_code_by_scenario?.[error.scenario] ?? "provider_error",
+            expected_provider_error_code: providerErrorCode(error),
+            expected_retriable: providerErrorRetriable(error),
+          } as AcceptanceCase);
+        }
+        if (apiType === primaryApiType) {
+          for (
+            const scenario of [
+              "malformed_response",
+              "wrong_content_type",
+              "missing_required_response_field",
+            ] as const
+          ) {
+            cases.push({
+              ...common,
+              case_id: caseId(
+                `t1.5.${provider.provider_driver}.${contract.id}.${apiType}.response.${scenario}`,
+              ),
+              priority: "P1",
+              mock_scenario: scenario,
+              expected_task_status: "failed",
+              expected_error_class: "provider_protocol_failed",
+              response_fixture: `${contract.id}.response.${scenario}`,
+            } as AcceptanceCase);
+          }
+        }
+      }
+    }
+  }
+  const cloudUpdateBase = cases.find((testCase) =>
+    testCase.provider_driver === "openai" &&
+    testCase.protocol_contract_id === "openai.responses.v1" &&
+    testCase.api_type === "llm" &&
+    testCase.mock_scenario === "success"
+  );
+  if (!cloudUpdateBase) {
+    throw new Error(
+      "OpenAI Responses LLM contract is required for the cloud update case",
+    );
+  }
+  cases.push({
+    ...cloudUpdateBase,
+    case_id: "t1.5.openai.openai.responses.v1.llm.cloud-update",
+    tags: [...cloudUpdateBase.tags, "cloud_update"],
+    cleanup: [...cloudUpdateBase.cleanup, "restore_cloud_provider_rules"],
+  });
+  const qwenResponsesBase = cases.find((testCase) =>
+    testCase.provider_driver === "qwen" &&
+    testCase.protocol_contract_id === "qwen.responses.compatible-v1" &&
+    testCase.api_type === "llm" &&
+    testCase.mock_scenario === "success"
+  );
+  if (!qwenResponsesBase) {
+    throw new Error(
+      "Qwen Responses LLM contract is required for the video input case",
+    );
+  }
+  cases.push({
+    ...qwenResponsesBase,
+    case_id: "t1.5.qwen.qwen.responses.compatible-v1.llm.video-input",
+    tags: [...qwenResponsesBase.tags, "video_input"],
+    model_selector: { kind: "exact", value: "qwen3.8-omni-flash" },
+    expected_wire_fixture: "qwen.responses.compatible-v1.request.video-input",
+  });
+  const historyProviders = new Set([
+    "openai",
+    "openrouter",
+    "claude",
+    "google-gemini",
+  ]);
+  const historyBases = cases.filter((testCase) =>
+    historyProviders.has(testCase.provider_driver ?? "") &&
+    testCase.api_type === "llm" &&
+    testCase.mock_scenario === "success" &&
+    !testCase.tags.includes("cloud_update") &&
+    !testCase.tags.includes("model_api_conformance") &&
+    !testCase.tags.includes("history") &&
+    !testCase.tags.includes("tool_history")
+  );
+  for (const base of historyBases) {
+    cases.push({
+      ...base,
+      case_id: caseId(
+        `t1.5.${base.provider_driver}.${base.protocol_contract_id}.llm.history`,
+      ),
+      tags: [...base.tags, "history"],
+      expected_wire_fixture: `${base.protocol_contract_id}.request.history`,
+    });
+    cases.push({
+      ...base,
+      case_id: caseId(
+        `t1.5.${base.provider_driver}.${base.protocol_contract_id}.llm.tool-history`,
+      ),
+      tags: [...base.tags, "tool_history"],
+      expected_wire_fixture:
+        `${base.protocol_contract_id}.request.tool-history`,
+    });
+    if (
+      ["openai", "openrouter"].includes(base.provider_driver ?? "") &&
+      !base.tags.includes("native_history_matrix_disabled")
+    ) {
+      cases.push({
+        ...base,
+        case_id: caseId(
+          `t1.5.${base.provider_driver}.${base.protocol_contract_id}.llm.native-history`,
+        ),
+        tags: [...base.tags, "history", "native_history"],
+        expected_wire_fixture:
+          `${base.protocol_contract_id}.request.native-history`,
+      });
+    }
+    if (base.provider_driver === "claude") {
+      cases.push({
+        ...base,
+        case_id: caseId(
+          `t1.5.${base.provider_driver}.${base.protocol_contract_id}.llm.structured-output`,
+        ),
+        tags: [...base.tags, "structured_output"],
+        expected_wire_fixture:
+          `${base.protocol_contract_id}.request.structured-output`,
+      });
+    }
+  }
+  const providerSwitchBases = historyBases.filter((testCase) =>
+    !testCase.tags.includes("provider_switch_matrix_disabled")
+  );
+  for (const source of providerSwitchBases) {
+    for (const target of providerSwitchBases) {
+      if (source.provider_driver === target.provider_driver) continue;
+      cases.push({
+        ...target,
+        case_id: caseId(
+          `t1.5.switch.${source.provider_driver}.${source.protocol_contract_id}.llm.to.${target.provider_driver}.${target.protocol_contract_id}.llm`,
+        ),
+        priority: "P0",
+        tags: [...target.tags, "history", "provider_switch_matrix"],
+        session: "shared-provider-switch",
+        expected_wire_fixture:
+          `${target.protocol_contract_id}.request.provider-switch`,
+        switch_source_provider_driver: source.provider_driver ?? undefined,
+        switch_source_contract_id: source.protocol_contract_id,
+        switch_source_model_id: catalog.providers.find((provider) =>
+          provider.provider_driver === source.provider_driver
+        )
+          ?.test_model_ids.llm,
+        switch_target_provider_driver: target.provider_driver ?? undefined,
+        switch_target_contract_id: target.protocol_contract_id,
+      } as AcceptanceCase);
+    }
+  }
+  const customDrivers = new Set(["openai", "claude", "google-gemini"]);
+  cases.push(
+    ...cases.filter((testCase) =>
+      customDrivers.has(testCase.provider_driver ?? "") &&
+      testCase.mock_scenario === "success" &&
+      !testCase.tags.includes("cloud_update") &&
+      !testCase.tags.includes("history") &&
+      !testCase.tags.includes("tool_history") &&
+      !testCase.tags.includes("structured_output") &&
+      !testCase.tags.includes("task_result_artifact") &&
+      !testCase.tags.includes("generated_artifact_id") &&
+      !testCase.tags.includes("video_scenario") &&
+      !testCase.tags.includes("model_api_conformance") &&
+      !testCase.tags.includes("custom_provider")
+    ).map((testCase) => ({
+      ...testCase,
+      case_id: caseId(
+        `t1.5.custom.${testCase.provider_driver}.${testCase.protocol_contract_id}.${testCase.api_type}.success`,
+      ),
+      tags: [...testCase.tags, "custom_provider"],
+      provider_instance: `t15-custom-${testCase.provider_driver}`,
+      expected_provider_instance: `t15-custom-${testCase.provider_driver}`,
+    })),
+  );
+  // Vendor models that reject explicit sampling parameters must have those
+  // parameters stripped by Provider Rules before the request reaches the wire.
+  // Each provider keeps a control case on a model without the constraint, so the
+  // assertion cannot pass just because the harness never sends the values.
+  const samplingConstraints: Array<{
+    provider_driver: string;
+    contract_id: string;
+    stripped_model: string;
+    forwarded_model: string;
+  }> = [
+    {
+      provider_driver: "claude",
+      contract_id: "anthropic.messages.2023-06-01",
+      stripped_model: "claude-sonnet-5-5",
+      forwarded_model: "claude-sonnet-5",
+    },
+    {
+      provider_driver: "openrouter",
+      contract_id: "openrouter.responses.v1",
+      stripped_model: "anthropic/claude-sonnet-5.5",
+      forwarded_model: "anthropic/claude-sonnet-5",
+    },
+  ];
+  for (const constraint of samplingConstraints) {
+    const samplingBase = cases.find((testCase) =>
+      testCase.provider_driver === constraint.provider_driver &&
+      testCase.protocol_contract_id === constraint.contract_id &&
+      testCase.api_type === "llm" &&
+      testCase.mock_scenario === "success" &&
+      !testCase.tags.includes("model_api_conformance")
+    );
+    if (!samplingBase) {
+      throw new Error(
+        `${constraint.contract_id} LLM contract is required for the sampling constraint cases`,
+      );
+    }
+    const samplingVariants: Array<[string, string, string]> = [
+      ["sampling-omitted", constraint.stripped_model, "sampling_omitted"],
+      ["sampling-forwarded", constraint.forwarded_model, "sampling_forwarded"],
+    ];
+    for (const [suffix, modelId, tag] of samplingVariants) {
+      cases.push({
+        ...samplingBase,
+        case_id: caseId(
+          `t1.5.${constraint.provider_driver}.${constraint.contract_id}.llm.${suffix}`,
+        ),
+        priority: "P0",
+        tags: [...samplingBase.tags, tag],
+        model_selector: { kind: "exact", value: modelId },
+        mock_scenario: "success",
+        expected_wire_fixture: `${constraint.contract_id}.request.${suffix}`,
+      } as AcceptanceCase);
+    }
+  }
+  for (const variant of variants) {
+    const contract = protocolContract(
+      catalog,
+      variant.provider_driver,
+      variant.contract_id,
+    );
+    if (
+      !contract.api_types.includes(variant.api_type) &&
+      !contract.variant_api_types?.includes(variant.api_type)
+    ) {
+      throw new Error(
+        `${variant.contract_id} does not support ${variant.api_type}`,
+      );
+    }
+    cases.push({
+      case_id: caseId(
+        `t1.5.${variant.provider_driver}.${contract.id}.${variant.api_type}.variant.${variant.model.provider_model_id}`,
+      ),
+      layer: "T1.5",
+      priority: "P0",
+      tags: [
+        "provider_protocol",
+        "variant",
+        variant.provider_driver,
+        variant.api_type,
+      ],
+      input_entry: "zone_gateway",
+      user: "acceptance-user-a",
+      session: "isolated-per-case",
+      provider_driver: variant.provider_driver,
+      provider_instance: `t15-${variant.provider_driver}`,
+      model_selector: { kind: "exact", value: variant.model.exact_model },
+      api_type: variant.api_type,
+      method: methodsForApiType(variant.api_type)[0] ?? variant.api_type,
+      execution_mode: "immediate",
+      required_capabilities: [],
+      disabled_capabilities: [],
+      fixtures: [],
+      mock_scenario: "success",
+      expected_exact_model: variant.model.exact_model,
+      expected_provider_instance: `t15-${variant.provider_driver}`,
+      expected_task_status: "succeeded",
+      expected_error_class: null,
+      expected_output: {
+        kinds: [],
+        attachment_count: { min: 0, max: 0 },
+        mime_types: [],
+      },
+      semantic_rubric: [],
+      timeout_ms: 30_000,
+      max_attempts: 1,
+      estimated_cost_usd: 0,
+      cleanup: ["reset_provider_mock", "remove_t15_provider_instance"],
+      protocol_contract_id: contract.id,
+      protocol_evidence_revision: catalog.revision,
+      protocol_adapter_id: contract.protocol_adapter_id,
+      provider_api_version: contract.api_version,
+      expected_wire_fixture:
+        `${contract.id}.request.variant.${variant.model.provider_model_id}`,
+      response_fixture: `${contract.id}.success`,
+      expected_provider_options: variant.expected_provider_options,
+    });
+  }
+  return cases;
+}

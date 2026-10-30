@@ -15,7 +15,8 @@ export type AppState =
   | 'unknown'
 
 export type AppRuntimeType = 'service' | 'dapp' | 'web' | 'agent'
-export type AppClass = 'system_builtin' | 'user_installed' | 'zone_installed'
+export type AppId = string & { readonly __appId: unique symbol }
+export type AppInstanceId = string & { readonly __appInstanceId: unique symbol }
 export type AvailabilityMatchType =
   | 'system_builtin'
   | 'owner'
@@ -33,22 +34,25 @@ export interface AvailabilityMatch {
  * `apps.details.summary`. Built from the backend's `AppServiceSpec`.
  */
 export interface AppSummary {
-  app_id: string
+  app_id: AppId
   /** Stable Zone-wide identity used by routing, authorization, and UI actions. */
-  app_instance_id: string
-  app_class: AppClass
+  app_instance_id: AppInstanceId
+  app_did: string
   runtime_type: AppRuntimeType
   owner_user_id: string
   availability_match: AvailabilityMatch | null
+  /** The AppDoc package name. */
+  name?: string | null
   show_name: string | null
+  /** AppDoc `presentation` text, each a language → text map; null when the document has none. */
+  presentation?: AppPresentationText | null
   version: string
-  /** Icon URL as declared in AppDoc; may be null/empty. */
+  /**
+   * AppDoc `presentation.links.app_icon_url`: absolute, a data URL, or relative to the app's own
+   * web host. `presentation.icons` (ObjIds) are not served to browsers yet.
+   */
   app_icon_url: string | null
-  /** Convention-based fallback: `res/<app_id>/appicon.png`. */
-  icon_res_url: string
   author: string
-  tags: string[]
-  categories: string[]
   app_index: number
   enable: boolean
   state: AppState | string
@@ -58,6 +62,12 @@ export interface AppSummary {
   web_hosts: string[]
 }
 
+export interface AppPresentationText {
+  title?: Record<string, string>
+  summary?: Record<string, string>
+  description?: Record<string, string>
+}
+
 export interface AppsListResponse {
   user_id: string
   total: number
@@ -65,9 +75,8 @@ export interface AppsListResponse {
 }
 
 export interface AppDetailsResponse {
-  app_id: string
-  app_instance_id: string
-  app_class: AppClass
+  app_id: AppId
+  app_instance_id: AppInstanceId
   owner_user_id: string
   spec_path: string
   summary: AppSummary
@@ -77,8 +86,13 @@ export interface AppDetailsResponse {
 
 export type AvailabilityEffect = 'allow' | 'deny'
 
+/**
+ * `admins` / `users` / `limited` are the account-type groups, `guest` the anonymous pseudo-group
+ * (requests without an account), `group:<id>` a system user group. System group rules come before
+ * the account-type rule; among a user's system groups an allow wins.
+ */
 export interface AvailabilityGroupRule {
-  group_id: 'admins' | 'users' | 'limited' | 'guest'
+  group_id: 'admins' | 'users' | 'limited' | 'guest' | `group:${string}`
   effect: AvailabilityEffect
 }
 
@@ -89,7 +103,7 @@ export interface AvailabilityUserRule {
 
 export interface AppAvailabilityPolicy {
   schema_version: number
-  app_instance_id: string
+  app_instance_id: AppInstanceId
   default_effect: 'deny'
   group_rules: AvailabilityGroupRule[]
   user_rules: AvailabilityUserRule[]
@@ -100,9 +114,8 @@ export interface AppAvailabilityPolicy {
 
 export interface AppAvailabilityDecision {
   allowed: boolean
-  app_id: string
-  app_instance_id: string
-  app_class: AppClass
+  app_id: AppId
+  app_instance_id: AppInstanceId
   owner_user_id: string
   availability_match?: AvailabilityMatch
   reason: string

@@ -161,6 +161,7 @@ Session title: {{ session.title }}
 | `text` | string | 系统从 `content` 渲染出的默认纯文本视图，包含标准 attachment marker |
 | `content` | array of `MsgContentBlock` | 结构化消息内容块，转自 `AiMessage.content` |
 | `attachments` | array of `AttachmentRef` | `content` 中图片、文档等非文本附件块的快捷索引 |
+| `message_references` | array | 来自 `MsgObject.thread` 的历史消息关系；当前包含 `{ relation: "reply_to", obj_id }` |
 
 `raw_text`、`text` 和 `content` 的区别：
 
@@ -173,6 +174,10 @@ Session title: {{ session.title }}
 系统会为复杂结构提供默认文本渲染，命名统一使用 `default_*_text` 或直接使用对象的 `text` 字段。`input.msg.text` 是 `MsgRef.content` 的默认文本视图：文本块按顺序输出，附件块以 `AttachmentRef.text_marker` 形式输出。模板只需要自然语言输入时优先使用 `input.msg.text` / `input.text`；需要精确判断图片、文档或 object id 时再读 `input.msg.content` / `input.msg.attachments`。
 
 附件不应只靠普通字符串表示。当前 MessageHub 入站模型中，文本在 `MsgContent.content`，附件在 `MsgContent.refs`；降到 LLMContext 后会成为 `AiContent::Image` / `AiContent::Document`。`AiMessage::text_content()` 只返回文本块，会跳过图片和文档。因此 `MsgRef.text` 必须由 OpenDAN 自己渲染，并保留结构化 `content` / `attachments`。
+
+MessageHub 入站消息在 OpenDAN 内部保持为独立 `AiMessage`：正文和附件分别使用 `AiContent::Text`、`AiContent::Image` / `AiContent::Document`，附件的原始 kind、role、label、MIME 和 `reply_to` 由 `buckyos.msg.metadata` ProviderState 保存。该 ProviderState 是内部结构化 IR，不作为普通 machine block 暴露给 Behavior。
+
+需要生成纯文本 user prompt 时，系统在最后一步统一渲染为一个合法 JSON 文档。schema 为 `od.msg/1`，同轮源消息放入 `messages` 数组且 schema 只出现一次。每条消息直接使用 `text`、`attachments`、`refs`；附件来源缩写为 `src.obj` / `src.url` / `src.base64`。`refs` 中的字符串表示默认 `reply_to`，其他关系写成 `{ "id", "relation" }`。所有空字段省略，不得通过 `\n\n` 拼接多个独立 JSON 文档来表达消息边界。
 
 `MsgContentBlock`：
 
@@ -254,7 +259,7 @@ Session title: {{ session.title }}
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `event_id` | string | 事件名 / 事件路径，例如 `timer.reminder_check` 或 `/task_mgr/<id>/status` |
+| `event_id` | string | 事件名 / 事件路径，例如 `timer.reminder_check` 或 `/obj/taskmgr/<id>/changed` |
 | `data` | object / null | 事件 payload |
 | `reason` | string / null | 订阅或调度方给出的可读原因；session 主动订阅事件时通常应填写 |
 | `observed_at_ms` | number | AgentSession 观察到事件并冻结输入的时间 |
@@ -467,6 +472,10 @@ load_background_hits = "all"
 ```
 
 需要注意的是，`load_changed_background_hits` 会记录上一次加载状态，只返回相比上次调用发生变化的部分。为了让事件和其它背景变化有时间汇聚，函数还有一个 session 级 60 秒硬间隔：同一 session 只要返回过一次非空结果，未来 60 秒内每次调用都会直接返回空，不读取也不刷新 hint 指纹。没有配置 `load_background_hits = "all"` 的 hook 不会读取 hints，`session.background_hint_changed` 为 `false`。
+
+### 6.1 已知对象（`## Objects`）
+
+Zone 宿主（OpenDAN）在每个 Session 的系统文本里、`## Commands` 之前放一段 `## Objects`（`DefaultAssembler.known_objects`，`runner/assembler.rs`）：Agent 自己 `obj://<agent_id>`、本 Session `obj://<agent_id>/sessions/<sid>`、绑定的工作区、Agent 与 owner 的消息会话（`obj://msg-center/owners/<did>/sessions`，owner 的只读）、owner 的 HomeStation 主页与文件（`cyfs:///home/<owner>/`），每条一句说明。只给引用、不注入对象内容和挂载表，Session 内不变（稳定前缀）；`read` 这些 URL 才得到对象说明。不注入 Zone default device：Agent 产生的路径属于其来源 runtime。Hint 带对象时，`<hint>` 有 `object="<url>"` 属性，background 行写 `about <url>`（agent-object-url TODO A4 / A5）。
 
 ## 7. Include 与安全边界
 

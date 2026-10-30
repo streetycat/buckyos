@@ -4,9 +4,11 @@ import type {
   CSSProperties,
   PointerEvent as ReactPointerEvent,
   ReactNode,
+  Ref,
 } from 'react'
 import { AppIcon } from '../../components/DesktopVisuals'
 import { useI18n } from '../../i18n/provider'
+import { useAppText } from '../../presentation/appText'
 import type { ThemeMode, WindowAppearancePreferences } from '../../models/ui'
 import {
   WindowDialogProvider,
@@ -118,6 +120,7 @@ function mixWithTransparency(color: string, opacityPercent: number) {
 export function DesktopWindowContainer({
   children,
   isFront,
+  ref,
   onClose,
   onDragPointerDown,
   onFocus,
@@ -139,12 +142,15 @@ export function DesktopWindowContainer({
   onResizePointerDown: (
     direction: ResizeDirection,
   ) => (event: ReactPointerEvent<HTMLDivElement>) => void
+  /** The window element; the layer writes drag/resize geometry to it directly. */
+  ref?: Ref<HTMLDivElement>
   style: CSSProperties
   themeMode: ThemeMode
   uiModel: DesktopWindowDataModel
   windowAppearance: WindowAppearancePreferences
 }) {
   const { t } = useI18n()
+  const appText = useAppText()
   const { app } = uiModel
   const isMaximized = uiModel.state === 'maximized'
   const hasFullBleedContent = app.manifest.contentPadding === 'none'
@@ -189,9 +195,14 @@ export function DesktopWindowContainer({
 
   return (
     <div
+      ref={ref}
       data-testid={`window-${app.id}`}
+      // Positioned by `transform` (see desktopWindowTransform) so a move is
+      // compositor-only; `left/top` stay at 0.
       className={clsx(
-        'pointer-events-auto shell-window absolute flex flex-col overflow-hidden rounded-[12px] border border-[color:var(--cp-border)] transition-[transform,box-shadow,opacity] duration-200 ease-[var(--cp-ease-emphasis)]',
+        'pointer-events-auto shell-window absolute left-0 top-0 flex flex-col overflow-hidden transition-[box-shadow,opacity] duration-200 ease-[var(--cp-ease-emphasis)]',
+        // A maximized window fills the workspace edge to edge.
+        isMaximized ? 'rounded-none border-0' : 'rounded-[12px] border border-[color:var(--cp-border)]',
         isFront ? 'opacity-100' : 'opacity-[0.97]',
       )}
       style={windowStyle}
@@ -209,7 +220,7 @@ export function DesktopWindowContainer({
       >
         <div
           data-testid={`window-drag-${app.id}`}
-          className="flex h-8 cursor-move select-none items-center justify-between gap-2 px-2 py-0.5 pl-2 pr-1"
+          className="relative flex h-8 cursor-move select-none items-center justify-end py-0.5 pr-1"
           style={titleBarStyle}
           onPointerDown={onDragPointerDown}
           onDoubleClick={(event) => {
@@ -224,13 +235,19 @@ export function DesktopWindowContainer({
             onMaximize()
           }}
         >
-          <div className="min-w-0 flex items-center gap-2">
+          <div
+            className={clsx(
+              'absolute inset-y-0 right-20 flex min-w-0 items-center gap-2',
+              isMaximized ? 'left-20 justify-center' : 'left-3 justify-start',
+            )}
+          >
             <span
               className="flex size-4 shrink-0 items-center justify-center"
               style={{ color: titleTextColor }}
             >
               <AppIcon
                 iconKey={app.iconKey}
+                iconUrl={app.iconUrl}
                 className={clsx(
                   'size-[12px] text-inherit',
                   themeMode === 'light' ? 'stroke-[1.9]' : 'stroke-[1.6]',
@@ -241,11 +258,11 @@ export function DesktopWindowContainer({
               className="truncate text-xs font-medium"
               style={{ color: titleTextColor }}
             >
-              {t(app.labelKey)}
+              {uiModel.title ?? appText(app).title}
             </p>
           </div>
           <div
-            className="flex items-center gap-px"
+            className="relative flex items-center gap-px"
             onPointerDown={(event) => event.stopPropagation()}
           >
             {app.manifest.allowMinimize ? (

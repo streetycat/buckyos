@@ -19,7 +19,6 @@
  *   use different rule sets (handled in the store layer).
  */
 import type {
-  DeadZone,
   DesktopPageState,
   FormFactor,
   LayoutItem,
@@ -30,11 +29,8 @@ import type {
 } from './ui'
 import {
   defaultWindowAppearancePreferences,
-  isLauncherApp,
   windowAppearancePreferencesSchema,
 } from './ui'
-import type { DesktopAppItem } from '../app/types'
-import { defaultDeadZone } from '../mock/data'
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -43,9 +39,16 @@ import { defaultDeadZone } from '../mock/data'
 export const runtimeStorageKey = 'buckyos.prototype.runtime.v1'
 export const windowGeometryStorageKey = 'buckyos.window-geometry.desktop.v1'
 export const windowAppearanceStorageKey = 'buckyos.window-appearance.v1'
+export const desktopTaskbarPinnedStorageKey = 'buckyos.desktop.taskbar-pinned.v1'
+/** v2: the default pins became MessageHub, AI Workspace, HomeStation and AI Center. */
+export const desktopTaskbarAppsStorageKey = 'buckyos.desktop.taskbar-apps.v2'
 
+/**
+ * Where this device keeps its desktop item positions (and the dead zone). v3: items are the Desktop folder's
+ * entries, keyed by file name (models/desktopFolder.ts).
+ */
 export function layoutStorageKey(formFactor: FormFactor) {
-  return `buckyos.layout.${formFactor}.v1`
+  return `buckyos.layout.${formFactor}.v3`
 }
 
 // ---------------------------------------------------------------------------
@@ -123,38 +126,6 @@ export function readWindowAppearancePreferences(): WindowAppearancePreferences {
     readJson(windowAppearanceStorageKey),
   )
   return parsed.success ? parsed.data : { ...defaultWindowAppearancePreferences }
-}
-
-// ---------------------------------------------------------------------------
-// Dead-zone migration
-// ---------------------------------------------------------------------------
-
-function legacyDeadZone(formFactor: FormFactor): DeadZone {
-  return formFactor === 'desktop'
-    ? { top: 64, bottom: 24, left: 20, right: 20 }
-    : { top: 52, bottom: 20, left: 12, right: 12 }
-}
-
-function matchesDeadZone(
-  target: DeadZone | undefined,
-  expected: DeadZone,
-) {
-  return (
-    target?.top === expected.top &&
-    target?.bottom === expected.bottom &&
-    target?.left === expected.left &&
-    target?.right === expected.right
-  )
-}
-
-export function migrateDeadZone(
-  layout: LayoutState,
-  formFactor: FormFactor,
-): LayoutState {
-  if (!matchesDeadZone(layout.deadZone, legacyDeadZone(formFactor))) {
-    return layout
-  }
-  return { ...layout, deadZone: { ...defaultDeadZone } }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,22 +280,50 @@ export function getMaxUsedSlot(
 ): number {
   let maxSlot = -1
   for (const item of page.items) {
-    if (item.slotIndex !== undefined) {
-      // Use slotIndex directly (new model)
-      const endSlot = item.slotIndex + (item.w - 1) * (order === 'col-major' ? rows : 1)
-        + (item.h - 1) * (order === 'col-major' ? 1 : cols)
-      maxSlot = Math.max(maxSlot, endSlot)
-    } else if (item.x !== undefined && item.y !== undefined) {
-      // Fallback to x/y (legacy or derived)
+    if (item.x !== undefined && item.y !== undefined) {
+      // Always derive from x/y against the grid we are laying out for: a
+      // stored slotIndex may have been computed for a different row count
+      // (the store starts with a default grid before the container is
+      // measured) and would then point at the wrong cell.
       for (let dx = 0; dx < item.w; dx++) {
         for (let dy = 0; dy < item.h; dy++) {
           const slot = coordToSlot(item.x + dx, item.y + dy, cols, rows, order)
           maxSlot = Math.max(maxSlot, slot)
         }
       }
+    } else if (item.slotIndex !== undefined) {
+      const endSlot = item.slotIndex + (item.w - 1) * (order === 'col-major' ? rows : 1)
+        + (item.h - 1) * (order === 'col-major' ? 1 : cols)
+      maxSlot = Math.max(maxSlot, endSlot)
     }
   }
   return maxSlot
+}
+
+/**
+ * Recompute `slotIndex` for every positioned item against the given grid.
+ * Returns the same object when nothing changed.
+ */
+export function refreshSlotIndexes(
+  layout: LayoutState,
+  cols: number,
+  rows: number,
+): LayoutState {
+  const order: ScanOrder = layout.formFactor === 'mobile' ? 'row-major' : 'col-major'
+  let anyChanged = false
+  const pages = layout.pages.map((page) => {
+    let pageChanged = false
+    const items = page.items.map((item) => {
+      if (item.x === undefined || item.y === undefined) return item
+      const slot = coordToSlot(item.x, item.y, cols, rows, order)
+      if (item.slotIndex === slot) return item
+      pageChanged = true
+      return { ...item, slotIndex: slot }
+    })
+    if (pageChanged) anyChanged = true
+    return pageChanged ? { ...page, items } : page
+  })
+  return anyChanged ? { ...layout, pages } : layout
 }
 
 /** Axis-aligned cell rectangle on the grid. */
@@ -392,10 +391,13 @@ export function findTailSlot(
 
   if (startSlot >= cap && w === 1 && h === 1) return null
 
-  // For 1×1 items, just convert startSlot
+  // For 1×1 items, take the first free slot from startSlot on. The tail is
+  // normally free by construction; the occupancy check only guards against
+  // inconsistent input (e.g. positions from a differently sized grid).
   if (w === 1 && h === 1) {
-    if (startSlot < cap) {
-      return slotToCoord(startSlot, cols, rows, scanOrder)
+    for (let slot = startSlot; slot < cap; slot++) {
+      const coord = slotToCoord(slot, cols, rows, scanOrder)
+      if (fits(page, coord.x, coord.y, 1, 1, cols, rows)) return coord
     }
     return null
   }
@@ -806,82 +808,8 @@ export function applyDragCollision(
 }
 
 // ---------------------------------------------------------------------------
-// Layout sanitisation & reconciliation
+// Lookup
 // ---------------------------------------------------------------------------
-
-export function sanitizeLayoutForApps(
-  layout: LayoutState,
-  apps: DesktopAppItem[],
-): LayoutState {
-  const launcherAppIds = new Set(
-    apps.filter((app) => isLauncherApp(app)).map((app) => app.id),
-  )
-  return {
-    ...layout,
-    pages: layout.pages.map((page) => ({
-      ...page,
-      items: page.items.filter(
-        (item) => item.type === 'widget' || launcherAppIds.has(item.appId),
-      ),
-    })),
-  }
-}
-
-export function reconcileLayoutWithDefaultApps(
-  layout: LayoutState,
-  defaultLayout: LayoutState,
-  apps: DesktopAppItem[],
-  formFactor: FormFactor,
-): LayoutState {
-  const sanitizedLayout = sanitizeLayoutForApps(layout, apps)
-  const launcherAppIds = new Set(
-    apps.filter((app) => isLauncherApp(app)).map((app) => app.id),
-  )
-  const existingAppIds = new Set(
-    sanitizedLayout.pages.flatMap((page) =>
-      page.items.flatMap((item) => (item.type === 'app' ? [item.appId] : [])),
-    ),
-  )
-
-  const newItems: LayoutItem[] = []
-  let nextSeq = sanitizedLayout.pages.reduce(
-    (max, page) => Math.max(max, ...page.items.map((i) => i.seq ?? 0)),
-    0,
-  ) + 1
-
-  defaultLayout.pages.forEach((defaultPage) => {
-    defaultPage.items.forEach((item) => {
-      if (
-        item.type !== 'app' ||
-        !launcherAppIds.has(item.appId) ||
-        existingAppIds.has(item.appId)
-      ) {
-        return
-      }
-      newItems.push({
-        ...item,
-        x: undefined,
-        y: undefined,
-        slotIndex: undefined,
-        placementType: 'auto',
-        seq: nextSeq++,
-      })
-      existingAppIds.add(item.appId)
-    })
-  })
-
-  if (newItems.length === 0) return sanitizedLayout
-
-  const pages = sanitizedLayout.pages.map((page) => ({
-    ...page,
-    items: [...page.items],
-  }))
-  if (pages.length === 0) {
-    pages.push({ id: `${formFactor}-page-1`, items: [] })
-  }
-  pages[pages.length - 1].items.push(...newItems)
-  return { ...sanitizedLayout, pages }
-}
 
 export function getPageIndex(layoutState: LayoutState, itemId: string) {
   return layoutState.pages.findIndex((page) =>
@@ -931,40 +859,3 @@ export function normalizeViewportProgress(
 }
 
 export const desktopMinCanvasSize = { width: 960, height: 720 }
-
-// ---------------------------------------------------------------------------
-// Slot sync: ensure slotIndex is populated from x/y (migration helper)
-// ---------------------------------------------------------------------------
-
-/**
- * Migrate a layout so that every positioned item has a slotIndex and seq.
- * Used when loading layouts that predate the slot-based model.
- */
-export function migrateToSlotModel(
-  layout: LayoutState,
-  cols: number,
-  rows: number,
-): LayoutState {
-  const order: ScanOrder = layout.formFactor === 'mobile' ? 'row-major' : 'col-major'
-  let globalSeq = 0
-
-  const pages = layout.pages.map((page, pageIdx) => ({
-    ...page,
-    items: page.items.map((item) => {
-      const needsSlot = item.slotIndex === undefined && item.x !== undefined && item.y !== undefined
-      const needsSeq = item.seq === undefined
-      if (!needsSlot && !needsSeq) return item
-      return {
-        ...item,
-        slotIndex: needsSlot
-          ? coordToSlot(item.x!, item.y!, cols, rows, order)
-          : item.slotIndex,
-        preferredPage: item.preferredPage ?? pageIdx,
-        placementType: item.placementType ?? ('manual' as PlacementType),
-        seq: needsSeq ? globalSeq++ : item.seq,
-      }
-    }),
-  }))
-
-  return { ...layout, pages }
-}

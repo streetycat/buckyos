@@ -71,6 +71,11 @@ pub struct QueueConfig {
     pub retention_seconds: Option<u64>,
     /// 是否需要同步落盘 (Write-Ahead-Log 语义)
     pub sync_write: bool,
+    /// 保留已确认的消息（日志语义，可回溯）。默认 false：生产者-消费者语义，
+    /// 一条消息被全部订阅确认（游标越过它）后即删除，消费正常时队列基本为空；
+    /// 没有订阅时不裁剪。ACK 与删除分离是使用者的选择。
+    #[serde(default)]
+    pub keep_acked: bool,
 
     pub other_app_can_read: bool,
     pub other_app_can_write: bool,
@@ -84,6 +89,7 @@ impl Default for QueueConfig {
             max_messages: None,
             retention_seconds: None,
             sync_write: false,
+            keep_acked: false,
             other_app_can_read: true,
             other_app_can_write: false,
             other_user_can_read: false,
@@ -218,9 +224,9 @@ impl MsgQueuePostMessageReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MsgQueueSubscribeReq {
     pub queue_urn: QueueUrn,
-    #[serde(rename = "userid", alias = "user_id")]
+    #[serde(rename = "userid")]
     pub user_id: String,
-    #[serde(rename = "appid", alias = "app_id")]
+    #[serde(rename = "appid")]
     pub app_id: String,
     pub sub_id: Option<String>,
     pub position: SubPosition,
@@ -967,11 +973,10 @@ impl<T: MsgQueueHandler> RPCHandler for MsgQueueServerHandler<T> {
 /// 这是一个纯函数，不涉及 IO。
 /// 规则:
 /// - 绝对路径对象 ID（`/xxx/...`）保持原样，作为最终 QueueUrn。
-/// - 兼容旧式 URN（`appid::owner::name`）透传，避免二次封装。
-/// - 其他名称按旧规则拼装为 `appid::owner::name`。
+/// - 其他名称拼装为 `appid::owner::name`。
 pub fn calc_queue_urn(appid: &str, app_owner: &str, name: &str) -> String {
     let normalized = name.trim();
-    if normalized.starts_with('/') || normalized.contains("::") {
+    if normalized.starts_with('/') {
         return normalized.to_string();
     }
     format!("{}::{}::{}", appid, app_owner, normalized)
@@ -1004,11 +1009,10 @@ mod tests {
     }
 
     #[test]
-    fn calc_queue_urn_keeps_legacy_urn() {
-        let legacy = "opendan::jarvis.test.buckyos.io::legacy_queue";
+    fn calc_queue_urn_wraps_names_containing_separators() {
         assert_eq!(
-            calc_queue_urn("ignored", "ignored", legacy),
-            legacy.to_string()
+            calc_queue_urn("app", "owner", "opendan::jarvis.test.buckyos.io::queue"),
+            "app::owner::opendan::jarvis.test.buckyos.io::queue"
         );
     }
 

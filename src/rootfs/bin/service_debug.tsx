@@ -6,9 +6,10 @@
 //
 // 支持：
 //   - pkg_list.script => HostScript
-//   - pkg_list.agent  => Agent / OpenDan
+//   - pkg_list.agent  => Agent / OpenDan（Agent 的构造 App：AppId = AgentId）
 //
-//   service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--worksession-test <json>] [--worksession-task-test <json>] [--detach]
+//   service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--opendan-bin <path>] [--detach] [-- <opendan args>]
+//   service_debug agents <owner_user_id>    列出 owner 名下的 Agent：<agent_id>\t<创建状态>\t<agent_did>
 
 type JsonValue =
   | string
@@ -28,10 +29,12 @@ type StartupOptions = {
   detach: boolean
   systemConfigUrl: string
   agentPackageRoot?: string
+  opendanBinary?: string
   opendanArgs: string[]
 }
 
-const DEFAULT_BUCKYOS_ROOT = '/opt/buckyos'
+const DEFAULT_BUCKYOS_ROOT = Deno.build.os === 'windows' ? 'C:\\buckyos' : '/opt/buckyos'
+const SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE = 'system-config-bootstrap'
 const DEFAULT_OPENDAN_SERVICE_PORT = 4060
 const DEFAULT_HOST_SCRIPT_SERVICE_PORT = 3000
 const OPENDAN_SERVICE_PORT_FALLBACK_KEYS = ['www', 'http', 'https', 'main']
@@ -92,15 +95,18 @@ function printUsage(): never {
   console.error(
     [
       'Usage:',
-      '  service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--worksession-test <json>] [--worksession-task-test <json>] [--detach]',
+      '  service_debug <app_service_name> <owner_user_id> [--port <port>] [--node-id <node_id>] [--agent-package-root <path>] [--opendan-bin <path>] [--detach] [-- <opendan args>]',
+      '  service_debug agents <owner_user_id>',
+      '',
+      'An agent runs as its own app: the app id is the AgentId.',
       '',
       'Example:',
-      '  service_debug buckyos_jarvis alice',
+      '  service_debug agents alice',
+      '  service_debug xiaobai.test.buckyos.io alice',
       '  service_debug buckyos_systest devtest',
-      '  service_debug buckyos_jarvis alice --port 14060',
-      '  service_debug buckyos_jarvis alice --agent-package-root ./rootfs/bin/buckyos_jarvis',
-      '  service_debug buckyos_jarvis alice --worksession-test ./case.json',
-      '  service_debug buckyos_jarvis alice --worksession-task-test ./case.json',
+      '  service_debug xiaobai.test.buckyos.io alice --port 14060',
+      '  service_debug xiaobai.test.buckyos.io alice --agent-package-root ./apps/jarvis_agent/agent',
+      '  service_debug xiaobai.test.buckyos.io alice --opendan-bin ./target/debug/opendan -- --web ./frame/opendan/web/dist',
     ].join('\n'),
   )
   Deno.exit(1)
@@ -122,11 +128,25 @@ function parseArgs(args: string[]): StartupOptions {
   let detach = false
   let systemConfigUrl = 'http://127.0.0.1:3200/kapi/system_config'
   let agentPackageRoot: string | undefined
+  let opendanBinary: string | undefined
   const opendanArgs: string[] = []
 
   for (let index = 2; index < args.length; index += 1) {
     const arg = args[index]
+    if (arg === '--') {
+      opendanArgs.push(...args.slice(index + 1))
+      break
+    }
     switch (arg) {
+      case '--opendan-bin': {
+        const raw = args[index + 1]?.trim()
+        index += 1
+        if (!raw) {
+          throw new Error('missing value for --opendan-bin')
+        }
+        opendanBinary = raw
+        break
+      }
       case '--node-id': {
         nodeId = args[index + 1]?.trim()
         index += 1
@@ -164,59 +184,7 @@ function parseArgs(args: string[]): StartupOptions {
         agentPackageRoot = raw
         break
       }
-      case '--worksession-test':
-      case '--work-session-test': {
-        const raw = args[index + 1]?.trim()
-        index += 1
-        if (!raw) {
-          throw new Error(`missing value for ${arg}`)
-        }
-        opendanArgs.push(arg, raw)
-        break
-      }
-      case '--worksession-task-test':
-      case '--work-session-task-test':
-      case 'worksession-task-test':
-      case 'work-session-task-test': {
-        const raw = args[index + 1]?.trim()
-        index += 1
-        if (!raw) {
-          throw new Error(`missing value for ${arg}`)
-        }
-        opendanArgs.push('--worksession-task-test', raw)
-        break
-      }
-      case '--': {
-        const next = args[index + 1]?.trim()
-        if (
-          next === 'worksession-task-test' ||
-          next === 'work-session-task-test' ||
-          next === '--worksession-task-test' ||
-          next === '--work-session-task-test'
-        ) {
-          const raw = args[index + 2]?.trim()
-          index += 2
-          if (!raw) {
-            throw new Error(`missing value for ${next}`)
-          }
-          opendanArgs.push('--worksession-task-test', raw)
-          break
-        }
-        throw new Error(`unknown argument after --: ${next || ''}`)
-      }
       default: {
-        if (arg.startsWith('--worksession-test=') || arg.startsWith('--work-session-test=')) {
-          opendanArgs.push(arg)
-          break
-        }
-        if (arg.startsWith('--worksession-task-test=') || arg.startsWith('--work-session-task-test=')) {
-          const value = arg.slice(arg.indexOf('=') + 1)
-          if (!value.trim()) {
-            throw new Error(`missing value for ${arg.slice(0, arg.indexOf('='))}`)
-          }
-          opendanArgs.push(`--worksession-task-test=${value}`)
-          break
-        }
         throw new Error(`unknown argument: ${arg}`)
       }
     }
@@ -230,6 +198,7 @@ function parseArgs(args: string[]): StartupOptions {
     detach,
     systemConfigUrl,
     agentPackageRoot,
+    opendanBinary,
     opendanArgs,
   }
 }
@@ -292,15 +261,6 @@ async function readJsonFile(path: string): Promise<JsonObject> {
 
 function uniquePkgName(pkgId: string): string {
   return pkgId.split('#', 1)[0].trim()
-}
-
-function getFullAppId(appId: string, ownerUserId: string): string {
-  return `${ownerUserId}-${appId}`
-}
-
-function getSessionTokenEnvKey(appFullId: string, isAppService: boolean): string {
-  const upper = appFullId.toUpperCase().replaceAll('-', '_')
-  return isAppService ? `${upper}_TOKEN` : `${upper}_SESSION_TOKEN`
 }
 
 function getAppDataDir(buckyosRoot: string, appId: string, ownerUserId: string): string {
@@ -399,11 +359,15 @@ async function importEd25519PrivateKeyFromPem(pem: string): Promise<CryptoKey> {
   )
 }
 
-async function generateAppServiceToken(
+// Device-signed assertions, as node-daemon issues them: a login assertion for
+// the app (exchanged at verify-hub by the app runtime), and, with `audience`,
+// the read-only bootstrap assertion system-config accepts from the device.
+async function generateDeviceAssertion(
   appId: string,
   subject: string,
   deviceName: string,
   privateKeyPem: string,
+  audience?: string,
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000)
   const header = {
@@ -411,17 +375,16 @@ async function generateAppServiceToken(
     kid: deviceName,
     typ: 'JWT',
   }
-  const payload = {
-    token_type: 'Normal',
+  const payload: Record<string, unknown> = {
     appid: appId,
-    jti: `${now}`,
-    session: now,
-    sub: subject,
-    aud: null,
     exp: now + VERIFY_HUB_TOKEN_EXPIRE_TIME * 2,
     iss: deviceName,
-    token: null,
-    extra: {},
+    jti: `${now}${Math.floor(Math.random() * 1_000_000)}`,
+    sub: subject,
+  }
+  if (audience) {
+    payload.aud = audience
+    payload.exp = now + 15 * 60
   }
 
   const encodedHeader = base64UrlEncode(new TextEncoder().encode(JSON.stringify(header)))
@@ -477,7 +440,13 @@ function selectAgentServicePort(
   return DEFAULT_OPENDAN_SERVICE_PORT
 }
 
-async function resolveOpendanBinary(buckyosRoot: string): Promise<string> {
+async function resolveOpendanBinary(buckyosRoot: string, overridePath?: string): Promise<string> {
+  if (overridePath) {
+    if (await fileExists(overridePath)) {
+      return overridePath
+    }
+    throw new Error(`opendan binary override not found: ${overridePath}`)
+  }
   const scriptDir = new URL('.', import.meta.url).pathname
   const candidates = [
     joinPath(buckyosRoot, 'bin', 'opendan', 'opendan'),
@@ -575,25 +544,13 @@ async function loadAppSpec(
   appId: string,
   ownerUserId: string,
 ): Promise<{ key: string; value: JsonObject }> {
-  const candidateKeys = [
-    `users/${ownerUserId}/agents/${appId}/spec`,
-    `users/${ownerUserId}/apps/${appId}/spec`,
-  ]
-
-  for (const key of candidateKeys) {
-    try {
-      const value = await sysConfigGet(client, key)
-      if (value) {
-        return { key, value }
-      }
-    } catch {
-      // try next key
-    }
+  const key = `users/${ownerUserId}/apps/${appId}/spec`
+  const value = await sysConfigGet(client, key)
+  if (value) {
+    return { key, value }
   }
 
-  throw new Error(
-    `app spec not found, checked: ${candidateKeys.join(', ')}`,
-  )
+  throw new Error(`app spec not found: ${key}`)
 }
 
 async function loadAppInstanceConfig(
@@ -601,25 +558,21 @@ async function loadAppInstanceConfig(
   nodeId: string,
   appId: string,
   ownerUserId: string,
-  spec: JsonObject,
 ): Promise<JsonObject> {
-  const nodeConfig = await sysConfigGet(client, `nodes/${nodeId}/config`).catch(() => null)
-  const instanceId = `${appId}@${ownerUserId}@${nodeId}`
-
-  if (nodeConfig) {
-    const apps = getNestedObject(nodeConfig, ['apps'])
-    const instance = apps?.[instanceId]
-    if (instance && typeof instance === 'object' && !Array.isArray(instance)) {
-      return instance as JsonObject
-    }
+  const nodeConfigKey = `nodes/${nodeId}/config`
+  const nodeConfig = await sysConfigGet(client, nodeConfigKey)
+  if (!nodeConfig) {
+    throw new Error(`node config not found: ${nodeConfigKey}`)
   }
 
-  return {
-    target_state: 'Started',
-    node_id: nodeId,
-    app_spec: spec,
-    service_ports_config: {},
+  const appInstanceId = `${appId}@${ownerUserId}`
+  const apps = getNestedObject(nodeConfig, ['apps'])
+  const instance = apps?.[appInstanceId]
+  if (!instance || typeof instance !== 'object' || Array.isArray(instance)) {
+    throw new Error(`app instance ${appInstanceId} not found in ${nodeConfigKey}`)
   }
+
+  return instance as JsonObject
 }
 
 function hasHostScriptPkg(appDoc: JsonObject): boolean {
@@ -656,12 +609,11 @@ type HostScriptLaunchContext = {
 
 type LaunchContext = AgentLaunchContext | HostScriptLaunchContext
 
-async function buildLaunchContext(options: StartupOptions) {
+// This device's identity and a system-config client with its read-only
+// bootstrap assertion (as node-daemon reads its configuration).
+async function connectAsDevice(systemConfigUrl: string) {
   const buckyosRoot = getBuckyosRoot()
-  const etcDir = joinPath(buckyosRoot, 'etc')
-  const nodeIdentityPath = joinPath(etcDir, 'node_identity.json')
-
-  const nodeIdentity = await readJsonFile(nodeIdentityPath)
+  const nodeIdentity = await readJsonFile(joinPath(buckyosRoot, 'etc', 'node_identity.json'))
   const deviceDid = getNestedString(nodeIdentity, ['device_did']) || ''
   if (!deviceDid) {
     throw new Error('device_did not found in node_identity.json')
@@ -675,22 +627,56 @@ async function buildLaunchContext(options: StartupOptions) {
   if (!deviceName) {
     throw new Error('device name not found in node_identity.json/did.json')
   }
+  const nodeDaemonToken = await generateDeviceAssertion(
+    'node-daemon',
+    deviceName,
+    deviceName,
+    nodePrivateKeyPem,
+    SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE,
+  )
+  return {
+    buckyosRoot,
+    deviceConfig,
+    deviceName,
+    nodePrivateKeyPem,
+    systemConfigClient: new KRPCClient(systemConfigUrl, nodeDaemonToken),
+  }
+}
+
+// The owner's agents, one line each: `<agent_id>\t<state>\t<agent_did>`.
+// `state` is the creation state of the install record (`ready` once a Loader
+// reported it loaded), `bound` for a spec without one.
+async function listAgents(ownerUserId: string, systemConfigUrl: string): Promise<void> {
+  const { systemConfigClient } = await connectAsDevice(systemConfigUrl)
+  const root = `users/${ownerUserId}/agents`
+  const ids = await systemConfigClient.call('sys_config_list', { key: root }).catch(() => [])
+  for (const id of Array.isArray(ids) ? ids : []) {
+    const read = (key: string) => sysConfigGet(systemConfigClient, `${root}/${id}/${key}`).catch(() => null)
+    const record = await read('install_record')
+    const spec = await read('spec')
+    const state = (record && getNestedString(record, ['state'])) || (spec ? 'bound' : 'unknown')
+    const did = (spec && getNestedString(spec, ['agent_did'])) || ''
+    console.log(`${id}\t${state}\t${did}`)
+  }
+}
+
+async function buildLaunchContext(options: StartupOptions) {
+  const {
+    buckyosRoot,
+    deviceConfig,
+    deviceName,
+    nodePrivateKeyPem,
+    systemConfigClient,
+  } = await connectAsDevice(options.systemConfigUrl)
 
   const nodeId = options.nodeId || deviceName
-  const appFullId = getFullAppId(options.appId, options.ownerUserId)
-  const serviceToken = await generateAppServiceToken(
+  const appInstanceId = `${options.appId}@${options.ownerUserId}`
+  const serviceToken = await generateDeviceAssertion(
     options.appId,
     options.ownerUserId,
     deviceName,
     nodePrivateKeyPem,
   )
-  const nodeDaemonToken = await generateAppServiceToken(
-    'node-daemon',
-    deviceName,
-    deviceName,
-    nodePrivateKeyPem,
-  )
-  const systemConfigClient = new KRPCClient(options.systemConfigUrl, nodeDaemonToken)
   const zoneConfig = await sysConfigGet(systemConfigClient, 'boot/config')
   if (!zoneConfig) {
     throw new Error('failed to load boot/config from system_config')
@@ -705,12 +691,23 @@ async function buildLaunchContext(options: StartupOptions) {
     nodeId,
     options.appId,
     options.ownerUserId,
-    spec,
   )
-  const appDoc = getNestedObject(appInstanceConfig, ['app_spec', 'app_doc']) ||
-    getNestedObject(spec, ['app_doc'])
+  if (getNestedString(spec, ['app_instance_id']) !== appInstanceId) {
+    throw new Error(`app spec identity does not match ${appInstanceId}`)
+  }
+  if (
+    getNestedString(appInstanceConfig, ['node_execution_spec', 'app_instance_id']) !==
+      appInstanceId
+  ) {
+    throw new Error(`node execution identity does not match ${appInstanceId}`)
+  }
+  const appDoc = getNestedObject(spec, ['app_doc'])
   if (!appDoc) {
     throw new Error('app_doc missing from app spec')
+  }
+  const appDid = getNestedString(spec, ['app_did'])
+  if (!appDid) {
+    throw new Error('app_did missing from app spec')
   }
 
   const env: Record<string, string> = {
@@ -718,12 +715,17 @@ async function buildLaunchContext(options: StartupOptions) {
     BUCKYOS_ZONE_CONFIG: JSON.stringify(zoneConfig),
     BUCKYOS_THIS_DEVICE: JSON.stringify(deviceConfig),
     BUCKYOS_HOST_GATEWAY: '127.0.0.1',
+    BUCKYOS_APP_DID: appDid,
+    BUCKYOS_APP_ID: options.appId,
+    BUCKYOS_APP_INSTANCE_ID: appInstanceId,
+    BUCKYOS_OWNER_USER_ID: options.ownerUserId,
+    BUCKYOS_DATA_DIR: getAppDataDir(buckyosRoot, options.appId, options.ownerUserId),
+    BUCKYOS_APP_TOKEN: serviceToken,
     app_instance_config: JSON.stringify(appInstanceConfig),
     app_media_info: JSON.stringify({
       pkg_id: '',
       full_path: '',
     }),
-    [getSessionTokenEnvKey(appFullId, true)]: serviceToken,
   }
 
   if (hasHostScriptPkg(appDoc)) {
@@ -760,8 +762,8 @@ async function buildLaunchContext(options: StartupOptions) {
 
   if (hasAgentPkg(appDoc)) {
     const agentPackage = await resolveAgentPackageRoot(buckyosRoot, appDoc, options.agentPackageRoot)
-    const opendanBinary = await resolveOpendanBinary(buckyosRoot)
-    const agentEnvRoot = getAppDataDir(buckyosRoot, options.appId, options.ownerUserId)
+    const opendanBinary = await resolveOpendanBinary(buckyosRoot, options.opendanBinary)
+    const agentEnvRoot = joinPath(buckyosRoot, 'data', 'home', options.ownerUserId, 'agents', options.appId)
     await Deno.mkdir(agentEnvRoot, { recursive: true })
     const servicePort = selectAgentServicePort(appDoc, appInstanceConfig, options.port)
 
@@ -777,6 +779,7 @@ async function buildLaunchContext(options: StartupOptions) {
       opendanArgs: options.opendanArgs,
       env: {
         ...env,
+        BUCKYOS_DATA_DIR: agentEnvRoot,
         app_media_info: JSON.stringify({
           pkg_id: agentPackage.pkgId,
           full_path: agentPackage.fullPath,
@@ -799,7 +802,7 @@ async function runForeground(
 ): Promise<number> {
   const child = new Deno.Command(opendanBinary, {
     args: [
-      '--agent-id',
+      '--app-id',
       appId,
       '--agent-bin',
       agentPackageRoot,
@@ -1011,7 +1014,7 @@ async function runDetached(
 ): Promise<void> {
   const child = new Deno.Command(opendanBinary, {
     args: [
-      '--agent-id',
+      '--app-id',
       appId,
       '--agent-bin',
       agentPackageRoot,
@@ -1030,6 +1033,14 @@ async function runDetached(
 
 async function main() {
   try {
+    if (Deno.args[0] === 'agents') {
+      const owner = Deno.args[1]?.trim()
+      if (!owner) {
+        printUsage()
+      }
+      await listAgents(owner, 'http://127.0.0.1:3200/kapi/system_config')
+      return
+    }
     const options = parseArgs(Deno.args)
     const launch: LaunchContext = await buildLaunchContext(options)
 

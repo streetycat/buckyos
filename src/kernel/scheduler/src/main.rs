@@ -1,5 +1,7 @@
 #![allow(unused_mut, unused, dead_code)]
 mod app;
+mod executor_auth;
+mod install_plan_executor;
 mod scheduler;
 mod scheduler_server;
 mod service;
@@ -51,10 +53,11 @@ async fn create_init_list_by_template(
     zone_document: &ZoneDocument,
     zone_document_str: &str,
     buckyos_root_dir: &Path,
+    security_root_dir: &Path,
 ) -> Result<HashMap<String, String>> {
     //load start_parms from active_service.
     let etc_dir = buckyos_root_dir.join("etc");
-    let start_params_file_path = etc_dir.join("start_config.json");
+    let start_params_file_path = security_root_dir.join("start_config.json");
     info!(
         "load start_params from :{}",
         start_params_file_path.to_string_lossy()
@@ -75,7 +78,12 @@ async fn create_init_list_by_template(
         .map_err(|e| anyhow::anyhow!("invalid jwk: {}", e))?;
 
     //load boot.template
-    let template_file_path = etc_dir.join("scheduler").join("boot.template.toml");
+    let private_template_path = security_root_dir.join("scheduler").join("boot.template.toml");
+    let template_file_path = if tokio::fs::try_exists(&private_template_path).await? {
+        private_template_path
+    } else {
+        etc_dir.join("scheduler").join("boot.template.toml")
+    };
     let template_str = match tokio::fs::read_to_string(&template_file_path).await {
         Ok(content) => content,
         Err(err) => {
@@ -127,6 +135,12 @@ async fn create_init_list_by_template(
         .await?
         .add_msg_center(&start_config)
         .await?
+        .add_nfs_server()
+        .await?
+        .add_aiworkspace()
+        .await?
+        .add_homestation()
+        .await?
         .add_workflow()
         .await?
         .add_control_panel()
@@ -137,13 +151,14 @@ async fn create_init_list_by_template(
         //.add_smb_service().await?
         .add_default_apps(&start_config)
         .await?
-        .add_default_agents(&start_config)
-        .await?
         .add_gateway_settings(&start_config)?;
     for ood_name in ood_names.iter() {
         builder.add_node(ood_name.as_str())?;
     }
     let mut config = builder.build();
+    // The product edition this installation was shipped as (etc/product.json).
+    let product = ProductProfile::load_installed(buckyos_root_dir).map_err(anyhow::Error::msg)?;
+    config.insert(PRODUCT_PROFILE_KEY.to_string(), serde_json::to_string(&product)?);
 
     Ok(config)
 }
@@ -171,7 +186,10 @@ async fn do_boot_scheduler() -> Result<()> {
     }
 
     let rpc_session_token = rpc_session_token_str.unwrap();
-    let system_config_client = SystemConfigClient::new(None, Some(rpc_session_token.as_str()));
+    let system_config_client = Arc::new(SystemConfigClient::new(
+        None,
+        Some(rpc_session_token.as_str()),
+    ));
     let boot_config = system_config_client.get("boot/config").await;
     if boot_config.is_ok() {
         return Err(anyhow::anyhow!(
@@ -179,10 +197,12 @@ async fn do_boot_scheduler() -> Result<()> {
         ));
     }
 
+    let roots = identity_roots().map_err(anyhow::Error::msg)?;
     let mut init_list = create_init_list_by_template(
         &zone_document,
         &zone_document_str,
         get_buckyos_root_dir().as_path(),
+        &roots.security_root,
     )
     .await
     .map_err(|e| {
@@ -207,7 +227,7 @@ async fn do_boot_scheduler() -> Result<()> {
     }
 
     info!("start boot schedule...");
-    let boot_result = schedule_loop(true).await;
+    let boot_result = schedule_loop(true, true).await;
     if boot_result.is_err() {
         error!(
             "boot schedule_loop failed: {:?}",
@@ -220,6 +240,24 @@ async fn do_boot_scheduler() -> Result<()> {
 
     info!("do boot scheduler success!");
     return Ok(());
+}
+
+/// Keeps `system/product` equal to the installed product profile: a product
+/// update ships a new `etc/product.json` (e.g. a new preinstalled script app
+/// version) and restarts the scheduler.
+async fn sync_product_profile(client: &SystemConfigClient) -> Result<()> {
+    let product = ProductProfile::load_installed(&get_buckyos_root_dir()).map_err(anyhow::Error::msg)?;
+    let raw = serde_json::to_string(&product)?;
+    let current = match client.get(PRODUCT_PROFILE_KEY).await {
+        Ok(value) => Some(value.value),
+        Err(SystemConfigError::KeyNotFound(_)) => None,
+        Err(error) => return Err(error.into()),
+    };
+    if current.as_deref() != Some(raw.as_str()) {
+        info!("product profile: {} edition ({PRODUCT_PROFILE_KEY} updated)", product.edition);
+        client.set(PRODUCT_PROFILE_KEY, &raw).await?;
+    }
+    Ok(())
 }
 
 async fn service_main(is_boot: bool) -> Result<i32> {
@@ -274,12 +312,24 @@ async fn service_main(is_boot: bool) -> Result<i32> {
             error!("buckyos-api-runtime::login failed: {:?}", e);
             e
         })?;
+        runtime.renew_token_from_verify_hub().await.map_err(|e| {
+            error!("exchange scheduler login assertion failed: {:?}", e);
+            e
+        })?;
+        runtime
+            .set_main_service_port(SCHEDULER_SERVICE_MAIN_PORT)
+            .await;
         set_buckyos_api_runtime(runtime).map_err(|err| {
             error!("register global runtime failed: {}", err);
             anyhow::anyhow!("register global runtime failed: {}", err)
         })?;
 
-        let scheduler_server = SchedulerServer::new();
+        let system_config_client = get_buckyos_api_runtime()?
+            .get_system_config_client()
+            .await?;
+        sync_product_profile(&system_config_client).await?;
+        let scheduler_server = SchedulerServer::new(system_config_client);
+        scheduler_server.recover_install_plan_executions().await?;
 
         //start!
         info!("Start Scheduler Server...");
@@ -287,7 +337,7 @@ async fn service_main(is_boot: bool) -> Result<i32> {
         runner.add_http_server("/kapi/scheduler".to_string(), Arc::new(scheduler_server));
         info!("Start scheduler loop task...");
         tokio::spawn(async move {
-            if let Err(err) = schedule_loop(false).await {
+            if let Err(err) = schedule_loop(false, false).await {
                 error!("schedule_loop failed: {:?}", err);
             }
         });
@@ -328,7 +378,8 @@ mod test {
     use buckyos_api::test_config;
     use jsonwebtoken::{jwk::Jwk, DecodingKey};
     use name_client::{
-        NameClient, NameClientConfig, NameInfo, NsProvider, RecordType, GLOBAL_NAME_CLIENT,
+        Carrier, DidDocType, NameClient, NameClientConfig, ResolveOpts, Revision, Source,
+        SourceAnswer, SourceRef, SourceTier, GLOBAL_NAME_CLIENT,
     };
     use name_lib::{
         DeviceDocument, DeviceInfo, EncodedDocument, NSError, OODDescriptionString,
@@ -379,12 +430,16 @@ mod test {
 
         let zone_document = prepare_scheduler_test_configs(temp_root.path()).await;
         let zone_document_str = serde_json::to_string(&zone_document).unwrap();
-        let mut init_map =
-            create_init_list_by_template(&zone_document, &zone_document_str, temp_root.path())
-                .await
-                .expect("init list generation should succeed");
+        let mut init_map = create_init_list_by_template(
+            &zone_document,
+            &zone_document_str,
+            temp_root.path(),
+            &temp_root.path().join("security"),
+        )
+        .await
+        .expect("init list generation should succeed");
         let start_config_value: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(temp_root.path().join("etc").join("start_config.json"))
+            &fs::read_to_string(temp_root.path().join("security").join("start_config.json"))
                 .expect("failed to read start_config"),
         )
         .expect("start_config should be valid json");
@@ -404,6 +459,30 @@ mod test {
         .expect("device info generation failed");
 
         assert!(init_map.contains_key("boot/config"));
+        let buckyos_info: BuckyOSInfo = serde_json::from_str(
+            init_map
+                .get(BUCKYOS_INFO_KEY)
+                .expect("BuckyOSInfo should be initialized"),
+        )
+        .expect("BuckyOSInfo should be valid JSON");
+        buckyos_info
+            .validate()
+            .expect("boot BuckyOSInfo should be valid");
+        assert_eq!(buckyos_info.release_channel, get_channel().to_string());
+        assert_eq!(buckyos_info.target, get_target());
+        assert_eq!(buckyos_info.installed_at, buckyos_info.updated_at);
+        let buckyos_dev_config: BuckyOSDevConfig = serde_json::from_str(
+            init_map
+                .get(BUCKYOS_DEV_CONFIG_KEY)
+                .expect("BuckyOSDevConfig should be initialized"),
+        )
+        .expect("BuckyOSDevConfig should be valid JSON");
+        buckyos_dev_config
+            .validate()
+            .expect("boot BuckyOSDevConfig should be valid");
+        assert!(!buckyos_dev_config.enabled);
+        assert_eq!(buckyos_dev_config.enabled_at, None);
+        assert_eq!(buckyos_dev_config.enabled_by, None);
         assert!(init_map.contains_key("security/verify-hub/key"));
         assert!(!init_map.contains_key("system/verify-hub/key"));
         assert!(!init_map.contains_key(&format!("devices/{}/doc", TEST_DEVICE_NAME)));
@@ -414,10 +493,82 @@ mod test {
         assert!(init_map.contains_key("services/repo-service/spec"));
         assert!(init_map.contains_key("services/repo-service/settings"));
         assert!(init_map.contains_key("services/repo-service/pkg_list"));
-        assert!(init_map.contains_key("services/aicc/spec"));
+        let aicc_spec: buckyos_api::KernelServiceSpec = serde_json::from_str(
+            init_map
+                .get("services/aicc/spec")
+                .expect("AICC spec should be initialized"),
+        )
+        .expect("AICC spec should be valid");
+        assert_eq!(
+            aicc_spec.spec_config.buckets,
+            buckyos_api::aicc_bucket_decls()
+        );
+        assert_eq!(
+            aicc_spec.spec_config.storage_quota_mib,
+            Some(buckyos_api::AICC_STORAGE_QUOTA_MIB)
+        );
+        let aicc_settings: serde_json::Value = serde_json::from_str(
+            init_map
+                .get("services/aicc/settings")
+                .expect("AICC settings should be initialized"),
+        )
+        .expect("AICC settings should be valid JSON");
+        assert_eq!(aicc_settings, serde_json::json!({"providers": []}));
         assert!(init_map.contains_key("services/msg-center/spec"));
+        assert!(init_map.contains_key("services/nfs-server/spec"));
+        assert!(init_map.contains_key("services/nfs-server/settings"));
+        assert!(init_map.contains_key("services/aiworkspace/spec"));
+        assert!(init_map.contains_key("services/aiworkspace/settings"));
+        assert!(init_map.contains_key("services/homestation/spec"));
+        assert!(init_map.contains_key("services/homestation/settings"));
         //assert!(init_map.contains_key("services/smb-service/spec"));
         assert!(init_map.contains_key(&format!("users/{}/profile", TEST_USERNAME)));
+        let install_settings: buckyos_api::SystemInstallSettings = serde_json::from_str(
+            init_map
+                .get("system/install_settings")
+                .expect("install settings should be preserved"),
+        )
+        .expect("install settings should use the pre-install seed schema");
+        assert_eq!(install_settings.pre_install_apps.len(), 2);
+        assert!(install_settings
+            .pre_install_apps
+            .contains_key("buckyos-systest.buckyos.bns.did"));
+        assert!(install_settings
+            .pre_install_apps
+            .contains_key("text-editor.buckyos.bns.did"));
+        assert_eq!(install_settings.agent_templates.len(), 1);
+        let jarvis_template = install_settings
+            .agent_templates
+            .get("jarvis.buckyos.bns.did")
+            .expect("Jarvis should be a bundled agent template");
+        jarvis_template
+            .validate()
+            .expect("bundled Jarvis template should be valid");
+        assert!(!init_map
+            .keys()
+            .any(|key| key.starts_with("users/") && key.contains("/agents/")));
+        let registry: AppRegistry = serde_json::from_str(
+            init_map
+                .get(APP_REGISTRY_KEY)
+                .expect("AppRegistry should be initialized"),
+        )
+        .expect("AppRegistry should be valid");
+        assert!(registry.apps.is_empty());
+        assert!(registry.instances.is_empty());
+        assert!(!init_map.keys().any(|key| {
+            key.starts_with("users/") && key.contains("/apps/buckyos-systest.buckyos.bns.did/")
+        }));
+        for (key, value) in init_map
+            .iter()
+            .filter(|(key, _)| key.starts_with("system/scheduler/install_plan_executions/"))
+        {
+            let record: InstallPlanExecutionRecord = serde_json::from_str(value)
+                .unwrap_or_else(|error| panic!("invalid execution record {key}: {error}"));
+            assert!(
+                !record.plan.task_id.contains("buckyos-systest"),
+                "ordinary pre-install App must not create a scheduler execution record"
+            );
+        }
         let user_settings: serde_json::Value = serde_json::from_str(
             init_map
                 .get(&format!("users/{}/settings", TEST_USERNAME))
@@ -441,11 +592,37 @@ mod test {
         println!("this_snapshot: {}", this_snapshot);
 
         assert!(!schedule_plan.tx_actions.is_empty());
+        assert!(!schedule_plan.tx_actions.contains_key("system/content_registry"));
+        let running_plan = build_schedule_plan(&init_map, false)
+            .await
+            .expect("normal schedule should succeed");
+        assert!(running_plan.tx_actions.contains_key("system/content_registry"));
         assert_eq!(schedule_plan.schedule_snapshot.nodes.len(), 1);
         assert!(schedule_plan
             .schedule_snapshot
             .service_infos
             .contains_key("scheduler"));
+
+        assert!(!init_map.contains_key("test/private_template"));
+        let private_template_dir = temp_root.path().join("security/scheduler");
+        fs::create_dir_all(&private_template_dir).unwrap();
+        fs::write(
+            private_template_dir.join("boot.template.toml"),
+            format!(
+                "{}\n\"test/private_template\" = \"selected\"\n",
+                include_str!("../../../rootfs/etc/scheduler/boot.template.toml")
+            ),
+        )
+        .unwrap();
+        let private_init_map = create_init_list_by_template(
+            &zone_document,
+            &zone_document_str,
+            temp_root.path(),
+            &temp_root.path().join("security"),
+        )
+        .await
+        .expect("private init template should load");
+        assert_eq!(private_init_map["test/private_template"], "selected");
 
         let mut multi_ood_zone_document = zone_document.clone();
         multi_ood_zone_document.oods = vec![
@@ -463,6 +640,7 @@ mod test {
             &multi_ood_zone_document,
             &multi_ood_zone_document_str,
             temp_root.path(),
+            &temp_root.path().join("security"),
         )
         .await
         .expect("multi OOD init list generation should succeed");
@@ -488,6 +666,7 @@ mod test {
             &gateway_only_zone_document,
             &gateway_only_zone_document_str,
             temp_root.path(),
+            &temp_root.path().join("security"),
         )
         .await
         .err()
@@ -505,137 +684,11 @@ mod test {
     fn write_boot_template(root: &Path) {
         let scheduler_dir = root.join("etc").join("scheduler");
         fs::create_dir_all(&scheduler_dir).unwrap();
-        let template = r#"
-"system/install_settings" = """
-{
-    "pre_install_apps": {
-        "buckyos_filebrowser": {
-            "app_doc": {
-                "did": "did:bns:buckyos_filebrowser.buckyos.ai",
-                "doc_type": "app",
-                "name": "buckyos_filebrowser",
-                "version": "0.5.1",
-                "meta": {
-                    "detail": "BuckyOS File Browser"
-                },
-                "create_time": 1743008063,
-                "last_update_time": 1743008063,
-                "exp": 1837616063,
-                "tag": "latest",
-                "author": "did:web:buckyos.ai",
-                "owner": "did:web:buckyos.ai",
-                "show_name": "BuckyOS File Browser",
-                "selector_type": "single",
-                "service_config_tips": {
-                    "data_mount_points": {
-                        "/srv/": null,
-                        "/database/": null,
-                        "/config/": null
-                    },
-                    "local_cache_mount_points": {},
-                    "service_endpoints": {
-                        "www": {
-                            "protocol": "http",
-                            "inner_port": 80,
-                            "required": true,
-                            "expose": {
-                                "route": {"type": "web"}
-                            }
-                        }
-                    }
-                },
-                "pkg_list": {
-                    "amd64_docker_image": {
-                        "pkg_id": "nightly-linux-amd64.buckyos_filebrowser-img#0.5.1",
-                        "docker_image_name": "buckyos/nightly-buckyos_filebrowser:0.5.1-amd64"
-                    },
-                    "aarch64_docker_image": {
-                        "pkg_id": "nightly-linux-aarch64.buckyos_filebrowser-img#0.5.1",
-                        "docker_image_name": "buckyos/nightly-buckyos_filebrowser:0.5.1-aarch64"
-                    },
-                    "amd64_win_app": {
-                        "pkg_id": "nightly-windows-amd64.buckyos_filebrowser-bin#0.5.1"
-                    },
-                    "aarch64_apple_app": {
-                        "pkg_id": "nightly-apple-aarch64.buckyos_filebrowser-bin#0.5.1"
-                    },
-                    "amd64_apple_app": {
-                        "pkg_id": "nightly-apple-amd64.buckyos_filebrowser-bin#0.5.1"
-                    }
-                }
-            },
-            "service_config": {
-                "www": {
-                    "protocol": "http",
-                    "inner_port": 80
-                }
-            },
-            "data_mount_point": {
-                "/root": {
-                    "target_path": "/root",
-                    "access": "read_write"
-                }
-            },
-            "local_cache_mount_point": {},
-            "external_mount_point": {},
-            "expose_config": {
-                "www": {
-                    "route": {
-                        "type": "web",
-                        "sub_hostname": ["filebrowser"]
-                    },
-                    "scope": "",
-                    "allow_guest": false,
-                    "bind_address": "0.0.0.0"
-                }
-            },
-            "res_pool_id": "default"
-        },
-        "buckyos_systest": {
-            "app_doc": {
-                "did": "did:bns:buckyos_systest.buckyos.ai",
-                "doc_type": "app",
-                "name": "buckyos_systest",
-                "version": "0.5.1",
-                "meta": {
-                    "detail": "BuckyOS System Test App"
-                },
-                "create_time": 1743008063,
-                "last_update_time": 1743008063,
-                "exp": 1837616063,
-                "tag": "latest",
-                "author": "did:web:buckyos.ai",
-                "owner": "did:web:buckyos.ai",
-                "show_name": "BuckyOS System Test",
-                "selector_type": "static",
-                "service_config_tips": {},
-                "pkg_list": {
-                    "web": {
-                        "pkg_id": "nightly-linux-amd64.buckyos_systest#0.5.1"
-                    }
-                }
-            },
-            "data_mount_point": {},
-            "local_cache_mount_point": {},
-            "external_mount_point": {},
-            "service_config": {},
-            "expose_config": {
-                "www": {
-                    "route": {
-                        "type": "web",
-                        "sub_hostname": ["buckyos_systest"]
-                    },
-                    "scope": "",
-                    "allow_guest": true
-                }
-            },
-            "res_pool_id": "default"
-        }
-    }
-}
-"""
-"#;
-        fs::write(scheduler_dir.join("boot.template.toml"), template).unwrap();
+        fs::write(
+            scheduler_dir.join("boot.template.toml"),
+            include_str!("../../../rootfs/etc/scheduler/boot.template.toml"),
+        )
+        .unwrap();
     }
 
     async fn prepare_scheduler_test_configs(root: &Path) -> ZoneDocument {
@@ -663,11 +716,11 @@ mod test {
         .await
         .expect("failed to create node config");
 
-        let etc_dir = root.join("etc");
-        fs::create_dir_all(&etc_dir).unwrap();
+        let security_dir = root.join("security");
+        fs::create_dir_all(&security_dir).unwrap();
         let start_config_src: std::path::PathBuf =
             output_dir.join(TEST_DEVICE_NAME).join("start_config.json");
-        fs::copy(start_config_src, etc_dir.join("start_config.json"))
+        fs::copy(start_config_src, security_dir.join("start_config.json"))
             .expect("failed to copy start_config");
 
         let owner_config_path = output_dir.join("user_config.json");
@@ -736,16 +789,16 @@ mod test {
 
         let mut docs = buckyos_api::test_config::gen_kernel_service_docs();
         docs.insert(
-            PackageId::unique_name_to_did("buckyos_filebrowser"),
+            PackageId::unique_name_to_did("buckyos_filebrowser").unwrap(),
             get_filebrowser_doc(),
         );
         let docs = docs
             .into_iter()
             .map(|(did, doc)| (did.to_raw_host_name(), doc))
             .collect();
-        client
-            .add_provider(Box::new(StaticProvider::new(docs)), None)
-            .await;
+        let provider = Arc::new(StaticProvider::new(docs));
+        client.set_method_authority("bns", provider.clone());
+        client.set_method_authority("web", provider);
         let _ = GLOBAL_NAME_CLIENT.set(client);
     }
 
@@ -822,31 +875,24 @@ mod test {
     }
 
     #[async_trait]
-    impl NsProvider for StaticProvider {
-        fn get_id(&self) -> String {
+    impl Source for StaticProvider {
+        fn id(&self) -> String {
             "static-provider".to_string()
         }
 
-        async fn query(
-            &self,
-            name: &str,
-            _record_type: Option<RecordType>,
-            _from_ip: Option<IpAddr>,
-        ) -> name_lib::NSResult<NameInfo> {
-            Err(NSError::NotFound(name.to_string()))
-        }
-
-        async fn query_did(
+        async fn get_document(
             &self,
             did: &DID,
-            _doc_type: Option<name_client::DidDocType>,
-            _from_ip: Option<IpAddr>,
-        ) -> name_lib::NSResult<EncodedDocument> {
-            let host = did.to_host_name();
-            self.docs
-                .get(&host)
-                .cloned()
-                .ok_or_else(|| NSError::NotFound(host))
+            _doc_type: &DidDocType,
+            _revision: &Revision,
+            _opts: &ResolveOpts,
+        ) -> SourceAnswer {
+            let sref = SourceRef::provider(self.id(), SourceTier::Authority);
+            let host = did.to_raw_host_name();
+            match self.docs.get(&host) {
+                Some(doc) => SourceAnswer::new(sref).with_body(doc.clone(), Carrier::Body),
+                None => SourceAnswer::no_answer(sref, host),
+            }
         }
     }
 }

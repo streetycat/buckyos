@@ -1,0 +1,253 @@
+# AICC 用户接口冻结文档
+
+状态：**Frozen / Beta 2.2**
+
+冻结日期：2026-09-14
+
+目标读者：应用开发者、Agent、AICC 管理 UI 与运维工具作者。
+
+本文说明如何使用当前 AICC。字段级唯一真相源是
+`src/kernel/buckyos-api/src/aicc_client.rs`；本文冻结调用方式、方法集合和跨方法语义。
+
+## 1. 入口与鉴权
+
+AICC 服务名为 `aicc`，服务端口为 `4040`，统一通过 NodeGateway 的
+`POST /kapi/aicc` 调用。推荐 Rust 调用方使用 `buckyos_api::AiccClient`；其它语言按 kRPC 信封调用：
+
+```json
+{
+  "method": "route.resolve",
+  "params": {},
+  "sys": [1001, "<session_token>", "trace-aicc-001"]
+}
+```
+
+`sys[0]` 是请求序号，`sys[1]` 是 session token，`sys[2]` 是可选 trace id。身份以 token/RPC context 为准，不能在 `params` 中指定 tenant 或冒充其它用户。
+
+## 2. 选择调用模式
+
+### 2.1 Helper：通常首选
+
+Helper 接受逻辑模型，一次完成路由与推理。目前冻结三个 Helper：
+
+- `helper.llm_chat`
+- `helper.text_to_image`
+- `helper.video_generate`
+
+适合希望随 inventory、成本和健康状态自动选择模型的应用。
+
+```json
+{
+  "method": "helper.llm_chat",
+  "params": {
+    "logical_model": "llm.plan",
+    "requirements": { "tool_call": true, "json_schema": true },
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "给出发布计划" }] }
+    ],
+    "idempotency_key": "release-plan-42"
+  },
+  "sys": [1001, "<session_token>", "trace-helper-42"]
+}
+```
+
+### 2.2 Route + typed inference：需要可观察/固定路由时使用
+
+先调用 `route.resolve`：
+
+```json
+{
+  "method": "route.resolve",
+  "params": {
+    "api_type": "llm",
+    "logical_model": "llm.plan",
+    "requirements": { "tool_call": true, "json_schema": true },
+    "policy": { "profile": "quality", "runtime_failover": true }
+  },
+  "sys": [1002, "<session_token>", "trace-route-42"]
+}
+```
+
+响应给出 `selected_exact_model`、`selected_model_uid`、Provider/adapter/driver/model identity、operation、能力、fallback candidates 和 inventory revision。随后把 `selected_exact_model` 传给 typed method：
+
+```json
+{
+  "method": "chat.completions.create",
+  "params": {
+    "exact_model": "gpt-5.1:reasoning-high@openai-primary",
+    "messages": [
+      { "role": "user", "content": [{ "type": "text", "text": "给出发布计划" }] }
+    ],
+    "idempotency_key": "release-plan-42"
+  },
+  "sys": [1003, "<session_token>", "trace-call-42"]
+}
+```
+
+`logical_model` 是不含 `@` 的用途路径。`exact_model` 必须是
+`<provider_model_id>[:<variant>]@<provider_instance_name>`。typed inference 不接受逻辑模型，也不接受用户传入 `provider_options`。
+
+## 3. 推理 Method
+
+| 能力 | kRPC method | Request -> Response |
+| --- | --- | --- |
+| LLM | `chat.completions.create` | `LlmChatInvokeRequest` -> `LlmChatInvokeResponse` |
+| 文生图 | `images.generate` | `TextToImageInvokeRequest` -> `TextToImageInvokeResponse` |
+| 文本 embedding | `embedding.text` | `EmbeddingTextRequest` -> `EmbeddingTextResponse` |
+| 多模态 embedding | `embedding.multimodal` | `EmbeddingMultimodalRequest` -> `EmbeddingMultimodalResponse` |
+| decision | `decision.evaluate` | `DecisionEvaluateRequest` -> `DecisionEvaluateResponse` |
+| rerank | `rerank` | `RerankRequest` -> `RerankResponse` |
+| 图生图 | `image.img2img` | `ImageToImageRequest` -> `ImageToImageResponse` |
+| 局部重绘 | `image.inpaint` | `ImageInpaintRequest` -> `ImageInpaintResponse` |
+| 图像放大 | `image.upscale` | `ImageUpscaleRequest` -> `ImageUpscaleResponse` |
+| 去背景 | `image.bg_remove` | `ImageBackgroundRemoveRequest` -> `ImageBackgroundRemoveResponse` |
+| OCR | `vision.ocr` | `VisionOcrRequest` -> `VisionOcrResponse` |
+| 图像描述 | `vision.caption` | `VisionCaptionRequest` -> `VisionCaptionResponse` |
+| 目标检测 | `vision.detect` | `VisionDetectRequest` -> `VisionDetectResponse` |
+| 图像分割 | `vision.segment` | `VisionSegmentRequest` -> `VisionSegmentResponse` |
+| TTS | `audio.tts` | `AudioTextToSpeechRequest` -> `AudioTextToSpeechResponse` |
+| ASR | `audio.asr` | `AudioSpeechRecognitionRequest` -> `AudioSpeechRecognitionResponse` |
+| 音乐生成 | `audio.music` | `AudioMusicRequest` -> `AudioMusicResponse` |
+| 音频增强 | `audio.enhance` | `AudioEnhanceRequest` -> `AudioEnhanceResponse` |
+| 视频生成 | `video.generate` | `VideoGenerateRequest` -> `VideoGenerateResponse` |
+| 视频编辑 | `video.edit` | `VideoEditRequest` -> `VideoEditResponse` |
+| 视频续写 | `video.extend` | `VideoExtendRequest` -> `VideoExtendResponse` |
+| 视频放大 | `video.upscale` | `VideoUpscaleRequest` -> `VideoUpscaleResponse` |
+| Computer Use | `agent.computer_use` | `ComputerUseRequest` -> `ComputerUseResponse` |
+
+method 已存在不表示任意模型都支持该能力。最终可用集合以 `models.list`、Provider inventory 和 route 结果为准。
+
+## 4. 通用请求语义
+
+typed request 共同字段：
+
+| 字段 | 规则 |
+| --- | --- |
+| `exact_model` | 必填；固定一次物理模型与 Provider Instance |
+| `trace_id` | 可选业务 trace；kRPC `sys[2]` 仍是传输 trace |
+| `execution_mode` | `immediate`（默认）或 `stream`；以所选 operation 支持为准 |
+| `idempotency_key` | 建议对有副作用/计费的请求设置；相同 key 必须对应相同请求体 |
+| `task_options.parent_id` | 可选父任务 |
+| `session_id` | 用于 session 路由连续性和 Provider 状态连续性 |
+
+Helper 另接受 `logical_model`、`requirements`、`disable`、`policy` 和可选
+`session_overlay`。请求字段默认拒绝未知字段，调用方应尽早发现拼写错误。
+
+## 5. 消息与资源
+
+LLM 消息使用 `AiMessage { role, content[] }` 的 content-block 模型，不把多模态内容拼进纯文本。支持的内容形态以 `AiContent` 枚举为准，包括 text、resource、tool call/result、thinking 和受控 Provider state。
+
+非文本输入统一使用：
+
+```json
+{ "kind": "url", "url": "https://example/image.png", "mime_hint": "image/png" }
+```
+
+```json
+{ "kind": "base64", "mime": "image/png", "data_base64": "..." }
+```
+
+```json
+{ "kind": "named_object", "obj_id": "<BuckyOS ObjId>" }
+```
+
+输入 URL 会经过服务端策略、大小与 MIME 校验；Named Object 会做租户鉴权。Provider 协议为 `BytesOnly` 时 URL 在首次调用前下载；`UrlOrBytes` 先直传并仅在明确的 URL 拒绝后转 bytes 重试；`UrlOnly` 先直传，仅在配置了公网 Named Object 下载入口时才可在明确拒绝后落入 NDN、换用公网 URL 重试，否则不重试。异步重提保持 BuckyOS task id，替换其远端 task id。较大输出应返回 `ResourceRef`/artifact，而不是把二进制放入诊断或错误字段。
+
+Provider 输出的 `ResourceRef::Url` 不保证可匿名下载。AICC 在返回结果时登记其来源，调用方通过 `open_artifact_url_reader(url, artifact_id?)` 按需读取；`artifact_id` 可省略，不使用 `task_id`。跨进程入口固定为 `POST /kapi/aicc/artifact/open`，成功响应是原始字节流。AICC 只打开已登记且属于当前 tenant/user 的 Provider URL；未登记普通 URL 不处理，跨 tenant、跨 user 或 artifact id 不匹配必须拒绝。
+
+## 6. 响应与任务
+
+typed response 共同字段为：`task_id`、`status`、业务结果、`usage?`、`cost?`、
+`finish_reason?`、`provider_task_ref?`、`route_trace?`、`event_ref?`、`error?`。
+
+`status` 值为 `succeeded | running | failed`：
+
+- `succeeded`：业务结果已经可读；
+- `running`：通过 `event_ref`/TaskMgr 观察后续状态，不能重复创建任务；
+- `failed`：读取结构化 `error`，不能只按空结果判断。
+
+取消：
+
+```json
+{
+  "method": "cancel",
+  "params": { "task_id": "aicc-task-id" },
+  "sys": [1004, "<session_token>", "trace-cancel-42"]
+}
+```
+
+响应 `CancelResponse { task_id, accepted }`。`accepted=true` 表示取消已确认；无权限、终态任务或 Provider 未确认取消不能伪装成成功。
+
+## 7. 路由控制
+
+`ModelRequirement` 用于硬需求，例如 `tool_call`、`json_schema`、`web_search`、
+`vision`、`image_generation`、`min_context_tokens`、视频生成需求 `video` 和 canonical field 要求。`ModelDisable` 用于显式禁用能力。
+
+逻辑路由中只有以 `llm.chat`、`llm.plan`、`llm.vision` 为入口的 LLM 请求可以启用云端联网搜索；这三个入口不把联网搜索作为硬性选模条件。本次路由的模型、Adapter 和 Provider discovery 均支持 `web_search` 且未被目录或请求禁用时，AICC 默认向云端开放搜索，由模型决定是否调用。其他逻辑入口（含 `llm.code`、规格、家族和自定义路径）会强制禁用 `web_search`，并在 route trace 中记录；入口限制在 fallback / failover 后仍生效。OpenAI Responses（含 SN）追加 `web_search`，Gemini Interactions 追加 `google_search`，OpenRouter Responses 转换为 `openrouter:web_search`，Claude Messages 追加 `{ "type": "web_search_20250305", "name": "web_search" }`；这些服务端工具与调用方的函数工具共存。不支持搜索的模型仍可使用 Agent 提供的工具；`disable.web_search = true` 关闭云端搜索。仅使用 Responses 格式的其他 Adapter 不会因此继承搜索能力。
+
+`chat.completions.create` 精确模型请求接受可选布尔字段 `web_search`，默认 `false`。显式设置 `true`（Playground 的“启用联网搜索”复选框）要求目标模型、Adapter 和 Provider 支持搜索，不支持时路由报错；启用只开放搜索能力，是否实际搜索由模型决定。该开关不改变上述逻辑入口限制。Claude 返回的 `server_tool_use` 和 `web_search_tool_result` 通过 `provider_state` 保存在响应及任务记录中，可用于核实是否实际发起搜索。MiniMax 等兼容 Messages 格式的 Adapter 不继承 Claude 搜索能力。
+
+协议依据：[Claude Web search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool)、[OpenAI Web search](https://developers.openai.com/api/docs/guides/tools-web-search)、[Gemini Google Search](https://ai.google.dev/gemini-api/docs/google-search)、[OpenRouter Web Search](https://openrouter.ai/docs/guides/features/server-tools/web-search)。
+
+`RoutePolicy` 支持：`cheap | fast | balanced | quality` profile、local only、fallback、runtime failover、explain、Provider allow/block、最大成本和最大延迟。策略只能缩小候选或改变排序，不能赋予模型/adapter 不存在的能力。
+
+session overlay 是请求级临时配置，不能绕过上层 locked policy。显式 exact model 默认不隐式换模型；只有策略明确允许 exact fallback 且服务构造了候选时例外。
+
+## 8. 管理接口
+
+| 目标 | method |
+| --- | --- |
+| 获取/更新路由配置 | `routing.get`, `routing.update` |
+| 原子重载 settings | `service.reload_settings` |
+| 列出模型 | `models.list` |
+| Provider/adapter catalog | `provider.catalog`, `protocol_adapter.list` |
+| 校验/新增 Provider | `provider.validate`, `provider.add` |
+| 列表/健康/更新/删除 | `provider.list`, `provider.health`, `provider.update`, `provider.delete` |
+| 立即刷新库存 | `provider.refresh_models` |
+| 配额/用量/route trace | `quota.query`, `usage.query`, `trace.query` |
+| metadata 更新状态/目标 | `driver_metadata_update.get`, `driver_metadata_update.set` |
+
+配置写入使用 `expected_settings_revision` 做 CAS。收到 `settings_revision_conflict` 后必须重新读取、重放用户意图，不能盲目覆盖。`provider.validate` 不写配置；`provider.add/update/delete` 才改变 system-config 并发布新 runtime。
+
+管理权限与普通推理权限分离。所有管理响应必须脱敏。
+
+## 9. Rust 调用示例
+
+```rust
+use buckyos_api::{AiMessage, AiRole, AiccClient, LlmChatHelperRequest};
+
+let messages = vec![AiMessage::text(AiRole::User, "你好".to_owned())];
+let mut request = LlmChatHelperRequest::new("llm.chat", messages);
+request.idempotency_key = Some("chat-42".to_owned());
+let response = client.helper_llm_chat(request).await?;
+```
+
+也可以先使用 `RouteResolveRequest::new(ApiType::Llm, "llm.chat")`，再用响应中的
+`selected_exact_model` 构造 `LlmChatInvokeRequest`。`AiccClient::invoke(AiccCall)` 只覆盖核心路由与推理调用；管理面使用对应 typed client method。
+
+## 10. 错误处理与重试
+
+业务错误可通过 `AiccError::from_krpc_error` 解码。稳定 code 见
+[Trait 与 Protocol 冻结设计](frozen_trait_protocol.md)。
+
+重试规则：
+
+- `invalid_*`、schema、permission、policy、budget、idempotency conflict 不自动重试；
+- 仅当 `retriable=true` 且请求具有可靠 `idempotency_key` 时重试计费操作；
+- 尊重 Provider 的 retry-after；
+- Provider 接受任务后的超时不等于任务不存在，应通过 TaskMgr/event 观察；
+- 不按 `message`、HTTP 状态或 Provider 私有错误正文做业务分支。
+
+## 11. 冻结后的变更规则
+
+method 名、request/response 字段、enum wire 值、逻辑/exact model 格式、资源 tag、任务状态和错误 code 均是用户合同。任何修改必须同步 Rust SDK、TypeScript 声明、dispatcher、本文、`aicc_api设计.md` 和 DV/contract tests。Beta 2.2 直接切换，不保留旧字段 alias。
+
+## Decision 批量求值（2026-09-25）
+
+`decision` 是独立 API Type 与 Capability，method 为 `decision.evaluate`，逻辑入口为 `decision`。请求用共享 `state` 与带稳定 ID 的 `choice | score | boolean` 问题列表；答案保留完整概率分布或为真概率，`confidence` 可缺失且不等于答案概率。Score 为零起点等级索引的期望值。完整字段、校验和示例见 [Decision API](decision_api.md)。
+
+`route.resolve` 的 `requirements.decision` 由实际输入推导；Rust `DecisionEvaluateRequest::requirements()` 与 WebSDK `decisionRequirements()` 提供相同推导。`routing.preview` 接受可选 `requirements`，复用相同资格判断。typed exact 调用重新校验输入能力与大小；首版只支持 immediate，不隐式拆题、不生成解释或执行动作。
+
+## 统一视频生成（2026-10-22）
+
+视频生成统一为 `video.generate`（精确模型）和业务字段相同的 `helper.video_generate`（逻辑模型，默认逻辑路径 `video.generate`）。文本、首尾帧（`keyframe`）、参考图/视频/音频都是同一请求的 `conditions[]`，prompt 用 `@{id}` 引用条件；输出规格放在 `output`。改写已有视频用 `video.edit`，只有具备真实编辑合同的模型可路由。`video.generate/edit/extend/upscale` 的结果统一为 `videos: GeneratedVideo[]`，带 Provider 声明值、AICC 实测值与偏差。`requirements.video` 由请求推导，Rust `VideoGenerateRequest::requirement()` 与 WebSDK `videoGenerationRequirement()` 提供相同推导。显式但模型不支持的条件或规格返回 `unsupported_operation`，不改写、不丢弃。完整字段、能力合同、执行顺序与 Provider 支持矩阵见 [统一视频生成协议](video_generation.md)。

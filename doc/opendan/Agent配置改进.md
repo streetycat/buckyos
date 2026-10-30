@@ -1,5 +1,7 @@
 # OpenDAN AgentRootFS 与配置文件改进计划
 
+> 2026-10-10 H4 已替代本文历史 END / 隐式 report-only 完成描述：Behavior 用 `<report end="true">`，工具用 `report(..., is_end=true)`；同次结束决策不带动作或非空调度。当前完成策略、持久提交与恢复以 [Session Directory Protocol](<protocol/Session Directory Protocol.md>) 和 [Agent Actions](<../llm_context/Agent Actions.md>) 为准。
+
 > **本文性质**:改进计划,不是最终 spec。
 >
 > **本版定位**:**breaking change**。不维护对旧 `agent.toml` / `BehaviorCfg` 的兼容映射,
@@ -178,7 +180,7 @@ session_class = "work"
 #     session_id_strategy / process_stack_limit / enabled)。
 #   - `[session.<class>.driver]`:运行期行为(switch_mode /
 #     inject_background_environment / report_delivery + 4 个 hook point 子表)。
-# 详细对应关系见 [Agent Session §3 + §8](./Agent%20Session.md)。
+# 新的职责分层见 [Agent Session 架构设计 §3.4](<OpenDAN Agent Session架构设计.md#34-执行基础设施的分层>)；本段为旧配置设计。
 #
 # 关于 active/restore:UI vs Work 的差异(UI 永远 active、Work 看 status)在 v0
 # 由 `kind` 隐式区分,无独立 `keep_alive` 字段。真要按 class 显式覆盖时再加。
@@ -252,7 +254,7 @@ pull_event = "none"
 # ─── 特化 Session 类:SelfCheck / SelfImprove ───────────────
 # 这两类 session 在调度上是 Work Session 的特化形式,通过 `kind` 字段标记;
 # 启用 / 禁用由 `enabled` 控制(默认 enabled = true,Jarvis 模板里两者都先关掉)。
-# 详细语义见 [Agent Session §3.3 / §3.4](./Agent%20Session.md)。
+# 向 Goal 迁移的语义见 [Agent Session 架构设计 §15.6](<OpenDAN Agent Session架构设计.md#156-原-session-设计的整合与迁移>)。
 
 [session.self_check]
 enabled             = false
@@ -302,7 +304,7 @@ pull_msg   = "none"
 pull_event = "none"
 ```
 
-**Hook point × pull policy 详解**见 [Agent Session §8](./Agent%20Session.md);
+**Hook point × pull policy 的旧设计与新目标对照**见 [Agent Session 架构设计 §15.6](<OpenDAN Agent Session架构设计.md#156-原-session-设计的整合与迁移>)；以下保留本稿当时的配置说明：
 `pull_event = "timer.*"` 这类 filter 命名空间当前固定在
 [`TimerEventKind`](../../src/frame/opendan/src/session_model.rs) 列举的几个事件类型,
 未识别的 filter 会在 startup 期被 `validate_driver_filters` 拒绝。
@@ -353,7 +355,7 @@ normal、planner → summarizer 用 fork),本版的回答是:**这种诉求不�
 | — | `[session.<class>.driver].switch_mode` | **新增**(从 behavior 上提),整个 class 统一 |
 | — | `[session.<class>.driver].inject_background_environment` | **新增**,控制是否在每轮 user message 前动态注入 `<background_environment>` |
 | — | `[session.<class>.driver].report_delivery` | **新增**,控制 WorkSession report 上行到 UI session 的默认范围 |
-| — | `[session.<class>.driver.{on_init, on_behavior_switch, on_behavior_step_ob, on_wakeup}]` | **新增**,Driver hook point × filter × pull policy(详见 [Agent Session §8](./Agent%20Session.md)) |
+| — | `[session.<class>.driver.{on_init, on_behavior_switch, on_behavior_step_ob, on_wakeup}]` | **新增**,Driver hook point × filter × pull policy；新目标与迁移见 [Agent Session 架构设计 §15.6](<OpenDAN Agent Session架构设计.md#156-原-session-设计的整合与迁移>) |
 
 > 旧 schema 直接在 `[session.<class>]` 顶层挂 `subscribe_events` / `switch_mode` /
 > `inject_background_environment` / `report_delivery` 等字段,这些位置在
@@ -374,7 +376,7 @@ normal、planner → summarizer 用 fork),本版的回答是:**这种诉求不�
 name = "explorer"
 objective = "..."
 system_prompt_template = "..."
-tool_whitelist = ["exec_bash", "..."]
+tool_whitelist = ["shell", "..."]
 approval_required = []
 tool_plan = "minimal_safe"
 mode = "behavior"
@@ -461,7 +463,7 @@ on_input_event = """
 # v0 暂时直接沿用现状字段语义,只是物理位置移到本段下。
 # v0 之后会与 skill / function tool 配置一起重新设计,届时 break change。
 [capabilities]
-tool_whitelist    = ["exec_bash", "write_file", "edit_file", "read", "sendmsg"]
+tool_whitelist    = ["shell", "write_file", "edit_file", "read", "sendmsg"]
 disable_capabilities = ["web_search"]
 approval_required = []
 tool_plan         = "minimal_safe"
@@ -569,7 +571,7 @@ PATH = SessionExecBin : AgentBin : RuntimeBin : SystemBin : <inherited>
 
 ### 6.2 Session `./tools/` 硬约束
 - 只放文本(脚本源码、`tool.toml`、prompts、schema),禁止二进制。
-- 单文件建议 ≤ 64 KB,整目录文件数建议 ≤ 几百(hot path,每次 `exec_bash` 起手要做 mtime 同步)。
+- 单文件建议 ≤ 64 KB,整目录文件数建议 ≤ 几百(hot path,每次 `shell` 起手要做 mtime 同步)。
 
 ### 6.3 Tool Plan
 位置:`<agent_root>/tool_plans/<plan>.toml`;schema 与渲染时机不变。
@@ -617,7 +619,7 @@ PATH = SessionExecBin : AgentBin : RuntimeBin : SystemBin : <inherited>
 |---|---|---|
 | `[on_context_limit_reached]` | `compress_then_continue` | 上下文满 ⇒ 压缩后继续 |
 | `[on_llm_message_compress]` | `context_window_ratio` | 一轮完成后按 context window 使用率自动压缩；不写则不启用自动压缩 |
-| `[on_provider_failed]` | `fallback_behavior`(带 `target = "<name>"`) | provider 失败 ⇒ 切到 target |
+| `[on_provider_failed]` | `fallback_behavior`(带 `target = "<name>"`) | 仅 provider 来源的终态错误(请求失败 / 超时 / 取消)⇒ 切到 target;输出协议、工具、运行时错误不触发 |
 | `[on_interrupt_graceful]` | `cancel_pending_tools_then_continue` | 收到 graceful 中断 ⇒ 注入 Cancelled 后继续 |
 | `[on_interrupt_discard]` | `end` | 收到 discard 中断 ⇒ 直接结束 process |
 
@@ -655,7 +657,7 @@ Workflow DSL 时就尾大不掉。要么不要,要么一次性全要。
 
 - **数据 / 运行时分离**:AgentRootFS 在宿主机普通文件系统;AgentRuntime 在 Linux 容器内。
 - **跨平台契约只落在 AgentRootFS**:目录结构、配置、session 数据平台无关;执行视图(PATH 里的 bin、
-  tmux pane、临时挂载)允许纯 Linux 形态。
+  临时挂载)允许纯 Linux 形态。
 - **`agent_root` 来源**:`opendan` 启动 BuckyOS AppService runtime 后,用 runtime appid / owner 调用
   `get_buckyos_app_data_dir(appid, owner)` 获取。
 - **COW 由容器内 OverlayFS 实现**:`OverlayFS(Package[RO], Data[RW])`,host 不做 overlay 生命周期。
@@ -701,8 +703,7 @@ Workflow DSL 时就尾大不掉。要么不要,要么一次性全要。
 
 2. **`[capabilities]` 最终 schema**:§5.3 v0 直接沿用现状三个字段,但需要在同一段下表达三类能力
    (v2 内建 Action / skill bundle / 传统 function-call tool),且每类都有"上层引用 + 下层细节定义"
-   的解耦诉求。需要等 [Agent Skill](./Agent%20Skill.md) 与 ToolManager 的配置形态一起定下来再收敛。
-   beta2.3 重做。
+   的解耦诉求。当前 skill 机制以 [OpenDAN 开发指南](../sdk/OpenDAN_Agent_Dev_Guide.md) 为准；与 ToolManager 的组合配置仍属本稿的后续设计，不定义当前 PIKG 或 skill 安装格式。
 
 3. **`process_stack_limit` 超限语义**(已落地为 v0 行为,保留为开放问题以备调优):
    `[session.<class>].process_stack_limit` 在 Fork / Independent 切换前由 `switch_behavior`
@@ -714,7 +715,7 @@ Workflow DSL 时就尾大不掉。要么不要,要么一次性全要。
 
 4. **Channel 类型的对外接口**:v0 把 Gateway inbound channel 硬编码在 runtime(`msg_center` +
    `kevent`),`[[channel]]` schema 段不识别。后续要插件化 channel(`http` 等)时,需要
-   定一个准入表,跟 [Agent Session 的事件订阅](./Agent%20Session的事件订阅.md) §2 三种模式
+   定一个准入表,跟 [Agent Session 架构设计 §12.7](<OpenDAN Agent Session架构设计.md#127-事件订阅与三种等待模式>) 的三种模式
    对齐,再决定是恢复 `[[channel]]` 段还是另起更窄的 schema。
 
 5. **prompt 模板默认值**:当前 `[prompt].on_init` 使用简单 `{var}` 替换;`on_input_event` 作为

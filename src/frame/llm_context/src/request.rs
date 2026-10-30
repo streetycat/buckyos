@@ -74,7 +74,7 @@ pub enum ToolMode {
 /// * **tools** — provider-native function calls exposed by `ToolManager`.
 ///   Controlled by `mode` + `whitelist`. Filters spec advertisement
 ///   (see [`crate::deps::resolve_tool_specs`]) and gates dispatch.
-/// * **actions** — XML behavior-loop tags (`exec_bash`, `write_file`, …)
+/// * **actions** — XML behavior-loop tags (`shell`, `write_file`, …)
 ///   parsed out of the LLM response. Controlled by `action_mode` +
 ///   `action_whitelist`. Filters dispatch only — the recognized tag set
 ///   itself is hardcoded by the XML parser.
@@ -85,16 +85,33 @@ pub struct ToolPolicy {
     pub whitelist: Vec<String>,
     pub action_mode: ToolMode,
     pub action_whitelist: Vec<String>,
-    /// 0 disables the tool loop (one inference only).
-    pub max_rounds: u32,
+    /// Tool iteration budget. One iteration is one completed native tool
+    /// batch (all provider tool calls of one response, dispatched) or one
+    /// behavior step that dispatches actions; native batches inside a
+    /// behavior step and the step's actions share this budget. It does not
+    /// count inferences (Rounds): the final tool-free answer, a pure
+    /// report / decision step and output-parse corrections consume nothing.
+    /// 0 disables tool dispatch (one inference only).
+    pub max_tool_iterations: u32,
+    /// Native tool calls one model response (one Round) may request; more
+    /// calls reject the whole batch. Does not limit the actions of a
+    /// behavior step.
     pub max_calls_per_round: u32,
     pub max_observation_bytes: u32,
     pub disable_capabilities: Vec<String>,
-    /// Whether tool calls within the same round may run concurrently.
+    /// Whether the tool calls of one response may run concurrently.
     pub parallel: bool,
-    /// Whether ToolManager is allowed to return `Observation::Pending` and
-    /// therefore yield `Outcome::PendingTool`. First version: false.
+    /// Whether ToolManager may return `Observation::Pending`, suspending the
+    /// run with `Outcome::PendingTool` until the scheduler fills the result.
+    /// When `false`, a `Pending` observation is a contract violation: the
+    /// call is recorded with an unknown effect and the run ends with
+    /// `Internal`. Passed to every tool call as `ToolCallCtx.allow_deferred`
+    /// so tools wait for their task inside the call instead.
     pub allow_deferred: bool,
+    /// Graceful finish (`LLMContextInterruptHandle::finish`): how long to
+    /// wait for a running tool that cannot cancel its work before the
+    /// finish falls back to an interrupt.
+    pub finish_grace_ms: u64,
 }
 
 impl Default for ToolPolicy {
@@ -104,12 +121,13 @@ impl Default for ToolPolicy {
             whitelist: Vec::new(),
             action_mode: ToolMode::All,
             action_whitelist: Vec::new(),
-            max_rounds: 8,
+            max_tool_iterations: 8,
             max_calls_per_round: 8,
             max_observation_bytes: 32 * 1024,
             disable_capabilities: Vec::new(),
             parallel: false,
             allow_deferred: false,
+            finish_grace_ms: 30_000,
         }
     }
 }
@@ -119,13 +137,28 @@ impl Default for ToolPolicy {
 pub enum OutputSpec {
     /// Free-form text, caller parses it themselves.
     Text,
-    /// Force JSON. Optional schema is informational for now; strict mode is
-    /// declared but enforcement depth depends on the provider adapter.
+    /// Force JSON. `schema` is forwarded to the provider adapter, which
+    /// enforces it natively where the provider supports structured output.
+    ///
+    /// Without `max_repairs` the waist only parses: `strict = true` makes a
+    /// parse failure an LLM-correctable `OutputParse` error (bounded by
+    /// `ErrorPolicy`); `strict = false` returns the raw text as
+    /// `ContextOutput::Text` instead.
+    ///
+    /// With `max_repairs = Some(n)` the output is a reply contract: the final
+    /// reply must parse, match `schema` (`json_check`, a subset of JSON
+    /// Schema) and pass the host's `OutputValidator`. A reply that fails gets
+    /// a correction message and another inference, at most `n` times per
+    /// run (`LLMContextState.output_repairs`); after that the raw text is
+    /// returned as `ContextOutput::Invalid` and the host decides. Repairs do
+    /// not count as consecutive errors.
     Json {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schema: Option<Value>,
         #[serde(default)]
         strict: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_repairs: Option<u32>,
     },
 }
 
@@ -143,12 +176,16 @@ pub enum BudgetAction {
     EscalateHuman,
 }
 
+/// When the waist yields `Outcome::ContextLimitReached { which:
+/// ApproachingWindow }`: the estimated size of the request about to be sent
+/// reaches (`>=`) this many tokens.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContextThreshold {
-    /// Fraction of provider window in [0.0, 1.0].
+    /// Fraction of `BudgetSpec.context_window_tokens`, in `(0.0, 1.0]`.
+    /// Requires the window; the threshold is `floor(window * value)`.
     Ratio { value: f32 },
-    /// Absolute used-token count.
+    /// Absolute token count, `> 0`.
     AbsoluteTokens { value: u32 },
 }
 
@@ -160,9 +197,19 @@ pub struct BudgetSpec {
     pub max_wallclock_ms: Option<u64>,
     pub max_cost_units: Option<u32>,
     pub on_exhausted: BudgetAction,
-    /// Warning threshold for context window. `None` disables — hitting the
-    /// provider hard edge then becomes a normal `Outcome::Error`.
+    /// Early-warning threshold for the context window (see
+    /// [`ContextThreshold`]). `None` disables the early yield only; a known
+    /// window overflow and a structured provider refusal still yield
+    /// `ContextLimitReached`. An invalid threshold (zero, ratio outside
+    /// `(0, 1]`, ratio without a window) ends the run with `Internal` before
+    /// any inference.
     pub context_yield_threshold: Option<ContextThreshold>,
+    /// Effective context window of the model(s) this request may run on, in
+    /// tokens, supplied by the caller / provider adapter (the waist never
+    /// looks it up). When set, a request whose estimate plus the completion
+    /// reserve (`model_policy.max_completion_tokens`) exceeds it is not sent:
+    /// the run yields `ContextLimitReached { which: HardLimit }`.
+    pub context_window_tokens: Option<u32>,
 }
 
 impl Default for BudgetSpec {
@@ -174,6 +221,7 @@ impl Default for BudgetSpec {
             max_cost_units: None,
             on_exhausted: BudgetAction::Fail,
             context_yield_threshold: None,
+            context_window_tokens: None,
         }
     }
 }
@@ -188,13 +236,19 @@ pub struct HumanPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ErrorPolicy {
-    /// Recoverable errors are folded into the accumulated history as a
-    /// tool/user observation so the LLM can self-correct. Once the count
-    /// of consecutive recoverable errors exceeds `max_consecutive_errors`,
-    /// the loop escalates to a terminal `Outcome::Error`.
+    /// LLM-correctable errors (`LLMComputeError::llm_correctable`) are fed
+    /// back into the history so the next inference can self-correct. The
+    /// counter increments once per failed iteration (one response and its
+    /// tool batch, or one behavior step), no matter how many calls in that
+    /// iteration failed, and resets only after an iteration completes
+    /// without any correctable error. A successful provider request by
+    /// itself does not reset it.
     ///
-    /// Safety net against "feed error → see error → produce same error"
-    /// loops. 0 disables the cap (not recommended).
+    /// `N` means at most `N` error feedbacks; the `N+1`-th consecutive
+    /// failure ends the run with `Outcome::Error`. `0` disables the cap and
+    /// leaves only the budget as a stop condition (not recommended).
+    /// Provider, runtime, snapshot and internal errors never touch this
+    /// counter: they end the run immediately.
     pub max_consecutive_errors: u32,
 }
 
@@ -206,12 +260,23 @@ impl Default for ErrorPolicy {
     }
 }
 
-/// Classification of an error after waist sees it. `Fatal` cannot be
-/// overridden by `ErrorPolicy.mode`.
+/// Classification of an error after waist sees it. Derived exhaustively
+/// from `LLMComputeError::llm_correctable`; `Fatal` cannot be overridden by
+/// `ErrorPolicy`.
 #[derive(Debug, Clone)]
 pub enum ErrorClass {
     Recoverable(crate::error::LLMComputeError),
     Fatal(crate::error::LLMComputeError),
+}
+
+impl From<crate::error::LLMComputeError> for ErrorClass {
+    fn from(err: crate::error::LLMComputeError) -> Self {
+        if err.llm_correctable() {
+            ErrorClass::Recoverable(err)
+        } else {
+            ErrorClass::Fatal(err)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

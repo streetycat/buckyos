@@ -5,7 +5,9 @@
 //! registrations, operation routes, instance leases and the persisted
 //! round-robin cursor. No SQL joins into the Task Core store.
 
-use crate::task_store::{rewrite_placeholders_to_dollar, split_sql_statements};
+use crate::task_store::{
+    existing_tables, rewrite_placeholders_to_dollar, split_sql_statements, table_columns,
+};
 use buckyos_api::*;
 use kRPC::{RPCErrors, Result};
 use log::*;
@@ -15,6 +17,15 @@ use sqlx::{AnyPool, Executor, Row};
 use std::sync::Once;
 
 static INSTALL_DRIVERS: Once = Once::new();
+
+const DISPATCH_TABLES: [&str; 6] = [
+    "dispatch_record",
+    "delivery_attempt",
+    "runner_registration",
+    "operation_route",
+    "target_instance",
+    "dispatch_cursor",
+];
 
 fn ensure_any_drivers_installed() {
     INSTALL_DRIVERS.call_once(install_default_drivers);
@@ -46,11 +57,16 @@ impl DispatchDb {
         schema: Option<&str>,
     ) -> std::result::Result<Self, String> {
         ensure_any_drivers_installed();
-        let mut opts = AnyPoolOptions::new().max_connections(8);
+        let mut opts = AnyPoolOptions::new().max_connections(if backend == RdbBackend::Sqlite {
+            1
+        } else {
+            8
+        });
         if backend == RdbBackend::Sqlite {
             opts = opts.after_connect(|conn, _meta| {
                 Box::pin(async move {
                     conn.execute("PRAGMA foreign_keys = ON;").await?;
+                    conn.execute("PRAGMA busy_timeout = 5000;").await?;
                     Ok(())
                 })
             });
@@ -83,7 +99,10 @@ impl DispatchDb {
         .await
     }
 
-    async fn apply_schema(&self, override_ddl: Option<&str>) -> std::result::Result<(), sqlx::Error> {
+    async fn apply_schema(
+        &self,
+        override_ddl: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
         let ddl: &str =
             override_ddl
                 .filter(|s| !s.trim().is_empty())
@@ -91,49 +110,55 @@ impl DispatchDb {
                     RdbBackend::Sqlite => TASK_DISPATCHER_RDB_SCHEMA_SQLITE,
                     RdbBackend::Postgres => TASK_DISPATCHER_RDB_SCHEMA_POSTGRES,
                 });
+        let existing = existing_tables(&self.pool, self.backend, &DISPATCH_TABLES).await?;
+        if existing.is_empty() {
+            let mut tx = self.pool.begin().await?;
+            for statement in split_sql_statements(ddl) {
+                (&mut *tx).execute(statement.as_str()).await?;
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+        self.check_current_layout(&existing).await?;
         for statement in split_sql_statements(ddl) {
             self.pool.execute(statement.as_str()).await?;
         }
-        // beta2.2 no-compat: a v2 store (dispatch_record.operation column)
-        // is dropped and rebuilt on the v3 layout.
-        let v2 = match self.backend {
-            RdbBackend::Sqlite => sqlx::query(
-                "SELECT 1 FROM pragma_table_info('dispatch_record') WHERE name = 'operation'",
-            )
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some(),
-            RdbBackend::Postgres => sqlx::query(
-                "SELECT 1 FROM information_schema.columns WHERE table_name = 'dispatch_record' AND column_name = 'operation'",
-            )
-            .fetch_optional(&self.pool)
-            .await?
-            .is_some(),
+        Ok(())
+    }
+
+    /// The dispatcher store keeps no version row, so an existing store must
+    /// have exactly the tables and columns of the current schema.
+    async fn check_current_layout(
+        &self,
+        existing: &[String],
+    ) -> std::result::Result<(), sqlx::Error> {
+        let mismatch = |detail: String| {
+            sqlx::Error::Protocol(format!(
+                "task-dispatcher store does not match schema v{}: {}",
+                TASK_DISPATCHER_RDB_SCHEMA_VERSION, detail
+            ))
         };
-        if v2 {
-            warn!("dispatch_db: 1.x schema detected; rebuilding as dispatcher schema v3 (no-compat)");
-            for table in [
-                "delivery_attempt",
-                "dispatch_record",
-                "runner_registration",
-                "operation_route",
-                "target_instance",
-                "dispatch_cursor",
-                "dispatch_approval",
-                "dispatch_event",
-                "target_registration",
-            ] {
-                let sql = format!("DROP TABLE IF EXISTS {}", table);
-                self.pool.execute(sql.as_str()).await?;
-            }
-            let ddl = match self.backend {
-                RdbBackend::Sqlite => TASK_DISPATCHER_RDB_SCHEMA_SQLITE,
-                RdbBackend::Postgres => TASK_DISPATCHER_RDB_SCHEMA_POSTGRES,
-            };
-            for statement in split_sql_statements(ddl) {
-                self.pool.execute(statement.as_str()).await?;
+        if existing.len() != DISPATCH_TABLES.len() {
+            return Err(mismatch(format!("found tables {:?}", existing)));
+        }
+        let current = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        for statement in split_sql_statements(TASK_DISPATCHER_RDB_SCHEMA_SQLITE) {
+            current.execute(statement.as_str()).await?;
+        }
+        for table in DISPATCH_TABLES {
+            let expected = table_columns(&current, RdbBackend::Sqlite, table).await?;
+            let actual = table_columns(&self.pool, self.backend, table).await?;
+            if actual != expected {
+                return Err(mismatch(format!(
+                    "table {} has columns {:?}",
+                    table, actual
+                )));
             }
         }
+        current.close().await;
         Ok(())
     }
 
@@ -253,6 +278,16 @@ impl DispatchDb {
         row.map(record_from_row).transpose().map_err(db_err)
     }
 
+    pub async fn list_task_ids(&self) -> Result<std::collections::HashSet<TaskId>> {
+        let rows = sqlx::query("SELECT task_id FROM dispatch_record WHERE task_id IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|row| row.try_get::<String, _>("task_id").map_err(db_err))
+            .collect()
+    }
+
     /// Guarded status/state transition. `expected_status` implements the
     /// dispatcher's own CAS: recovery and the evaluation loop can race, only
     /// one transition wins.
@@ -317,7 +352,10 @@ impl DispatchDb {
             .collect()
     }
 
-    pub async fn list_records_in_status(&self, statuses: &[DispatchStatus]) -> Result<Vec<DispatchRecord>> {
+    pub async fn list_records_in_status(
+        &self,
+        statuses: &[DispatchStatus],
+    ) -> Result<Vec<DispatchRecord>> {
         let mut records = Vec::new();
         for status in statuses {
             let sql = self.render_sql(
@@ -485,9 +523,8 @@ impl DispatchDb {
             .as_ref()
             .map(|r| r.registration_revision + 1)
             .unwrap_or(1);
-        let registration_json = serde_json::to_string(&registration).map_err(|e| {
-            RPCErrors::ReasonError(format!("serialize registration: {}", e))
-        })?;
+        let registration_json = serde_json::to_string(&registration)
+            .map_err(|e| RPCErrors::ReasonError(format!("serialize registration: {}", e)))?;
         if existing.is_some() {
             let sql = self.render_sql(
                 "UPDATE runner_registration SET owner_user_id = ?, owner_app_id = ?, registration_revision = ?, registration_json = ?, enabled = ?, updated_at = ? WHERE target_id = ?",
@@ -524,7 +561,9 @@ impl DispatchDb {
     }
 
     pub async fn get_registration(&self, target_id: &str) -> Result<Option<TargetRegistration>> {
-        let sql = self.render_sql("SELECT registration_json, enabled FROM runner_registration WHERE target_id = ?");
+        let sql = self.render_sql(
+            "SELECT registration_json, enabled FROM runner_registration WHERE target_id = ?",
+        );
         let row = sqlx::query(&sql)
             .bind(target_id)
             .fetch_optional(&self.pool)
@@ -540,8 +579,13 @@ impl DispatchDb {
     }
 
     pub async fn list_registrations(&self) -> Result<Vec<TargetRegistration>> {
-        let sql = self.render_sql("SELECT registration_json, enabled FROM runner_registration ORDER BY target_id");
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await.map_err(db_err)?;
+        let sql = self.render_sql(
+            "SELECT registration_json, enabled FROM runner_registration ORDER BY target_id",
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         let mut registrations = Vec::new();
         for row in rows {
             let registration_json: String = row.try_get("registration_json").map_err(db_err)?;
@@ -588,9 +632,8 @@ impl DispatchDb {
                 DISPATCH_ERR_TARGET_NOT_REGISTERED, target_id
             )));
         }
-        let sql = self.render_sql(
-            "SELECT last_lease_epoch FROM runner_registration WHERE target_id = ?",
-        );
+        let sql =
+            self.render_sql("SELECT last_lease_epoch FROM runner_registration WHERE target_id = ?");
         let row = sqlx::query(&sql)
             .bind(target_id)
             .fetch_one(&self.pool)
@@ -600,7 +643,11 @@ impl DispatchDb {
         Ok(epoch.max(0) as u64)
     }
 
-    pub async fn set_operation_route(&self, schema_id: &str, default_target_id: &str) -> Result<OperationRoute> {
+    pub async fn set_operation_route(
+        &self,
+        schema_id: &str,
+        default_target_id: &str,
+    ) -> Result<OperationRoute> {
         let now = crate::task_store::now_ms();
         let existing = self.get_operation_route(schema_id).await?;
         let revision = existing.map(|r| r.revision + 1).unwrap_or(1);
@@ -654,7 +701,10 @@ impl DispatchDb {
 
     pub async fn list_operation_routes(&self) -> Result<Vec<OperationRoute>> {
         let sql = self.render_sql("SELECT * FROM operation_route ORDER BY schema_id");
-        let rows = sqlx::query(&sql).fetch_all(&self.pool).await.map_err(db_err)?;
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         rows.into_iter()
             .map(|row| route_from_row(row).map_err(db_err))
             .collect()
@@ -697,9 +747,8 @@ impl DispatchDb {
         target_id: &str,
         instance_id: &str,
     ) -> Result<Option<TargetInstance>> {
-        let sql = self.render_sql(
-            "SELECT * FROM target_instance WHERE target_id = ? AND instance_id = ?",
-        );
+        let sql = self
+            .render_sql("SELECT * FROM target_instance WHERE target_id = ? AND instance_id = ?");
         let row = sqlx::query(&sql)
             .bind(target_id)
             .bind(instance_id)
@@ -726,9 +775,8 @@ impl DispatchDb {
     }
 
     pub async fn remove_instance(&self, target_id: &str, instance_id: &str) -> Result<()> {
-        let sql = self.render_sql(
-            "DELETE FROM target_instance WHERE target_id = ? AND instance_id = ?",
-        );
+        let sql =
+            self.render_sql("DELETE FROM target_instance WHERE target_id = ? AND instance_id = ?");
         sqlx::query(&sql)
             .bind(target_id)
             .bind(instance_id)
@@ -764,7 +812,8 @@ impl DispatchDb {
 
     /// Persisted RoundRobin cursor (doc §11.2 determinism requirement).
     pub async fn get_cursor(&self, target_id: &str) -> Result<Option<String>> {
-        let sql = self.render_sql("SELECT cursor_instance_id FROM dispatch_cursor WHERE target_id = ?");
+        let sql =
+            self.render_sql("SELECT cursor_instance_id FROM dispatch_cursor WHERE target_id = ?");
         let row = sqlx::query(&sql)
             .bind(target_id)
             .fetch_optional(&self.pool)
@@ -866,6 +915,8 @@ fn record_from_row(row: AnyRow) -> std::result::Result<DispatchRecord, sqlx::Err
             on_behalf_of: String::new(),
             zone_trusted_caller: false,
             workflow_ref: None,
+            parent_task_id: None,
+            storage_domain: None,
             input_digest: String::new(),
             created_at: 0,
             expires_at: None,

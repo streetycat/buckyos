@@ -1,0 +1,1665 @@
+use super::anthropic_models::AnthropicModelsDiscovery;
+use super::*;
+use crate::catalog::{
+    CatalogSnapshot, ProviderCredentialKind, ProviderFieldMode as CatalogProviderFieldMode,
+    ResolvedProviderConfiguration,
+};
+use crate::protocol::{CodecRegistry, CredentialKind, HttpTransport, HttpTransportConfig};
+use crate::provider::{
+    catalog_only_inventory, validate_discovery, CatalogOnlyDiscovery, CredentialDescriptor,
+    DiscoveryMode, DynamicLoginCredentialResolver, FallbackDiscovery, ProviderAuthMode,
+    ProviderConnectionContract, ProviderDiscovery, ProviderDiscoverySnapshot, ProviderError,
+    ProviderFieldMode, ProviderFieldSchema, ProviderInstanceConfig, ProviderProfile,
+    ProviderResult, RefreshPolicy,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BuiltinDiscoveryFactory {
+    CatalogOnly,
+    TypeSafeCatalog,
+    OpenAi,
+    Claude,
+    MiniMax,
+    Gemini,
+    OpenRouter,
+    Kimi,
+    Glm,
+    DeepSeek,
+    VolcengineArk,
+    Sn,
+    Standard,
+}
+
+fn discovery_behaviors() -> BTreeMap<&'static str, BuiltinDiscoveryFactory> {
+    BTreeMap::from([
+        ("catalog-only", BuiltinDiscoveryFactory::CatalogOnly),
+        ("typesafe-catalog", BuiltinDiscoveryFactory::TypeSafeCatalog),
+        ("openai-models", BuiltinDiscoveryFactory::OpenAi),
+        ("anthropic-models", BuiltinDiscoveryFactory::Claude),
+        ("minimax-models", BuiltinDiscoveryFactory::MiniMax),
+        ("gemini-models", BuiltinDiscoveryFactory::Gemini),
+        ("openrouter-models", BuiltinDiscoveryFactory::OpenRouter),
+        ("kimi-models", BuiltinDiscoveryFactory::Kimi),
+        ("glm-models", BuiltinDiscoveryFactory::Glm),
+        ("deepseek-models", BuiltinDiscoveryFactory::DeepSeek),
+        (
+            "volcengine-ark-models",
+            BuiltinDiscoveryFactory::VolcengineArk,
+        ),
+        ("sn-models", BuiltinDiscoveryFactory::Sn),
+        (
+            "openai-compatible-models",
+            BuiltinDiscoveryFactory::Standard,
+        ),
+        ("standard-models", BuiltinDiscoveryFactory::Standard),
+    ])
+}
+
+#[derive(Clone)]
+struct BuiltinProviderRegistration {
+    profile: ProviderProfile,
+    connection: BuiltinConnectionFactory,
+    discovery_behavior_id: String,
+    dynamic_login_behavior_id: Option<String>,
+    supports_any_adapter: bool,
+    instance_rules: Option<buckyos_api::ProviderInstanceRules>,
+}
+
+#[derive(Clone)]
+enum BuiltinConnectionFactory {
+    Configured(ProviderConnectionContract),
+    Sn(ProviderConnectionContract),
+}
+
+impl BuiltinConnectionFactory {
+    fn build(&self, auth_mode: ProviderAuthMode) -> ProviderConnectionContract {
+        match self {
+            Self::Configured(connection) => connection.clone(),
+            Self::Sn(connection) => {
+                let mut connection = connection.clone();
+                if auth_mode == ProviderAuthMode::DynamicLogin {
+                    connection.account = ProviderFieldSchema::required();
+                }
+                connection
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BuiltinProviderBinding {
+    pub profile: ProviderProfile,
+    pub connection: ProviderConnectionContract,
+    pub discovery: Arc<dyn ProviderDiscovery>,
+    pub dynamic_login_resolver: Option<Arc<dyn DynamicLoginCredentialResolver>>,
+    pub instance_rules: Option<buckyos_api::ProviderInstanceRules>,
+}
+
+pub(crate) struct BuiltinProviderRequest<'a> {
+    pub provider_profile_id: &'a str,
+    pub protocol_adapter_id: &'a str,
+    pub auth_mode: ProviderAuthMode,
+    pub credential_kind: Option<CredentialKind>,
+    pub configured_inventory: Option<ProviderDiscoverySnapshot>,
+}
+
+pub(crate) struct BuiltinProviderRegistry {
+    providers: BTreeMap<String, BuiltinProviderRegistration>,
+    codecs: Arc<CodecRegistry>,
+    custom_provider_adapter_ids: BTreeSet<String>,
+    transport_config: HttpTransportConfig,
+    dynamic_login_resolvers: BTreeMap<String, Arc<dyn DynamicLoginCredentialResolver>>,
+}
+
+pub(crate) const CUSTOM_PROVIDER_PROFILE_ID: &str = "custom";
+
+impl std::fmt::Debug for BuiltinProviderRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BuiltinProviderRegistry")
+            .field(
+                "provider_profiles",
+                &self.providers.keys().collect::<Vec<_>>(),
+            )
+            .field("codecs", &self.codecs)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) fn builtin_provider_registry(
+    catalog: &CatalogSnapshot,
+) -> ProviderResult<BuiltinProviderRegistry> {
+    BuiltinProviderRegistry::new(catalog, HttpTransportConfig::default())
+}
+
+pub(crate) fn builtin_provider_codecs() -> ProviderResult<Arc<CodecRegistry>> {
+    builtin_codec_registry().map(Arc::new)
+}
+
+impl BuiltinProviderRegistry {
+    pub(crate) fn new(
+        catalog: &CatalogSnapshot,
+        transport_config: HttpTransportConfig,
+    ) -> ProviderResult<Self> {
+        let providers = builtin_provider_registrations(catalog)?
+            .into_iter()
+            .map(|registration| {
+                (
+                    registration.profile.provider_profile_id.clone(),
+                    registration,
+                )
+            })
+            .collect();
+        let codecs = Arc::new(builtin_codec_registry()?);
+        let custom_provider_adapter_ids =
+            configured_custom_provider_adapters(catalog, codecs.as_ref())?;
+        let dynamic_login_resolvers: BTreeMap<_, Arc<dyn DynamicLoginCredentialResolver>> =
+            BTreeMap::from([(
+                "sn".to_owned(),
+                Arc::new(SnDynamicLoginResolver::new(
+                    reqwest::Client::new(),
+                    SN_DYNAMIC_LOGIN_PROFILE_ID.to_owned(),
+                )) as Arc<dyn DynamicLoginCredentialResolver>,
+            )]);
+        Ok(Self {
+            providers,
+            codecs,
+            custom_provider_adapter_ids,
+            transport_config,
+            dynamic_login_resolvers,
+        })
+    }
+
+    pub(crate) fn profiles(&self) -> impl ExactSizeIterator<Item = &ProviderProfile> {
+        self.providers.values().map(|provider| &provider.profile)
+    }
+
+    pub(crate) fn codecs(&self) -> Arc<CodecRegistry> {
+        self.codecs.clone()
+    }
+
+    pub(crate) fn custom_provider_adapter_ids(&self) -> &BTreeSet<String> {
+        &self.custom_provider_adapter_ids
+    }
+
+    pub(crate) fn dynamic_login_resolver(&self) -> Arc<dyn DynamicLoginCredentialResolver> {
+        self.dynamic_login_resolvers
+            .get("sn")
+            .expect("SN dynamic-login behavior must be registered")
+            .clone()
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        request: BuiltinProviderRequest<'_>,
+    ) -> ProviderResult<BuiltinProviderBinding> {
+        let registration = self
+            .providers
+            .get(request.provider_profile_id)
+            .ok_or_else(|| ProviderError::UnknownProfile(request.provider_profile_id.to_owned()))?;
+        let adapter = self
+            .codecs
+            .adapter(request.protocol_adapter_id)
+            .ok_or_else(|| ProviderError::UnknownAdapter(request.protocol_adapter_id.to_owned()))?;
+        if registration.supports_any_adapter
+            && !self
+                .custom_provider_adapter_ids
+                .contains(request.protocol_adapter_id)
+        {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "protocol adapter `{}` is reserved for a built-in provider",
+                request.protocol_adapter_id
+            )));
+        }
+        if !registration.supports_any_adapter
+            && registration.profile.default_protocol_adapter_id != request.protocol_adapter_id
+        {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "provider profile `{}` requires protocol adapter `{}`",
+                request.provider_profile_id, registration.profile.default_protocol_adapter_id
+            )));
+        }
+        let dynamic_login_resolver = if request.auth_mode == ProviderAuthMode::DynamicLogin {
+            let behavior_id = registration
+                .dynamic_login_behavior_id
+                .as_deref()
+                .ok_or_else(|| {
+                    ProviderError::InvalidConfiguration(format!(
+                        "provider profile `{}` does not support dynamic login",
+                        request.provider_profile_id
+                    ))
+                })?;
+            Some(
+                self.dynamic_login_resolvers
+                    .get(behavior_id)
+                    .ok_or_else(|| {
+                        ProviderError::InvalidConfiguration(format!(
+                            "unknown dynamic-login behavior `{behavior_id}`"
+                        ))
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let profile = if registration.supports_any_adapter {
+            custom_profile_for_adapter(&registration.profile, adapter, request.credential_kind)?
+        } else {
+            registration
+                .profile
+                .with_credential(request.credential_kind)?
+        };
+        let discovery = self.discovery(
+            &registration.discovery_behavior_id,
+            request.provider_profile_id,
+            request.protocol_adapter_id,
+            request.configured_inventory,
+            registration.profile.default_inventory.clone(),
+        )?;
+        Ok(BuiltinProviderBinding {
+            profile,
+            connection: registration.connection.build(request.auth_mode),
+            discovery,
+            dynamic_login_resolver,
+            instance_rules: registration.instance_rules.clone(),
+        })
+    }
+
+    pub(crate) fn resolve_instance(
+        &self,
+        instance: &ProviderInstanceConfig,
+        auth_mode: ProviderAuthMode,
+        configured_inventory: Option<ProviderDiscoverySnapshot>,
+    ) -> ProviderResult<BuiltinProviderBinding> {
+        self.resolve(BuiltinProviderRequest {
+            provider_profile_id: &instance.provider_profile_id,
+            protocol_adapter_id: &instance.protocol_adapter_id,
+            auth_mode,
+            credential_kind: instance.credential_kind,
+            configured_inventory,
+        })
+    }
+
+    fn discovery(
+        &self,
+        behavior_id: &str,
+        provider_profile_id: &str,
+        protocol_adapter_id: &str,
+        configured_inventory: Option<ProviderDiscoverySnapshot>,
+        default_inventory: Option<ProviderDiscoverySnapshot>,
+    ) -> ProviderResult<Arc<dyn ProviderDiscovery>> {
+        let transport = || {
+            HttpTransport::new(self.transport_config.clone())
+                .map_err(|error| ProviderError::InvalidConfiguration(error.to_string()))
+        };
+        let factory = discovery_behaviors()
+            .get(behavior_id)
+            .copied()
+            .ok_or_else(|| {
+                ProviderError::InvalidConfiguration(format!(
+                    "unknown provider discovery behavior `{behavior_id}`"
+                ))
+            })?;
+        if matches!(
+            factory,
+            BuiltinDiscoveryFactory::CatalogOnly | BuiltinDiscoveryFactory::TypeSafeCatalog
+        ) {
+            let configured = configured_inventory.is_some();
+            let inventory = configured_inventory.or(default_inventory).ok_or_else(|| {
+                ProviderError::InvalidConfiguration(format!(
+                    "catalog-only provider `{provider_profile_id}` has no inventory"
+                ))
+            })?;
+            validate_discovery(&inventory)?;
+            let inventory: Arc<dyn ProviderDiscovery> = if configured {
+                Arc::new(CatalogOnlyDiscovery::new(inventory))
+            } else {
+                Arc::new(CatalogOnlyDiscovery::catalog_managed(inventory))
+            };
+            if factory == BuiltinDiscoveryFactory::TypeSafeCatalog {
+                return Ok(Arc::new(super::typesafe::TypeSafeCatalogDiscovery(
+                    inventory,
+                )));
+            }
+            if provider_profile_id == "fal" && !configured {
+                return Ok(Arc::new(super::fal::FalPricingDiscovery {
+                    inventory,
+                    transport: Arc::new(transport()?),
+                }));
+            }
+            return Ok(inventory);
+        }
+        let primary: Arc<dyn ProviderDiscovery> = match factory {
+            BuiltinDiscoveryFactory::CatalogOnly | BuiltinDiscoveryFactory::TypeSafeCatalog => {
+                unreachable!()
+            }
+            BuiltinDiscoveryFactory::OpenAi => Arc::new(OpenAiDiscovery::new(transport()?)),
+            BuiltinDiscoveryFactory::Claude => Arc::new(claude_discovery(transport()?)),
+            BuiltinDiscoveryFactory::MiniMax => Arc::new(minimax_discovery(transport()?)),
+            BuiltinDiscoveryFactory::Gemini => Arc::new(GeminiDiscovery::new(transport()?)),
+            BuiltinDiscoveryFactory::OpenRouter => Arc::new(OpenRouterDiscovery::new(transport()?)),
+            BuiltinDiscoveryFactory::Kimi => Arc::new(KimiDiscovery::new(transport()?)),
+            BuiltinDiscoveryFactory::Glm => Arc::new(glm_models_discovery(transport()?)),
+            BuiltinDiscoveryFactory::DeepSeek => Arc::new(openai_compatible_models_discovery(
+                DEEPSEEK_PROFILE_ID,
+                crate::protocol::DEEPSEEK_RESPONSES_ADAPTER_ID,
+                transport()?,
+            )),
+            BuiltinDiscoveryFactory::VolcengineArk => Arc::new(
+                openai_responses_compatible::VolcengineArkModelsDiscovery::new(
+                    provider_profile_id,
+                    protocol_adapter_id,
+                    transport()?,
+                ),
+            ),
+            BuiltinDiscoveryFactory::Sn => Arc::new(SnDiscovery::new(transport()?)),
+            BuiltinDiscoveryFactory::Standard => match self
+                .codecs
+                .adapter(protocol_adapter_id)
+                .map(|adapter| adapter.protocol_family_id.as_str())
+            {
+                Some("claude") => Arc::new(AnthropicModelsDiscovery::for_profile(
+                    CLAUDE_SPEC,
+                    provider_profile_id,
+                    protocol_adapter_id,
+                    transport()?,
+                )),
+                Some("gemini") => Arc::new(GeminiDiscovery::for_profile(
+                    provider_profile_id,
+                    protocol_adapter_id,
+                    transport()?,
+                )),
+                _ => Arc::new(openai_compatible_models_discovery(
+                    provider_profile_id,
+                    protocol_adapter_id,
+                    transport()?,
+                )),
+            },
+        };
+        let configured_fallback = configured_inventory.is_some();
+        let fallback_inventory = configured_inventory.or(default_inventory);
+        let Some(inventory) = fallback_inventory else {
+            return Ok(primary);
+        };
+        super::super::validate_discovery(&inventory)?;
+        let fallback: Arc<dyn ProviderDiscovery> = if configured_fallback {
+            Arc::new(CatalogOnlyDiscovery::new(inventory))
+        } else {
+            Arc::new(CatalogOnlyDiscovery::catalog_managed(inventory))
+        };
+        Ok(Arc::new(FallbackDiscovery::new(primary, fallback)))
+    }
+}
+
+fn configured_custom_provider_adapters(
+    catalog: &CatalogSnapshot,
+    codecs: &CodecRegistry,
+) -> ProviderResult<BTreeSet<String>> {
+    let mut configured = BTreeSet::new();
+    for provider in catalog.known_providers() {
+        let Some(rules_id) = provider.provider_rules_id.as_deref() else {
+            continue;
+        };
+        let Some(rules) = catalog.provider_rules(rules_id) else {
+            continue;
+        };
+        let provider_adapter = codecs
+            .adapter(&provider.protocol_adapter_id)
+            .ok_or_else(|| {
+                ProviderError::InvalidConfiguration(format!(
+                    "known provider `{}` references unknown adapter `{}`",
+                    provider.provider_profile_id, provider.protocol_adapter_id
+                ))
+            })?;
+        for adapter_id in &rules.custom_provider_adapters {
+            let adapter = codecs.adapter(adapter_id).ok_or_else(|| {
+                ProviderError::InvalidConfiguration(format!(
+                    "provider rules `{rules_id}` expose unknown custom-provider adapter `{adapter_id}`"
+                ))
+            })?;
+            if adapter.protocol_family_id != provider_adapter.protocol_family_id {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "provider rules `{rules_id}` cannot expose adapter `{adapter_id}` from another protocol family"
+                )));
+            }
+            if !configured.insert(adapter_id.clone()) {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "custom-provider adapter `{adapter_id}` is exposed by more than one provider rules catalog"
+                )));
+            }
+        }
+    }
+    Ok(configured)
+}
+
+pub(crate) fn custom_profile_for_adapter(
+    profile: &ProviderProfile,
+    adapter: &crate::protocol::AdapterDescriptor,
+    requested: Option<CredentialKind>,
+) -> ProviderResult<ProviderProfile> {
+    let credential = CredentialDescriptor {
+        kind: adapter.credential.kind,
+        header_name: adapter.credential.header_name.clone(),
+    };
+    if requested.is_some_and(|kind| kind != credential.kind) {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "custom provider adapter `{}` requires credential kind `{}`",
+            adapter.protocol_adapter_id,
+            credential.kind.as_str()
+        )));
+    }
+    let mut selected = profile.clone();
+    selected.default_protocol_adapter_id = adapter.protocol_adapter_id.clone();
+    selected.credential = credential;
+    selected.credential_variants.clear();
+    Ok(selected)
+}
+
+fn builtin_provider_registrations(
+    catalog: &CatalogSnapshot,
+) -> ProviderResult<Vec<BuiltinProviderRegistration>> {
+    let mut providers = vec![custom_registration()];
+    for known in catalog.known_providers() {
+        providers.push(catalog_registration(
+            catalog,
+            &known.provider_profile_id,
+            false,
+        )?);
+    }
+    let mut unique = BTreeMap::new();
+    for provider in &providers {
+        let id = provider.profile.provider_profile_id.clone();
+        if unique.insert(id.clone(), ()).is_some() {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "duplicate builtin provider profile `{id}`"
+            )));
+        }
+    }
+    Ok(providers)
+}
+
+fn catalog_registration(
+    catalog: &CatalogSnapshot,
+    provider_profile_id: &str,
+    supports_any_adapter: bool,
+) -> ProviderResult<BuiltinProviderRegistration> {
+    let configuration = catalog
+        .resolve_provider_configuration(provider_profile_id)
+        .map_err(|error| ProviderError::InvalidConfiguration(error.to_string()))?;
+    let mut profile = profile_from_catalog(&configuration);
+    profile.default_inventory = catalog_only_inventory(catalog, provider_profile_id);
+    let connection = connection_from_catalog(&configuration);
+    let connection = match configuration.connection_behavior_id.as_deref() {
+        None | Some("standard") => BuiltinConnectionFactory::Configured(connection),
+        Some("sn") => BuiltinConnectionFactory::Sn(connection),
+        Some(id) => {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "unknown provider connection behavior `{id}`"
+            )))
+        }
+    };
+    Ok(BuiltinProviderRegistration {
+        profile,
+        connection,
+        discovery_behavior_id: configuration.discovery_behavior_id,
+        dynamic_login_behavior_id: configuration.dynamic_login_behavior_id,
+        supports_any_adapter,
+        instance_rules: None,
+    })
+}
+
+fn profile_from_catalog(configuration: &ResolvedProviderConfiguration) -> ProviderProfile {
+    ProviderProfile {
+        provider_profile_id: configuration.provider_profile_id.clone(),
+        display_name: configuration.display_name.clone(),
+        default_protocol_adapter_id: configuration.protocol_adapter_id.clone(),
+        credential: credential_from_catalog(&configuration.credential),
+        credential_variants: configuration
+            .credential_variants
+            .iter()
+            .map(credential_from_catalog)
+            .collect(),
+        discovery_mode: if matches!(
+            configuration.discovery_behavior_id.as_str(),
+            "catalog-only" | "typesafe-catalog"
+        ) {
+            DiscoveryMode::CatalogOnly
+        } else {
+            DiscoveryMode::MachineApi
+        },
+        refresh: RefreshPolicy::default(),
+        default_inventory: None,
+        accepts_any_adapter: false,
+    }
+}
+
+pub(super) fn credential_from_catalog(
+    credential: &crate::catalog::ProviderCredentialDescriptor,
+) -> CredentialDescriptor {
+    CredentialDescriptor {
+        kind: match credential.kind {
+            ProviderCredentialKind::Bearer => CredentialKind::Bearer,
+            ProviderCredentialKind::NamedHeader => CredentialKind::NamedHeader,
+            ProviderCredentialKind::FalKey => CredentialKind::FalKey,
+            ProviderCredentialKind::GlmJwt => CredentialKind::GlmJwt,
+        },
+        header_name: credential.header_name.clone(),
+    }
+}
+
+fn connection_from_catalog(
+    configuration: &ResolvedProviderConfiguration,
+) -> ProviderConnectionContract {
+    ProviderConnectionContract {
+        default_base_url: configuration.default_base_url.clone(),
+        region: field_from_catalog(&configuration.connection.region),
+        workspace: field_from_catalog(&configuration.connection.workspace),
+        account: field_from_catalog(&configuration.connection.account),
+        policy_region: configuration
+            .connection
+            .policy_region
+            .as_ref()
+            .map(field_from_catalog),
+        region_base_urls: configuration.connection.region_base_urls.clone(),
+        operation_base_urls: configuration.connection.operation_base_urls.clone(),
+    }
+}
+
+pub(super) fn field_from_catalog(
+    schema: &crate::catalog::ProviderFieldSchema,
+) -> ProviderFieldSchema {
+    ProviderFieldSchema {
+        mode: match schema.mode {
+            CatalogProviderFieldMode::Unsupported => ProviderFieldMode::Unsupported,
+            CatalogProviderFieldMode::Optional => ProviderFieldMode::Optional,
+            CatalogProviderFieldMode::Required => ProviderFieldMode::Required,
+        },
+        default_value: schema.default_value.clone(),
+        allowed_values: schema.allowed_values.iter().cloned().collect(),
+    }
+}
+
+fn custom_registration() -> BuiltinProviderRegistration {
+    BuiltinProviderRegistration {
+        profile: ProviderProfile {
+            provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID.to_owned(),
+            display_name: "Custom Provider".to_owned(),
+            default_protocol_adapter_id: crate::protocol::OPENAI_RESPONSES_ADAPTER_ID.to_owned(),
+            credential: CredentialDescriptor {
+                kind: crate::protocol::CredentialKind::Bearer,
+                header_name: None,
+            },
+            credential_variants: Vec::new(),
+            discovery_mode: DiscoveryMode::MachineApi,
+            refresh: RefreshPolicy::default(),
+            default_inventory: None,
+            accepts_any_adapter: true,
+        },
+        connection: BuiltinConnectionFactory::Configured(ProviderConnectionContract {
+            default_base_url: String::new(),
+            region: ProviderFieldSchema::optional(),
+            workspace: ProviderFieldSchema::optional(),
+            account: ProviderFieldSchema::optional(),
+            policy_region: None,
+            region_base_urls: BTreeMap::new(),
+            operation_base_urls: BTreeMap::new(),
+        }),
+        discovery_behavior_id: "standard-models".to_owned(),
+        dynamic_login_behavior_id: None,
+        supports_any_adapter: true,
+        instance_rules: Some(Default::default()),
+    }
+}
+
+fn builtin_codec_registry() -> ProviderResult<CodecRegistry> {
+    let mut registry = CodecRegistry::default();
+    crate::protocol::register_builtin_adapter_plugins(&mut registry)
+        .map_err(|error| ProviderError::InvalidConfiguration(error.to_string()))?;
+    Ok(registry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::CatalogKind;
+    use crate::protocol::{
+        CLAUDE_MESSAGES_ADAPTER_ID, FAL_QUEUE_ADAPTER_ID, FAL_QUEUE_OPERATION_ID,
+        GEMINI_ADAPTER_ID, GLM_CHAT_ADAPTER_ID, KIMI_CHAT_ADAPTER_ID, MINIMAX_MESSAGES_ADAPTER_ID,
+        OPENAI_CHAT_COMPLETIONS_ADAPTER_ID, OPENAI_RESPONSES_ADAPTER_ID,
+        OPENROUTER_RESPONSES_ADAPTER_ID,
+    };
+    use crate::provider::{
+        CredentialReference, InventoryBuilder, ModelAvailability, ProviderConnectionInput,
+        ProviderHealthState,
+    };
+    use crate::settings::{load_builtin_metadata, MetadataFile, MetadataSource, MetadataSources};
+    use buckyos_api::ApiType;
+    use serde_json::{json, Value};
+    use std::collections::BTreeSet;
+
+    fn configured_inventory() -> ProviderDiscoverySnapshot {
+        ProviderDiscoverySnapshot {
+            revision: Some("configured-1".to_owned()),
+            discovered_at_ms: 1,
+            health: ProviderHealthState::Healthy,
+            models: Vec::new(),
+        }
+    }
+
+    fn registry() -> BuiltinProviderRegistry {
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        builtin_provider_registry(catalog.as_ref()).unwrap()
+    }
+
+    #[test]
+    fn typesafe_static_inventory_alias_identity_and_custom_protocol_are_explicit() {
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            ..Default::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        let registry = builtin_provider_registry(&catalog).unwrap();
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: "typesafe",
+                protocol_adapter_id: "typesafe-systemone",
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert_eq!(
+            binding
+                .profile
+                .default_inventory
+                .as_ref()
+                .unwrap()
+                .models
+                .iter()
+                .map(|m| m.provider_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["jev-1.13.0"]
+        );
+        for alias in ["jev-latest", "jev-preview"] {
+            let crate::catalog::ProviderModelMatch::Matched(identity) =
+                binding.discovery.match_model_driver(alias, &catalog)
+            else {
+                panic!("confirmed alias must match")
+            };
+            assert_eq!(identity.model_driver_id, "typesafe");
+            assert_eq!(identity.model_id, "jev-1.13.0");
+        }
+        assert!(matches!(
+            binding.discovery.match_model_driver("jev-99.0.0", &catalog),
+            crate::catalog::ProviderModelMatch::NotHandled
+        ));
+        assert!(catalog.match_model("jev-99.0.0").is_err());
+        let custom = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: "custom",
+                protocol_adapter_id: "typesafe-systemone",
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: Some(configured_inventory()),
+            })
+            .unwrap();
+        assert_eq!(
+            custom.profile.default_protocol_adapter_id,
+            "typesafe-systemone"
+        );
+    }
+
+    #[test]
+    fn production_registry_contains_every_builtin_once() {
+        let registry = registry();
+        let profile_ids = registry
+            .profiles()
+            .map(|profile| profile.provider_profile_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            profile_ids,
+            BTreeSet::from([
+                "claude",
+                "custom",
+                "deepseek",
+                "doubao",
+                "doubao-agent-plan",
+                "doubao-speech",
+                "fal",
+                "gemini",
+                "glm",
+                "kimi",
+                "minimax",
+                "openai",
+                "openrouter",
+                "qwen",
+                "sn",
+                "typesafe",
+            ])
+        );
+        assert_eq!(registry.profiles().len(), profile_ids.len());
+
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        let behaviors = discovery_behaviors();
+        for provider in catalog.known_providers() {
+            assert!(
+                behaviors.contains_key(provider.discovery_behavior_id.as_str()),
+                "{} references an unregistered discovery behavior {}",
+                provider.provider_profile_id,
+                provider.discovery_behavior_id
+            );
+        }
+
+        let codecs = registry.codecs();
+        let adapter_ids = codecs
+            .adapters()
+            .map(|adapter| adapter.protocol_adapter_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(codecs.adapters().len(), adapter_ids.len());
+        assert_eq!(adapter_ids.len(), 19);
+        for profile in registry.profiles() {
+            assert!(adapter_ids.contains(profile.default_protocol_adapter_id.as_str()));
+        }
+        let custom_provider_families = registry
+            .custom_provider_adapter_ids()
+            .iter()
+            .filter_map(|adapter_id| codecs.adapter(adapter_id))
+            .map(|adapter| adapter.protocol_family_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            custom_provider_families,
+            BTreeSet::from(["claude", "gemini", "openai", "typesafe-systemone"])
+        );
+        assert_eq!(
+            registry.custom_provider_adapter_ids(),
+            &BTreeSet::from([
+                CLAUDE_MESSAGES_ADAPTER_ID.to_owned(),
+                GEMINI_ADAPTER_ID.to_owned(),
+                OPENAI_CHAT_COMPLETIONS_ADAPTER_ID.to_owned(),
+                OPENAI_RESPONSES_ADAPTER_ID.to_owned(),
+                "typesafe-systemone".to_owned(),
+            ])
+        );
+        for adapter_id in [
+            OPENAI_RESPONSES_ADAPTER_ID,
+            OPENAI_CHAT_COMPLETIONS_ADAPTER_ID,
+            MINIMAX_MESSAGES_ADAPTER_ID,
+            OPENROUTER_RESPONSES_ADAPTER_ID,
+            KIMI_CHAT_ADAPTER_ID,
+            GLM_CHAT_ADAPTER_ID,
+            FAL_QUEUE_ADAPTER_ID,
+            SN_OPENAI_ADAPTER_ID,
+        ] {
+            assert!(adapter_ids.contains(adapter_id));
+        }
+        assert!(codecs
+            .native_task_codec(
+                FAL_QUEUE_ADAPTER_ID,
+                FAL_QUEUE_OPERATION_ID,
+                ApiType::ImageTextToImage,
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn builtin_metadata_inventory_contains_only_explicitly_declared_models() {
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        let registry = builtin_provider_registry(catalog.as_ref()).unwrap();
+
+        for profile in registry.profiles() {
+            if profile.provider_profile_id == CUSTOM_PROVIDER_PROFILE_ID {
+                continue;
+            }
+            let Some(discovery) = profile.default_inventory.clone() else {
+                continue;
+            };
+            let instance = ProviderInstanceConfig {
+                provider_instance_name: format!("{}-golden", profile.provider_profile_id),
+                provider_profile_id: profile.provider_profile_id.clone(),
+                protocol_adapter_id: profile.default_protocol_adapter_id.clone(),
+                base_url: "https://provider.example/v1".to_owned(),
+                operation_base_urls: BTreeMap::new(),
+                credential: CredentialReference {
+                    reference: "secret://provider".to_owned(),
+                },
+                credential_kind: None,
+                provider_rules_id: Some(profile.provider_profile_id.clone()),
+                region: None,
+                workspace: None,
+                account: None,
+                request_timeout: std::time::Duration::from_secs(120),
+                auto_sync_models: true,
+                instance_rules: None,
+            };
+            let inventory = InventoryBuilder::build(
+                profile,
+                &instance,
+                discovery,
+                catalog.as_ref(),
+                &registry.codecs(),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", profile.provider_profile_id));
+
+            let declared = &catalog
+                .provider_rules(&profile.provider_profile_id)
+                .unwrap()
+                .static_inventory_models;
+            assert!(inventory
+                .models
+                .iter()
+                .all(|model| declared.contains(&model.provider_model_id)));
+            if declared.is_empty() {
+                assert!(inventory.models.is_empty());
+            }
+            for model in &inventory.models {
+                assert!(
+                    !model.logical_mounts.is_empty()
+                        || catalog
+                            .resolve_model(&model.model_driver_id, &model.origin_model_id)
+                            .is_ok(),
+                    "{}:{} produced no logical mounts",
+                    profile.provider_profile_id,
+                    model.provider_model_id
+                );
+                assert!(
+                    model
+                        .logical_mounts
+                        .iter()
+                        .all(|mount| !mount.contains('{') && !mount.contains('}')),
+                    "{}:{} has unexpanded mounts {:?}",
+                    profile.provider_profile_id,
+                    model.origin_model_id,
+                    model.logical_mounts
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_registers_new_provider_profile_with_existing_adapter() {
+        let local = [
+            (
+                CatalogKind::ModelDriver,
+                json!({
+                    "format": "buckyos.aicc.model-driver-catalog",
+                    "schema_version": 2,
+                    "schema_revision": 0,
+                    "model_driver_id": "vendor",
+                    "revision_seq": 2,
+                    "models": [{"id": "vendor-model", "api_types": ["llm"], "llm":{"spec":"vendor-spec","effort":"native","default_effort":"native","supported_efforts":["native"],"stability":"stable","weight":1.0}}],
+                    "patterns": [],
+                    "defaults": {},
+                    "specs": [{"id":"vendor-spec","direct_only":true}]
+                }),
+            ),
+            (
+                CatalogKind::ProviderRules,
+                json!({
+                    "format": "buckyos.aicc.provider-rules-catalog",
+                    "schema_version": 1,
+                    "schema_revision": 1,
+                    "revision_seq": 2,
+                    "provider_profile_id": "vendor",
+                    "static_inventory_models": ["vendor-model"],
+                    "models": [],
+                    "patterns": [{
+                        "match": "*",
+                        "operations": {"llm": "responses.create"}
+                    }],
+                    "variants": []
+                }),
+            ),
+            (
+                CatalogKind::KnownProvider,
+                json!({
+                    "format": "buckyos.aicc.known-provider-catalog",
+                    "schema_version": 1,
+                    "schema_revision": 0,
+                    "revision_seq": 2,
+                    "catalog_id": "vendor",
+                    "providers": [{
+                        "provider_profile_id": "vendor",
+                        "display_name": "Vendor",
+                        "base_url": "https://vendor.example/v1",
+                        "protocol_adapter_id": "openai-responses",
+                        "discovery_behavior_id": "openai-compatible-models",
+                        "provider_rules_id": "vendor",
+                        "credential": {"kind": "bearer"},
+                        "connection": {
+                            "region": {"mode": "unsupported"},
+                            "workspace": {"mode": "unsupported"},
+                            "account": {"mode": "unsupported"}
+                        }
+                    }]
+                }),
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, document)| {
+            MetadataFile::parse(
+                MetadataSource::Local,
+                kind,
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            local,
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+
+        let registry = builtin_provider_registry(catalog.as_ref()).unwrap();
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: "vendor",
+                protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+
+        assert_eq!(binding.profile.provider_profile_id, "vendor");
+        assert_eq!(binding.profile.discovery_mode, DiscoveryMode::MachineApi);
+        assert_eq!(
+            binding
+                .profile
+                .default_inventory
+                .as_ref()
+                .unwrap()
+                .models
+                .iter()
+                .map(|model| model.provider_model_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vendor-model"]
+        );
+    }
+
+    #[test]
+    fn metadata_source_manager_supplies_all_builtin_catalogs_to_registry() {
+        let registry = registry();
+        let files = load_builtin_metadata().unwrap();
+        assert_eq!(files.len(), 42);
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.kind == CatalogKind::KnownProvider)
+                .count(),
+            13
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.kind == CatalogKind::ProviderRules)
+                .count(),
+            15
+        );
+        assert_eq!(
+            files
+                .iter()
+                .filter(|file| file.kind == CatalogKind::ModelDriver)
+                .count(),
+            14
+        );
+
+        let snapshot = MetadataSources {
+            builtin: files,
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        for profile in registry.profiles() {
+            if profile.provider_profile_id == CUSTOM_PROVIDER_PROFILE_ID {
+                assert!(snapshot
+                    .known_provider(CUSTOM_PROVIDER_PROFILE_ID)
+                    .is_none());
+                assert!(snapshot
+                    .provider_rules(CUSTOM_PROVIDER_PROFILE_ID)
+                    .is_none());
+                continue;
+            }
+            assert!(snapshot
+                .known_provider(&profile.provider_profile_id)
+                .is_some());
+            assert!(snapshot
+                .provider_rules(&profile.provider_profile_id)
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn cloud_provider_rules_control_custom_provider_adapter_visibility() {
+        let mut openai_rules: Value = serde_json::from_slice(include_bytes!(
+            "../../../driver_metadata/providers/openai.provider.json"
+        ))
+        .unwrap();
+        openai_rules["revision_seq"] = json!(3);
+        openai_rules["custom_provider_adapters"] = json!([OPENAI_RESPONSES_ADAPTER_ID]);
+        let cloud = MetadataFile::parse(
+            MetadataSource::Cloud,
+            CatalogKind::ProviderRules,
+            serde_json::to_vec(&openai_rules).unwrap(),
+        )
+        .unwrap();
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            cloud: vec![cloud],
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+        let registry = builtin_provider_registry(catalog.as_ref()).unwrap();
+
+        assert!(registry
+            .custom_provider_adapter_ids()
+            .contains(OPENAI_RESPONSES_ADAPTER_ID));
+        assert!(!registry
+            .custom_provider_adapter_ids()
+            .contains(OPENAI_CHAT_COMPLETIONS_ADAPTER_ID));
+    }
+
+    #[test]
+    fn registry_configuration_comes_from_effective_snapshot() {
+        let mut document: Value = serde_json::from_slice(
+            &load_builtin_metadata()
+                .unwrap()
+                .into_iter()
+                .find(|file| {
+                    file.kind == CatalogKind::KnownProvider
+                        && file.catalog_id == OPENAI_PROVIDER_PROFILE_ID
+                })
+                .unwrap()
+                .contents,
+        )
+        .unwrap();
+        document["providers"][0]["display_name"] = Value::String("Local OpenAI".to_owned());
+        document["providers"][0]["base_url"] = Value::String("https://local.example/v1".to_owned());
+        let local = MetadataFile::parse(
+            MetadataSource::Local,
+            CatalogKind::KnownProvider,
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            local: vec![local],
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+
+        let registry = builtin_provider_registry(catalog.as_ref()).unwrap();
+        let profile = registry
+            .profiles()
+            .find(|profile| profile.provider_profile_id == OPENAI_PROVIDER_PROFILE_ID)
+            .unwrap();
+        assert_eq!(profile.display_name, "Local OpenAI");
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: OPENAI_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: &profile.default_protocol_adapter_id,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert_eq!(
+            binding.connection.default_base_url,
+            "https://local.example/v1"
+        );
+    }
+
+    #[test]
+    fn resource_input_form_follows_the_codec_resource_encoding_path() {
+        let codecs = builtin_provider_codecs().unwrap();
+        let form = |adapter: &str, operation: &str, api_type: ApiType| {
+            codecs
+                .codec(adapter, operation, api_type)
+                .expect("operation binding is registered")
+                .resource_input_form()
+        };
+        // `llm` codecs write the URL string into the request body verbatim, so
+        // the payload must never be downloaded. The derived adapters
+        // (`doubao-responses`, `glm-chat`, `kimi-chat`) must forward the base
+        // declaration.
+        for (adapter, operation, api_type) in [
+            ("openai-responses", "responses.create", ApiType::Llm),
+            ("doubao-responses", "responses.create", ApiType::Llm),
+            ("claude-messages", "messages.create", ApiType::Llm),
+            ("glm-chat", "chat.completions.create", ApiType::Llm),
+            ("kimi-chat", "chat.completions.create", ApiType::Llm),
+            ("gemini-interactions", "interactions.create", ApiType::Llm),
+            (
+                "qwen-media",
+                "dashscope.image_edit",
+                ApiType::ImageImageToImage,
+            ),
+        ] {
+            assert_eq!(
+                form(adapter, operation, api_type),
+                crate::resource::ResourceInputForm::UrlOrBytes,
+                "{adapter} accepts a URL and an inlined payload"
+            );
+        }
+        // Audio transcription goes through `OpenAiAudioCodec`, a multipart
+        // upload that needs the audio bytes even when the caller supplied a URL.
+        // It does not declare a URL-accepting input form, so it keeps the
+        // `BytesOnly` default.
+        assert_eq!(
+            form(
+                "openai-responses",
+                "audio.transcriptions",
+                ApiType::AudioSpeechRecognition
+            ),
+            crate::resource::ResourceInputForm::BytesOnly
+        );
+        // Image generation goes through `OpenAiImageCodec`, which likewise does
+        // not declare URL support and therefore keeps the `BytesOnly` default.
+        assert_eq!(
+            form(
+                "openai-responses",
+                "images.generate",
+                ApiType::ImageTextToImage
+            ),
+            crate::resource::ResourceInputForm::BytesOnly
+        );
+        // Native task codecs declare their form on `NativeTaskCodec`, and each of
+        // these writes the URL into its submit payload verbatim instead of
+        // uploading a file. Without the declaration they would fall back to the
+        // `BytesOnly` default and download a payload the Provider never needed.
+        let native_form = |adapter: &str, operation: &str, api_type: ApiType| {
+            codecs
+                .native_task_codec(adapter, operation, api_type)
+                .expect("native task binding is registered")
+                .resource_input_form()
+        };
+        for (adapter, operation, api_type) in [
+            ("fal-queue", "queue.submit", ApiType::VideoUpscale),
+            ("glm-media", "videos.generate", ApiType::VideoGenerate),
+            (
+                "qwen-media",
+                "dashscope.video_synthesis",
+                ApiType::VideoGenerate,
+            ),
+            (
+                "doubao-media",
+                "ark.contents.generate",
+                ApiType::VideoGenerate,
+            ),
+            (
+                "gemini-interactions",
+                "models.predictLongRunning",
+                ApiType::VideoGenerate,
+            ),
+            (
+                "minimax-media",
+                "video_generation.create",
+                ApiType::VideoGenerate,
+            ),
+            (
+                "openrouter-responses",
+                "videos.create",
+                ApiType::VideoGenerate,
+            ),
+        ] {
+            assert_eq!(
+                native_form(adapter, operation, api_type),
+                crate::resource::ResourceInputForm::UrlOrBytes,
+                "{adapter} accepts a URL and an inlined payload"
+            );
+        }
+        // OpenAI video keeps the default on purpose: editing posts the source
+        // as a multipart file, so the bytes are required even when the caller
+        // supplied a URL.
+        assert_eq!(
+            native_form("openai-responses", "videos.create", ApiType::VideoEdit),
+            crate::resource::ResourceInputForm::BytesOnly
+        );
+        // The immediate MiniMax codec serves several wire grammars from one
+        // struct, so its form has to follow the api type: per-codec granularity
+        // could only express the strictest member, and an image edit would keep
+        // downloading a payload the protocol could have taken as a URL.
+        assert_eq!(
+            form(
+                "minimax-media",
+                "speech_to_text.create",
+                ApiType::AudioSpeechRecognition
+            ),
+            crate::resource::ResourceInputForm::BytesOnly
+        );
+        assert_eq!(
+            form(
+                "minimax-media",
+                "image_generation.create",
+                ApiType::ImageImageToImage
+            ),
+            crate::resource::ResourceInputForm::UrlOrBytes
+        );
+        // Doubao speech binds one api type to two operations with different
+        // wire shapes. The flash endpoint accepts `audio.url` or `audio.data`,
+        // so a URL passes through untouched; the standard `submit`/`query` task
+        // only accepts `audio.url`, so `UrlOnly` makes the pipeline publish
+        // caller-supplied bytes to the local object store and hand the Provider
+        // the resulting object URL instead of downloading or rejecting them.
+        assert_eq!(
+            form(
+                "doubao-responses",
+                "asr.recognize.flash",
+                ApiType::AudioSpeechRecognition
+            ),
+            crate::resource::ResourceInputForm::UrlOrBytes
+        );
+        assert_eq!(
+            native_form(
+                "doubao-responses",
+                "asr.recognize.submit",
+                ApiType::AudioSpeechRecognition
+            ),
+            crate::resource::ResourceInputForm::UrlOnly
+        );
+    }
+
+    #[test]
+    fn fal_uses_catalog_default_inventory_without_configured_discovery() {
+        let registry = registry();
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: FAL_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: FAL_QUEUE_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        let inventory = binding.profile.default_inventory.unwrap();
+        assert_eq!(inventory.revision.as_deref(), Some("catalog-fal-3"));
+        assert_eq!(inventory.models.len(), 4);
+        assert!(inventory
+            .models
+            .iter()
+            .all(|model| model.availability == ModelAvailability::Available));
+    }
+
+    #[test]
+    fn sn_registry_does_not_require_ui_hints() {
+        let mut document: Value = serde_json::from_slice(
+            &load_builtin_metadata()
+                .unwrap()
+                .into_iter()
+                .find(|file| {
+                    file.kind == CatalogKind::KnownProvider
+                        && file.catalog_id == SN_PROVIDER_PROFILE_ID
+                })
+                .unwrap()
+                .contents,
+        )
+        .unwrap();
+        document["providers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ui_hints");
+        let local = MetadataFile::parse(
+            MetadataSource::Local,
+            CatalogKind::KnownProvider,
+            serde_json::to_vec(&document).unwrap(),
+        )
+        .unwrap();
+        let catalog = MetadataSources {
+            builtin: load_builtin_metadata().unwrap(),
+            local: vec![local],
+            ..MetadataSources::default()
+        }
+        .build_snapshot(
+            crate::settings::BUILTIN_CATALOG_REVISION_SEQ,
+            &crate::catalog::CatalogBuildOptions::default(),
+        )
+        .unwrap();
+
+        let registry = builtin_provider_registry(catalog.as_ref()).unwrap();
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: SN_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: SN_OPENAI_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::DynamicLogin,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert!(binding.dynamic_login_resolver.is_some());
+    }
+
+    #[test]
+    fn glm_credential_variant_and_regional_endpoints_use_typed_catalog() {
+        let registry = registry();
+        let glm = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: GLM_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: GLM_CHAT_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: Some(CredentialKind::GlmJwt),
+                configured_inventory: Some(configured_inventory()),
+            })
+            .unwrap();
+        assert_eq!(glm.profile.credential.kind, CredentialKind::GlmJwt);
+        assert_eq!(
+            glm.connection
+                .resolve(ProviderConnectionInput {
+                    region: Some("china"),
+                    ..ProviderConnectionInput::default()
+                })
+                .unwrap()
+                .base_url,
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+        assert_eq!(
+            glm.connection
+                .resolve(ProviderConnectionInput {
+                    base_url: Some("https://glm-proxy.example/v1"),
+                    region: Some("china"),
+                    ..ProviderConnectionInput::default()
+                })
+                .unwrap()
+                .base_url,
+            "https://glm-proxy.example/v1"
+        );
+
+        let minimax = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: MINIMAX_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: MINIMAX_MESSAGES_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert_eq!(
+            minimax
+                .connection
+                .resolve(ProviderConnectionInput {
+                    region: Some("china"),
+                    ..ProviderConnectionInput::default()
+                })
+                .unwrap()
+                .base_url,
+            "https://api.minimax.cn/anthropic"
+        );
+
+        assert!(matches!(
+            registry.resolve(BuiltinProviderRequest {
+                provider_profile_id: OPENAI_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: Some(CredentialKind::GlmJwt),
+                configured_inventory: None,
+            }),
+            Err(ProviderError::InvalidConfiguration(message))
+                if message.contains("does not support credential kind `glm_jwt`")
+        ));
+    }
+
+    #[test]
+    fn every_profile_resolves_through_the_same_instance_entrypoint() {
+        let registry = registry();
+        assert_eq!(
+            registry
+                .providers
+                .get(DOUBAO_PROFILE_ID)
+                .unwrap()
+                .profile
+                .discovery_mode,
+            crate::provider::DiscoveryMode::MachineApi
+        );
+        assert_eq!(
+            registry
+                .providers
+                .get(DOUBAO_AGENT_PLAN_PROFILE_ID)
+                .unwrap()
+                .profile
+                .discovery_mode,
+            crate::provider::DiscoveryMode::CatalogOnly
+        );
+        assert_eq!(
+            registry
+                .providers
+                .get(QWEN_PROFILE_ID)
+                .unwrap()
+                .profile
+                .discovery_mode,
+            crate::provider::DiscoveryMode::MachineApi
+        );
+        for profile in registry.profiles() {
+            let configured_inventory = (profile.discovery_mode
+                == crate::provider::DiscoveryMode::CatalogOnly)
+                .then(configured_inventory);
+            let instance = ProviderInstanceConfig {
+                provider_instance_name: format!("{}-main", profile.provider_profile_id),
+                provider_profile_id: profile.provider_profile_id.clone(),
+                protocol_adapter_id: profile.default_protocol_adapter_id.clone(),
+                base_url: "https://provider.example/v1".to_owned(),
+                operation_base_urls: BTreeMap::new(),
+                credential: CredentialReference {
+                    reference: "secret://provider".to_owned(),
+                },
+                credential_kind: None,
+                provider_rules_id: (profile.provider_profile_id != CUSTOM_PROVIDER_PROFILE_ID)
+                    .then(|| profile.provider_profile_id.clone()),
+                region: None,
+                workspace: None,
+                account: None,
+                request_timeout: std::time::Duration::from_secs(120),
+                auto_sync_models: true,
+                instance_rules: None,
+            };
+            let binding = registry
+                .resolve_instance(&instance, ProviderAuthMode::ApiKey, configured_inventory)
+                .unwrap();
+            assert_eq!(
+                binding.profile.provider_profile_id,
+                profile.provider_profile_id
+            );
+            assert!(binding.dynamic_login_resolver.is_none());
+            assert_eq!(
+                binding.instance_rules,
+                (profile.provider_profile_id == CUSTOM_PROVIDER_PROFILE_ID)
+                    .then(buckyos_api::ProviderInstanceRules::default)
+            );
+        }
+
+        let sn = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: SN_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: SN_OPENAI_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::DynamicLogin,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert!(sn.dynamic_login_resolver.is_some());
+    }
+
+    #[test]
+    fn custom_provider_only_accepts_public_protocol_adapters() {
+        let registry = registry();
+        let binding = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: Some(configured_inventory()),
+            })
+            .unwrap();
+
+        assert_eq!(
+            binding.profile.provider_profile_id,
+            CUSTOM_PROVIDER_PROFILE_ID
+        );
+        assert_eq!(binding.profile.credential.kind, CredentialKind::Bearer);
+        assert_eq!(binding.profile.credential.header_name, None);
+        assert_eq!(binding.instance_rules, Some(Default::default()));
+        assert_eq!(
+            binding
+                .connection
+                .resolve(ProviderConnectionInput {
+                    base_url: Some("https://custom.example/v1"),
+                    ..ProviderConnectionInput::default()
+                })
+                .unwrap()
+                .base_url,
+            "https://custom.example/v1"
+        );
+        assert!(binding
+            .connection
+            .resolve(ProviderConnectionInput::default())
+            .is_err());
+
+        let missing_inventory = registry
+            .resolve(BuiltinProviderRequest {
+                provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: None,
+            })
+            .unwrap();
+        assert_eq!(
+            missing_inventory.profile.discovery_mode,
+            DiscoveryMode::MachineApi
+        );
+
+        let dynamic_login = registry.resolve(BuiltinProviderRequest {
+            provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID,
+            protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+            auth_mode: ProviderAuthMode::DynamicLogin,
+            credential_kind: None,
+            configured_inventory: Some(configured_inventory()),
+        });
+        assert!(matches!(
+            dynamic_login,
+            Err(ProviderError::InvalidConfiguration(message))
+                if message == "provider profile `custom` does not support dynamic login"
+        ));
+
+        for (adapter, kind, header) in [
+            (OPENAI_RESPONSES_ADAPTER_ID, CredentialKind::Bearer, None),
+            (
+                crate::protocol::CLAUDE_MESSAGES_ADAPTER_ID,
+                CredentialKind::NamedHeader,
+                Some("x-api-key"),
+            ),
+            (
+                crate::protocol::GEMINI_ADAPTER_ID,
+                CredentialKind::NamedHeader,
+                Some("x-goog-api-key"),
+            ),
+        ] {
+            let binding = registry
+                .resolve(BuiltinProviderRequest {
+                    provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID,
+                    protocol_adapter_id: adapter,
+                    auth_mode: ProviderAuthMode::ApiKey,
+                    credential_kind: None,
+                    configured_inventory: Some(configured_inventory()),
+                })
+                .unwrap();
+            assert_eq!(binding.profile.credential.kind, kind);
+            assert_eq!(binding.profile.credential.header_name.as_deref(), header);
+        }
+
+        for adapter in [
+            GLM_CHAT_ADAPTER_ID,
+            MINIMAX_MESSAGES_ADAPTER_ID,
+            FAL_QUEUE_ADAPTER_ID,
+            OPENROUTER_RESPONSES_ADAPTER_ID,
+        ] {
+            let result = registry.resolve(BuiltinProviderRequest {
+                provider_profile_id: CUSTOM_PROVIDER_PROFILE_ID,
+                protocol_adapter_id: adapter,
+                auth_mode: ProviderAuthMode::ApiKey,
+                credential_kind: None,
+                configured_inventory: Some(configured_inventory()),
+            });
+            assert!(matches!(
+                result,
+                Err(ProviderError::InvalidConfiguration(message))
+                    if message == format!(
+                        "protocol adapter `{adapter}` is reserved for a built-in provider"
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn unknown_profile_and_adapter_have_stable_errors() {
+        let registry = registry();
+        let unknown_profile = registry.resolve(BuiltinProviderRequest {
+            provider_profile_id: "missing-profile",
+            protocol_adapter_id: OPENAI_RESPONSES_ADAPTER_ID,
+            auth_mode: ProviderAuthMode::ApiKey,
+            credential_kind: None,
+            configured_inventory: None,
+        });
+        assert!(matches!(
+            unknown_profile,
+            Err(ProviderError::UnknownProfile(id)) if id == "missing-profile"
+        ));
+
+        let unknown_adapter = registry.resolve(BuiltinProviderRequest {
+            provider_profile_id: OPENAI_PROVIDER_PROFILE_ID,
+            protocol_adapter_id: "missing-adapter",
+            auth_mode: ProviderAuthMode::ApiKey,
+            credential_kind: None,
+            configured_inventory: None,
+        });
+        assert!(matches!(
+            unknown_adapter,
+            Err(ProviderError::UnknownAdapter(id)) if id == "missing-adapter"
+        ));
+    }
+}

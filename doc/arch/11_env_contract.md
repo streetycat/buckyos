@@ -14,7 +14,7 @@
 ## 命名和边界
 
 - `BUCKYOS_*` 是 BuckyOS 自有命名空间。新增对外契约优先放在这个命名空间。
-- 动态 token 变量由 `get_session_token_env_key()` 生成：先把 app/service id 转成大写，再把 `-` 替换成 `_`。AppService 用 `*_TOKEN`，KernelService/FrameService 用 `*_SESSION_TOKEN`。
+- 系统服务 token 变量由 `get_service_session_token_env_key()` 生成：把 service id 转成大写、把 `-` 替换成 `_`，再追加 `_SESSION_TOKEN`。普通 AppService 不使用动态变量名，只读取 `BUCKYOS_APP_TOKEN`。
 - `app_instance_config`、`app_media_info`、`local_app_instance_config` 是历史形成的小写内部变量，只在 node-daemon 拉起 app/local app 时使用；不要继续扩展新的小写变量。
 - `OPENDAN_*`、`SCRIPT_*` 当前仍有兼容读写点，但新协议应优先用 `BUCKYOS_*` 和文件/RootFS 元数据表达。
 - 含 token、私钥、API key 的变量不应写入普通日志。诊断脚本需要 redact。
@@ -24,7 +24,7 @@
 
 | 变量 | 来源 | 消费方 | 语义 |
 | --- | --- | --- | --- |
-| `BUCKYOS_ROOT` | 用户、安装脚本、`start.py`、`node_control` | 路径工具、node-daemon、OpenDAN、安装/卸载脚本 | BuckyOS host 运行时根目录。类 Unix 默认 `/opt/buckyos`；Windows 默认 `%APPDATA%/buckyos`，部分工具再回退到 `%USERPROFILE%/buckyos`。 |
+| `BUCKYOS_ROOT` | 用户、安装脚本、`start.py`、`node_control` | 路径工具、node-daemon、OpenDAN、安装/卸载脚本 | BuckyOS host 运行时根目录。类 Unix 默认 `/opt/buckyos`；Windows 默认 `C:\buckyos`。 |
 | `BUCKYOS_BUILD_ROOT` | 用户或打包命令 | `make_local_pkg.py`、`src/publish/make_local_*` | 本地打包/发布 staging root，默认类 Unix `/opt/buckyosci`，Windows `C:\opt\buckyosci`。 |
 | `BUCKYOS_DEV_HOME` | 开发者 | `buckyos-api` AppClient runtime | AppClient 开发态配置目录覆盖；存在时优先于 `$BUCKYOS_ROOT/etc` 加载 runtime 配置。 |
 | `APPDATA` / `USERPROFILE` / `LOCALAPPDATA` | OS | Windows 路径解析与打包变量展开 | Windows 平台默认目录和 installer 模板展开使用。 |
@@ -50,10 +50,13 @@ node-daemon 的 `AppLoader` 是 app/agent worker 环境变量的权威注入者�
 
 | 变量 | 来源 | 消费方 | 语义 |
 | --- | --- | --- | --- |
-| `BUCKYOS_APP_ID` | node-daemon | app/agent/脚本、OpenDAN | app id，不包含 owner 前缀。 |
+| `BUCKYOS_APP_DID` | node-daemon | app/agent/脚本、SDK | canonical AppDID。 |
+| `BUCKYOS_APP_ID` | node-daemon | app/agent/脚本、OpenDAN | AppDID 的 canonical raw hostname，不包含 owner。 |
+| `BUCKYOS_APP_INSTANCE_ID` | node-daemon | app/agent/脚本、SDK | canonical `{app_id}@{owner_user_id}`。 |
 | `BUCKYOS_APP_TYPE` | node-daemon | `publish/aios/entrypoint.sh` | worker 分发类型：当前入口支持 `agent`、`script`、`custom`/空命令。 |
 | `BUCKYOS_OWNER_USER_ID` | node-daemon | app/agent、路径与权限逻辑 | app 实例所属 owner user id。 |
 | `BUCKYOS_DATA_DIR` | node-daemon | app/agent/脚本 | worker 内 app 持久 user/app data 目录，当前形态为 `/opt/buckyos/data/home/<owner>/.local/share/<app_id>`。 |
+| `BUCKYOS_APP_TOKEN` | node-daemon | AppService SDK/runtime | 与当前 AppInstanceId 精确绑定的启动 token。不得持久化或复用于其它 Owner 的实例。 |
 | `BUCKYOS_LOG_DIR` | node-daemon | app/agent | worker 内日志目录。 |
 | `BUCKYOS_STORAGE_DIR` | node-daemon | app/agent | worker 内 app storage 目录。 |
 | `BUCKYOS_PKG_SOURCE_DIR` | node-daemon/aios 默认值 | aios entrypoint | 上游只读 package 挂载，aios 默认 `/mnt/buckyos/pkg`。 |
@@ -62,18 +65,23 @@ node-daemon 的 `AppLoader` 是 app/agent worker 环境变量的权威注入者�
 | `BUCKYOS_EXTTOOL_DIR` | node-daemon/aios 默认值 | aios entrypoint | 节点共享 ExtTool 只读卷，aios 默认 `/opt/buckyos/tools`。entrypoint 会把其 `bin` 放到 `PATH` 前面。 |
 | `BUCKYOS_SAFE_MODE` | node-daemon/aios 默认值 | aios entrypoint | `1` 时重置 package 工作副本和 sync metadata；默认 `0`。 |
 | `BUCKYOS_SERVICE_PORT` | node-daemon | agent/service | app/agent 暴露服务端口。agent 未注入时 aios 入口默认 `4060`。 |
-| `BUCKYOS_HOST_GATEWAY` | node-daemon | `buckyos-api` runtime | 容器访问 host 本地服务的 host 名。runtime 会把 app/frame service 的本地 system service URL 解析到该 host。 |
+| `BUCKYOS_HOST_GATEWAY` | node-daemon、AppClient 调用方 | `buckyos-api` runtime | 容器访问 host 本地服务的 host 名。runtime 会把 app/frame service 的本地 system service URL 解析到该 host；Rust AppClient 在该变量非空时也通过该 host 的 NodeGateway 访问 system-config 和其它 kRPC 服务，默认端口 `3180`。 |
 | `BUCKYOS_KEVENT_DAEMON_ADDR` | node-daemon | `buckyos-api` runtime（App/Agent Worker，包括 OpenDAN） | KEvent daemon bridge endpoint，格式为 `host:port`。node-daemon 默认注入 `host.docker.internal:3183`；未设置时 runtime 回退到 `BUCKYOS_HOST_GATEWAY` 指定的 host 和端口 `3183`。 |
+| `BUCKYOS_TOOL_ENDPOINT` | node-daemon（仅 Agent 容器） | 容器内 `buckyos` CLI | 宿主 NodeGateway 地址 `http://<BUCKYOS_HOST_GATEWAY 同值>:3180`。CLI 只认该变量，不读 `BUCKYOS_HOST_GATEWAY`；镜像 launcher 仅在该变量缺失且 `BUCKYOS_HOST_GATEWAY` 非空时自行按此规则补出。身份用 Session 注入的 `BUCKYOS_APPCLIENT_SESSION_TOKEN`。 |
+| `BUCKYOS_AGENT_SKILLS_PKG_DIR` | node-daemon（仅声明了 `pkg_list.agent_skills` 的 Agent） | OpenDAN | 已安装 `agent_skills` 子包的只读挂载点，固定 `/mnt/buckyos/agent_skills`；未声明该子包时不注入也不挂载。 |
 
 同时注入的内部变量：
 
 | 变量 | 来源 | 语义 |
 | --- | --- | --- |
-| `app_instance_config` | node-daemon | `AppServiceInstanceConfig` JSON。`buckyos-api` 会从中解析 app id 和 owner。 |
-| `<FULL_APPID>_TOKEN` | node-daemon | AppService 启动 token。`FULL_APPID` 当前由 `<owner>-<app_id>` 组成，转大写并把 `-` 替换为 `_` 后加 `_TOKEN`。 |
+| `app_instance_config` | node-daemon | `AppServiceInstanceConfig` JSON。它是执行投影，不是 SDK 的身份来源；SDK 从上表的固定环境变量读取身份，并校验各字段一致。 |
 | `app_media_info` | node-daemon | package media 信息 JSON；worker 内会把 `full_path` 改写为 `BUCKYOS_PKG_DIR`。 |
 | `local_app_instance_config` | node-daemon | local app config JSON。 |
 | `loca_app_instance_config` | node-daemon | `local_app_instance_config` 的拼写兼容变量。不要新增依赖。 |
+
+Agent 容器还会得到宿主 BuckyOS Tool 分发的只读挂载：`$BUCKYOS_ROOT/libexec/buckyos-tool/` 下的 `cli/`、`dist/`、`package.json`、`distribution.json` 分别挂到容器 `/opt/buckyos/libexec/buckyos-tool/` 同名路径；`runtime/`（宿主 Deno，可能不是 Linux 二进制）不挂载，宿主缺某项时跳过并记 warning。镜像的 `/usr/local/bin/buckyos` 用镜像自带 Deno 运行挂载的 `cli/system_bootstrap.ts`，挂载缺失或 `distribution.json` 的 `protocol_version` 不是 `1`、`deno_version` 主版本与镜像 Deno 不同时直接报错；`buckyos-agent` 工具也从挂载的 `dist/node.mjs` 加载 SDK。
+
+App 数据目录固定为 `$BUCKYOS_ROOT/data/home/{owner_user_id}/.local/share/{app_id}`，cache 固定为 `$BUCKYOS_ROOT/data/cache/{owner_user_id}/{app_id}`。Docker 容器名为 `buckyos-app-{app_host_name}`，其中 `app_host_name` 直接取自 NodeExecutionSpec 的 Registry 投影；实例卷仍为 `buckyos-instance-{sha256(app_instance_id)}`，使用完整 64 位 lowercase hex。容器通过 `buckyos.app_instance_id` label 保存可诊断的语义身份。
 
 aios entrypoint 派生或兼容变量：
 
@@ -86,8 +94,6 @@ aios entrypoint 派生或兼容变量：
 | `SCRIPT_APP_ID` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_APP_ID`。 |
 | `SCRIPT_PACKAGE_ROOT` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_PKG_DIR`。 |
 | `SCRIPT_DATA_ROOT` | aios entrypoint | 旧 script-service 兼容变量，值来自 `BUCKYOS_DATA_DIR`。 |
-| `OPENDAN_SERVICE_PORT` | node-daemon | OpenDAN 兼容变量，值同 `BUCKYOS_SERVICE_PORT`。 |
-| `OPENDAN_AGENT_ID` | node-daemon | OpenDAN 兼容变量，值同 `BUCKYOS_APP_ID`。 |
 
 ## AppClient 和 AgentTool 变量
 
@@ -99,6 +105,8 @@ aios entrypoint 派生或兼容变量：
 | `OPENDAN_AGENT_ROOT` | AgentTool runner | AgentTool runtime context | Agent RootFS 根目录。新的 AgentTool 最小契约之一。 |
 | `OPENDAN_SESSION_ID` | AgentTool runner | AgentTool runtime context | 当前 agent session id。 |
 | `OPENDAN_TRACE_ID` | AgentTool runner | AgentTool runtime context | 可选 trace id。 |
+
+Rust AppClient 的网络路径独立于设备角色和 token 来源：`BUCKYOS_HOST_GATEWAY` 缺失、为空或只有空白时，system-config 和其它 kRPC 服务都走 Zone host，协议由 runtime 的 HTTPS 策略决定。该变量非空时，复用 app/frame service 的宿主机地址解析逻辑，通过 HTTP 访问 NodeGateway；网关端口取 `BuckyOSRuntime.node_gateway_port`，默认 `3180`。容器内 AppClient 子进程应继承 `BUCKYOS_HOST_GATEWAY` 和 `BUCKYOS_THIS_DEVICE`，不需要删除设备文档。宿主机 AppClient 需要本机路径时显式设置 `BUCKYOS_HOST_GATEWAY=127.0.0.1`。
 
 AgentTool 新实现目标是只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID`、`BUCKYOS_APPCLIENT_SESSION_TOKEN` 和可选 `OPENDAN_TRACE_ID`；其它 `OPENDAN_*` 应从 Agent RootFS、session state 或 BuckyOS runtime 推导。
 
@@ -112,7 +120,7 @@ AgentTool 新实现目标是只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID
 | `BUCKYOS_TG_API_ID` | msg-center Telegram tunnel | Telegram API id，启用 grammers gateway 时必填。 |
 | `BUCKYOS_TG_API_HASH` | msg-center Telegram tunnel | Telegram API hash，启用 grammers gateway 时必填。 |
 | `BUCKYOS_TG_SESSION_DIR` | msg-center Telegram tunnel | Telegram session 目录覆盖。 |
-| `BUCKYOS_KEVENT_RINGBUFFER_PATH` | kevent shared ringbuffer | 覆盖共享 ringbuffer 文件路径，默认 `/tmp/buckyos_kevent_ringbuffer_v2.shm`；测试中需要串行管理。 |
+| `BUCKYOS_KEVENT_RINGBUFFER_PATH` | kevent shared ringbuffer | 覆盖共享 ringbuffer 文件路径，POSIX 默认 `/tmp/buckyos_kevent_ringbuffer_v2.shm`，Windows 默认 `$BUCKYOS_ROOT\tmp\buckyos_kevent_ringbuffer_v2.shm`（`/tmp` 在 Windows 是盘符相对路径，会按启动方 cwd 所在盘分裂成多份）。节点内所有进程必须解析到同一个文件，否则事件总线会静默裂开；测试中需要串行管理。 |
 | `BUCKYOS_KEVENT_KMSG_CASES` | `test/kevent_kmsg` | 选择 kevent/kmsg 测试 case。 |
 | `BUCKYOS_WEBSDK_ROOT` | sys_test | 覆盖 web sdk 搜索目录。 |
 
@@ -173,6 +181,6 @@ AgentTool 新实现目标是只依赖 `OPENDAN_AGENT_ROOT`、`OPENDAN_SESSION_ID
 1. 先判断是否真的是启动边界。如果是持久状态、可调 settings、调度结果或权限策略，应进入 system-config 或文件协议，不应新增环境变量。
 2. 新增正式变量使用 `BUCKYOS_*`；模块私有变量要写清楚模块所有者和默认值。
 3. 涉及 app/service/Agent 可见变量时，同步检查 `node_daemon/app_loader`、`publish/aios/entrypoint.sh`、`buckyos-api runtime`、相关文档和测试。
-4. 涉及 token 命名时复用 `get_session_token_env_key()`，不要手写另一个命名规则。
+4. 普通 App token 固定使用 `BUCKYOS_APP_TOKEN`；系统服务 token 命名复用 `get_service_session_token_env_key()`。
 5. 改 JSON 变量的 schema 时按协议变更处理，同时检查前后端、文档和测试。
 6. 环境变量是进程级全局状态，Rust/TS/Python 并行测试里修改变量必须串行化或用独立进程隔离。

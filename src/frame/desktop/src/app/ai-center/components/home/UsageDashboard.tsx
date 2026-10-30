@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { Activity, Check, ChevronDown, ChevronUp, Copy, CreditCard, DollarSign, Filter, HelpCircle, Route, Wallet } from 'lucide-react'
+import { Activity, Check, ChevronDown, ChevronUp, Copy, CreditCard, DollarSign, Filter, Gauge, HelpCircle, Route, Wallet } from 'lucide-react'
 import { useMediaQuery } from '@mui/material'
 import { useI18n } from '../../../../i18n/provider'
 import { useAICCStore, useAIStatus, useProviders, useUsageSummary, useUsageTrend } from '../../hooks/use-aicc-store'
+import { useDebouncedEffect } from '../../hooks/use-debounced-value'
 import { SummaryCard } from '../shared/SummaryCard'
 import { PagedListFooter } from '../shared/paged-list'
 import { LongField } from '../shared/LongField'
 import { RouteTraceAuditPanel } from '../usage/RouteTraceAuditPanel'
-import type { RouteTrace, UsageEvent, UsageEventsPage, UsageTimeRange } from '../../../../api/aicc_mgr'
+import type { RouteTrace, UsageEvent, UsageEventsPage, UsageSummary, UsageTimeRange } from '../../../../api/aicc_mgr'
+import type { QuotaRuleDraft } from '../../datamodel/quota'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -20,12 +22,22 @@ function sortedEntries(record: Record<string, number>, limit?: number): Array<[s
   return limit == null ? entries : entries.slice(0, limit)
 }
 
-function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number]): string {
+type TFn = (key: string, fallback?: string, variables?: Record<string, string | number>) => string
+
+function usageStatusLabel(status: UsageEvent['status'], t: TFn): string {
+  return status === 'success' ? t('aiCenter.home.usageStatusSuccess', 'Success') : t('aiCenter.home.usageStatusFailed', 'Failed')
+}
+
+function candidateWeightSummary(candidate: RouteTrace['ranked_candidates'][number], t: TFn): string {
   const inputs = candidate.preference_score_inputs
   const exact = inputs?.exact_model_weight ?? candidate.exact_model_weight ?? 1
   const provider = inputs?.provider_weight ?? candidate.provider_weight ?? 1
   const combined = inputs?.combined_weight ?? exact * provider
-  return `exact ${formatWeight(exact)} · provider ${formatWeight(provider)} · combined ${formatWeight(combined)}`
+  return t('aiCenter.home.weightSummary', 'exact {{exact}} · provider {{provider}} · combined {{combined}}', {
+    exact: formatWeight(exact),
+    provider: formatWeight(provider),
+    combined: formatWeight(combined),
+  })
 }
 
 function formatWeight(weight: number): string {
@@ -34,6 +46,11 @@ function formatWeight(weight: number): string {
 
 function usageFinanceAmount(event: UsageEvent): number {
   return event.finance_snapshot?.amount ?? 0
+}
+
+function formatUsageEventMoney(event: UsageEvent): string {
+  const currency = event.finance_snapshot?.currency
+  return currency ? formatMoney(usageFinanceAmount(event), currency) : '-'
 }
 
 function usageTokens(event: UsageEvent): number {
@@ -79,18 +96,26 @@ function usageProviderDisplayName(event: UsageEvent, providerNames: Map<string, 
   return providerNames.get(identifier) ?? identifier
 }
 
-function formatUsd(amount: number): string {
-  if (amount === 0) return '$0.0'
+function formatMoney(amount: number, currency: string): string {
   const abs = Math.abs(amount)
-  if (abs < 0.0001) return amount < 0 ? '-$<0.0001' : '$<0.0001'
-  if (abs < 0.01) return `$${amount.toFixed(4)}`
-  return `$${amount.toFixed(2)}`
+  const digits = abs > 0 && abs < 0.01 ? 4 : 2
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency, currencyDisplay: 'code', maximumFractionDigits: digits }).format(amount)
+  } catch {
+    return `${amount.toFixed(digits)} ${currency}`
+  }
 }
 
-function formatLocalTime(value: string): string {
+function formatFinanceTotals(totals: UsageSummary['finance_totals'], expanded = false): string {
+  if (totals.length === 0) return '-'
+  const visible = expanded ? totals : totals.slice(0, 1)
+  return visible.map((money) => formatMoney(money.amount, money.currency)).join('\n')
+}
+
+function formatLocalTime(value: string, locale: string): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString(undefined, {
+  return date.toLocaleString(locale, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -116,10 +141,10 @@ function localDayStart(value = new Date()): Date {
   return result
 }
 
-function localTrailingDaysRange(days: number): UsageTimeRange {
-  const start = localDayStart()
+function localTrailingDaysRange(days: number, nowMs: number): UsageTimeRange {
+  const start = localDayStart(new Date(nowMs))
   start.setDate(start.getDate() - Math.max(0, days - 1))
-  return { startTimeMs: start.getTime(), endTimeMs: Date.now() }
+  return { startTimeMs: start.getTime(), endTimeMs: nowMs }
 }
 
 function timeRangeToQuery(
@@ -129,7 +154,7 @@ function timeRangeToQuery(
   nowMs: number,
 ): UsageTimeRange {
   if (value === 'custom') {
-    const start = dateInputStart(customStartDate) ?? localTrailingDaysRange(30).startTimeMs
+    const start = dateInputStart(customStartDate) ?? localTrailingDaysRange(30, nowMs).startTimeMs
     const end = dateInputEnd(customEndDate) ?? nowMs
     return { startTimeMs: start, endTimeMs: end }
   }
@@ -143,7 +168,7 @@ function timeRangeToQuery(
   if (duration != null) {
     return { startTimeMs: nowMs - duration, endTimeMs: nowMs }
   }
-  return localTrailingDaysRange(30)
+  return { startTimeMs: 0, endTimeMs: nowMs }
 }
 
 function uniqueSorted(values: Array<string | undefined>): string[] {
@@ -157,6 +182,11 @@ type MultiFilter = {
   query: string
   selected: string[]
 }
+type FilterText = {
+  provider: string
+  model: string
+  app: string
+}
 type KpiCard = {
   icon: ReactNode
   title: string
@@ -168,9 +198,16 @@ type KpiCard = {
 const PAGE_SIZE = 10
 const HOME_USAGE_LIMIT = 5
 const EMPTY_MULTI_FILTER: MultiFilter = { query: '', selected: [] }
+const EMPTY_FILTER_TEXT: FilterText = { provider: '', model: '', app: '' }
+// Free-text filters are debounced before they reach the usage query so typing does not issue an RPC per keystroke.
+const FILTER_TEXT_DEBOUNCE_MS = 250
 
-export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
-  const { t } = useI18n()
+function sameFilterText(left: FilterText, right: FilterText): boolean {
+  return left.provider === right.provider && left.model === right.model && left.app === right.app
+}
+
+export function UsageDashboard({ mode = 'home', onSetQuota }: { mode?: 'home' | 'usage'; onSetQuota?: (draft: Partial<QuotaRuleDraft>) => void }) {
+  const { t, locale } = useI18n()
   const store = useAICCStore()
   const status = useAIStatus()
   const providers = useProviders()
@@ -183,8 +220,12 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
   const [appAgentFilter, setAppAgentFilter] = useState<MultiFilter>(EMPTY_MULTI_FILTER)
   const [customStartDate, setCustomStartDate] = useState('')
   const [customEndDate, setCustomEndDate] = useState('')
+  // Free-text portion of the filters as last committed to the query (see useDebouncedEffect below).
+  const [committedFilterText, setCommittedFilterText] = useState<FilterText>(EMPTY_FILTER_TEXT)
   const [detailPage, setDetailPage] = useState(1)
-  const [nowMs] = useState(() => Date.now())
+  // Upper bound of the query window; refreshed whenever a new query series starts (filter change, retry)
+  // and kept stable while paging through that series.
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const [pageCursors, setPageCursors] = useState<Record<number, string | undefined>>({ 1: undefined })
   const [usagePage, setUsagePage] = useState<UsageEventsPage>({ events: [], totalRequests: 0 })
   const [usageLoading, setUsageLoading] = useState(false)
@@ -198,12 +239,23 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
   const [filtersSheetOpen, setFiltersSheetOpen] = useState(false)
   const [usageTab, setUsageTab] = useState<'usage' | 'trace'>('usage')
   const [homeBreakdownKey, setHomeBreakdownKey] = useState<HomeBreakdownKey>('provider')
+  const [costExpanded, setCostExpanded] = useState(false)
   const detailRef = useRef<HTMLElement | null>(null)
   const linkedTraceRef = useRef<HTMLElement | null>(null)
   const isUsagePage = mode === 'usage'
   const pageLimit = isUsagePage ? PAGE_SIZE : HOME_USAGE_LIMIT
+  const hasMultipleCurrencies = summary.finance_totals.length > 1
+  const costValue = formatFinanceTotals(summary.finance_totals, costExpanded)
+  const currencyInteraction = hasMultipleCurrencies
+    ? costExpanded
+      ? t('aiCenter.home.collapseCurrenciesHint', 'Click to collapse currencies')
+      : t('aiCenter.home.expandCurrenciesHint', '{{count}} currencies · click to expand', { count: summary.finance_totals.length })
+    : t('aiCenter.home.costEstimated', 'Estimated from usage events')
+  const costSubtitle = summary.finance_complete
+    ? currencyInteraction
+    : `${currencyInteraction} · ${t('aiCenter.home.partialFinance', 'Partial financial total')}`
 
-  const snProvider = providers.find((p) => p.config.provider_type === 'sn_router')
+  const snProvider = providers.find((p) => p.config.provider_profile_id === 'sn')
   const snCredit = snProvider?.account.balance_value
   const balanceProviders = providers.filter((p) => p.account.balance_supported && p.account.balance_value != null)
   const usageOnlyProviders = providers.filter((p) => p.account.usage_supported && !p.account.balance_supported)
@@ -228,12 +280,12 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
   )
   const usageQueryFilters = useMemo(() => ({
     providerInstanceNames: providerFilter.selected,
-    providerInstanceQuery: providerFilter.query,
+    providerInstanceQuery: committedFilterText.provider,
     providerModels: modelFilter.selected,
-    providerModelQuery: modelFilter.query,
+    providerModelQuery: committedFilterText.model,
     appIds: appAgentFilter.selected,
-    appQuery: appAgentFilter.query,
-  }), [appAgentFilter, modelFilter, providerFilter])
+    appQuery: committedFilterText.app,
+  }), [appAgentFilter.selected, committedFilterText, modelFilter.selected, providerFilter.selected])
   const currentCursor = pageCursors[detailPage]
   const effectiveDetailPage = detailPage
   const pageStart = (effectiveDetailPage - 1) * pageLimit
@@ -306,33 +358,55 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
     setDetailPage(1)
     setPageCursors({ 1: undefined })
     setUsageError(null)
+    setNowMs(Date.now())
   }
+
+  const retryUsagePage = () => {
+    setUsageError(null)
+    setNowMs(Date.now())
+    setUsageRetryKey((value) => value + 1)
+  }
+
+  useDebouncedEffect(
+    `${providerFilter.query}\u0000${modelFilter.query}\u0000${appAgentFilter.query}`,
+    FILTER_TEXT_DEBOUNCE_MS,
+    () => {
+      const next: FilterText = { provider: providerFilter.query, model: modelFilter.query, app: appAgentFilter.query }
+      if (sameFilterText(next, committedFilterText)) return
+      setCommittedFilterText(next)
+      resetUsagePaging()
+    },
+  )
 
   const updateTimeRange = (value: TimeRangeFilter) => {
     setTimeRange(value)
     resetUsagePaging()
   }
 
+  // Selection changes hit the query immediately; free-text changes are committed by the debounce above.
   const updateProviderFilter = (value: MultiFilter) => {
     setProviderFilter(value)
-    resetUsagePaging()
+    if (value.selected !== providerFilter.selected) resetUsagePaging()
   }
 
   const updateModelFilter = (value: MultiFilter) => {
     setModelFilter(value)
-    resetUsagePaging()
+    if (value.selected !== modelFilter.selected) resetUsagePaging()
   }
 
   const updateAppAgentFilter = (value: MultiFilter) => {
     setAppAgentFilter(value)
-    resetUsagePaging()
+    if (value.selected !== appAgentFilter.selected) resetUsagePaging()
   }
 
   const balanceSubtitle = balanceProviders
     .map((p) => {
-      const unit = p.account.balance_unit === 'usd' ? '$' : ''
-      const suffix = p.account.balance_unit === 'credit' ? ' Credit' : ''
-      return `${p.config.provider_instance_name}: ${unit}${p.account.balance_value}${suffix}`
+      const amount = p.account.balance_unit === 'usd'
+        ? `$${p.account.balance_value}`
+        : p.account.balance_unit === 'credit'
+          ? t('aiCenter.home.creditAmount', '{{amount}} Credit', { amount: String(p.account.balance_value) })
+          : String(p.account.balance_value)
+      return `${p.config.provider_instance_name}: ${amount}`
     })
     .join(' · ')
 
@@ -355,6 +429,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
     setProviderFilter(target === 'provider' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
     setModelFilter(target === 'model' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
     setAppAgentFilter(target === 'appAgent' ? { query: '', selected: [value] } : EMPTY_MULTI_FILTER)
+    setCommittedFilterText(EMPTY_FILTER_TEXT)
     resetUsagePaging()
     window.requestAnimationFrame(() => {
       detailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -387,6 +462,11 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
     },
   ]
   const activeHomeBreakdown = homeBreakdowns.find((item) => item.key === homeBreakdownKey) ?? homeBreakdowns[0]
+  const setQuotaFor = (key: HomeBreakdownKey, label: string) => {
+    if (key === 'provider') onSetQuota?.({ resource: { type: 'provider', provider_instance_name: label } })
+    if (key === 'model') onSetQuota?.({ resource: { type: 'model', exact_model: label } })
+    if (key === 'appAgent') onSetQuota?.({ object: { type: 'user_app', user_id: '', app_id: label } })
+  }
   const selectHomeBreakdown = (key: HomeBreakdownKey, label: string) => {
     if (key === 'provider') applyBreakdownFilter('provider', label)
     if (key === 'model') applyBreakdownFilter('model', label)
@@ -431,22 +511,25 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
               icon: <Activity size={18} />,
               title: t('aiCenter.home.status', 'AI Status'),
               value: status.state === 'disabled' ? t('aiCenter.home.disabled', 'Disabled') : t('aiCenter.home.enabled', 'Enabled'),
-              subtitle: `${status.provider_count} Provider instances / ${status.model_count} Models / ${status.health_counts.degraded} degraded`,
+              subtitle: t('aiCenter.home.statusSummary', '{{providers}} Provider instances / {{models}} Models / {{degraded}} degraded', { providers: status.provider_count, models: status.model_count, degraded: status.health_counts.degraded }),
               tone: status.health_counts.degraded > 0 || status.health_counts.unavailable > 0 || status.quota_warnings > 0 ? 'warning' : 'ok',
             },
             {
               icon: <CreditCard size={18} />,
               title: t('aiCenter.home.credit', 'SN Credit'),
-              value: snCredit != null ? `${snCredit} Credit` : '-',
-              subtitle: snProvider ? `${snProvider.account.pricing_mode} / top up available` : undefined,
+              value: snCredit != null ? t('aiCenter.home.creditAmount', '{{amount}} Credit', { amount: snCredit }) : t('aiCenter.home.unavailable', 'Not available'),
+              subtitle: snProvider
+                ? t('aiCenter.home.snBalanceUnavailable', 'SN Router does not expose a balance query.')
+                : undefined,
               tone: 'accent',
             },
             {
               icon: <DollarSign size={18} />,
               title: t('aiCenter.home.estimatedCost', 'Est. Cost'),
-              value: formatUsd(summary.total_estimated_cost),
-              subtitle: t('aiCenter.home.costEstimated', 'Estimated from usage events'),
-              tone: summary.total_estimated_cost > 0 ? 'warning' : 'default',
+              value: costValue,
+              subtitle: costSubtitle,
+              onClick: hasMultipleCurrencies ? () => setCostExpanded((value) => !value) : undefined,
+              tone: summary.finance_totals.some((money) => money.amount > 0) ? 'warning' : 'default',
             },
             {
               icon: <Wallet size={18} />,
@@ -464,18 +547,18 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
           icon={<Activity size={18} />}
           title={t('aiCenter.home.status', 'AI Status')}
           value={status.state === 'disabled' ? t('aiCenter.home.disabled', 'Disabled') : t('aiCenter.home.enabled', 'Enabled')}
-          subtitle={`${status.provider_count} Provider instances · ${status.model_count} Models · ${status.health_counts.degraded} degraded`}
+          subtitle={t('aiCenter.home.statusSummary', '{{providers}} Provider instances / {{models}} Models / {{degraded}} degraded', { providers: status.provider_count, models: status.model_count, degraded: status.health_counts.degraded })}
         />
         <SummaryCard
           icon={<CreditCard size={18} />}
           title={t('aiCenter.home.credit', 'SN Credit')}
-          value={snCredit != null ? `${snCredit} Credit` : '—'}
-          subtitle={snProvider ? `${snProvider.account.pricing_mode} · top up available` : undefined}
+          value={snCredit != null ? t('aiCenter.home.creditAmount', '{{amount}} Credit', { amount: snCredit }) : t('aiCenter.home.unavailable', 'Not available')}
+          subtitle={snProvider ? t('aiCenter.home.snBalanceUnavailable', 'SN Router does not expose a balance query.') : undefined}
         />
         <SummaryCard
           icon={<DollarSign size={18} />}
           title={t('aiCenter.home.estimatedCost', 'Est. Cost')}
-          value={formatUsd(summary.total_estimated_cost)}
+          value={costValue}
           subtitle={t('aiCenter.home.costEstimated', 'Estimated from usage events')}
         />
         <SummaryCard
@@ -501,7 +584,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
               <div key={point.timestamp} className="flex-1 flex flex-col items-center gap-1 min-w-0">
                 <div
                   className="w-full rounded-t-sm"
-                  title={`${point.timestamp}: ${formatTokens(point.tokens)} tokens / $${point.estimated_cost.toFixed(4)}`}
+                  title={t('aiCenter.home.trendPointTitle', '{{time}}: {{tokens}} tokens / {{cost}}', { time: point.timestamp, tokens: formatTokens(point.tokens), cost: formatFinanceTotals(point.finance_totals, true) })}
                   style={{
                     height: `${Math.max(4, (point.tokens / maxTrendTokens) * (isMobile ? 132 : 180))}px`,
                     background: point.tokens > 0 ? 'var(--cp-accent)' : 'var(--cp-border)',
@@ -521,10 +604,10 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
             {t('aiCenter.home.usageSummary', 'Usage Summary')}
           </h3>
           <div className="grid grid-cols-2 gap-4 items-stretch">
-            <Stat label={t('aiCenter.home.today', 'Today')} value={`${formatTokens(summary.today_tokens)} tokens`} />
-            <Stat label={t('aiCenter.home.thisMonth', 'This Month')} value={`${formatTokens(summary.this_month_tokens)} tokens`} />
-            <Stat label={t('aiCenter.home.total', 'Total')} value={`${formatTokens(summary.total_tokens)} tokens`} />
-            <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={formatUsd(summary.total_estimated_cost)} />
+            <Stat label={t('aiCenter.home.today', 'Today')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.today_tokens) })} />
+            <Stat label={t('aiCenter.home.thisMonth', 'This Month')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.this_month_tokens) })} />
+            <Stat label={t('aiCenter.home.total', 'Total')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.total_tokens) })} />
+            <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={formatFinanceTotals(summary.finance_totals)} />
           </div>
         </section>
       </div>}
@@ -534,11 +617,11 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
           {t('aiCenter.home.usageSummary', 'Usage Summary')}
         </h3>
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4 items-stretch">
-          <Stat label={t('aiCenter.home.today', 'Today')} value={`${formatTokens(summary.today_tokens)} tokens`} />
-          <Stat label={t('aiCenter.home.thisMonth', 'This Month')} value={`${formatTokens(summary.this_month_tokens)} tokens`} />
-          <Stat label={t('aiCenter.home.total', 'Total')} value={`${formatTokens(summary.total_tokens)} tokens`} />
+          <Stat label={t('aiCenter.home.today', 'Today')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.today_tokens) })} />
+          <Stat label={t('aiCenter.home.thisMonth', 'This Month')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.this_month_tokens) })} />
+          <Stat label={t('aiCenter.home.total', 'Total')} value={t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(summary.total_tokens) })} />
           <Stat label={t('aiCenter.home.requests', 'Requests')} value={summary.total_requests.toString()} />
-          <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={formatUsd(summary.total_estimated_cost)} />
+          <Stat label={t('aiCenter.home.totalCost', 'Total Est. Cost')} value={formatFinanceTotals(summary.finance_totals)} />
         </div>
       </section>}
 
@@ -573,6 +656,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
                 total={summary.total_tokens}
                 activeLabel={item.activeLabel}
                 onSelect={item.key === 'apiType' ? undefined : (label) => selectHomeBreakdown(item.key, label)}
+                onSetQuota={item.key === 'apiType' || !onSetQuota ? undefined : (label) => setQuotaFor(item.key, label)}
                 viewAllLabel={t('aiCenter.home.viewAll', 'View all')}
                 showLessLabel={t('aiCenter.home.showLess', 'Show less')}
                 filterLabel={t('aiCenter.home.filterToDetail', 'Filter Usage Detail')}
@@ -587,6 +671,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
               total={summary.total_tokens}
               activeLabel={activeHomeBreakdown.activeLabel}
               onSelect={activeHomeBreakdown.key === 'apiType' ? undefined : (label) => selectHomeBreakdown(activeHomeBreakdown.key, label)}
+              onSetQuota={activeHomeBreakdown.key === 'apiType' || !onSetQuota ? undefined : (label) => setQuotaFor(activeHomeBreakdown.key, label)}
               viewAllLabel={t('aiCenter.home.viewAll', 'View all')}
               showLessLabel={t('aiCenter.home.showLess', 'Show less')}
               filterLabel={t('aiCenter.home.filterToDetail', 'Filter Usage Detail')}
@@ -725,11 +810,21 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
             </colgroup>
             <thead className="sticky top-0 z-10">
               <tr style={{ background: 'var(--cp-bg)', boxShadow: '0 1px 0 var(--cp-border)' }}>
-                {['Time', 'Provider', 'Exact Model', 'API Type', 'App / Agent', 'Task / Session', 'Tokens', 'Cost', 'Status'].map((h) => (
-                  <th key={h} className="text-left text-xs font-medium px-4 py-2" style={{ color: 'var(--cp-muted)' }}>
+                {([
+                  ['time', t('aiCenter.home.colTime', 'Time')],
+                  ['provider', t('aiCenter.home.colProvider', 'Provider')],
+                  ['model', t('aiCenter.home.colExactModel', 'Exact Model')],
+                  ['apiType', t('aiCenter.home.colApiType', 'API Type')],
+                  ['appAgent', t('aiCenter.home.colAppAgent', 'App / Agent')],
+                  ['taskSession', t('aiCenter.home.taskSession', 'Task / Session')],
+                  ['tokens', t('aiCenter.home.colTokens', 'Tokens')],
+                  ['cost', t('aiCenter.home.colCost', 'Cost')],
+                  ['status', t('aiCenter.home.colStatus', 'Status')],
+                ] as Array<[string, string]>).map(([key, h]) => (
+                  <th key={key} className="text-left text-xs font-medium px-4 py-2" style={{ color: 'var(--cp-muted)' }}>
                     <span className="inline-flex items-center gap-1">
                       {h}
-                      {h === 'Task / Session' && (
+                      {key === 'taskSession' && (
                         <span
                           className="inline-flex"
                           title={t('aiCenter.home.taskSessionTooltip', 'Task / Session is the AICC task id or Agent session id that produced this usage event.')}
@@ -749,7 +844,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
                 const providerDisplayName = usageProviderDisplayName(event, providerNames)
                 return (
                   <tr key={event.id} style={{ borderTop: '1px solid var(--cp-border)' }}>
-                    <td className="px-4 py-2 text-xs whitespace-nowrap" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp)}</td>
+                    <td className="px-4 py-2 text-xs whitespace-nowrap" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp, locale)}</td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>
                       <CopyableText
                         value={providerDisplayName}
@@ -779,8 +874,8 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
                       )}
                     </td>
                     <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>{formatTokens(tokens)}</td>
-                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>{formatUsd(usageFinanceAmount(event))}</td>
-                    <td className="px-4 py-2 text-xs" style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>{event.status}</td>
+                    <td className="px-4 py-2 text-xs" style={{ color: 'var(--cp-text)' }}>{formatUsageEventMoney(event)}</td>
+                    <td className="px-4 py-2 text-xs" style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>{usageStatusLabel(event.status, t)}</td>
                   </tr>
                 )
               })}
@@ -827,10 +922,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
             onLoadMore={() => {
               if (hasUsageMore) setDetailPage((page) => page + 1)
             }}
-            onRetry={() => {
-              setUsageError(null)
-              setUsageRetryKey((value) => value + 1)
-            }}
+            onRetry={retryUsagePage}
             onPreviousPage={() => setDetailPage((page) => Math.max(1, page - 1))}
             onNextPage={() => setDetailPage((page) => Math.min(detailPageCount, page + 1))}
             canGoPrevious={effectiveDetailPage > 1}
@@ -842,7 +934,7 @@ export function UsageDashboard({ mode = 'home' }: { mode?: 'home' | 'usage' }) {
               previous: t('common.previous', 'Previous'),
               next: t('common.next', 'Next'),
               page: t('aiCenter.home.pageNumber', 'Page {{page}}'),
-              loading: t('common.loading', 'Loading'),
+              loading: t('common.loading', 'Loading...'),
               loadMore: t('common.loadMore', 'Load more'),
               retry: t('common.retry', 'Retry'),
               error: t('aiCenter.home.usageLoadFailed', 'Could not load usage events.'),
@@ -1062,7 +1154,7 @@ function UsageEventCard({
   providerNames: Map<string, string>
   onOpenTrace: (taskId: string) => void
 }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [copied, setCopied] = useState(false)
   const tokens = usageTokens(event)
   const providerIdentifier = readableUsageProviderIdentifier(event)
@@ -1072,8 +1164,8 @@ function UsageEventCard({
     `provider: ${providerDisplayName}`,
     `model: ${event.exact_model}`,
     `tokens: ${formatTokens(tokens)}`,
-    `cost: ${formatUsd(usageFinanceAmount(event))}`,
-    `time: ${formatLocalTime(event.timestamp)}`,
+    `cost: ${formatUsageEventMoney(event)}`,
+    `time: ${formatLocalTime(event.timestamp, locale)}`,
     `status: ${event.status}`,
     event.session_id ? `task/session: ${event.session_id}` : '',
   ].filter(Boolean).join('\n')
@@ -1105,14 +1197,14 @@ function UsageEventCard({
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp)}</div>
+          <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp, locale)}</div>
           <div className="mt-1 text-sm font-medium" style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>
-            {event.status}
+            {usageStatusLabel(event.status, t)}
           </div>
         </div>
         <div className="text-right">
-          <div className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{formatUsd(usageFinanceAmount(event))}</div>
-          <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{formatTokens(tokens)} tokens</div>
+          <div className="text-base font-semibold" style={{ color: 'var(--cp-text)' }}>{formatUsageEventMoney(event)}</div>
+          <div className="text-xs" style={{ color: 'var(--cp-muted)' }}>{t('aiCenter.home.tokenCount', '{{count}} tokens', { count: formatTokens(tokens) })}</div>
         </div>
       </div>
       <div className="mt-3 grid grid-cols-1 gap-2 text-xs">
@@ -1161,15 +1253,16 @@ function RecentUsageRow({
   event: UsageEvent
   providerNames: Map<string, string>
 }) {
+  const { t, locale } = useI18n()
   const tokens = usageTokens(event)
   const providerDisplayName = usageProviderDisplayName(event, providerNames)
   return (
     <div className="grid grid-cols-1 gap-2 rounded-lg px-3 py-2 text-xs md:grid-cols-[108px_minmax(120px,0.8fr)_minmax(180px,1.2fr)_80px_80px]" style={{ background: 'var(--cp-bg)' }}>
-      <span style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp)}</span>
+      <span style={{ color: 'var(--cp-muted)' }}>{formatLocalTime(event.timestamp, locale)}</span>
       <span className="truncate" title={providerDisplayName} style={{ color: 'var(--cp-text)' }}>{providerDisplayName}</span>
       <span className="truncate font-mono" title={event.exact_model} style={{ color: 'var(--cp-text)' }}>{event.exact_model}</span>
       <span style={{ color: 'var(--cp-muted)' }}>{formatTokens(tokens)}</span>
-      <span style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>{event.status}</span>
+      <span style={{ color: event.status === 'success' ? 'var(--cp-success)' : 'var(--cp-danger)' }}>{usageStatusLabel(event.status, t)}</span>
     </div>
   )
 }
@@ -1228,7 +1321,7 @@ function RecentTraceCard({ trace }: { trace: RouteTrace }) {
       <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_minmax(260px,1.2fr)]">
         <div className="min-w-0">
           <div className="truncate text-xs" style={{ color: 'var(--cp-muted)' }}>
-            {trace.requested_model}{' -> '}{trace.selected_exact_model ?? t('aiCenter.home.noExactResolved', 'unresolved')}
+            {trace.requested_model}{' -> '}{trace.selected_exact_model ?? t('aiCenter.home.unresolved', 'unresolved')}
           </div>
           <div className="mt-1 text-sm" style={{ color: 'var(--cp-text)' }}>
             {trace.user_summary?.reason_short}
@@ -1288,12 +1381,13 @@ function RecentTraceCandidate({
   candidate: RouteTrace['ranked_candidates'][number]
   selected: boolean
 }) {
+  const { t } = useI18n()
   return (
     <div className="flex justify-between gap-3 text-xs">
       <span className="min-w-0" style={{ color: selected ? 'var(--cp-accent)' : 'var(--cp-muted)' }}>
         <span className="block truncate">{candidate.exact_model}</span>
         <span className="block" style={{ color: 'var(--cp-muted)' }}>
-          {candidateWeightSummary(candidate)}
+          {candidateWeightSummary(candidate, t)}
         </span>
       </span>
       <span className="shrink-0" style={{ color: 'var(--cp-muted)' }}>{candidate.final_score?.toFixed(2)}</span>
@@ -1518,7 +1612,7 @@ function MultiSelectFilter({
         <input
           value={value.query}
           onChange={(event) => onChange({ ...value, query: event.target.value })}
-          placeholder={selectedCount > 0 ? `${selectedCount} selected` : allLabel}
+          placeholder={selectedCount > 0 ? t('aiCenter.home.selectedCount', '{{count}} selected', { count: selectedCount }) : allLabel}
           className="h-full min-w-0 flex-1 rounded-l-md bg-transparent px-2 text-xs outline-none"
           style={{ color: 'var(--cp-text)' }}
         />
@@ -1527,7 +1621,7 @@ function MultiSelectFilter({
           onClick={() => setOpen((current) => !current)}
           className="flex h-full w-8 shrink-0 items-center justify-center rounded-r-md"
           style={{ color: selectedCount > 0 ? 'var(--cp-accent)' : 'var(--cp-muted)', borderLeft: '1px solid var(--cp-border)' }}
-          aria-label={`${label} options`}
+          aria-label={t('aiCenter.home.filterOptions', '{{label}} options', { label })}
         >
           <ChevronDown size={14} />
         </button>
@@ -1645,6 +1739,7 @@ function Breakdown({
   total,
   activeLabel,
   onSelect,
+  onSetQuota,
   viewAllLabel,
   showLessLabel,
   filterLabel,
@@ -1655,11 +1750,13 @@ function Breakdown({
   total: number
   activeLabel?: string
   onSelect?: (label: string) => void
+  onSetQuota?: (label: string) => void
   viewAllLabel: string
   showLessLabel: string
   filterLabel: string
   emptyLabel: string
 }) {
+  const { t } = useI18n()
   const [expanded, setExpanded] = useState(false)
   const hiddenCount = Math.max(0, rows.length - 4)
   const visibleRows = expanded ? rows : rows.slice(0, 4)
@@ -1676,15 +1773,31 @@ function Breakdown({
       </div>
       <div className={`flex flex-col gap-1 ${expanded ? 'max-h-80 overflow-y-auto pr-1' : ''}`}>
         {visibleRows.map(([label, value]) => (
-          <MeterRow
-            key={label}
-            label={label}
-            value={value}
-            max={total}
-            active={activeLabel === label}
-            actionLabel={filterLabel}
-            onClick={onSelect ? () => onSelect(label) : undefined}
-          />
+          <div key={label} className="flex min-w-0 items-center gap-1">
+            <div className="min-w-0 flex-1">
+              <MeterRow
+                label={label}
+                value={value}
+                max={total}
+                active={activeLabel === label}
+                actionLabel={filterLabel}
+                onClick={onSelect ? () => onSelect(label) : undefined}
+              />
+            </div>
+            {onSetQuota && (
+              <button
+                type="button"
+                data-testid="usage-set-quota"
+                onClick={() => onSetQuota(label)}
+                title={`${t('aiCenter.quota.setQuota', 'Set quota')}: ${label}`}
+                aria-label={`${t('aiCenter.quota.setQuota', 'Set quota')}: ${label}`}
+                className="shrink-0 rounded-md p-2 outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--cp-accent)]"
+                style={{ color: 'var(--cp-muted)' }}
+              >
+                <Gauge size={14} />
+              </button>
+            )}
+          </div>
         ))}
         {rows.length === 0 && (
           <div className="rounded-md px-2 py-6 text-center text-xs" style={{ color: 'var(--cp-muted)', background: 'var(--cp-bg)' }}>

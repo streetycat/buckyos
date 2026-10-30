@@ -12,7 +12,7 @@ import type {
 
 /* ── Entities ── */
 
-export const mockEntities: Entity[] = [
+const seedEntities: Entity[] = [
   {
     id: 'agent-coder',
     type: 'agent',
@@ -373,14 +373,13 @@ export const mockEntities: Entity[] = [
 
 /* ── Sessions ── */
 
-export const mockSessions: Record<string, Session[]> = {
+const seedSessions: Record<string, Pick<Session, 'id' | 'entityId' | 'title' | 'type' | 'source' | 'lastActiveAt' | 'unreadCount' | 'panel'>[]> = {
   'agent-coder': [
     {
       id: 'session-coder-1',
       entityId: 'agent-coder',
       title: 'Auth Module Refactor',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 2 * 60_000,
       unreadCount: 3,
     },
@@ -389,8 +388,7 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'agent-coder',
       title: 'API Documentation',
       type: 'chat',
-      isActive: false,
-      lastActiveAt: Date.now() - 3600_000,
+      lastActiveAt: Date.now() - 4 * 3600_000,
       unreadCount: 0,
     },
     {
@@ -399,8 +397,31 @@ export const mockSessions: Record<string, Session[]> = {
       title: 'Bug Investigation #142',
       type: 'task',
       source: 'linear',
-      isActive: false,
       lastActiveAt: Date.now() - 2 * 3600_000,
+      unreadCount: 0,
+    },
+    {
+      id: 'session-coder-task',
+      entityId: 'agent-coder',
+      title: 'Release Checklist',
+      type: 'chat',
+      lastActiveAt: Date.now() - 3 * 60_000,
+      unreadCount: 0,
+    },
+    {
+      id: 'session-coder-ask',
+      entityId: 'agent-coder',
+      title: 'Docs Cleanup',
+      type: 'chat',
+      lastActiveAt: Date.now() - 6 * 60_000,
+      unreadCount: 1,
+    },
+    {
+      id: 'session-coder-qa',
+      entityId: 'agent-coder',
+      title: 'Release Notes',
+      type: 'chat',
+      lastActiveAt: Date.now() - 3 * 3600_000,
       unreadCount: 0,
     },
   ],
@@ -410,7 +431,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'person-alice',
       title: 'Direct Message',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 15 * 60_000,
       unreadCount: 1,
     },
@@ -421,7 +441,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'group-team',
       title: 'General',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 30 * 60_000,
       unreadCount: 8,
     },
@@ -432,7 +451,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'group-team-design',
       title: 'Design Discussion',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 45 * 60_000,
       unreadCount: 2,
     },
@@ -443,7 +461,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'group-team-backend',
       title: 'Backend Sync',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 2 * 3600_000,
       unreadCount: 0,
     },
@@ -454,9 +471,17 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'service-release-hub',
       title: 'Release Overview',
       type: 'workspace',
-      isActive: true,
       lastActiveAt: Date.now() - 22 * 60_000,
       unreadCount: 4,
+      panel: {
+        title: 'Ticket #1042 · Release 2.4 rollout',
+        text: 'Staged rollout is paused at 25% while the sync regression is verified on the canary zone. Resume needs sign-off from QA and the release owner.',
+        fields: [
+          { label: 'Status', value: 'In review', tone: 'warning' },
+          { label: 'Owner', value: 'Alice Chen' },
+          { label: 'Due', value: 'Fri 18:00' },
+        ],
+      },
     },
   ],
   'release-war-room': [
@@ -465,7 +490,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-war-room',
       title: 'War Room',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 12 * 60_000,
       unreadCount: 2,
     },
@@ -476,7 +500,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-design-signoff',
       title: 'Design Sign-off',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 35 * 60_000,
       unreadCount: 1,
     },
@@ -487,7 +510,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-customer-watch',
       title: 'Customer Watch',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 95 * 60_000,
       unreadCount: 0,
     },
@@ -498,7 +520,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-build-bot',
       title: 'Build Bot',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 22 * 60_000,
       unreadCount: 0,
     },
@@ -509,7 +530,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-qa-bot',
       title: 'QA Sentinel',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 8 * 60_000,
       unreadCount: 1,
     },
@@ -520,7 +540,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'release-deploy-gate',
       title: 'Deploy Gate',
       type: 'workspace',
-      isActive: true,
       lastActiveAt: Date.now() - 18 * 60_000,
       unreadCount: 0,
     },
@@ -531,7 +550,6 @@ export const mockSessions: Record<string, Session[]> = {
       entityId: 'person-bob',
       title: 'Direct Message',
       type: 'chat',
-      isActive: true,
       lastActiveAt: Date.now() - 3600_000,
       unreadCount: 0,
     },
@@ -559,6 +577,7 @@ const participantDids = {
 } as const
 
 export function getMockEntityDid(entityId: string) {
+  if (entityId.startsWith('did:')) return entityId
   return mockEntityDids[entityId] ?? `did:buckyos:entity:${entityId}`
 }
 
@@ -574,7 +593,7 @@ export function createOutgoingMockMessage({
   createdAtMs?: number
 }): MessageObject {
   return createChatMessage({
-    id: `msg-local-${createdAtMs}`,
+    id: `msg-local-${crypto.randomUUID()}`,
     from: MOCK_SELF_DID,
     to: [getMockEntityDid(entityId)],
     senderName: 'You',
@@ -585,7 +604,91 @@ export function createOutgoingMockMessage({
   })
 }
 
-const mockMessageSeeds: Record<string, readonly MessageObject[]> = {
+/** Task ids the seeded Agent replies of `session-coder-task` carry in `agent_task` (served by `mock/tasks.ts`). */
+export const MOCK_AGENT_TASKS = {
+  done: 'task-turn-report',
+  fast: 'task-turn-clock',
+  failed: 'task-turn-deploy',
+  foreign: 'task-turn-foreign',
+  running: 'task-turn-checklist',
+  /** Waits for the answer to a question (`session-coder-ask`). */
+  asking: 'task-turn-docs',
+  /** Asked two questions, then replied (`session-coder-qa`). */
+  answered: 'task-turn-notes',
+  /** Only ever carried by an edit, so it must never be read. */
+  hijack: 'task-turn-hijack',
+} as const
+
+/**
+ * Agent replies as an Agent Turn sends them: a placeholder carrying
+ * `agent_task`, replaced by one final `edit` when the Turn ends; a quick Turn
+ * sends a single ordinary reply that carries `agent_task`.
+ */
+function agentTaskSeeds(sessionId: string): MessageObject[] {
+  const you = (id: string, content: string, minutesAgo: number) => createChatMessage({ id, from: participantDids.you, to: [participantDids.codeAssistant], senderName: 'You', content, createdAtMs: Date.now() - minutesAgo * 60_000, deliveryStatus: 'read', sessionId })
+  const agent = (id: string, content: MsgContent, minutesAgo: number, extra: Partial<MessageObject>): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: Date.now() - minutesAgo * 60_000, sessionId, contentOverride: content }), ...extra })
+  const placeholder: MsgContent = { format: 'text/plain', content: 'Got it, working on it…' }
+  return [
+    you('msg-ct-1', 'Summarize yesterday\'s build failures.', 50),
+    agent('msg-ct-2', placeholder, 49, { agent_task: { task_id: MOCK_AGENT_TASKS.done } }),
+    agent('msg-ct-2-final', {
+      format: 'text/markdown',
+      content: '## Build failures\n\n- **3 failures** yesterday, 2 of them flaky\n- The real regression is in `relations.ts`\n\nThe full report is attached.',
+      refs: [{ role: 'output', label: 'design-brief.pdf', target: { type: 'data_obj', obj_id: 'cyfile:mock-doc-brief', uri_hint: 'cyfs://cyfile:mock-doc-brief' } }],
+    }, 45, { relates_to: { rel: 'edit', target: 'msg-ct-2' }, agent_task: { task_id: MOCK_AGENT_TASKS.hijack } }),
+    you('msg-ct-3', 'What time is it in UTC?', 40),
+    agent('msg-ct-4', { format: 'text/plain', content: 'It is 09:41 UTC.' }, 40, { agent_task: { task_id: MOCK_AGENT_TASKS.fast } }),
+    you('msg-ct-5', 'Deploy the docs preview.', 35),
+    agent('msg-ct-6', placeholder, 34, { agent_task: { task_id: MOCK_AGENT_TASKS.failed } }),
+    agent('msg-ct-6-final', { format: 'text/plain', content: 'The deployment failed: the preview bucket is over quota.' }, 30, { relates_to: { rel: 'edit', target: 'msg-ct-6' } }),
+    you('msg-ct-7', 'Who approved that deploy?', 21),
+    agent('msg-ct-8', { format: 'text/plain', content: 'It was approved in another workspace.' }, 20, { agent_task: { task_id: MOCK_AGENT_TASKS.foreign } }),
+    you('msg-ct-9', 'Check the MessageHub release checklist.', 4),
+    agent('msg-ct-10', placeholder, 3, { agent_task: { task_id: MOCK_AGENT_TASKS.running } }),
+  ]
+}
+
+/**
+ * An Agent Turn that asks the user (`agent_ask`): each question is a
+ * `thread` reply to the Turn's placeholder, and so is each answer. The
+ * questions and answers fold under the placeholder; the final edit replies.
+ */
+function agentAskSeeds(sessionId: string, done: boolean): MessageObject[] {
+  const minutes = (value: number) => Date.now() - value * 60_000
+  const you = (id: string, content: string, at: number, extra: Partial<MessageObject> = {}): MessageObject => ({ ...createChatMessage({ id, from: participantDids.you, to: [participantDids.codeAssistant], senderName: 'You', content, createdAtMs: at, deliveryStatus: 'read', sessionId }), ...extra })
+  const agent = (id: string, content: MsgContent, at: number, extra: Partial<MessageObject> = {}): MessageObject => ({ ...createChatMessage({ id, from: participantDids.codeAssistant, to: [participantDids.you], senderName: 'CodeAssistant', content: content.content ?? '', createdAtMs: at, sessionId, contentOverride: content }), ...extra })
+  const text = (content: string): MsgContent => ({ format: 'text/plain', content })
+  const placeholder = text('Got it, working on it…')
+  if (!done) {
+    const anchor = 'msg-qa-2'
+    const thread = { relates_to: { rel: 'thread', target: anchor } }
+    return [
+      you('msg-qa-1', 'Tidy up the project docs.', minutes(10)),
+      agent(anchor, placeholder, minutes(10), { agent_task: { task_id: MOCK_AGENT_TASKS.asking } }),
+      agent('msg-qa-3', text('Who are the docs for: new contributors, or the people using the release?'), minutes(9), { ...thread, agent_ask: { anchor, call_id: 'call-docs-1', turn: 3, input: { kind: 'text', options: [], allow_text: false } } }),
+      you('msg-qa-4', 'New contributors.', minutes(8), thread),
+      agent('msg-qa-5', text('Which docs should I tidy?\n\na. docs/ only\nb. The whole repository'), minutes(6), { ...thread, agent_ask: { anchor, call_id: 'call-docs-2', turn: 3, input: { kind: 'choice', options: [{ id: 'a', label: 'docs/ only' }, { id: 'b', label: 'The whole repository' }], allow_text: false } } }),
+    ]
+  }
+  const anchor = 'msg-qd-2'
+  const thread = { relates_to: { rel: 'thread', target: anchor } }
+  return [
+    you('msg-qd-1', 'Draft the release notes for 2.4.', minutes(190)),
+    agent(anchor, placeholder, minutes(190), { agent_task: { task_id: MOCK_AGENT_TASKS.answered } }),
+    agent('msg-qd-3', text('Who are the notes for?\n\n- a. Developers\n- b. End users'), minutes(189), { ...thread, agent_ask: { anchor, call_id: 'call-notes-1', turn: 7, input: { kind: 'choice', options: [{ id: 'a', label: 'Developers' }, { id: 'b', label: 'End users' }], allow_text: true } } }),
+    you('msg-qd-4', 'End users', minutes(188), { ...thread, content: { format: 'text/plain', content: 'End users', machine: { intent: 'agent_ask.answer', data: { call_id: 'call-notes-1', option: 'b' } } } }),
+    agent('msg-qd-5', text('Should the notes mention the known sync issue?'), minutes(187), { ...thread, agent_ask: { anchor, call_id: 'call-notes-2', turn: 7, input: { kind: 'text', options: [], allow_text: false } } }),
+    you('msg-qd-6', 'Yes, with the workaround.', minutes(186), thread),
+    agent('msg-qd-2-final', { format: 'text/markdown', content: '## Release 2.4\n\n- Faster sync on large folders\n- **Known issue:** sync can stall after sleep; reopen the app to resume.' }, minutes(182), { relates_to: { rel: 'edit', target: anchor } }),
+    // An ordinary reply to the Agent's reply: it keeps its own row.
+    you('msg-qd-8', 'Thanks, please keep it under one page.', minutes(180), thread),
+  ]
+}
+
+export const mockMessageSeeds: Record<string, readonly MessageObject[]> = {
+  'session-coder-task': agentTaskSeeds('session-coder-task'),
+  'session-coder-ask': agentAskSeeds('session-coder-ask', false),
+  'session-coder-qa': agentAskSeeds('session-coder-qa', true),
   'session-coder-1': [
     createChatMessage({
       id: 'msg-c1-1',
@@ -715,6 +818,57 @@ const mockMessageSeeds: Record<string, readonly MessageObject[]> = {
               uri_hint: 'https://upload.wikimedia.org/wikipedia/commons/9/95/Museo_di_Santa_Giulia_Coro_delle_Monache_Deposizione_Paolo_da_Caylina_Brescia.jpg',
             },
           },
+        ],
+      },
+    }),
+    createChatMessage({
+      id: 'msg-a1-7',
+      from: participantDids.alice,
+      to: [participantDids.you],
+      senderName: 'Alice',
+      content: 'New loading animation, plus the harbor shot for the header.',
+      createdAtMs: Date.now() - 11 * 60_000,
+      sessionId: 'session-alice-1',
+      contentOverride: {
+        format: 'text/plain',
+        content: 'New loading animation, plus the harbor shot for the header.',
+        refs: [
+          { role: 'input', label: 'orbit-loader.gif', target: { type: 'data_obj', obj_id: 'cyfile:mock-gif-orbit', uri_hint: 'cyfs://cyfile:mock-gif-orbit' } },
+          { role: 'input', label: 'harbor-sunset.png', target: { type: 'data_obj', obj_id: 'cyfile:mock-photo-harbor', uri_hint: 'cyfs://cyfile:mock-photo-harbor' } },
+        ],
+      },
+    }),
+    createChatMessage({
+      id: 'msg-a1-8',
+      from: participantDids.you,
+      to: [participantDids.alice],
+      senderName: 'You',
+      content: 'Here is the screen recording and the interview cut.',
+      createdAtMs: Date.now() - 10 * 60_000,
+      deliveryStatus: 'read',
+      sessionId: 'session-alice-1',
+      contentOverride: {
+        format: 'text/plain',
+        content: 'Here is the screen recording and the interview cut.',
+        refs: [
+          { role: 'input', label: 'screen-recording.webm', target: { type: 'data_obj', obj_id: 'cyfile:mock-video-clip', uri_hint: 'cyfs://cyfile:mock-video-clip' } },
+          { role: 'input', label: 'interview-cut.mov', target: { type: 'data_obj', obj_id: 'cyfile:mock-video-interview', uri_hint: 'cyfs://cyfile:mock-video-interview' } },
+        ],
+      },
+    }),
+    createChatMessage({
+      id: 'msg-a1-9',
+      from: participantDids.alice,
+      to: [participantDids.you],
+      senderName: 'Alice',
+      content: 'And the brief for Friday.',
+      createdAtMs: Date.now() - 9 * 60_000,
+      sessionId: 'session-alice-1',
+      contentOverride: {
+        format: 'text/plain',
+        content: 'And the brief for Friday.',
+        refs: [
+          { role: 'input', label: 'design-brief.pdf', target: { type: 'data_obj', obj_id: 'cyfile:mock-doc-brief', uri_hint: 'cyfs://cyfile:mock-doc-brief' } },
         ],
       },
     }),
@@ -898,7 +1052,7 @@ function createStatusMessage({
 
 /* ── Entity Details ── */
 
-export const mockEntityDetails: Record<string, EntityDetail> = {
+const seedEntityDetails: Record<string, EntityDetail> = {
   'agent-coder': {
     id: 'agent-coder',
     type: 'agent',
@@ -985,3 +1139,33 @@ export const mockEntityDetails: Record<string, EntityDetail> = {
     createdAt: Date.now() - 45 * 24 * 3600_000,
   },
 }
+
+function normalizeEntity(entity: Entity): Entity {
+  return {
+    ...entity,
+    id: getMockEntityDid(entity.id),
+    children: entity.children?.map(normalizeEntity),
+    childrenSections: entity.childrenSections?.map(section => ({ ...section, childIds: section.childIds.map(getMockEntityDid) })),
+  }
+}
+
+export const mockEntities = [
+  ...seedEntities.map(normalizeEntity),
+  { id: 'did:bns:assistant.alice', type: 'agent' as const, name: 'Bucky Assistant', tags: ['agent'], unreadCount: 0, lastActiveAt: 0 },
+  // The zone's `root` account is a contact like any zone user but never listed (buckyos#638).
+  { id: 'did:bns:root', type: 'person' as const, name: 'root', tags: ['zone_user'], unreadCount: 0, lastActiveAt: 0, source: 'buckyos', sources: ['buckyos'], domain: 'managed' as const },
+]
+export const mockEntityDetails = Object.fromEntries(Object.entries(seedEntityDetails).map(([id, detail]) => [getMockEntityDid(id), { ...detail, ...normalizeEntity(detail) }]))
+export const mockSessions: Record<string, Session[]> = Object.fromEntries(Object.entries(seedSessions).map(([id, sessions]) => [getMockEntityDid(id), sessions.map(session => ({
+  ...session,
+  entityId: getMockEntityDid(id),
+  ownerDid: MOCK_SELF_DID,
+  binding: session.source && session.source !== 'buckyos'
+    ? { kind: 'tunnel' as const, tunnelInstanceId: `${session.source}-work`, endpointDid: `did:${session.source}:${id}`, connectionName: `${session.source} · Work`, supportsMultipleSessions: false, canCreateRemoteSession: false, canSend: true, connected: true }
+    : { kind: 'native' as const, targetDid: getMockEntityDid(id) },
+  origin: 'remote_context' as const,
+  lifecycle: 'active' as const,
+  createdAt: session.lastActiveAt - 86400000,
+  shared: { title: session.title, description: '', updatedAt: session.lastActiveAt },
+  members: { [MOCK_SELF_DID]: { nickname: 'Me', updatedAt: session.lastActiveAt }, [getMockEntityDid(id)]: { nickname: seedEntities.find(entity => entity.id === id)?.name ?? id, updatedAt: session.lastActiveAt } },
+}))]))

@@ -6,25 +6,25 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use buckyos_api::{
-    get_buckyos_api_runtime, init_buckyos_api_runtime, load_app_identity_from_env,
-    parse_typed_task_data, BuckyOSRuntimeType, CommitResultReq, FailTaskReq,
-    RunnerWriteEnvelope, Task, TaskDataType, TaskError, TaskManagerClient, TaskOutcome, TaskPhase,
-    ToolExecBashTaskData, TypedTaskData,
+    get_buckyos_api_runtime, load_app_identity_from_env,
+    parse_typed_task_data, CommitResultReq, FailTaskReq, RunnerWriteEnvelope,
+    Task, TaskDataType, TaskError, TaskManagerClient, TaskOutcome, TaskPhase, ToolShellTaskData,
+    TypedTaskData,
 };
 use kRPC::kRPC;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use tokio::fs;
 use tokio::io::{self, AsyncReadExt};
-use tokio::process::Command;
 
 use agent_did_object_lib::{
-    AgentDIDObjectRuntime, ObjectRouteConfig, ReadInput as ObjectReadInput, ReadLineRange,
-    XCallInput as ObjectXCallInput,
+    AgentDIDObjectRuntime, ObjectRouteConfig, ObjectUrlReader, XCallInput as ObjectXCallInput,
 };
 use agent_tool::agent_attention_signal::{
-    CreateExtractionWindowInput, DiscoverEventArgs, DiscoverObjectObservationArgs,
-    DiscoverRelationshipArgs, DiscoverSkillCoverageGapArgs, SignalLifecycleStatus,
+    AttentionSignal, CreateExtractionWindowInput, DiscoverEventArgs,
+    DiscoverObjectObservationArgs, DiscoverRelationshipArgs, DiscoverSkillCoverageGapArgs,
+    ExtractionWindow, SignalLifecycleStatus,
 };
 use agent_tool::agent_memory::{
     AddObservationOp, AgentMemory, AgentMemoryConfig, AgentMemoryError, FlatSetOp, LoadOptions,
@@ -39,85 +39,50 @@ use agent_tool::agent_notebook::{
     PromoteToSystemResult, ReadNotebookInput, RemoveItemRemarkInput, WriteReason,
 };
 use agent_tool::llm_tool_carft::{self, CommandNotFoundRequest};
-use agent_tool::skills_mgr::{
-    CreateCandidateInput as SkillCreateCandidateInput, LifecycleState as SkillLifecycleState,
-    ListSkillsInput, OwnerScope as SkillOwnerScope,
-    RenderSelectedInput as SkillRenderSelectedInput, RiskLevel as SkillRiskLevel, SkillSourceType,
-    SkillTaskResult, SkillType, SkillsMgr, SkillsMgrConfig, SkillsMgrError,
-    UsageMode as SkillUsageMode, UserFeedback as SkillUserFeedback,
-    ValidateSelectionInput as SkillValidateSelectionInput, DEFAULT_MAX_SELECTED_SKILLS,
-    DEFAULT_RENDER_TOKEN_BUDGET, SKILLS_DIR,
-};
 use agent_tool::{
     cli_error_result, cli_exit_code_for_error, cli_result_from_tool_result, cli_success_result,
-    normalize_abs_path, now_ms, render_cli_output, session_record_path, AgentAttentionSignalStore,
+    normalize_abs_path, render_cli_output, session_record_path, AgentAttentionSignalStore,
     AgentToolError, AgentToolManager, AgentToolPendingReason, AgentToolResult, AgentToolStatus,
-    AttentionSignalStoreConfig, AttentionSignalToolRuntime, BindWorkspaceTool, CliRunOutput,
-    CreateWorkspaceTool, DcrontabTool, DiscoverEventTool, DiscoverObjectObservationTool,
+    AttentionSignalStoreConfig, AttentionSignalToolRuntime, CliRunOutput,
+    DcrontabTool, DiscoverEventTool, DiscoverObjectObservationTool,
     DiscoverRelationshipTool, DiscoverSkillCoverageGapTool, EditFileTool, FileToolConfig,
     GetSessionTool, GlobTool, GrepTool, NoopFileWriteAudit, ReadFileTool, RuntimeContext,
-    SessionRuntimeContext, SessionViewBackend, TodoTool, TodoToolConfig, ToolCtx, TypedTool,
-    WorkspaceToolBackend, WriteFileTool, DEFAULT_READ_TOKEN_LIMIT,
+    SessionRuntimeContext, SessionViewBackend, ToolCtx, TypedTool,
+    WriteFileTool, DEFAULT_READ_TOKEN_LIMIT,
 };
 use agent_tool::{llm_explore, llm_understand_media, run_local_llm};
-use chrono::{DateTime, Duration, Utc};
-use opendan::buildin_tool::{
-    AlreadyImprovedOutput, BeginAttentionSignalExtractionArgs,
-    BeginAttentionSignalExtractionOutput, CommitSessionHistoryImprovedArgs,
-    CommitSessionHistoryImprovedOutput, CompleteAttentionSignalExtractionArgs,
-    CompleteAttentionSignalExtractionOutput, ListPendingAttentionSignalsArgs,
-    ListPendingAttentionSignalsOutput, MarkAttentionSignalConsumedArgs,
-    MarkAttentionSignalConsumedOutput, ReadSessionHistoryArgs, ReadSessionHistoryOutput,
-    SessionHistoryMessageOutput,
-};
-use opendan::round_history::{
-    SessionHistoryQuery, SessionHistoryReadOptions, SessionHistoryReader,
-};
-use opendan::session_model::{AlreadyImprovedState, SessionKind, SessionMeta};
 
 const TOOL_CHECK_TASK: &str = "check_task";
 const TOOL_CANCEL_TASK: &str = "cancel_task";
 const TOOL_FINISH_TASK: &str = "finish_task";
 const TOOL_READ_OBJECT: &str = "read";
-const TOOL_X_CALL: &str = "x-call";
-const TOOL_X_CALL_SNAKE: &str = "x_call";
+const TOOL_XCALL: &str = "xcall";
+const XCALL_USAGE: &str = "xcall <object> <action> [--params <json>] [key=value ...] [--key=value ...] [--config <route.toml>]";
 const TOOL_AGENT_MEMORY: &str = "agent-memory";
 const TOOL_AGENT_MEMORY_SNAKE: &str = "agent_memory";
 const TOOL_AGENT_NOTEBOOK: &str = "agent-notebook";
 const TOOL_AGENT_NOTEBOOK_SNAKE: &str = "agent_notebook";
-const TOOL_AGENT_SKILLS: &str = "agent-skills";
-const TOOL_AGENT_SKILLS_SNAKE: &str = "agent_skills";
-const TOOL_READ_SESSION_HISTORY: &str = "read_session_history";
-const TOOL_COMMIT_SESSION_HISTORY_IMPROVED: &str = "commit_session_history_improved";
 const TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION: &str = "BeginAttentionSignalExtraction";
 const TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION: &str = "CompleteAttentionSignalExtraction";
 const TOOL_LIST_PENDING_ATTENTION_SIGNALS: &str = "ListPendingAttentionSignals";
 const TOOL_MARK_ATTENTION_SIGNAL_CONSUMED: &str = "MarkAttentionSignalConsumed";
-const TOOL_NAMES: [&str; 32] = [
+const TOOL_NAMES: [&str; 24] = [
     "Glob",
     "Grep",
     "dcrontab",
     TOOL_READ_OBJECT,
-    TOOL_X_CALL,
-    TOOL_X_CALL_SNAKE,
+    TOOL_XCALL,
     "read_file",
     "write_file",
     "edit_file",
-    "todo",
     "get_session",
-    "create_workspace",
-    "bind_workspace",
     TOOL_AGENT_MEMORY,
     TOOL_AGENT_MEMORY_SNAKE,
     TOOL_AGENT_NOTEBOOK,
     TOOL_AGENT_NOTEBOOK_SNAKE,
-    TOOL_AGENT_SKILLS,
-    TOOL_AGENT_SKILLS_SNAKE,
     TOOL_CHECK_TASK,
     TOOL_CANCEL_TASK,
     TOOL_FINISH_TASK,
-    TOOL_READ_SESSION_HISTORY,
-    TOOL_COMMIT_SESSION_HISTORY_IMPROVED,
     TOOL_BEGIN_ATTENTION_SIGNAL_EXTRACTION,
     TOOL_COMPLETE_ATTENTION_SIGNAL_EXTRACTION,
     agent_tool::TOOL_DISCOVER_EVENT,
@@ -131,7 +96,6 @@ const AGENT_MEMORY_ROOT_ENV: &str = "AGENT_MEMORY_ROOT";
 const AGENT_MEMORY_DIR_NAME: &str = "memory";
 const AGENT_NOTEBOOK_ROOT_ENV: &str = "AGENT_NOTEBOOK_ROOT";
 const AGENT_NOTEBOOK_DIR_NAME: &str = "notebook";
-const AGENT_SKILLS_ROOT_ENV: &str = "AGENT_SKILLS_ROOT";
 const EXIT_SUCCESS: i32 = agent_tool::CLI_EXIT_SUCCESS;
 const COMMAND_NOT_FOUND_PROXY: &str = agent_tool::CLI_COMMAND_NOT_FOUND_SUBCOMMAND;
 const MAIN_BINARY_NAME: &str = "agent_tool";
@@ -139,74 +103,10 @@ const DEFAULT_AGENT_NAME: &str = "did:opendan:cli";
 const DEFAULT_WAKEUP_ID: &str = "cli-wakeup";
 const DEFAULT_BEHAVIOR: &str = "cli";
 const SESSION_RECORD_FILE: &str = "session.json";
-const SESSION_WORKSPACE_BINDINGS_REL_PATH: &str = "workspaces/session_workspace_bindings.json";
-const WORKSPACE_INDEX_FILE: &str = "index.json";
-const DEFAULT_HISTORY_PAGE_SIZE: usize = 50;
-const MAX_HISTORY_PAGE_SIZE: usize = 200;
-const DEFAULT_HISTORY_TOKEN_LIMIT: u32 = 40 * 1024;
-const DEFAULT_HISTORY_WINDOW_MS: i64 = 10 * 60 * 1000;
 const ATTENTION_EXTRACTION_RUNTIME_REL_PATH: &str =
     ".runtime/attention_signal_extraction/current.json";
 const OBJECT_ROUTE_CONFIG_ENV: &str = "AGENT_DID_OBJECT_ROUTE_CONFIG";
 const OPENDAN_OBJECT_ROUTE_CONFIG_ENV: &str = "OPENDAN_AGENT_OBJECT_ROUTE_CONFIG";
-const DEFAULT_OBJECT_ROUTE_CONFIG: &str = r#"
-version = 1
-
-[[adapters]]
-id = "filesystem"
-type = "filesystem"
-
-[[adapters]]
-id = "web"
-type = "web"
-
-[[adapters]]
-id = "agent-runtime"
-type = "agent_runtime"
-
-[[adapters]]
-id = "did-object"
-type = "did_object"
-
-[[routes]]
-id = "file-read"
-priority = 100
-match_type = "scheme"
-pattern = "file"
-adapter = "filesystem"
-methods = ["read"]
-
-[[routes]]
-id = "http-web-read"
-priority = 10
-match_type = "scheme"
-pattern = "http"
-adapter = "web"
-methods = ["read"]
-
-[[routes]]
-id = "https-web-read"
-priority = 10
-match_type = "scheme"
-pattern = "https"
-adapter = "web"
-methods = ["read"]
-
-[[routes]]
-id = "https-did-object-call"
-priority = 10
-match_type = "scheme"
-pattern = "https"
-adapter = "did-object"
-methods = ["x_call", "subscribe_event"]
-
-[[routes]]
-id = "agent-runtime"
-priority = 10
-match_type = "scheme"
-pattern = "agent"
-adapter = "agent-runtime"
-"#;
 
 #[derive(Clone, Debug)]
 struct CliRuntimeEnv {
@@ -242,7 +142,7 @@ impl CliRuntimeEnv {
                 trace_id,
                 agent_name,
                 behavior: DEFAULT_BEHAVIOR.to_string(),
-                step_idx: 0,
+                tool_call_index: 0,
                 wakeup_id: DEFAULT_WAKEUP_ID.to_string(),
                 session_id,
                 read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
@@ -295,10 +195,6 @@ enum ParsedCommand {
         tool_name: String,
         raw_tokens: Vec<String>,
     },
-    ObjectRead {
-        route_config_path: Option<PathBuf>,
-        input: ObjectReadInput,
-    },
     ObjectXCall {
         tool_name: String,
         route_config_path: Option<PathBuf>,
@@ -327,10 +223,6 @@ enum ParsedCommand {
         tool_name: String,
         invocation: AgentNotebookInvocation,
     },
-    AgentSkills {
-        tool_name: String,
-        invocation: AgentSkillsInvocation,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -346,110 +238,6 @@ struct AgentMemoryInvocation {
     root_override: Option<PathBuf>,
     quiet: bool,
     verb: AgentMemoryVerb,
-}
-
-#[derive(Clone, Debug)]
-struct AgentSkillsInvocation {
-    root_override: Option<PathBuf>,
-    verb: AgentSkillsVerb,
-}
-
-#[derive(Clone, Debug)]
-enum AgentSkillsVerb {
-    Init,
-    Install {
-        path: PathBuf,
-        id: Option<String>,
-        name: Option<String>,
-        title: Option<String>,
-        description: Option<String>,
-        skill_type: Option<SkillType>,
-        group_id: Option<String>,
-        intent_tags: Vec<String>,
-        required_tools: Vec<String>,
-        risk_level: Option<SkillRiskLevel>,
-        source_type: SkillSourceType,
-        target_scope: SkillOwnerScope,
-        trust_hint: String,
-        installed_by: Option<String>,
-        promote: bool,
-    },
-    List {
-        filter: ListSkillsInput,
-    },
-    ExplorerHints {
-        filter: ListSkillsInput,
-    },
-    View {
-        skill_ref: String,
-        package_path: Option<String>,
-    },
-    Promote {
-        skill_ref: String,
-        actor: Option<String>,
-    },
-    Archive {
-        skill_ref: String,
-        reason: String,
-        actor: Option<String>,
-    },
-    Restore {
-        skill_ref: String,
-        reason: String,
-        actor: Option<String>,
-    },
-    Validate {
-        requested: Vec<String>,
-        max_count: usize,
-        allowed_states: Vec<SkillLifecycleState>,
-        risk_budget: SkillRiskLevel,
-    },
-    SelectSession {
-        session_id: Option<String>,
-        requested: Vec<String>,
-        risk_budget: SkillRiskLevel,
-        max_count: usize,
-    },
-    SelectTodo {
-        session_id: Option<String>,
-        todo_id: String,
-        requested: Vec<String>,
-        risk_budget: SkillRiskLevel,
-        max_count: usize,
-    },
-    UnselectSession {
-        session_id: Option<String>,
-        skill_refs: Vec<String>,
-    },
-    UnselectTodo {
-        session_id: Option<String>,
-        todo_id: String,
-        skill_refs: Vec<String>,
-    },
-    SelectedList {
-        session_id: Option<String>,
-        todo_id: Option<String>,
-    },
-    RenderSelected {
-        session_id: Option<String>,
-        todo_id: Option<String>,
-        max_skills: usize,
-        token_budget: usize,
-        include_metadata: bool,
-        include_usage_instructions: bool,
-    },
-    RecordUsed {
-        usage_id: String,
-        mode: SkillUsageMode,
-        evidence: Vec<String>,
-    },
-    RecordResult {
-        usage_id: String,
-        result: SkillTaskResult,
-        feedback: Option<SkillUserFeedback>,
-        failure_reason: Option<String>,
-        output_refs: Vec<String>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -518,14 +306,35 @@ enum AgentMemoryVerb {
     Compact,
 }
 
+/// Run the `agent_tool` command line and exit with its status: the
+/// `agent_tool` binary, and the multi-call `opendan` executable when it is
+/// invoked under a name [`handles_invocation_name`] accepts (aios image).
+pub fn main() -> ! {
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let output = rt.block_on(run_process());
+    if !output.stdout.is_empty() {
+        print!("{}", output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    std::process::exit(output.exit_code);
+}
+
+/// Whether a process invoked as `name` (the file name of argv[0]) is this
+/// CLI: `agent_tool` itself or one of the tools it serves by name.
+pub fn handles_invocation_name(name: &str) -> bool {
+    name == MAIN_BINARY_NAME || is_tool_name(name)
+}
+
 pub async fn run_process() -> CliRunOutput {
     let args = env::args_os().collect::<Vec<_>>();
 
-    // `agent_tool run_local_llm ...` / `agent_tool llm_explore ...` 走独立的
+    // `agent_tool xllm ...` / `agent_tool llm_explore ...` 走独立的
     // dev/test 子命令，不经过 tool dispatcher（它们不是 AgentTool）。这里
     // 短路掉，让它们自己负责 stdout / stderr / exit code（直接 println /
     // eprintln，避免 buffer 大段 JSON）。
-    if args.get(1).and_then(|v| v.to_str()) == Some("run_local_llm") {
+    if args.get(1).and_then(|v| v.to_str()) == Some("xllm") {
         let sub_args: Vec<String> = args
             .iter()
             .skip(2)
@@ -605,6 +414,13 @@ async fn execute(
                 agent_env_root: env.has_agent_env.then(|| env.agent_env_root.clone()),
             };
             let (result, exit_code) = llm_tool_carft::run_subcommand(req).await;
+            if should_suppress_command_not_found_stdout(&result, exit_code) {
+                return Ok(CliRunOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
             Ok(render_cli_output(&result, exit_code))
         }
         ParsedCommand::Help { tool_name } => Ok(render_cli_output(
@@ -615,6 +431,9 @@ async fn execute(
             tool_name,
             raw_tokens,
         } => {
+            if tool_name == TOOL_READ_OBJECT && raw_tokens.iter().any(|t| t.contains("://") && !t.contains("file://")) {
+                ensure_zone_runtime().await;
+            }
             let mgr = build_cli_tool_manager(&env).await?;
             let Some(tool) = mgr.get_any_tool(&tool_name) else {
                 return Err(AgentToolError::NotFound(tool_name));
@@ -637,10 +456,6 @@ async fn execute(
                 EXIT_SUCCESS,
             ))
         }
-        ParsedCommand::ObjectRead {
-            route_config_path,
-            input,
-        } => dispatch_object_read(&env, route_config_path, input).await,
         ParsedCommand::ObjectXCall {
             tool_name,
             route_config_path,
@@ -664,31 +479,23 @@ async fn execute(
             tool_name,
             invocation,
         } => Ok(dispatch_agent_notebook(&env, &tool_name, invocation, stdin_override).await),
-        ParsedCommand::AgentSkills {
-            tool_name,
-            invocation,
-        } => Ok(dispatch_agent_skills(&env, &tool_name, invocation).await),
         ParsedCommand::CancelTask {
             tool_name,
             task_id,
             recursive,
         } => {
             let task_mgr = build_task_manager_client(&env).await?;
-            let before = task_mgr.get_task(&task_id).await.map_err(|err| {
-                AgentToolError::ExecFailed(format!("get task `{task_id}` failed: {err}"))
-            })?;
             task_mgr
                 .cancel_task(&task_id, recursive)
                 .await
                 .map_err(|err| {
                     AgentToolError::ExecFailed(format!("cancel task `{task_id}` failed: {err}"))
                 })?;
-            let interrupt_error = interrupt_task_if_supported(&before).await;
             let after = task_mgr.get_task(&task_id).await.map_err(|err| {
                 AgentToolError::ExecFailed(format!("reload task `{task_id}` failed: {err}"))
             })?;
             Ok(render_cli_output(
-                &build_cancel_task_result(&tool_name, after, recursive, interrupt_error),
+                &build_cancel_task_result(&tool_name, after, recursive),
                 EXIT_SUCCESS,
             ))
         }
@@ -750,6 +557,16 @@ async fn execute(
     }
 }
 
+fn should_suppress_command_not_found_stdout(result: &AgentToolResult, exit_code: i32) -> bool {
+    exit_code == agent_tool::CLI_EXIT_COMMAND_NOT_FOUND
+        && result.tool.as_deref() == Some("llm_tool_carft")
+        && result
+            .details
+            .get("outcome")
+            .and_then(|value| value.as_str())
+            == Some("skipped")
+}
+
 /// Routes a CliInvocation through `exec` (bash form) or `call` (json
 /// form), resolving any optional stdin pickup before the JSON args go
 /// in.
@@ -780,27 +597,6 @@ async fn dispatch_tool(
     }
 }
 
-async fn dispatch_object_read(
-    env: &CliRuntimeEnv,
-    route_config_path: Option<PathBuf>,
-    mut input: ObjectReadInput,
-) -> Result<CliRunOutput, AgentToolError> {
-    if input.session_id.is_none() {
-        input.session_id = Some(env.call_ctx.session_id.clone());
-    }
-    if input.max_tokens.is_none() {
-        input.max_tokens = Some(env.call_ctx.read_token_limit as usize);
-    }
-    let runtime = build_object_runtime(env, route_config_path).await?;
-    match runtime.read(input).await {
-        Ok(result) => Ok(render_cli_output(
-            &success_result(TOOL_READ_OBJECT, result),
-            EXIT_SUCCESS,
-        )),
-        Err(err) => Ok(render_object_error_output(Some(TOOL_READ_OBJECT), err)),
-    }
-}
-
 async fn dispatch_object_x_call(
     env: &CliRuntimeEnv,
     tool_name: &str,
@@ -813,6 +609,7 @@ async fn dispatch_object_x_call(
     if input.trace_id.is_none() {
         input.trace_id = Some(env.call_ctx.trace_id.clone());
     }
+    ensure_zone_runtime().await;
     let runtime = build_object_runtime(env, route_config_path).await?;
     match runtime.x_call(input).await {
         Ok(result) => {
@@ -830,6 +627,12 @@ async fn dispatch_object_x_call(
         }
         Err(err) => Ok(render_object_error_output(Some(tool_name), err)),
     }
+}
+
+/// Object URLs are read with this process's Zone identity (the session's token in an Agent's shell); without one
+/// the object library reports that there is no Zone here.
+async fn ensure_zone_runtime() {
+    let _ = agent_tool::xllm::ensure_buckyos_runtime().await;
 }
 
 async fn build_object_runtime(
@@ -854,8 +657,7 @@ async fn load_object_route_config(
             .await
             .map_err(object_error_to_agent_tool_error);
     }
-    ObjectRouteConfig::from_toml_str(DEFAULT_OBJECT_ROUTE_CONFIG)
-        .map_err(object_error_to_agent_tool_error)
+    Ok(ObjectRouteConfig::builtin())
 }
 
 fn render_object_error_output(
@@ -948,10 +750,7 @@ fn parse_tool_command(
     }
 
     match tool_name.as_str() {
-        TOOL_READ_OBJECT => parse_object_read_cli_command(tokens, current_dir),
-        TOOL_X_CALL | TOOL_X_CALL_SNAKE => {
-            parse_object_x_call_cli_command(tool_name, tokens, current_dir)
-        }
+        TOOL_XCALL => parse_object_x_call_cli_command(tool_name, tokens, current_dir),
         TOOL_CHECK_TASK => parse_check_task_cli_command(tool_name, tokens),
         TOOL_CANCEL_TASK => parse_cancel_task_cli_command(tool_name, tokens),
         TOOL_FINISH_TASK => parse_finish_task_cli_command(tool_name, tokens),
@@ -960,9 +759,6 @@ fn parse_tool_command(
         }
         TOOL_AGENT_NOTEBOOK | TOOL_AGENT_NOTEBOOK_SNAKE => {
             parse_agent_notebook_cli_command(tool_name, tokens)
-        }
-        TOOL_AGENT_SKILLS | TOOL_AGENT_SKILLS_SNAKE => {
-            parse_agent_skills_cli_command(tool_name, tokens)
         }
         _ => {
             // All real tools defer their argv parsing to the registry's
@@ -975,135 +771,6 @@ fn parse_tool_command(
             })
         }
     }
-}
-
-fn parse_object_read_cli_command(
-    tokens: &[String],
-    current_dir: &Path,
-) -> Result<ParsedCommand, AgentToolError> {
-    let mut route_config_path = None;
-    let mut object = None;
-    let mut purpose = None;
-    let mut session_id = None;
-    let mut content_only = false;
-    let mut offset = None;
-    let mut limit = None;
-    let mut options = json!({});
-    let mut idx = 0usize;
-
-    while idx < tokens.len() {
-        let token = &tokens[idx];
-        match token.as_str() {
-            "--config" | "--route-config" => {
-                idx += 1;
-                let Some(path) = tokens.get(idx) else {
-                    return Err(with_tool_usage(
-                        "missing route config path",
-                        TOOL_READ_OBJECT,
-                    ));
-                };
-                route_config_path = Some(resolve_cli_path(path, current_dir));
-            }
-            "--purpose" => {
-                idx += 1;
-                purpose = Some(required_token(tokens, idx, "--purpose", TOOL_READ_OBJECT)?);
-            }
-            "--session-id" => {
-                idx += 1;
-                session_id = Some(required_token(
-                    tokens,
-                    idx,
-                    "--session-id",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--content-only" => content_only = true,
-            "--offset" => {
-                idx += 1;
-                offset = Some(parse_object_usize(
-                    &required_token(tokens, idx, "--offset", TOOL_READ_OBJECT)?,
-                    "offset",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--limit" => {
-                idx += 1;
-                limit = Some(parse_object_usize(
-                    &required_token(tokens, idx, "--limit", TOOL_READ_OBJECT)?,
-                    "limit",
-                    TOOL_READ_OBJECT,
-                )?);
-            }
-            "--options" => {
-                idx += 1;
-                options = parse_json_arg(
-                    &required_token(tokens, idx, "--options", TOOL_READ_OBJECT)?,
-                    "--options",
-                    TOOL_READ_OBJECT,
-                )?;
-            }
-            _ if token.starts_with("--") => {
-                return Err(with_tool_usage(
-                    format!("unsupported flag `{token}`"),
-                    TOOL_READ_OBJECT,
-                ));
-            }
-            _ => {
-                if let Some((key, value)) = token.split_once('=') {
-                    match key {
-                        "object" | "uri" => object = Some(value.to_string()),
-                        "purpose" => purpose = Some(value.to_string()),
-                        "session_id" | "session-id" => session_id = Some(value.to_string()),
-                        "content_only" | "content-only" => {
-                            content_only = parse_object_bool(value, key, TOOL_READ_OBJECT)?
-                        }
-                        "offset" => {
-                            offset = Some(parse_object_usize(value, "offset", TOOL_READ_OBJECT)?)
-                        }
-                        "limit" => {
-                            limit = Some(parse_object_usize(value, "limit", TOOL_READ_OBJECT)?)
-                        }
-                        "options" => options = parse_json_arg(value, "options", TOOL_READ_OBJECT)?,
-                        _ => {
-                            return Err(with_tool_usage(
-                                format!("unsupported key `{key}`"),
-                                TOOL_READ_OBJECT,
-                            ));
-                        }
-                    }
-                } else if object.is_none() {
-                    object = Some(token.clone());
-                } else {
-                    return Err(with_tool_usage(
-                        format!("unexpected positional argument `{token}`"),
-                        TOOL_READ_OBJECT,
-                    ));
-                }
-            }
-        }
-        idx += 1;
-    }
-
-    let object = object
-        .map(|value| canonical_object_url_for_cli(&value, current_dir))
-        .transpose()?
-        .ok_or_else(|| with_tool_usage("missing object/uri", TOOL_READ_OBJECT))?;
-
-    Ok(ParsedCommand::ObjectRead {
-        route_config_path,
-        input: ObjectReadInput {
-            object,
-            purpose,
-            session_id,
-            content_only,
-            range: (offset.is_some() || limit.is_some()).then_some(ReadLineRange {
-                offset: offset.unwrap_or(1),
-                limit,
-            }),
-            max_tokens: None,
-            options,
-        },
-    })
 }
 
 fn parse_object_x_call_cli_command(
@@ -1704,7 +1371,7 @@ fn parse_agent_memory_object_upsert(rest: &[String]) -> Result<AgentMemoryVerb, 
     if let Some(alias) = pending_alias {
         aliases.push(ObjectAliasInput {
             alias,
-            alias_type: pending_alias_type.unwrap_or_else(|| "name".to_string()),
+            alias_type: parse_memory_enum(pending_alias_type.as_deref().unwrap_or("name"))?,
             confidence: confidence.unwrap_or(0.5),
         });
     }
@@ -1713,7 +1380,9 @@ fn parse_agent_memory_object_upsert(rest: &[String]) -> Result<AgentMemoryVerb, 
             .ok_or_else(|| agent_memory_invalid("`object upsert` requires `--occasion`"))?,
         op: UpsertObjectOp {
             object_id,
-            kind: kind.ok_or_else(|| agent_memory_invalid("`object upsert` requires `--kind`"))?,
+            kind: parse_memory_enum(
+                &kind.ok_or_else(|| agent_memory_invalid("`object upsert` requires `--kind`"))?,
+            )?,
             canonical_name: name
                 .ok_or_else(|| agent_memory_invalid("`object upsert` requires `--name`"))?,
             aliases,
@@ -1843,11 +1512,15 @@ fn parse_agent_memory_observe(rest: &[String]) -> Result<AgentMemoryVerb, AgentT
             .ok_or_else(|| agent_memory_invalid("`observe add` requires `--occasion`"))?,
         op: AddObservationOp {
             observation_id: None,
-            kind: kind.ok_or_else(|| agent_memory_invalid("`observe add` requires `--kind`"))?,
+            kind: parse_memory_enum(
+                &kind.ok_or_else(|| agent_memory_invalid("`observe add` requires `--kind`"))?,
+            )?,
             entities,
             content: content_parts.join(" "),
             source_excerpt: None,
             source_ref: None,
+            occurred_at: None,
+            scope: None,
             confidence: confidence
                 .ok_or_else(|| agent_memory_invalid("`observe add` requires `--confidence`"))?,
         },
@@ -2184,6 +1857,7 @@ fn parse_agent_memory_relate(rest: &[String]) -> Result<AgentMemoryVerb, AgentTo
         occasion_id: occasion_id
             .ok_or_else(|| agent_memory_invalid("`relate` requires `--occasion`"))?,
         op: UpsertRelationOp {
+            item_id: None,
             subject: subject
                 .ok_or_else(|| agent_memory_invalid("`relate` requires `--subject`"))?,
             predicate: predicate
@@ -2196,6 +1870,8 @@ fn parse_agent_memory_relate(rest: &[String]) -> Result<AgentMemoryVerb, AgentTo
             write_reason: reason
                 .ok_or_else(|| agent_memory_invalid("`relate` requires `--reason`"))?,
             replaces: Vec::new(),
+            expected_revision: None,
+            meta: Default::default(),
         },
     })
 }
@@ -2258,8 +1934,10 @@ fn parse_agent_memory_set_status(rest: &[String]) -> Result<AgentMemoryVerb, Age
         occasion_id: occasion_id
             .ok_or_else(|| agent_memory_invalid("`set-status` requires `--occasion`"))?,
         op: SetStatusOp {
-            target_kind: target_kind
-                .ok_or_else(|| agent_memory_invalid("`set-status` requires `--target-kind`"))?,
+            target_kind: parse_memory_enum(
+                &target_kind
+                    .ok_or_else(|| agent_memory_invalid("`set-status` requires `--target-kind`"))?,
+            )?,
             target_id: target_id
                 .ok_or_else(|| agent_memory_invalid("`set-status` requires `--target`"))?,
             status: status
@@ -2267,8 +1945,17 @@ fn parse_agent_memory_set_status(rest: &[String]) -> Result<AgentMemoryVerb, Age
             reason: reason
                 .ok_or_else(|| agent_memory_invalid("`set-status` requires `--reason`"))?,
             replaced_by,
+            expected_revision: None,
+            evidence: Vec::new(),
         },
     })
+}
+
+fn parse_memory_enum<T: std::str::FromStr<Err = AgentMemoryError>>(
+    raw: &str,
+) -> Result<T, AgentToolError> {
+    raw.parse::<T>()
+        .map_err(|e| agent_memory_invalid(e.to_string()))
 }
 
 fn parse_load_count(raw: &str, name: &str) -> Result<usize, AgentToolError> {
@@ -2324,850 +2011,6 @@ fn parse_agent_memory_compact(rest: &[String]) -> Result<AgentMemoryVerb, AgentT
     Ok(AgentMemoryVerb::Compact)
 }
 
-// =================================================================
-//  agent-skills CLI
-// =================================================================
-
-const AGENT_SKILLS_USAGE: &str = "agent-skills [--root <path> | env AGENT_SKILLS_ROOT] \
-<init|install|list|hints|explorer-hints|view|promote|archive|restore|validate|\
-select-session|select-todo|unselect-session|unselect-todo|selected-list|render-selected|\
-record-used|record-result> [...]";
-
-fn agent_skills_invalid(message: impl Into<String>) -> AgentToolError {
-    AgentToolError::InvalidArgs(format!("{}\nUsage: {}", message.into(), AGENT_SKILLS_USAGE))
-}
-
-fn parse_agent_skills_cli_command(
-    tool_name: String,
-    tokens: &[String],
-) -> Result<ParsedCommand, AgentToolError> {
-    let mut root_override: Option<PathBuf> = None;
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match tokens[idx].as_str() {
-            "--root" => {
-                idx += 1;
-                root_override = Some(PathBuf::from(skill_required_flag(tokens, idx, "--root")?));
-            }
-            v if v.starts_with("--root=") => {
-                root_override = Some(PathBuf::from(&v["--root=".len()..]));
-            }
-            _ => break,
-        }
-        idx += 1;
-    }
-
-    let verb_token = tokens
-        .get(idx)
-        .ok_or_else(|| agent_skills_invalid("missing verb"))?
-        .clone();
-    let rest = &tokens[idx + 1..];
-    let verb = match verb_token.as_str() {
-        "init" => {
-            if !rest.is_empty() {
-                return Err(agent_skills_invalid("`init` takes no arguments"));
-            }
-            AgentSkillsVerb::Init
-        }
-        "install" => parse_agent_skills_install(rest)?,
-        "list" | "hints" => AgentSkillsVerb::List {
-            filter: parse_agent_skills_filter(rest, false)?,
-        },
-        "explorer-hints" => AgentSkillsVerb::ExplorerHints {
-            filter: parse_agent_skills_filter(rest, false)?,
-        },
-        "view" => parse_agent_skills_view(rest)?,
-        "promote" => parse_agent_skills_promote(rest)?,
-        "archive" => parse_agent_skills_archive(rest)?,
-        "restore" => parse_agent_skills_restore(rest)?,
-        "validate" => parse_agent_skills_validate(rest)?,
-        "select-session" => parse_agent_skills_select_session(rest)?,
-        "select-todo" => parse_agent_skills_select_todo(rest)?,
-        "unselect-session" => parse_agent_skills_unselect_session(rest)?,
-        "unselect-todo" => parse_agent_skills_unselect_todo(rest)?,
-        "selected-list" => parse_agent_skills_selected_list(rest)?,
-        "render-selected" => parse_agent_skills_render_selected(rest)?,
-        "record-used" => parse_agent_skills_record_used(rest)?,
-        "record-result" => parse_agent_skills_record_result(rest)?,
-        other => return Err(agent_skills_invalid(format!("unknown verb `{other}`"))),
-    };
-    Ok(ParsedCommand::AgentSkills {
-        tool_name,
-        invocation: AgentSkillsInvocation {
-            root_override,
-            verb,
-        },
-    })
-}
-
-fn parse_agent_skills_install(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let mut positionals = Vec::new();
-    let mut id = None;
-    let mut name = None;
-    let mut title = None;
-    let mut description = None;
-    let mut skill_type = None;
-    let mut group_id = None;
-    let mut intent_tags = Vec::new();
-    let mut required_tools = Vec::new();
-    let mut risk_level = None;
-    let mut source_type = SkillSourceType::OwnerInstalled;
-    let mut target_scope = SkillOwnerScope::Agent;
-    let mut trust_hint = "medium".to_string();
-    let mut installed_by = None;
-    let mut promote = false;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--id" => {
-                idx += 1;
-                id = Some(skill_required_flag(rest, idx, "--id")?);
-            }
-            v if v.starts_with("--id=") => id = Some(v["--id=".len()..].to_string()),
-            "--name" => {
-                idx += 1;
-                name = Some(skill_required_flag(rest, idx, "--name")?);
-            }
-            v if v.starts_with("--name=") => name = Some(v["--name=".len()..].to_string()),
-            "--title" => {
-                idx += 1;
-                title = Some(skill_required_flag(rest, idx, "--title")?);
-            }
-            v if v.starts_with("--title=") => title = Some(v["--title=".len()..].to_string()),
-            "--description" => {
-                idx += 1;
-                description = Some(skill_required_flag(rest, idx, "--description")?);
-            }
-            v if v.starts_with("--description=") => {
-                description = Some(v["--description=".len()..].to_string())
-            }
-            "--type" => {
-                idx += 1;
-                skill_type = Some(parse_skill_type(&skill_required_flag(
-                    rest, idx, "--type",
-                )?)?);
-            }
-            v if v.starts_with("--type=") => {
-                skill_type = Some(parse_skill_type(&v["--type=".len()..])?)
-            }
-            "--group" | "--group-id" => {
-                idx += 1;
-                group_id = Some(skill_required_flag(rest, idx, token)?);
-            }
-            v if v.starts_with("--group=") => group_id = Some(v["--group=".len()..].to_string()),
-            v if v.starts_with("--group-id=") => {
-                group_id = Some(v["--group-id=".len()..].to_string())
-            }
-            "--tags" => {
-                idx += 1;
-                intent_tags = split_csv(&skill_required_flag(rest, idx, "--tags")?);
-            }
-            v if v.starts_with("--tags=") => intent_tags = split_csv(&v["--tags=".len()..]),
-            "--tools" => {
-                idx += 1;
-                required_tools = split_csv(&skill_required_flag(rest, idx, "--tools")?);
-            }
-            v if v.starts_with("--tools=") => required_tools = split_csv(&v["--tools=".len()..]),
-            "--risk" | "--risk-level" => {
-                idx += 1;
-                risk_level = Some(parse_skill_risk(&skill_required_flag(rest, idx, token)?)?);
-            }
-            v if v.starts_with("--risk=") => {
-                risk_level = Some(parse_skill_risk(&v["--risk=".len()..])?)
-            }
-            v if v.starts_with("--risk-level=") => {
-                risk_level = Some(parse_skill_risk(&v["--risk-level=".len()..])?)
-            }
-            "--source-type" => {
-                idx += 1;
-                source_type =
-                    parse_skill_source_type(&skill_required_flag(rest, idx, "--source-type")?)?;
-            }
-            v if v.starts_with("--source-type=") => {
-                source_type = parse_skill_source_type(&v["--source-type=".len()..])?
-            }
-            "--scope" => {
-                idx += 1;
-                target_scope = parse_skill_scope(&skill_required_flag(rest, idx, "--scope")?)?;
-            }
-            v if v.starts_with("--scope=") => {
-                target_scope = parse_skill_scope(&v["--scope=".len()..])?
-            }
-            "--trust" | "--trust-hint" => {
-                idx += 1;
-                trust_hint = skill_required_flag(rest, idx, token)?;
-            }
-            v if v.starts_with("--trust=") => trust_hint = v["--trust=".len()..].to_string(),
-            v if v.starts_with("--trust-hint=") => {
-                trust_hint = v["--trust-hint=".len()..].to_string()
-            }
-            "--installed-by" | "--actor" => {
-                idx += 1;
-                installed_by = Some(skill_required_flag(rest, idx, token)?);
-            }
-            v if v.starts_with("--installed-by=") => {
-                installed_by = Some(v["--installed-by=".len()..].to_string())
-            }
-            v if v.starts_with("--actor=") => {
-                installed_by = Some(v["--actor=".len()..].to_string())
-            }
-            "--promote" => promote = true,
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `install`"
-                )))
-            }
-            v => positionals.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if positionals.len() != 1 {
-        return Err(agent_skills_invalid(format!(
-            "`install` expects exactly one package/file path, got {}",
-            positionals.len()
-        )));
-    }
-    Ok(AgentSkillsVerb::Install {
-        path: PathBuf::from(positionals.remove(0)),
-        id,
-        name,
-        title,
-        description,
-        skill_type,
-        group_id,
-        intent_tags,
-        required_tools,
-        risk_level,
-        source_type,
-        target_scope,
-        trust_hint,
-        installed_by,
-        promote,
-    })
-}
-
-fn parse_agent_skills_filter(
-    rest: &[String],
-    include_all_default: bool,
-) -> Result<ListSkillsInput, AgentToolError> {
-    let mut filter = ListSkillsInput::default();
-    if include_all_default {
-        filter.states = vec![
-            SkillLifecycleState::Candidate,
-            SkillLifecycleState::Active,
-            SkillLifecycleState::Preferred,
-            SkillLifecycleState::NeedsReverification,
-            SkillLifecycleState::Stale,
-            SkillLifecycleState::Archived,
-            SkillLifecycleState::Blocked,
-            SkillLifecycleState::Rejected,
-        ];
-    }
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--all" => {
-                filter.states = vec![
-                    SkillLifecycleState::Candidate,
-                    SkillLifecycleState::Active,
-                    SkillLifecycleState::Preferred,
-                    SkillLifecycleState::NeedsReverification,
-                    SkillLifecycleState::Stale,
-                    SkillLifecycleState::Archived,
-                    SkillLifecycleState::Blocked,
-                    SkillLifecycleState::Rejected,
-                ];
-            }
-            "--state" => {
-                idx += 1;
-                filter.states =
-                    parse_skill_states_csv(&skill_required_flag(rest, idx, "--state")?)?;
-            }
-            v if v.starts_with("--state=") => {
-                filter.states = parse_skill_states_csv(&v["--state=".len()..])?
-            }
-            "--type" => {
-                idx += 1;
-                filter.types = parse_skill_types_csv(&skill_required_flag(rest, idx, "--type")?)?;
-            }
-            v if v.starts_with("--type=") => {
-                filter.types = parse_skill_types_csv(&v["--type=".len()..])?
-            }
-            "--tags" => {
-                idx += 1;
-                filter.intent_tags = split_csv(&skill_required_flag(rest, idx, "--tags")?);
-            }
-            v if v.starts_with("--tags=") => filter.intent_tags = split_csv(&v["--tags=".len()..]),
-            "--object-types" => {
-                idx += 1;
-                filter.object_types = split_csv(&skill_required_flag(rest, idx, "--object-types")?);
-            }
-            v if v.starts_with("--object-types=") => {
-                filter.object_types = split_csv(&v["--object-types=".len()..])
-            }
-            "--tools" => {
-                idx += 1;
-                filter.required_tools = split_csv(&skill_required_flag(rest, idx, "--tools")?);
-            }
-            v if v.starts_with("--tools=") => {
-                filter.required_tools = split_csv(&v["--tools=".len()..])
-            }
-            "--risk-budget" => {
-                idx += 1;
-                filter.risk_budget = Some(parse_skill_risk(&skill_required_flag(
-                    rest,
-                    idx,
-                    "--risk-budget",
-                )?)?);
-            }
-            v if v.starts_with("--risk-budget=") => {
-                filter.risk_budget = Some(parse_skill_risk(&v["--risk-budget=".len()..])?)
-            }
-            "--limit" => {
-                idx += 1;
-                filter.limit = Some(parse_skill_usize(
-                    &skill_required_flag(rest, idx, "--limit")?,
-                    "limit",
-                )?);
-            }
-            v if v.starts_with("--limit=") => {
-                filter.limit = Some(parse_skill_usize(&v["--limit=".len()..], "limit")?)
-            }
-            v => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported filter arg `{v}`"
-                )))
-            }
-        }
-        idx += 1;
-    }
-    Ok(filter)
-}
-
-fn parse_agent_skills_view(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    if rest.is_empty() || rest.len() > 2 {
-        return Err(agent_skills_invalid(
-            "`view` expects <skill_ref> [package_path]",
-        ));
-    }
-    Ok(AgentSkillsVerb::View {
-        skill_ref: rest[0].clone(),
-        package_path: rest.get(1).cloned(),
-    })
-}
-
-fn parse_agent_skills_promote(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (skill_ref, actor) = parse_skill_ref_actor(rest, "promote")?;
-    Ok(AgentSkillsVerb::Promote { skill_ref, actor })
-}
-
-fn parse_agent_skills_archive(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (skill_ref, actor, reason) = parse_skill_ref_actor_reason(rest, "archive")?;
-    Ok(AgentSkillsVerb::Archive {
-        skill_ref,
-        actor,
-        reason,
-    })
-}
-
-fn parse_agent_skills_restore(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (skill_ref, actor, reason) = parse_skill_ref_actor_reason(rest, "restore")?;
-    Ok(AgentSkillsVerb::Restore {
-        skill_ref,
-        actor,
-        reason,
-    })
-}
-
-fn parse_agent_skills_validate(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (requested, max_count, allowed_states, risk_budget, _session, _todo) =
-        parse_selection_like_args(rest, "validate")?;
-    Ok(AgentSkillsVerb::Validate {
-        requested,
-        max_count,
-        allowed_states,
-        risk_budget,
-    })
-}
-
-fn parse_agent_skills_select_session(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (requested, max_count, _allowed_states, risk_budget, session_id, _todo) =
-        parse_selection_like_args(rest, "select-session")?;
-    Ok(AgentSkillsVerb::SelectSession {
-        session_id,
-        requested,
-        risk_budget,
-        max_count,
-    })
-}
-
-fn parse_agent_skills_select_todo(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (requested, max_count, _allowed_states, risk_budget, session_id, todo_id) =
-        parse_selection_like_args(rest, "select-todo")?;
-    Ok(AgentSkillsVerb::SelectTodo {
-        session_id,
-        todo_id: todo_id.ok_or_else(|| agent_skills_invalid("`select-todo` requires `--todo`"))?,
-        requested,
-        risk_budget,
-        max_count,
-    })
-}
-
-fn parse_agent_skills_unselect_session(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (skill_refs, _max_count, _allowed_states, _risk_budget, session_id, _todo) =
-        parse_selection_like_args(rest, "unselect-session")?;
-    Ok(AgentSkillsVerb::UnselectSession {
-        session_id,
-        skill_refs,
-    })
-}
-
-fn parse_agent_skills_unselect_todo(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (skill_refs, _max_count, _allowed_states, _risk_budget, session_id, todo_id) =
-        parse_selection_like_args(rest, "unselect-todo")?;
-    Ok(AgentSkillsVerb::UnselectTodo {
-        session_id,
-        todo_id: todo_id
-            .ok_or_else(|| agent_skills_invalid("`unselect-todo` requires `--todo`"))?,
-        skill_refs,
-    })
-}
-
-fn parse_agent_skills_selected_list(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let (session_id, todo_id) = parse_session_todo_flags(rest, "selected-list")?;
-    Ok(AgentSkillsVerb::SelectedList {
-        session_id,
-        todo_id,
-    })
-}
-
-fn parse_agent_skills_render_selected(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let mut session_id = None;
-    let mut todo_id = None;
-    let mut max_skills = DEFAULT_MAX_SELECTED_SKILLS;
-    let mut token_budget = DEFAULT_RENDER_TOKEN_BUDGET;
-    let mut include_metadata = true;
-    let mut include_usage_instructions = true;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--session" => {
-                idx += 1;
-                session_id = Some(skill_required_flag(rest, idx, "--session")?);
-            }
-            v if v.starts_with("--session=") => {
-                session_id = Some(v["--session=".len()..].to_string())
-            }
-            "--todo" => {
-                idx += 1;
-                todo_id = Some(skill_required_flag(rest, idx, "--todo")?);
-            }
-            v if v.starts_with("--todo=") => todo_id = Some(v["--todo=".len()..].to_string()),
-            "--max-skills" => {
-                idx += 1;
-                max_skills = parse_skill_usize(
-                    &skill_required_flag(rest, idx, "--max-skills")?,
-                    "max-skills",
-                )?;
-            }
-            v if v.starts_with("--max-skills=") => {
-                max_skills = parse_skill_usize(&v["--max-skills=".len()..], "max-skills")?
-            }
-            "--token-budget" => {
-                idx += 1;
-                token_budget = parse_skill_usize(
-                    &skill_required_flag(rest, idx, "--token-budget")?,
-                    "token-budget",
-                )?;
-            }
-            v if v.starts_with("--token-budget=") => {
-                token_budget = parse_skill_usize(&v["--token-budget=".len()..], "token-budget")?
-            }
-            "--no-metadata" => include_metadata = false,
-            "--no-usage-instructions" => include_usage_instructions = false,
-            v => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported arg `{v}` for `render-selected`"
-                )))
-            }
-        }
-        idx += 1;
-    }
-    Ok(AgentSkillsVerb::RenderSelected {
-        session_id,
-        todo_id,
-        max_skills,
-        token_budget,
-        include_metadata,
-        include_usage_instructions,
-    })
-}
-
-fn parse_agent_skills_record_used(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let mut positionals = Vec::new();
-    let mut mode = SkillUsageMode::Applied;
-    let mut evidence = Vec::new();
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--mode" => {
-                idx += 1;
-                mode = parse_skill_usage_mode(&skill_required_flag(rest, idx, "--mode")?)?;
-            }
-            v if v.starts_with("--mode=") => mode = parse_skill_usage_mode(&v["--mode=".len()..])?,
-            "--evidence" => {
-                idx += 1;
-                evidence = split_csv(&skill_required_flag(rest, idx, "--evidence")?);
-            }
-            v if v.starts_with("--evidence=") => evidence = split_csv(&v["--evidence=".len()..]),
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `record-used`"
-                )))
-            }
-            v => positionals.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if positionals.len() != 1 {
-        return Err(agent_skills_invalid("`record-used` expects <usage_id>"));
-    }
-    Ok(AgentSkillsVerb::RecordUsed {
-        usage_id: positionals.remove(0),
-        mode,
-        evidence,
-    })
-}
-
-fn parse_agent_skills_record_result(rest: &[String]) -> Result<AgentSkillsVerb, AgentToolError> {
-    let mut positionals = Vec::new();
-    let mut result = None;
-    let mut feedback = None;
-    let mut failure_reason = None;
-    let mut output_refs = Vec::new();
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--result" => {
-                idx += 1;
-                result = Some(parse_skill_task_result(&skill_required_flag(
-                    rest, idx, "--result",
-                )?)?);
-            }
-            v if v.starts_with("--result=") => {
-                result = Some(parse_skill_task_result(&v["--result=".len()..])?)
-            }
-            "--feedback" => {
-                idx += 1;
-                feedback = Some(parse_skill_feedback(&skill_required_flag(
-                    rest,
-                    idx,
-                    "--feedback",
-                )?)?);
-            }
-            v if v.starts_with("--feedback=") => {
-                feedback = Some(parse_skill_feedback(&v["--feedback=".len()..])?)
-            }
-            "--failure-reason" => {
-                idx += 1;
-                failure_reason = Some(skill_required_flag(rest, idx, "--failure-reason")?);
-            }
-            v if v.starts_with("--failure-reason=") => {
-                failure_reason = Some(v["--failure-reason=".len()..].to_string())
-            }
-            "--output-refs" => {
-                idx += 1;
-                output_refs = split_csv(&skill_required_flag(rest, idx, "--output-refs")?);
-            }
-            v if v.starts_with("--output-refs=") => {
-                output_refs = split_csv(&v["--output-refs=".len()..])
-            }
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `record-result`"
-                )))
-            }
-            v => positionals.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if positionals.len() != 1 {
-        return Err(agent_skills_invalid("`record-result` expects <usage_id>"));
-    }
-    Ok(AgentSkillsVerb::RecordResult {
-        usage_id: positionals.remove(0),
-        result: result
-            .ok_or_else(|| agent_skills_invalid("`record-result` requires `--result`"))?,
-        feedback,
-        failure_reason,
-        output_refs,
-    })
-}
-
-fn parse_skill_ref_actor(
-    rest: &[String],
-    verb: &str,
-) -> Result<(String, Option<String>), AgentToolError> {
-    let mut positionals = Vec::new();
-    let mut actor = None;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--actor" => {
-                idx += 1;
-                actor = Some(skill_required_flag(rest, idx, "--actor")?);
-            }
-            v if v.starts_with("--actor=") => actor = Some(v["--actor=".len()..].to_string()),
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `{verb}`"
-                )))
-            }
-            v => positionals.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if positionals.len() != 1 {
-        return Err(agent_skills_invalid(format!(
-            "`{verb}` expects <skill_ref>"
-        )));
-    }
-    Ok((positionals.remove(0), actor))
-}
-
-fn parse_skill_ref_actor_reason(
-    rest: &[String],
-    verb: &str,
-) -> Result<(String, Option<String>, String), AgentToolError> {
-    let mut positionals = Vec::new();
-    let mut actor = None;
-    let mut reason = None;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--actor" => {
-                idx += 1;
-                actor = Some(skill_required_flag(rest, idx, "--actor")?);
-            }
-            v if v.starts_with("--actor=") => actor = Some(v["--actor=".len()..].to_string()),
-            "--reason" => {
-                idx += 1;
-                reason = Some(skill_required_flag(rest, idx, "--reason")?);
-            }
-            v if v.starts_with("--reason=") => reason = Some(v["--reason=".len()..].to_string()),
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `{verb}`"
-                )))
-            }
-            v => positionals.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if positionals.len() != 1 {
-        return Err(agent_skills_invalid(format!(
-            "`{verb}` expects <skill_ref>"
-        )));
-    }
-    Ok((
-        positionals.remove(0),
-        actor,
-        reason.ok_or_else(|| agent_skills_invalid(format!("`{verb}` requires `--reason`")))?,
-    ))
-}
-
-fn parse_selection_like_args(
-    rest: &[String],
-    verb: &str,
-) -> Result<
-    (
-        Vec<String>,
-        usize,
-        Vec<SkillLifecycleState>,
-        SkillRiskLevel,
-        Option<String>,
-        Option<String>,
-    ),
-    AgentToolError,
-> {
-    let mut requested = Vec::new();
-    let mut max_count = DEFAULT_MAX_SELECTED_SKILLS;
-    let mut allowed_states = vec![SkillLifecycleState::Active, SkillLifecycleState::Preferred];
-    let mut risk_budget = SkillRiskLevel::Medium;
-    let mut session_id = None;
-    let mut todo_id = None;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--max-count" => {
-                idx += 1;
-                max_count = parse_skill_usize(
-                    &skill_required_flag(rest, idx, "--max-count")?,
-                    "max-count",
-                )?;
-            }
-            v if v.starts_with("--max-count=") => {
-                max_count = parse_skill_usize(&v["--max-count=".len()..], "max-count")?
-            }
-            "--allowed-states" => {
-                idx += 1;
-                allowed_states =
-                    parse_skill_states_csv(&skill_required_flag(rest, idx, "--allowed-states")?)?;
-            }
-            v if v.starts_with("--allowed-states=") => {
-                allowed_states = parse_skill_states_csv(&v["--allowed-states=".len()..])?
-            }
-            "--risk-budget" => {
-                idx += 1;
-                risk_budget = parse_skill_risk(&skill_required_flag(rest, idx, "--risk-budget")?)?;
-            }
-            v if v.starts_with("--risk-budget=") => {
-                risk_budget = parse_skill_risk(&v["--risk-budget=".len()..])?
-            }
-            "--session" => {
-                idx += 1;
-                session_id = Some(skill_required_flag(rest, idx, "--session")?);
-            }
-            v if v.starts_with("--session=") => {
-                session_id = Some(v["--session=".len()..].to_string())
-            }
-            "--todo" => {
-                idx += 1;
-                todo_id = Some(skill_required_flag(rest, idx, "--todo")?);
-            }
-            v if v.starts_with("--todo=") => todo_id = Some(v["--todo=".len()..].to_string()),
-            v if v.starts_with("--") => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported flag `{v}` for `{verb}`"
-                )))
-            }
-            v => requested.push(v.to_string()),
-        }
-        idx += 1;
-    }
-    if requested.is_empty() && !matches!(verb, "selected-list" | "render-selected") {
-        return Err(agent_skills_invalid(format!(
-            "`{verb}` expects at least one skill ref"
-        )));
-    }
-    Ok((
-        requested,
-        max_count,
-        allowed_states,
-        risk_budget,
-        session_id,
-        todo_id,
-    ))
-}
-
-fn parse_session_todo_flags(
-    rest: &[String],
-    verb: &str,
-) -> Result<(Option<String>, Option<String>), AgentToolError> {
-    let mut session_id = None;
-    let mut todo_id = None;
-    let mut idx = 0usize;
-    while idx < rest.len() {
-        let token = &rest[idx];
-        match token.as_str() {
-            "--session" => {
-                idx += 1;
-                session_id = Some(skill_required_flag(rest, idx, "--session")?);
-            }
-            v if v.starts_with("--session=") => {
-                session_id = Some(v["--session=".len()..].to_string())
-            }
-            "--todo" => {
-                idx += 1;
-                todo_id = Some(skill_required_flag(rest, idx, "--todo")?);
-            }
-            v if v.starts_with("--todo=") => todo_id = Some(v["--todo=".len()..].to_string()),
-            v => {
-                return Err(agent_skills_invalid(format!(
-                    "unsupported arg `{v}` for `{verb}`"
-                )))
-            }
-        }
-        idx += 1;
-    }
-    Ok((session_id, todo_id))
-}
-
-fn skill_required_flag(
-    tokens: &[String],
-    idx: usize,
-    flag: &str,
-) -> Result<String, AgentToolError> {
-    tokens
-        .get(idx)
-        .cloned()
-        .ok_or_else(|| agent_skills_invalid(format!("missing value for `{flag}`")))
-}
-
-fn parse_skill_usize(raw: &str, name: &str) -> Result<usize, AgentToolError> {
-    raw.trim()
-        .parse::<usize>()
-        .map_err(|_| agent_skills_invalid(format!("invalid `--{name}` value `{raw}`")))
-}
-
-fn parse_skill_type(raw: &str) -> Result<SkillType, AgentToolError> {
-    SkillType::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_types_csv(raw: &str) -> Result<Vec<SkillType>, AgentToolError> {
-    split_csv(raw)
-        .into_iter()
-        .map(|value| parse_skill_type(&value))
-        .collect()
-}
-
-fn parse_skill_source_type(raw: &str) -> Result<SkillSourceType, AgentToolError> {
-    SkillSourceType::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_scope(raw: &str) -> Result<SkillOwnerScope, AgentToolError> {
-    SkillOwnerScope::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_risk(raw: &str) -> Result<SkillRiskLevel, AgentToolError> {
-    SkillRiskLevel::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_state(raw: &str) -> Result<SkillLifecycleState, AgentToolError> {
-    SkillLifecycleState::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_states_csv(raw: &str) -> Result<Vec<SkillLifecycleState>, AgentToolError> {
-    split_csv(raw)
-        .into_iter()
-        .map(|value| parse_skill_state(&value))
-        .collect()
-}
-
-fn parse_skill_usage_mode(raw: &str) -> Result<SkillUsageMode, AgentToolError> {
-    SkillUsageMode::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_task_result(raw: &str) -> Result<SkillTaskResult, AgentToolError> {
-    SkillTaskResult::parse(raw).map_err(agent_skills_error)
-}
-
-fn parse_skill_feedback(raw: &str) -> Result<SkillUserFeedback, AgentToolError> {
-    SkillUserFeedback::parse(raw).map_err(agent_skills_error)
-}
-
-fn agent_skills_error(err: SkillsMgrError) -> AgentToolError {
-    AgentToolError::InvalidArgs(err.to_string())
-}
-
 fn resolve_agent_memory_root(env: &CliRuntimeEnv, override_path: Option<PathBuf>) -> PathBuf {
     if let Some(p) = override_path {
         return canonicalize_or_normalize(p, Some(env.current_dir.as_path()));
@@ -3190,18 +2033,6 @@ fn resolve_agent_notebook_root(env: &CliRuntimeEnv, override_path: Option<PathBu
         }
     }
     cli_state_root(env).join(AGENT_NOTEBOOK_DIR_NAME)
-}
-
-fn resolve_agent_skills_root(env: &CliRuntimeEnv, override_path: Option<PathBuf>) -> PathBuf {
-    if let Some(p) = override_path {
-        return canonicalize_or_normalize(p, Some(env.current_dir.as_path()));
-    }
-    if env.allow_dev_overrides() {
-        if let Some(value) = first_path_env(&[AGENT_SKILLS_ROOT_ENV], &env.current_dir) {
-            return value;
-        }
-    }
-    cli_state_root(env).join(SKILLS_DIR)
 }
 
 fn resolve_agent_notebook_session_id(env: &CliRuntimeEnv) -> Option<String> {
@@ -3263,6 +2094,18 @@ async fn dispatch_agent_memory(
     } = invocation;
 
     let root = resolve_agent_memory_root(env, root_override);
+
+    // Cognitions change only through the memory_maintenance Goal's
+    // consolidation (its host tools, under the consolidation lease). The CLI
+    // writes are administrative: refused inside a Session shell.
+    if agent_memory_verb_writes(&verb) && !env.allow_dev_overrides() {
+        return agent_memory_error_output(
+            AgentMemoryError::ReadOnly(
+                "agent-memory writes are administrative and refused inside a session: cognitions change only through the memory_maintenance goal's consolidation (perceive with `agent-session ctl perceive`)".to_string(),
+            ),
+            quiet,
+        );
+    }
 
     // `set` form B reads content from stdin BEFORE spawn_blocking so we can
     // surface the same async stdin path as the rest of the CLI.
@@ -3348,6 +2191,18 @@ async fn read_stdin_content(stdin_override: Option<String>) -> Result<String, Ag
 /// Synchronous worker: opens the memory root and dispatches a single verb.
 /// The returned `String` is the verb's stdout body per §5 (or empty for
 /// verbs with no stdout output).
+/// Verbs that change the Graph or its root.
+fn agent_memory_verb_writes(verb: &AgentMemoryVerb) -> bool {
+    !matches!(
+        verb,
+        AgentMemoryVerb::Get { .. }
+            | AgentMemoryVerb::List { .. }
+            | AgentMemoryVerb::ListObjects { .. }
+            | AgentMemoryVerb::Load { .. }
+            | AgentMemoryVerb::Verify { repair: false }
+    )
+}
+
 fn run_agent_memory_blocking(
     root: &Path,
     verb: AgentMemoryVerb,
@@ -3369,9 +2224,14 @@ fn run_agent_memory_blocking(
                 content,
                 reason,
                 entities,
-                tags,
                 weight: None,
                 confidence: None,
+                evidence: Vec::new(),
+                expected_revision: None,
+                meta: agent_tool::agent_memory::ItemMeta {
+                    tags,
+                    ..Default::default()
+                },
             })?;
             Ok(String::new())
         }
@@ -3424,24 +2284,24 @@ fn run_agent_memory_blocking(
             ))
         }
         AgentMemoryVerb::ObserveAdd { occasion_id, op } => {
-            let wrapper = mem.observe(&occasion_id, op)?;
-            Ok(format!("OCCASION {}\nSTATUS added\n", wrapper))
+            let r = mem.observe(&occasion_id, op)?;
+            Ok(format_commit_result(&r, "added"))
         }
         AgentMemoryVerb::ObjectUpsert { occasion_id, op } => {
-            let wrapper = mem.upsert_object(&occasion_id, op)?;
-            Ok(format!("OCCASION {}\nSTATUS updated\n", wrapper))
+            let r = mem.upsert_object(&occasion_id, op)?;
+            Ok(format_commit_result(&r, "updated"))
         }
         AgentMemoryVerb::ObjectReinforce { occasion_id, op } => {
-            let wrapper = mem.reinforce_object(&occasion_id, op)?;
-            Ok(format!("OCCASION {}\nSTATUS reinforced\n", wrapper))
+            let r = mem.reinforce_object(&occasion_id, op)?;
+            Ok(format_commit_result(&r, "reinforced"))
         }
         AgentMemoryVerb::Relate { occasion_id, op } => {
-            let wrapper = mem.relate(&occasion_id, op)?;
-            Ok(format!("OCCASION {}\nSTATUS related\n", wrapper))
+            let r = mem.relate(&occasion_id, op)?;
+            Ok(format_commit_result(&r, "related"))
         }
         AgentMemoryVerb::SetStatus { occasion_id, op } => {
-            let wrapper = mem.set_status(&occasion_id, op)?;
-            Ok(format!("OCCASION {}\nSTATUS updated\n", wrapper))
+            let r = mem.set_status(&occasion_id, op)?;
+            Ok(format_commit_result(&r, "updated"))
         }
         AgentMemoryVerb::Load {
             tags,
@@ -3464,6 +2324,9 @@ fn run_agent_memory_blocking(
         }
         AgentMemoryVerb::Verify { repair } => {
             let report = mem.verify(repair)?;
+            if report.has_unrecoverable() {
+                return Err(AgentMemoryError::Corrupted(format_verify_report(&report)));
+            }
             Ok(format_verify_report(&report))
         }
         AgentMemoryVerb::Compact => {
@@ -3473,36 +2336,54 @@ fn run_agent_memory_blocking(
     }
 }
 
+/// `OCCASION` plus the real ids the operation produced (TD-17).
+fn format_commit_result(r: &agent_tool::agent_memory::CommitResult, status: &str) -> String {
+    use agent_tool::agent_memory::ObjectOutcome;
+    let mut out = format!("OCCASION {}\n", r.occasion_id);
+    for o in &r.report.observations {
+        out.push_str(&format!("OBSERVATION {o}\n"));
+    }
+    for o in &r.report.objects {
+        let outcome = match o.outcome {
+            ObjectOutcome::Created => "created",
+            ObjectOutcome::Updated => "updated",
+            ObjectOutcome::Merged => "merged",
+        };
+        out.push_str(&format!("OBJECT {} {outcome}\n", o.object_id));
+        for shared in &o.shared_aliases {
+            out.push_str(&format!(
+                "ALIAS_SHARED {} {}\n",
+                shared.alias,
+                shared.other_objects.join(",")
+            ));
+        }
+    }
+    for i in &r.report.items {
+        out.push_str(&format!("ITEM {}@{} {}\n", i.item_id, i.revision, i.status));
+    }
+    out.push_str(&format!("STATUS {status}\n"));
+    out
+}
+
 fn format_verify_report(report: &agent_tool::VerifyReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("OK_KEYS {}\n", report.ok_keys));
-    out.push_str(&format!("ORPHAN_FILES {}\n", report.orphan_files.len()));
-    for p in &report.orphan_files {
-        out.push_str(&format!("  orphan {}\n", p.display()));
-    }
     out.push_str(&format!(
-        "TOMBSTONE_RESIDUE {}\n",
-        report.tombstone_residue.len()
+        "OCCASIONS {}\nOBJECTS {}\nOBSERVATIONS {}\nITEMS {}\n",
+        report.occasions, report.objects, report.observations, report.items
     ));
-    for p in &report.tombstone_residue {
-        out.push_str(&format!("  tombstone {}\n", p.display()));
+    for (name, list) in [
+        ("LOG_ERRORS", &report.log_errors),
+        ("REFERENCE_ERRORS", &report.reference_errors),
+        ("ALIAS_CONFLICTS", &report.alias_conflicts),
+        ("DERIVED_ISSUES", &report.derived_issues),
+    ] {
+        out.push_str(&format!("{name} {}\n", list.len()));
+        for e in list {
+            out.push_str(&format!("  {e}\n"));
+        }
     }
-    out.push_str(&format!(
-        "MISSING_CONTENT {}\n",
-        report.missing_content.len()
-    ));
-    for k in &report.missing_content {
-        out.push_str(&format!("  missing {}\n", k));
-    }
-    out.push_str(&format!(
-        "DIGEST_MISMATCH {}\n",
-        report.digest_mismatch.len()
-    ));
-    for k in &report.digest_mismatch {
-        out.push_str(&format!("  mismatch {}\n", k));
-    }
-    if report.repaired_index {
-        out.push_str("REPAIRED_INDEX 1\n");
+    if report.repaired {
+        out.push_str("REPAIRED_DERIVED 1\n");
     }
     out
 }
@@ -4484,326 +3365,6 @@ fn agent_notebook_error_output(err: NotebookError) -> CliRunOutput {
     }
 }
 
-fn agent_skills_error_output(err: SkillsMgrError) -> CliRunOutput {
-    let exit_code = err.exit_code();
-    let payload = json!({
-        "status": "error",
-        "code": err.code(),
-        "message": err.to_string(),
-    });
-    CliRunOutput {
-        exit_code,
-        stdout: format!("{payload}\n"),
-        stderr: String::new(),
-    }
-}
-
-async fn dispatch_agent_skills(
-    env: &CliRuntimeEnv,
-    _tool_name: &str,
-    invocation: AgentSkillsInvocation,
-) -> CliRunOutput {
-    let AgentSkillsInvocation {
-        root_override,
-        verb,
-    } = invocation;
-    let root = resolve_agent_skills_root(env, root_override);
-    let default_actor = env.call_ctx.agent_name.clone();
-    let default_session_id = env.runtime_context.session_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        run_agent_skills_blocking(&root, &default_actor, &default_session_id, verb)
-    })
-    .await
-    .unwrap_or_else(|join| {
-        Err(SkillsMgrError::Storage(format!(
-            "agent-skills worker panicked: {join}"
-        )))
-    });
-    match result {
-        Ok(value) => {
-            let mut stdout =
-                serde_json::to_string(&value).unwrap_or_else(|_| "{\"status\":\"ok\"}".to_string());
-            stdout.push('\n');
-            CliRunOutput {
-                exit_code: 0,
-                stdout,
-                stderr: String::new(),
-            }
-        }
-        Err(err) => agent_skills_error_output(err),
-    }
-}
-
-fn run_agent_skills_blocking(
-    root: &Path,
-    default_actor: &str,
-    default_session_id: &str,
-    verb: AgentSkillsVerb,
-) -> Result<Json, SkillsMgrError> {
-    let mgr = SkillsMgr::open(SkillsMgrConfig::new(root))?;
-    match verb {
-        AgentSkillsVerb::Init => Ok(json!({
-            "status": "ok",
-            "root": root.to_string_lossy().to_string(),
-        })),
-        AgentSkillsVerb::Install {
-            path,
-            id,
-            name,
-            title,
-            description,
-            skill_type,
-            group_id,
-            intent_tags,
-            required_tools,
-            risk_level,
-            source_type,
-            target_scope,
-            trust_hint,
-            installed_by,
-            promote,
-        } => {
-            let installed_by = installed_by.unwrap_or_else(|| default_actor.to_string());
-            let source_uri = path.to_string_lossy().to_string();
-            let result = mgr.create_candidate(SkillCreateCandidateInput {
-                source_uri,
-                source_type,
-                installed_by: installed_by.clone(),
-                target_scope,
-                trust_hint,
-                package_path: Some(path),
-                body: None,
-                id,
-                name,
-                title,
-                description,
-                skill_type,
-                group_id,
-                intent_tags,
-                required_tools,
-                risk_level,
-            })?;
-            if promote {
-                let promoted = mgr.promote(&result.candidate.skill_id, &installed_by)?;
-                Ok(json!({
-                    "status": "ok",
-                    "install": result,
-                    "promoted": promoted,
-                }))
-            } else {
-                Ok(json!({
-                    "status": "ok",
-                    "install": result,
-                }))
-            }
-        }
-        AgentSkillsVerb::List { filter } => {
-            let skills = mgr.list_skills(filter)?;
-            Ok(json!({
-                "status": "ok",
-                "skills": skills,
-            }))
-        }
-        AgentSkillsVerb::ExplorerHints { filter } => {
-            let skills = mgr.skill_hints_for_explorer(filter)?;
-            Ok(json!({
-                "status": "ok",
-                "skills": skills,
-            }))
-        }
-        AgentSkillsVerb::View {
-            skill_ref,
-            package_path,
-        } => {
-            let value = mgr.skill_view(&skill_ref, package_path.as_deref())?;
-            Ok(json!({
-                "status": "ok",
-                "skill": value,
-            }))
-        }
-        AgentSkillsVerb::Promote { skill_ref, actor } => {
-            let actor = actor.unwrap_or_else(|| default_actor.to_string());
-            let skill = mgr.promote(&skill_ref, &actor)?;
-            Ok(json!({
-                "status": "ok",
-                "skill": skill,
-            }))
-        }
-        AgentSkillsVerb::Archive {
-            skill_ref,
-            reason,
-            actor,
-        } => {
-            let actor = actor.unwrap_or_else(|| default_actor.to_string());
-            let skill = mgr.archive(&skill_ref, &actor, &reason)?;
-            Ok(json!({
-                "status": "ok",
-                "skill": skill,
-            }))
-        }
-        AgentSkillsVerb::Restore {
-            skill_ref,
-            reason,
-            actor,
-        } => {
-            let actor = actor.unwrap_or_else(|| default_actor.to_string());
-            let skill = mgr.restore(&skill_ref, &actor, &reason)?;
-            Ok(json!({
-                "status": "ok",
-                "skill": skill,
-            }))
-        }
-        AgentSkillsVerb::Validate {
-            requested,
-            max_count,
-            allowed_states,
-            risk_budget,
-        } => {
-            let result = mgr.validate_selection(SkillValidateSelectionInput {
-                requested,
-                max_count,
-                allowed_states,
-                risk_budget,
-            })?;
-            Ok(json!({
-                "status": "ok",
-                "validation": result,
-            }))
-        }
-        AgentSkillsVerb::SelectSession {
-            session_id,
-            requested,
-            risk_budget,
-            max_count,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let selected = mgr.select_for_session(
-                &session_id,
-                SkillValidateSelectionInput {
-                    requested,
-                    max_count,
-                    allowed_states: vec![
-                        SkillLifecycleState::Active,
-                        SkillLifecycleState::Preferred,
-                    ],
-                    risk_budget,
-                },
-            )?;
-            Ok(json!({
-                "status": "ok",
-                "selected": selected,
-            }))
-        }
-        AgentSkillsVerb::SelectTodo {
-            session_id,
-            todo_id,
-            requested,
-            risk_budget,
-            max_count,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let selected = mgr.select_for_todo(
-                &session_id,
-                &todo_id,
-                SkillValidateSelectionInput {
-                    requested,
-                    max_count,
-                    allowed_states: vec![
-                        SkillLifecycleState::Active,
-                        SkillLifecycleState::Preferred,
-                    ],
-                    risk_budget,
-                },
-            )?;
-            Ok(json!({
-                "status": "ok",
-                "selected": selected,
-            }))
-        }
-        AgentSkillsVerb::UnselectSession {
-            session_id,
-            skill_refs,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let selected = mgr.unselect_for_session(&session_id, &skill_refs)?;
-            Ok(json!({
-                "status": "ok",
-                "selected": selected,
-            }))
-        }
-        AgentSkillsVerb::UnselectTodo {
-            session_id,
-            todo_id,
-            skill_refs,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let selected = mgr.unselect_for_todo(&session_id, &todo_id, &skill_refs)?;
-            Ok(json!({
-                "status": "ok",
-                "selected": selected,
-            }))
-        }
-        AgentSkillsVerb::SelectedList {
-            session_id,
-            todo_id,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let selected = mgr.selected_list(&session_id, todo_id.as_deref())?;
-            Ok(json!({
-                "status": "ok",
-                "selected": selected,
-            }))
-        }
-        AgentSkillsVerb::RenderSelected {
-            session_id,
-            todo_id,
-            max_skills,
-            token_budget,
-            include_metadata,
-            include_usage_instructions,
-        } => {
-            let session_id = session_id.unwrap_or_else(|| default_session_id.to_string());
-            let fragment = mgr.render_selected(SkillRenderSelectedInput {
-                session_id,
-                todo_id,
-                max_skills,
-                token_budget,
-                include_metadata,
-                include_usage_instructions,
-            })?;
-            Ok(json!({
-                "status": "ok",
-                "fragment": fragment,
-            }))
-        }
-        AgentSkillsVerb::RecordUsed {
-            usage_id,
-            mode,
-            evidence,
-        } => {
-            let usage = mgr.record_used(&usage_id, mode, evidence)?;
-            Ok(json!({
-                "status": "ok",
-                "usage": usage,
-            }))
-        }
-        AgentSkillsVerb::RecordResult {
-            usage_id,
-            result,
-            feedback,
-            failure_reason,
-            output_refs,
-        } => {
-            let usage =
-                mgr.record_result(&usage_id, result, feedback, failure_reason, output_refs)?;
-            Ok(json!({
-                "status": "ok",
-                "usage": usage,
-            }))
-        }
-    }
-}
-
 async fn dispatch_agent_notebook(
     env: &CliRuntimeEnv,
     _tool_name: &str,
@@ -5172,45 +3733,6 @@ fn cli_state_root(env: &CliRuntimeEnv) -> PathBuf {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct CliLocalWorkspaceSessionBinding {
-    session_id: String,
-    bound_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct CliWorkspaceRecord {
-    workspace_id: String,
-    name: String,
-    relative_path: Option<String>,
-    created_by_session: Option<String>,
-    created_at_ms: u64,
-    updated_at_ms: u64,
-    bound_sessions: Vec<CliLocalWorkspaceSessionBinding>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct CliWorkspaceIndex {
-    agent_did: String,
-    workspaces: Vec<CliWorkspaceRecord>,
-    updated_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct CliSessionWorkspaceBinding {
-    session_id: String,
-    local_workspace_id: String,
-    workspace_path: String,
-    workspace_rel_path: String,
-    agent_env_root: String,
-    bound_at_ms: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct CliSessionBindingsFile {
-    bindings: Vec<CliSessionWorkspaceBinding>,
-}
-
 #[derive(Clone)]
 struct CliSessionBackend {
     state_root: PathBuf,
@@ -5224,18 +3746,54 @@ impl SessionViewBackend for CliSessionBackend {
     }
 }
 
-#[derive(Clone)]
-struct CliWorkspaceBackend {
-    state_root: PathBuf,
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct BeginAttentionSignalExtractionArgs {
+    session_id: String,
+    window_start: String,
+    window_end: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct BeginAttentionSignalExtractionOutput {
+    owner_id: String,
     agent_id: String,
+    agent_scope_id: String,
+    user_id: String,
+    session_id: String,
+    window_start: String,
+    window_end: String,
+    extraction_window_id: String,
 }
 
-struct CliReadSessionHistoryTool {
-    agent_root: PathBuf,
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct CompleteAttentionSignalExtractionArgs {}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct CompleteAttentionSignalExtractionOutput {
+    extraction_window: ExtractionWindow,
 }
 
-struct CliCommitSessionHistoryImprovedTool {
-    agent_root: PathBuf,
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct ListPendingAttentionSignalsArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ListPendingAttentionSignalsOutput {
+    agent_scope_id: String,
+    returned: usize,
+    signals: Vec<AttentionSignal>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct MarkAttentionSignalConsumedArgs {
+    signal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct MarkAttentionSignalConsumedOutput {
+    signal: AttentionSignal,
 }
 
 struct CliBeginAttentionSignalExtractionTool {
@@ -5280,167 +3838,6 @@ struct CliDiscoverSkillCoverageGapTool {
     store: Arc<AgentAttentionSignalStore>,
     agent_root: PathBuf,
     current_session_id: String,
-}
-
-#[async_trait]
-impl TypedTool for CliReadSessionHistoryTool {
-    type Args = ReadSessionHistoryArgs;
-    type Output = ReadSessionHistoryOutput;
-
-    fn name(&self) -> &str {
-        TOOL_READ_SESSION_HISTORY
-    }
-
-    fn description(&self) -> &str {
-        "Read target Agent Session history from <agent_root>/sessions/<session_id>/round_history."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some(
-            "read_session_history '{\"session_id\":\"...\",\"from_already_improved\":true,\"token_limit\":40960}' | read_session_history session_id=<id> already_improved token_limit=40960".to_string(),
-        )
-    }
-
-    fn parse_bash_args(
-        &self,
-        tokens: &[String],
-        _shell_cwd: Option<&Path>,
-    ) -> Result<Json, AgentToolError> {
-        parse_read_session_history_cli_args(tokens)
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!(
-            "read {} message(s) from session {} ({})",
-            output.returned, output.session_id, output.query
-        )
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let session_id = args.session_id.trim();
-        validate_session_id_arg(session_id)?;
-        let session_dir = session_dir(&self.agent_root, session_id);
-        if !session_dir.is_dir() {
-            return Err(AgentToolError::ExecFailed(format!(
-                "session `{session_id}` not found"
-            )));
-        }
-
-        let token_limit = args.token_limit.unwrap_or(DEFAULT_HISTORY_TOKEN_LIMIT);
-        let reader = SessionHistoryReader::open(&session_dir)
-            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-        let already_improved = load_already_improved_state(&session_dir).await?;
-        let (result, query_label) = if args.from_already_improved {
-            let start_round_index = already_improved.committed_round_index.saturating_add(1);
-            let result = reader
-                .read_session_messages_from_round_index(
-                    start_round_index,
-                    SessionHistoryReadOptions { token_limit },
-                )
-                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-            (
-                result,
-                format!("already_improved from_round={start_round_index}"),
-            )
-        } else {
-            let (query, query_label) = build_history_query(&args)?;
-            let result = reader
-                .read_session_messages(query, SessionHistoryReadOptions { token_limit })
-                .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-            (result, query_label)
-        };
-        let commit_round_index = args
-            .from_already_improved
-            .then_some(result.last_round_index)
-            .flatten();
-        let latest_round_index = result.latest_round_index;
-        let messages = result
-            .messages
-            .into_iter()
-            .map(|msg| {
-                let ts_ms = msg.ts.timestamp_millis().max(0) as u64;
-                SessionHistoryMessageOutput {
-                    round_index: msg.round_index,
-                    seq: msg.seq,
-                    ts_ms,
-                    ts: msg.ts.to_rfc3339(),
-                    role: msg.role.as_str().to_string(),
-                    text: msg.text,
-                }
-            })
-            .collect::<Vec<_>>();
-        Ok(ReadSessionHistoryOutput {
-            session_id: session_id.to_string(),
-            query: query_label,
-            already_improved: already_improved_output(&already_improved),
-            commit_round_index,
-            latest_round_index,
-            total_candidates: result.total_candidates,
-            returned: messages.len(),
-            truncated: result.truncated,
-            messages,
-        })
-    }
-}
-
-#[async_trait]
-impl TypedTool for CliCommitSessionHistoryImprovedTool {
-    type Args = CommitSessionHistoryImprovedArgs;
-    type Output = CommitSessionHistoryImprovedOutput;
-
-    fn name(&self) -> &str {
-        TOOL_COMMIT_SESSION_HISTORY_IMPROVED
-    }
-
-    fn description(&self) -> &str {
-        "Commit self-improve processing progress into target session .meta/session.json."
-    }
-
-    fn usage(&self) -> Option<String> {
-        Some(
-            "commit_session_history_improved '{\"session_id\":\"...\",\"round_index\":3}' | commit_session_history_improved session_id=<id> round_index=3".to_string(),
-        )
-    }
-
-    fn build_summary(&self, output: &Self::Output) -> String {
-        format!(
-            "committed improved history for session {} through round {}",
-            output.session_id, output.committed_round_index
-        )
-    }
-
-    async fn execute(
-        &self,
-        _ctx: &ToolCtx<'_>,
-        args: Self::Args,
-    ) -> Result<Self::Output, AgentToolError> {
-        let session_id = args.session_id.trim();
-        validate_session_id_arg(session_id)?;
-        let session_dir = session_dir(&self.agent_root, session_id);
-        if !session_dir.is_dir() {
-            return Err(AgentToolError::ExecFailed(format!(
-                "session `{session_id}` not found"
-            )));
-        }
-        let latest_round_index = SessionHistoryReader::open(&session_dir)
-            .and_then(|reader| reader.latest_round_index())
-            .map_err(|err| AgentToolError::ExecFailed(format!("{err:#}")))?;
-        let target_round_index = latest_round_index
-            .map(|latest| args.round_index.min(latest))
-            .unwrap_or(0);
-        let (previous, committed) =
-            commit_already_improved_state(&session_dir, target_round_index).await?;
-        Ok(CommitSessionHistoryImprovedOutput {
-            session_id: session_id.to_string(),
-            committed_round_index: committed.committed_round_index,
-            previous_committed_round_index: previous.committed_round_index,
-            latest_round_index,
-        })
-    }
 }
 
 #[async_trait]
@@ -5490,23 +3887,7 @@ impl TypedTool for CliBeginAttentionSignalExtractionTool {
             ));
         }
 
-        let target_session_dir = session_dir(&self.agent_root, session_id);
-        let meta = load_session_meta(&target_session_dir)
-            .await?
-            .ok_or_else(|| {
-                AgentToolError::ExecFailed(format!("session `{session_id}` meta not found"))
-            })?;
-        if matches!(meta.kind, SessionKind::SelfImprove) {
-            return Err(AgentToolError::InvalidArgs(
-                "self-improve session history cannot be used as self-improve input".to_string(),
-            ));
-        }
-
-        let owner_id = if meta.owner.trim().is_empty() {
-            "system".to_string()
-        } else {
-            meta.owner.clone()
-        };
+        let owner_id = "system".to_string();
         let user_id = owner_id.clone();
         let agent_scope_id = self.agent_id.clone();
         let store = open_attention_store(&self.agent_root)?;
@@ -5792,189 +4173,6 @@ fn session_dir(agent_root: &Path, session_id: &str) -> PathBuf {
     agent_root.join("sessions").join(session_id)
 }
 
-fn session_meta_path(session_dir: &Path) -> PathBuf {
-    session_dir.join(".meta").join("session.json")
-}
-
-async fn load_session_meta(session_dir: &Path) -> Result<Option<SessionMeta>, AgentToolError> {
-    let path = session_meta_path(session_dir);
-    match fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice::<SessionMeta>(&bytes)
-            .map(Some)
-            .map_err(|err| {
-                AgentToolError::ExecFailed(format!("parse {} failed: {err}", path.display()))
-            }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(AgentToolError::ExecFailed(format!(
-            "read {} failed: {err}",
-            path.display()
-        ))),
-    }
-}
-
-async fn write_session_meta(session_dir: &Path, meta: &SessionMeta) -> Result<(), AgentToolError> {
-    let path = session_meta_path(session_dir);
-    let dir = path.parent().ok_or_else(|| {
-        AgentToolError::ExecFailed(format!("invalid session meta path {}", path.display()))
-    })?;
-    fs::create_dir_all(dir).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!("mkdir {} failed: {err}", dir.display()))
-    })?;
-    let bytes = serde_json::to_vec_pretty(meta).map_err(|err| {
-        AgentToolError::ExecFailed(format!("serialize session meta failed: {err}"))
-    })?;
-    let tmp = dir.join(format!(
-        "session.json.{}.{}.tmp",
-        std::process::id(),
-        now_ms()
-    ));
-    fs::write(&tmp, &bytes).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!("write {} failed: {err}", tmp.display()))
-    })?;
-    fs::rename(&tmp, &path).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!("rename to {} failed: {err}", path.display()))
-    })?;
-    Ok(())
-}
-
-async fn load_already_improved_state(
-    session_dir: &Path,
-) -> Result<AlreadyImprovedState, AgentToolError> {
-    Ok(load_session_meta(session_dir)
-        .await?
-        .map(|meta| meta.already_improved)
-        .unwrap_or_default())
-}
-
-async fn commit_already_improved_state(
-    session_dir: &Path,
-    round_index: u64,
-) -> Result<(AlreadyImprovedState, AlreadyImprovedState), AgentToolError> {
-    let mut meta = load_session_meta(session_dir).await?.ok_or_else(|| {
-        AgentToolError::ExecFailed(format!(
-            "session meta not found under {}",
-            session_dir.display()
-        ))
-    })?;
-    let previous = meta.already_improved.clone();
-    if round_index > meta.already_improved.committed_round_index {
-        meta.already_improved.committed_round_index = round_index;
-        meta.already_improved.committed_at_ms = now_ms();
-    }
-    let committed = meta.already_improved.clone();
-    write_session_meta(session_dir, &meta).await?;
-    Ok((previous, committed))
-}
-
-fn already_improved_output(state: &AlreadyImprovedState) -> AlreadyImprovedOutput {
-    AlreadyImprovedOutput {
-        committed_round_index: state.committed_round_index,
-        committed_at_ms: state.committed_at_ms,
-    }
-}
-
-fn parse_read_session_history_cli_args(tokens: &[String]) -> Result<Json, AgentToolError> {
-    if tokens.len() == 1 && tokens[0].trim().starts_with('{') {
-        return agent_tool::parse_default_bash_exec_args(tokens);
-    }
-    let mut normalized = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        match token.as_str() {
-            "already_improved" | "from_already_improved" => {
-                normalized.push("from_already_improved=true".to_string())
-            }
-            _ => normalized.push(token.clone()),
-        }
-    }
-    agent_tool::parse_default_bash_exec_args(&normalized)
-}
-
-fn build_history_query(
-    args: &ReadSessionHistoryArgs,
-) -> Result<(SessionHistoryQuery, String), AgentToolError> {
-    let exact_start = parse_optional_time(args.start_ms, args.start.as_deref(), "start")?;
-    let exact_end = parse_optional_time(args.end_ms, args.end.as_deref(), "end")?;
-    if exact_start.is_some() || exact_end.is_some() {
-        let start = exact_start.ok_or_else(|| {
-            AgentToolError::InvalidArgs(
-                "`start`/`start_ms` is required with exact time range".to_string(),
-            )
-        })?;
-        let end = exact_end.ok_or_else(|| {
-            AgentToolError::InvalidArgs(
-                "`end`/`end_ms` is required with exact time range".to_string(),
-            )
-        })?;
-        if start > end {
-            return Err(AgentToolError::InvalidArgs(
-                "`start` must not be greater than `end`".to_string(),
-            ));
-        }
-        return Ok((
-            SessionHistoryQuery::TimeRange { start, end },
-            format!("time_range {}..{}", start.to_rfc3339(), end.to_rfc3339()),
-        ));
-    }
-
-    let at = parse_optional_time(args.at_ms, args.at.as_deref(), "at")?;
-    if let Some(at) = at {
-        let window_ms = args.window_ms.unwrap_or(DEFAULT_HISTORY_WINDOW_MS as u64) as i64;
-        if window_ms <= 0 {
-            return Err(AgentToolError::InvalidArgs(
-                "`window_ms` must be greater than zero".to_string(),
-            ));
-        }
-        let half = Duration::milliseconds(window_ms / 2);
-        let start = at - half;
-        let end = at + Duration::milliseconds(window_ms - window_ms / 2);
-        return Ok((
-            SessionHistoryQuery::TimeRange { start, end },
-            format!("around {} window_ms={window_ms}", at.to_rfc3339()),
-        ));
-    }
-
-    let page = args.page.unwrap_or(0);
-    if page < -1 {
-        return Err(AgentToolError::InvalidArgs(
-            "`page` must be -1 or a non-negative integer".to_string(),
-        ));
-    }
-    let page_size = args.page_size.unwrap_or(DEFAULT_HISTORY_PAGE_SIZE);
-    if page_size == 0 {
-        return Err(AgentToolError::InvalidArgs(
-            "`page_size` must be greater than zero".to_string(),
-        ));
-    }
-    let page_size = page_size.min(MAX_HISTORY_PAGE_SIZE);
-    Ok((
-        SessionHistoryQuery::Page { page, page_size },
-        format!("page={page} page_size={page_size}"),
-    ))
-}
-
-fn parse_optional_time(
-    ms: Option<u64>,
-    rfc3339: Option<&str>,
-    name: &str,
-) -> Result<Option<DateTime<Utc>>, AgentToolError> {
-    match (ms, rfc3339.map(str::trim).filter(|s| !s.is_empty())) {
-        (Some(ms), None) => {
-            let ms = i64::try_from(ms)
-                .map_err(|_| AgentToolError::InvalidArgs(format!("`{name}_ms` is out of range")))?;
-            DateTime::<Utc>::from_timestamp_millis(ms)
-                .map(Some)
-                .ok_or_else(|| AgentToolError::InvalidArgs(format!("`{name}_ms` is invalid")))
-        }
-        (None, Some(value)) => DateTime::parse_from_rfc3339(value)
-            .map(|dt| Some(dt.with_timezone(&Utc)))
-            .map_err(|err| AgentToolError::InvalidArgs(format!("invalid `{name}` time: {err}"))),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => Err(AgentToolError::InvalidArgs(format!(
-            "use either `{name}_ms` or `{name}`, not both"
-        ))),
-    }
-}
-
 fn open_attention_store(agent_root: &Path) -> Result<AgentAttentionSignalStore, AgentToolError> {
     AgentAttentionSignalStore::open(AttentionSignalStoreConfig::new(
         agent_root.join("attention_signals"),
@@ -6040,228 +4238,6 @@ async fn remove_attention_runtime(
     }
 }
 
-#[async_trait]
-impl WorkspaceToolBackend for CliWorkspaceBackend {
-    async fn create_workspace(
-        &self,
-        ctx: &SessionRuntimeContext,
-        name: String,
-        summary: String,
-    ) -> Result<Json, AgentToolError> {
-        let session_id = ctx.session_id.trim();
-        if session_id.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "session_id is required".to_string(),
-            ));
-        }
-        let session = load_session_json(&self.state_root, session_id).await?;
-        if build_session_summary_view(&session)
-            .get("local_workspace_id")
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
-        {
-            return Err(AgentToolError::InvalidArgs(format!(
-                "session `{session_id}` already bound local workspace"
-            )));
-        }
-
-        let now = now_ms();
-        let workspace_id = format!("ws-{now:x}-{:x}", std::process::id());
-        let mut index = load_workspace_index(&self.state_root).await?;
-        let workspace_dir_name =
-            allocate_cli_workspace_dir_name(&self.state_root, &index, &name).await?;
-        let workspace_rel_path = format!("workspaces/{workspace_dir_name}");
-        let workspace_path = self.state_root.join(&workspace_rel_path);
-        fs::create_dir_all(&workspace_path).await.map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "create workspace dir `{}` failed: {err}",
-                workspace_path.display()
-            ))
-        })?;
-        let summary_path = workspace_path.join("SUMMARY.md");
-        fs::write(&summary_path, format!("{}\n", summary.trim()))
-            .await
-            .map_err(|err| {
-                AgentToolError::ExecFailed(format!(
-                    "write workspace summary failed: path={} err={err}",
-                    summary_path.display()
-                ))
-            })?;
-
-        let workspace = CliWorkspaceRecord {
-            workspace_id: workspace_id.clone(),
-            name: name.trim().to_string(),
-            relative_path: Some(workspace_rel_path.clone()),
-            created_by_session: Some(session_id.to_string()),
-            created_at_ms: now,
-            updated_at_ms: now,
-            bound_sessions: vec![CliLocalWorkspaceSessionBinding {
-                session_id: session_id.to_string(),
-                bound_at_ms: now,
-            }],
-        };
-        index.workspaces.push(workspace.clone());
-        index.agent_did = self.agent_id.clone();
-        index.updated_at_ms = now;
-        save_workspace_index(&self.state_root, &index).await?;
-
-        let binding = CliSessionWorkspaceBinding {
-            session_id: session_id.to_string(),
-            local_workspace_id: workspace_id.clone(),
-            workspace_path: workspace_path.to_string_lossy().to_string(),
-            workspace_rel_path,
-            agent_env_root: self.state_root.to_string_lossy().to_string(),
-            bound_at_ms: now,
-        };
-        save_session_binding(&self.state_root, &binding).await?;
-        let session_updated = persist_session_workspace_binding(
-            &self.state_root,
-            session_id,
-            &workspace_id,
-            Some(workspace.name.as_str()),
-            &binding,
-        )
-        .await?;
-
-        Ok(json!({
-            "ok": true,
-            "workspace": workspace,
-            "binding": binding,
-            "summary_path": summary_path.to_string_lossy().to_string(),
-            "session_id": session_id,
-            "session_updated": session_updated
-        }))
-    }
-
-    async fn resolve_workspace_id(
-        &self,
-        workspace_ref: &str,
-        shell_cwd: Option<&Path>,
-    ) -> Result<String, AgentToolError> {
-        let workspace_ref = workspace_ref.trim();
-        if workspace_ref.is_empty() {
-            return Err(AgentToolError::InvalidArgs(
-                "workspace argument cannot be empty".to_string(),
-            ));
-        }
-
-        let index = load_workspace_index(&self.state_root).await?;
-        if let Some(found) = index
-            .workspaces
-            .iter()
-            .find(|item| item.workspace_id == workspace_ref)
-        {
-            return Ok(found.workspace_id.clone());
-        }
-
-        let parsed = Path::new(workspace_ref);
-        let candidate = if parsed.is_absolute() {
-            parsed.to_path_buf()
-        } else if let Some(cwd) = shell_cwd {
-            cwd.join(parsed)
-        } else {
-            std::env::current_dir()
-                .map_err(|err| {
-                    AgentToolError::ExecFailed(format!("read current_dir failed: {err}"))
-                })?
-                .join(parsed)
-        };
-        let normalized_candidate = canonicalize_or_normalize(candidate, None);
-        for item in index.workspaces {
-            let workspace_path = workspace_root_for_record(&self.state_root, &item);
-            if canonicalize_or_normalize(workspace_path, None) == normalized_candidate {
-                return Ok(item.workspace_id);
-            }
-        }
-
-        Err(AgentToolError::InvalidArgs(format!(
-            "workspace not found: `{workspace_ref}`; expected workspace_id or workspace_path"
-        )))
-    }
-
-    async fn bind_workspace(
-        &self,
-        _ctx: &SessionRuntimeContext,
-        session_id: &str,
-        workspace_id: &str,
-    ) -> Result<Json, AgentToolError> {
-        let session = load_session_json(&self.state_root, session_id).await?;
-        if build_session_summary_view(&session)
-            .get("local_workspace_id")
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some()
-        {
-            return Err(AgentToolError::InvalidArgs(format!(
-                "session `{session_id}` already bound local workspace"
-            )));
-        }
-        if load_session_binding(&self.state_root, session_id)
-            .await?
-            .is_some()
-        {
-            return Err(AgentToolError::InvalidArgs(format!(
-                "session `{session_id}` already bound local workspace"
-            )));
-        }
-
-        let mut index = load_workspace_index(&self.state_root).await?;
-        let Some(workspace) = index
-            .workspaces
-            .iter_mut()
-            .find(|item| item.workspace_id == workspace_id)
-        else {
-            return Err(AgentToolError::InvalidArgs(format!(
-                "workspace not found: `{workspace_id}`"
-            )));
-        };
-
-        let now = now_ms();
-        workspace.updated_at_ms = now;
-        workspace
-            .bound_sessions
-            .push(CliLocalWorkspaceSessionBinding {
-                session_id: session_id.to_string(),
-                bound_at_ms: now,
-            });
-        let workspace_snapshot = workspace.clone();
-        index.updated_at_ms = now;
-        save_workspace_index(&self.state_root, &index).await?;
-
-        let workspace_path = workspace_root_for_record(&self.state_root, &workspace_snapshot);
-        let binding = CliSessionWorkspaceBinding {
-            session_id: session_id.to_string(),
-            local_workspace_id: workspace_id.to_string(),
-            workspace_path: workspace_path.to_string_lossy().to_string(),
-            workspace_rel_path: workspace_snapshot
-                .relative_path
-                .clone()
-                .unwrap_or_else(|| format!("workspaces/{workspace_id}")),
-            agent_env_root: self.state_root.to_string_lossy().to_string(),
-            bound_at_ms: now,
-        };
-        save_session_binding(&self.state_root, &binding).await?;
-        let session_updated = persist_session_workspace_binding(
-            &self.state_root,
-            session_id,
-            workspace_id,
-            Some(workspace_snapshot.name.as_str()),
-            &binding,
-        )
-        .await?;
-
-        Ok(json!({
-            "ok": true,
-            "binding": binding,
-            "session_id": session_id,
-            "session_updated": session_updated
-        }))
-    }
-}
-
 /// Single registry-of-tools used by the CLI dispatcher. Replaces the
 /// per-tool `build_xxx_tool` factories — adding a new tool here is a one
 /// line `register_typed_tool` call instead of a new branch in
@@ -6276,13 +4252,6 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
         state_root: state_root.clone(),
     })))?;
 
-    let workspace_backend = Arc::new(CliWorkspaceBackend {
-        state_root: state_root.clone(),
-        agent_id: env.call_ctx.agent_name.clone(),
-    });
-    mgr.register_typed_tool(CreateWorkspaceTool::new(workspace_backend.clone()))?;
-    mgr.register_typed_tool(BindWorkspaceTool::new(workspace_backend))?;
-
     // NOTE: agent-memory is no longer a TypedTool — it has its own
     // top-level CLI dispatch (see `dispatch_agent_memory`) so the agent
     // can invoke it directly via shell per the v2.8 contract.
@@ -6292,15 +4261,15 @@ async fn build_cli_tool_manager(env: &CliRuntimeEnv) -> Result<AgentToolManager,
     mgr.register_typed_tool(GrepTool::new(file_cfg.clone()))?;
     mgr.register_typed_tool(DcrontabTool::new())?;
     mgr.register_typed_tool(ReadFileTool::new(file_cfg.clone()))?;
+    // The Session's `read` (agent_tool ReadTool) with the same object reader OpenDAN gives it.
+    let routes = load_object_route_config(env, None).await?;
+    let objects = AgentDIDObjectRuntime::new(routes).map_err(object_error_to_agent_tool_error)?;
+    mgr.register_tool_arc(Arc::new(
+        agent_tool::read_tool::ReadTool::new(file_cfg.clone())
+            .with_urls(Some(Arc::new(ObjectUrlReader::new(objects)))),
+    ))?;
     mgr.register_typed_tool(WriteFileTool::new(file_cfg.clone(), audit.clone()))?;
     mgr.register_typed_tool(EditFileTool::new(file_cfg, audit))?;
-    mgr.register_typed_tool(TodoTool::new(TodoToolConfig::new(state_root)))?;
-    mgr.register_typed_tool(CliReadSessionHistoryTool {
-        agent_root: env.agent_env_root.clone(),
-    })?;
-    mgr.register_typed_tool(CliCommitSessionHistoryImprovedTool {
-        agent_root: env.agent_env_root.clone(),
-    })?;
     mgr.register_typed_tool(CliBeginAttentionSignalExtractionTool {
         agent_root: env.agent_env_root.clone(),
         current_session_id: env.call_ctx.session_id.clone(),
@@ -6391,10 +4360,10 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
             }
         }
         match name {
+            TOOL_XCALL => XCALL_USAGE.to_string(),
             TOOL_CHECK_TASK => "check_task <task_id>".to_string(),
             TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]".to_string(),
             TOOL_FINISH_TASK => "finish_task <task_id> [failed] [--message <text>]".to_string(),
-            TOOL_AGENT_SKILLS | TOOL_AGENT_SKILLS_SNAKE => AGENT_SKILLS_USAGE.to_string(),
             _ => format!("{name} ..."),
         }
     };
@@ -6420,16 +4389,10 @@ async fn build_help_result(env: &CliRuntimeEnv, tool_name: Option<&str>) -> Agen
 
 fn with_tool_usage(message: impl Into<String>, tool_name: &str) -> AgentToolError {
     let usage = match tool_name {
-        TOOL_READ_OBJECT => {
-            "read <object-or-path> [--content-only] [--offset <1-based-line>] [--limit <lines>] [--config <route.toml>]"
-        }
-        TOOL_X_CALL | TOOL_X_CALL_SNAKE => {
-            "x-call <object> <action> [--params <json>] [key=value ...] [--key=value ...] [--config <route.toml>]"
-        }
+        TOOL_XCALL => XCALL_USAGE,
         TOOL_CHECK_TASK => "check_task <task_id>",
         TOOL_CANCEL_TASK => "cancel_task <task_id> [--recursive]",
         TOOL_FINISH_TASK => "finish_task <task_id> [failed] [--message <text>]",
-        TOOL_AGENT_SKILLS | TOOL_AGENT_SKILLS_SNAKE => AGENT_SKILLS_USAGE,
         _ => "agent_tool <tool> ...",
     };
     AgentToolError::InvalidArgs(format!("{}\nUsage: {usage}", message.into()))
@@ -6598,30 +4561,6 @@ async fn load_session_json(state_root: &Path, session_id: &str) -> Result<Json, 
     })
 }
 
-async fn save_session_json(
-    state_root: &Path,
-    session_id: &str,
-    session: &Json,
-) -> Result<(), AgentToolError> {
-    let path = session_file_path(state_root, session_id)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "create session dir `{}` failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(session)
-        .map_err(|err| AgentToolError::ExecFailed(format!("serialize session failed: {err}")))?;
-    fs::write(&path, bytes).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!(
-            "write session file `{}` failed: {err}",
-            path.display()
-        ))
-    })
-}
-
 fn build_session_summary_view(session: &Json) -> Json {
     let runtime_state = session
         .pointer("/meta/runtime_state")
@@ -6660,238 +4599,6 @@ fn build_session_summary_view(session: &Json) -> Json {
     })
 }
 
-async fn load_workspace_index(state_root: &Path) -> Result<CliWorkspaceIndex, AgentToolError> {
-    let path = state_root.join(WORKSPACE_INDEX_FILE);
-    match fs::read_to_string(&path).await {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "parse workspace index `{}` failed: {err}",
-                path.display()
-            ))
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(CliWorkspaceIndex::default()),
-        Err(err) => Err(AgentToolError::ExecFailed(format!(
-            "read workspace index `{}` failed: {err}",
-            path.display()
-        ))),
-    }
-}
-
-async fn save_workspace_index(
-    state_root: &Path,
-    index: &CliWorkspaceIndex,
-) -> Result<(), AgentToolError> {
-    let path = state_root.join(WORKSPACE_INDEX_FILE);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "create workspace index dir `{}` failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(index).map_err(|err| {
-        AgentToolError::ExecFailed(format!("serialize workspace index failed: {err}"))
-    })?;
-    fs::write(&path, bytes).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!(
-            "write workspace index `{}` failed: {err}",
-            path.display()
-        ))
-    })
-}
-
-async fn load_session_bindings_file(
-    state_root: &Path,
-) -> Result<CliSessionBindingsFile, AgentToolError> {
-    let path = state_root.join(SESSION_WORKSPACE_BINDINGS_REL_PATH);
-    match fs::read_to_string(&path).await {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "parse session bindings `{}` failed: {err}",
-                path.display()
-            ))
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(CliSessionBindingsFile::default())
-        }
-        Err(err) => Err(AgentToolError::ExecFailed(format!(
-            "read session bindings `{}` failed: {err}",
-            path.display()
-        ))),
-    }
-}
-
-async fn save_session_bindings_file(
-    state_root: &Path,
-    file: &CliSessionBindingsFile,
-) -> Result<(), AgentToolError> {
-    let path = state_root.join(SESSION_WORKSPACE_BINDINGS_REL_PATH);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await.map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "create session bindings dir `{}` failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(file).map_err(|err| {
-        AgentToolError::ExecFailed(format!("serialize session bindings failed: {err}"))
-    })?;
-    fs::write(&path, bytes).await.map_err(|err| {
-        AgentToolError::ExecFailed(format!(
-            "write session bindings `{}` failed: {err}",
-            path.display()
-        ))
-    })
-}
-
-async fn load_session_binding(
-    state_root: &Path,
-    session_id: &str,
-) -> Result<Option<CliSessionWorkspaceBinding>, AgentToolError> {
-    let file = load_session_bindings_file(state_root).await?;
-    Ok(file
-        .bindings
-        .into_iter()
-        .find(|item| item.session_id.trim() == session_id))
-}
-
-async fn save_session_binding(
-    state_root: &Path,
-    binding: &CliSessionWorkspaceBinding,
-) -> Result<(), AgentToolError> {
-    let mut file = load_session_bindings_file(state_root).await?;
-    file.bindings
-        .retain(|item| item.session_id.trim() != binding.session_id.trim());
-    file.bindings.push(binding.clone());
-    save_session_bindings_file(state_root, &file).await
-}
-
-async fn persist_session_workspace_binding(
-    state_root: &Path,
-    session_id: &str,
-    workspace_id: &str,
-    workspace_name: Option<&str>,
-    binding: &CliSessionWorkspaceBinding,
-) -> Result<bool, AgentToolError> {
-    let mut session = load_session_json(state_root, session_id).await?;
-    let Some(root_map) = session.as_object_mut() else {
-        return Err(AgentToolError::ExecFailed(
-            "session record must be a json object".to_string(),
-        ));
-    };
-    let meta = root_map
-        .entry("meta".to_string())
-        .or_insert_with(|| json!({}));
-    if !meta.is_object() {
-        *meta = json!({});
-    }
-    let meta_map = meta.as_object_mut().expect("meta object");
-    if !meta_map.contains_key("runtime_state") {
-        meta_map.insert("runtime_state".to_string(), json!({}));
-    }
-    let runtime_state = meta_map
-        .get_mut("runtime_state")
-        .expect("runtime_state present");
-    if !runtime_state.is_object() {
-        *runtime_state = json!({});
-    }
-    let workspace_info = json!({
-        "workspace_id": workspace_id,
-        "local_workspace_id": workspace_id,
-        "workspace_name": workspace_name.unwrap_or(""),
-        "workspace_type": "local",
-        "binding": binding
-    });
-    let runtime_map = runtime_state.as_object_mut().expect("runtime_state object");
-    runtime_map.insert(
-        "local_workspace_id".to_string(),
-        Json::String(workspace_id.to_string()),
-    );
-    runtime_map.insert("workspace_info".to_string(), workspace_info);
-    let now = now_ms();
-    root_map.insert("updated_at_ms".to_string(), json!(now));
-    root_map.insert("last_activity_ms".to_string(), json!(now));
-    save_session_json(state_root, session_id, &session).await?;
-    Ok(true)
-}
-
-fn workspace_root_for_record(state_root: &Path, record: &CliWorkspaceRecord) -> PathBuf {
-    record
-        .relative_path
-        .as_deref()
-        .map(|rel| state_root.join(rel))
-        .unwrap_or_else(|| state_root.join("workspaces").join(&record.workspace_id))
-}
-
-async fn allocate_cli_workspace_dir_name(
-    state_root: &Path,
-    index: &CliWorkspaceIndex,
-    workspace_name: &str,
-) -> Result<String, AgentToolError> {
-    let base_name = sanitize_cli_workspace_dir_name(workspace_name);
-
-    for suffix in 1u32.. {
-        let candidate = if suffix == 1 {
-            base_name.clone()
-        } else {
-            format!("{base_name}-{suffix}")
-        };
-
-        let already_indexed = index.workspaces.iter().any(|item| {
-            item.relative_path
-                .as_deref()
-                .and_then(|rel| Path::new(rel).file_name())
-                .and_then(|value| value.to_str())
-                == Some(candidate.as_str())
-        });
-        if already_indexed {
-            continue;
-        }
-
-        let candidate_path = state_root.join("workspaces").join(&candidate);
-        if !fs::try_exists(&candidate_path).await.map_err(|err| {
-            AgentToolError::ExecFailed(format!(
-                "check workspace dir `{}` failed: {err}",
-                candidate_path.display()
-            ))
-        })? {
-            return Ok(candidate);
-        }
-    }
-
-    unreachable!("workspace dir allocation should always find a candidate")
-}
-
-fn sanitize_cli_workspace_dir_name(workspace_name: &str) -> String {
-    let mut out = String::new();
-    let mut pending_dash = false;
-
-    for ch in workspace_name.trim().chars() {
-        let is_forbidden =
-            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|');
-        if is_forbidden {
-            if !out.is_empty() {
-                pending_dash = true;
-            }
-            continue;
-        }
-
-        if pending_dash && !out.ends_with('-') {
-            out.push('-');
-        }
-        pending_dash = false;
-        out.push(ch);
-    }
-
-    let sanitized = out.trim_matches([' ', '.']).trim();
-    match sanitized {
-        "" | "." | ".." => "workspace".to_string(),
-        _ => sanitized.to_string(),
-    }
-}
-
 async fn build_task_manager_client(
     env: &CliRuntimeEnv,
 ) -> Result<TaskManagerClient, AgentToolError> {
@@ -6903,20 +4610,23 @@ async fn build_task_manager_client(
         });
     }
 
-    if env.allow_dev_overrides() {
+    if env.allow_dev_overrides() && env.runtime_context.appclient_session_token.is_none() {
         if let Some(client) = resolve_dev_task_manager_client() {
             return Ok(client);
         }
     }
 
     require_runtime_token_for_rpc(env)?;
-    let runtime = init_buckyos_api_runtime("opendan", None, BuckyOSRuntimeType::FrameService)
+    agent_tool::xllm::ensure_buckyos_runtime()
         .await
         .map_err(|err| {
             AgentToolError::ExecFailed(format!(
                 "init runtime for task-manager access failed: {err}"
             ))
         })?;
+    let runtime = get_buckyos_api_runtime().map_err(|err| {
+        AgentToolError::ExecFailed(format!("get runtime for task-manager access failed: {err}"))
+    })?;
     runtime.get_task_mgr_client().await.map_err(|err| {
         AgentToolError::ExecFailed(format!("init task-manager client failed: {err}"))
     })
@@ -6926,34 +4636,34 @@ fn build_check_task_result(tool_name: &str, task: Task) -> AgentToolResult {
     let top_status = task_protocol_status(&task);
     let summary = task_summary(&task, top_status);
     let pending_reason = task_pending_reason(&task);
-    let exec_bash_task = tool_exec_bash_task_data(&task);
-    let is_exec_bash_task = exec_bash_task.is_some();
-    let mut detail = if is_exec_bash_task {
+    let shell_task = tool_shell_task_data(&task);
+    let is_shell_task = shell_task.is_some();
+    let mut detail = if is_shell_task {
         json!({})
     } else {
         normalized_task_detail(&task)
     };
-    if !is_exec_bash_task {
+    if !is_shell_task {
         if let Some(map) = detail.as_object_mut() {
             map.insert("task".to_string(), json!(task.clone()));
         }
     }
 
-    let cmd_line = if is_exec_bash_task {
-        exec_bash_task
+    let cmd_line = if is_shell_task {
+        shell_task
             .as_ref()
             .and_then(|data| data.command.clone())
     } else {
         Some(format!("{tool_name} {}", task.task_id))
     };
-    let output = exec_bash_task.as_ref().and_then(|data| data.output.clone());
-    let return_code = exec_bash_task
+    let output = shell_task.as_ref().and_then(|data| data.output.clone());
+    let return_code = shell_task
         .as_ref()
         .and_then(|data| data.return_code.or(data.exit_code));
-    let estimated_wait = exec_bash_task
+    let estimated_wait = shell_task
         .as_ref()
         .and_then(|data| data.estimated_wait.clone());
-    let check_after = exec_bash_task
+    let check_after = shell_task
         .as_ref()
         .and_then(|data| data.check_after)
         .or_else(|| (top_status == AgentToolStatus::Pending).then_some(5));
@@ -6962,7 +4672,7 @@ fn build_check_task_result(tool_name: &str, task: Task) -> AgentToolResult {
         .with_status(top_status)
         .with_result(summary)
         .with_task_id(task.task_id.clone());
-    if !is_exec_bash_task {
+    if !is_shell_task {
         result = result.with_tool(tool_name);
     }
     if let Some(cmd_line) = cmd_line.as_deref() {
@@ -6990,21 +4700,14 @@ fn build_cancel_task_result(
     tool_name: &str,
     task: Task,
     recursive: bool,
-    interrupt_error: Option<String>,
 ) -> AgentToolResult {
     let mut detail = normalized_task_detail(&task);
     if let Some(map) = detail.as_object_mut() {
         map.insert("task".to_string(), json!(task.clone()));
         map.insert("recursive".to_string(), Json::Bool(recursive));
-        if let Some(err) = interrupt_error.as_ref() {
-            map.insert("interrupt_error".to_string(), Json::String(err.clone()));
-        }
     }
 
-    let summary = match interrupt_error {
-        Some(err) => format!("canceled task {} (interrupt failed: {err})", task.task_id),
-        None => format!("canceled task {}", task.task_id),
-    };
+    let summary = format!("canceled task {}", task.task_id);
 
     AgentToolResult::from_details(detail)
         .with_status(AgentToolStatus::Success)
@@ -7042,7 +4745,10 @@ fn build_finish_task_result(
     AgentToolResult::from_details(detail)
         .with_status(AgentToolStatus::Success)
         .with_result(format!("{outcome_text} task {}", task.task_id))
-        .with_title(format!("{tool_name} {} {outcome_text} => success", task.task_id))
+        .with_title(format!(
+            "{tool_name} {} {outcome_text} => success",
+            task.task_id
+        ))
         .with_tool(tool_name)
         .with_cmd_line(match outcome {
             FinishTaskOutcome::Completed => format!("{tool_name} {}", task.task_id),
@@ -7094,7 +4800,7 @@ fn normalized_task_detail(task: &Task) -> Json {
 fn task_protocol_status(task: &Task) -> AgentToolStatus {
     match (task.phase, task.outcome) {
         (TaskPhase::Terminal, Some(TaskOutcome::Succeeded)) => {
-            match tool_exec_bash_task_data(task)
+            match tool_shell_task_data(task)
                 .and_then(|data| data.status)
                 .as_deref()
             {
@@ -7108,7 +4814,7 @@ fn task_protocol_status(task: &Task) -> AgentToolStatus {
 }
 
 fn task_summary(task: &Task, protocol_status: AgentToolStatus) -> String {
-    let exec_summary = tool_exec_bash_task_data(task).and_then(|data| data.summary);
+    let exec_summary = tool_shell_task_data(task).and_then(|data| data.summary);
     exec_summary
         .as_deref()
         .map(str::trim)
@@ -7132,57 +4838,29 @@ fn task_summary(task: &Task, protocol_status: AgentToolStatus) -> String {
 }
 
 fn task_pending_reason(task: &Task) -> Option<AgentToolPendingReason> {
-    let pending_reason = tool_exec_bash_task_data(task).and_then(|data| data.pending_reason);
+    let pending_reason = tool_shell_task_data(task).and_then(|data| data.pending_reason);
     pending_reason
         .as_deref()
         .and_then(|value| match value {
             "user_approval" => Some(AgentToolPendingReason::UserApproval),
-            "wait_for_install" | "external_callback" => {
-                Some(AgentToolPendingReason::WaitForInstall)
-            }
+            "wait_for_install" => Some(AgentToolPendingReason::WaitForInstall),
             "long_running" => Some(AgentToolPendingReason::LongRunning),
             _ => None,
         })
         .or_else(|| match task.phase {
             TaskPhase::Waiting => Some(AgentToolPendingReason::UserApproval),
-            TaskPhase::Promised
-            | TaskPhase::Accepted
-            | TaskPhase::Running
-            | TaskPhase::Paused => Some(AgentToolPendingReason::LongRunning),
+            TaskPhase::Promised | TaskPhase::Accepted | TaskPhase::Running | TaskPhase::Paused => {
+                Some(AgentToolPendingReason::LongRunning)
+            }
             TaskPhase::Terminal => None,
         })
 }
 
-async fn interrupt_task_if_supported(task: &Task) -> Option<String> {
-    let tmux_target = tool_exec_bash_task_data(task)?.tmux_target?;
-    let tmux_target = tmux_target.trim();
-    if tmux_target.is_empty() {
-        return None;
-    }
-
-    let output = match Command::new("tmux")
-        .args(["send-keys", "-t", tmux_target, "C-c"])
-        .output()
-        .await
+fn tool_shell_task_data(task: &Task) -> Option<ToolShellTaskData> {
+    match parse_typed_task_data(TaskDataType::ToolShell.as_str(), task_data_payload(task))
+        .ok()?
     {
-        Ok(output) => output,
-        Err(err) => return Some(format!("tmux interrupt `{tmux_target}` failed: {err}")),
-    };
-    if output.status.success() {
-        return None;
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Some(if stderr.is_empty() {
-        format!("tmux interrupt `{tmux_target}` failed")
-    } else {
-        format!("tmux interrupt `{tmux_target}` failed: {stderr}")
-    })
-}
-
-fn tool_exec_bash_task_data(task: &Task) -> Option<ToolExecBashTaskData> {
-    match parse_typed_task_data(TaskDataType::ToolExecBash.as_str(), task_data_payload(task)).ok()? {
-        TypedTaskData::ToolExecBash(data) if data.kind == TaskDataType::ToolExecBash.as_str() => {
+        TypedTaskData::ToolShell(data) if data.kind == TaskDataType::ToolShell.as_str() => {
             Some(data)
         }
         _ => None,
@@ -7205,8 +4883,6 @@ mod tests {
     use std::sync::Mutex;
 
     use agent_tool::RuntimeContextSource;
-    use buckyos_api::{AiMessage, AiRole};
-    use opendan::round_history::{ContextMode, RoundStatus, RoundTrigger, SessionHistoryWriter};
     use tempfile::tempdir;
     use tokio::fs;
     use tokio::io::AsyncWriteExt as _;
@@ -7244,7 +4920,7 @@ mod tests {
                 trace_id: "trace-test".to_string(),
                 agent_name: "did:example:agent".to_string(),
                 behavior: "cli".to_string(),
-                step_idx: 0,
+                tool_call_index: 0,
                 wakeup_id: "wakeup-test".to_string(),
                 session_id: "session-test".to_string(),
                 read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
@@ -7306,40 +4982,12 @@ mod tests {
                 trace_id: "trace-test".to_string(),
                 agent_name: "did:example:agent".to_string(),
                 behavior: "cli".to_string(),
-                step_idx: 0,
+                tool_call_index: 0,
                 wakeup_id: "wakeup-test".to_string(),
                 session_id: "session-test".to_string(),
                 read_token_limit: DEFAULT_READ_TOKEN_LIMIT,
             },
         }
-    }
-
-    async fn seed_session(agent_env_root: &Path, session_id: &str, pwd: &Path) {
-        let now = now_ms();
-        let session = json!({
-            "session_id": session_id,
-            "owner_agent": "did:example:agent",
-            "title": "CLI Session",
-            "summary": "",
-            "status": "wait",
-            "created_at_ms": now,
-            "updated_at_ms": now,
-            "last_activity_ms": now,
-            "meta": {
-                "runtime_state": {
-                    "state": "wait",
-                    "current_behavior": "plan",
-                    "step_index": 0,
-                    "local_workspace_id": Json::Null,
-                    "workspace_info": {
-                        "workspace_path": pwd.to_string_lossy().to_string()
-                    }
-                }
-            }
-        });
-        save_session_json(agent_env_root, session_id, &session)
-            .await
-            .expect("save session");
     }
 
     fn seed_agent_identity(agent_root: &Path, owner_user_id: &str, agent_id: &str) {
@@ -7352,48 +5000,6 @@ mod tests {
             ),
         )
         .expect("write agent identity");
-    }
-
-    async fn seed_opendan_session_meta(agent_root: &Path, session_id: &str, kind: SessionKind) {
-        let session_dir = agent_root.join("sessions").join(session_id);
-        fs::create_dir_all(session_dir.join(".meta"))
-            .await
-            .expect("create session meta dir");
-        let meta = SessionMeta::new(
-            session_id.to_string(),
-            kind,
-            "chat_route".to_string(),
-            "alice".to_string(),
-        );
-        let bytes = serde_json::to_vec_pretty(&meta).expect("serialize session meta");
-        fs::write(session_dir.join(".meta").join("session.json"), bytes)
-            .await
-            .expect("write session meta");
-    }
-
-    async fn seed_round_history(agent_root: &Path, session_id: &str, text: &str) {
-        let session_dir = agent_root.join("sessions").join(session_id);
-        let mut writer = SessionHistoryWriter::open(&session_dir)
-            .await
-            .expect("open history writer");
-        writer
-            .begin_round(
-                RoundTrigger::UserMsg {
-                    preview: text.to_string(),
-                },
-                Vec::new(),
-                ContextMode::Chat,
-            )
-            .await
-            .expect("begin round");
-        writer
-            .append_message(AiMessage::text(AiRole::User, text), None)
-            .await
-            .expect("append message");
-        writer
-            .finalize_round(RoundStatus::Completed)
-            .await
-            .expect("finalize round");
     }
 
     #[tokio::test]
@@ -7430,7 +5036,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_read_cli_uses_agent_did_runtime_for_bare_path() {
+    async fn read_cli_is_the_session_read() {
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
         let cwd = root.join("workspace");
@@ -7441,111 +5047,36 @@ mod tests {
             .await
             .expect("write demo file");
 
-        let output = execute(
+        for args in [vec!["demo.txt", "range=2-2"], vec!["uri=demo.txt", "offset=1", "limit=1"]] {
+            let mut argv = vec![OsString::from("/tmp/agent_tool"), OsString::from("read")];
+            argv.extend(args.iter().map(OsString::from));
+            let output = execute(argv, test_env(root.clone(), cwd.clone()), None)
+                .await
+                .expect("run read");
+            assert_eq!(output.exit_code, EXIT_SUCCESS, "{}", output.stdout);
+            let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
+            assert_eq!(payload["status"], "success");
+            assert_eq!(payload["tool"], "read");
+            assert_eq!(payload["detail"]["content"], "line-2\n", "{args:?} {}", output.stdout);
+        }
+
+        // An object URL goes to the object library: refused without a Zone, not found in one.
+        let err = execute(
             vec![
                 OsString::from("/tmp/agent_tool"),
                 OsString::from("read"),
-                OsString::from("demo.txt"),
-                OsString::from("--content-only"),
-                OsString::from("--offset"),
-                OsString::from("2"),
-                OsString::from("--limit"),
-                OsString::from("1"),
+                OsString::from("obj://aiworkspace/ws_1"),
             ],
             test_env(root, cwd),
             None,
         )
         .await
-        .expect("run object read");
-
-        assert_eq!(output.exit_code, EXIT_SUCCESS);
-        let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
-        assert_eq!(payload["status"], "success");
-        assert_eq!(payload["tool"], "read");
-        assert_eq!(payload["cmd_name"], "read");
-        assert_eq!(payload["output"], "line-2");
+        .expect_err("no such workspace");
+        assert!(err.to_string().contains("obj://aiworkspace/ws_1"), "{err}");
     }
 
     #[tokio::test]
-    async fn object_read_cli_returns_unchanged_for_same_session_id_env() {
-        let _lock = nb_lock();
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd)
-            .await
-            .expect("create workspace dir");
-        fs::write(cwd.join("demo.txt"), "line-1\nline-2\n")
-            .await
-            .expect("write demo file");
-        seed_agent_identity(&root, "alice", "did:example:agent");
-
-        struct EnvGuard {
-            key: &'static str,
-            previous: Option<std::ffi::OsString>,
-        }
-        impl EnvGuard {
-            fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-                let previous = std::env::var_os(key);
-                std::env::set_var(key, value);
-                Self { key, previous }
-            }
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(previous) = self.previous.as_ref() {
-                    std::env::set_var(self.key, previous);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-
-        struct CwdGuard(std::path::PathBuf);
-        impl CwdGuard {
-            fn set(path: &Path) -> Self {
-                let previous = std::env::current_dir().expect("read current dir");
-                std::env::set_current_dir(path).expect("set current dir");
-                Self(previous)
-            }
-        }
-        impl Drop for CwdGuard {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.0);
-            }
-        }
-
-        let session_id = format!("unchanged-session-{}", now_ms());
-        let _g1 = EnvGuard::set(agent_tool::OPENDAN_AGENT_ROOT_ENV, &root);
-        let _g2 = EnvGuard::set(agent_tool::OPENDAN_SESSION_ID_ENV, &session_id);
-        let _g3 = EnvGuard::set(agent_tool::OPENDAN_TRACE_ID_ENV, "trace-unchanged");
-        let _cwd = CwdGuard::set(&cwd);
-
-        let args = vec![
-            OsString::from("/tmp/agent_tool"),
-            OsString::from("read"),
-            OsString::from("demo.txt"),
-            OsString::from("--content-only"),
-        ];
-        let first = execute(args.clone(), CliRuntimeEnv::from_process().unwrap(), None)
-            .await
-            .expect("first read");
-        assert_eq!(first.exit_code, EXIT_SUCCESS);
-        let first_payload: Json = serde_json::from_str(&first.stdout).expect("parse first json");
-        assert_eq!(first_payload["detail"]["unchanged"], false);
-        assert_eq!(first_payload["output"], "line-1\nline-2\n");
-
-        let second = execute(args, CliRuntimeEnv::from_process().unwrap(), None)
-            .await
-            .expect("second read");
-        assert_eq!(second.exit_code, EXIT_SUCCESS);
-        let second_payload: Json = serde_json::from_str(&second.stdout).expect("parse second json");
-        assert_eq!(second_payload["detail"]["unchanged"], true);
-        assert_eq!(second_payload["output"], "和上一次read相比没有变化");
-    }
-
-    #[tokio::test]
-    async fn object_x_call_cli_uses_route_config_and_local_http_adapter() {
+    async fn object_xcall_cli_uses_route_config_and_local_http_adapter() {
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
         let cwd = root.join("workspace");
@@ -7604,7 +5135,7 @@ methods = ["x_call"]
         let output = execute(
             vec![
                 OsString::from("/tmp/agent_tool"),
-                OsString::from("x-call"),
+                OsString::from("xcall"),
                 OsString::from("--config"),
                 OsString::from(config_path),
                 OsString::from("obj://demo/item"),
@@ -7616,14 +5147,14 @@ methods = ["x_call"]
             None,
         )
         .await
-        .expect("run object x-call");
+        .expect("run object xcall");
         server.await.expect("server task");
 
         assert_eq!(output.exit_code, EXIT_SUCCESS);
         let payload: Json = serde_json::from_str(&output.stdout).expect("parse json");
         assert_eq!(payload["status"], "success");
-        assert_eq!(payload["tool"], "x-call");
-        assert_eq!(payload["cmd_name"], "x_call");
+        assert_eq!(payload["tool"], "xcall");
+        assert_eq!(payload["cmd_name"], "xcall");
         assert_eq!(payload["detail"]["reserved"], true);
         assert_eq!(payload["output"], "ok");
     }
@@ -7676,43 +5207,15 @@ methods = ["x_call"]
     }
 
     #[tokio::test]
-    async fn attention_stage1_cli_flow_reads_discovers_completes_and_commits() {
+    async fn attention_stage1_cli_flow_discovers_and_completes() {
         let _guard = nb_lock();
         let temp = tempdir().expect("create tempdir");
         let root = temp.path().join("agent");
         let cwd = root.join("workspace");
         fs::create_dir_all(&cwd).await.expect("create cwd");
         let target_session = "target-session";
-        seed_opendan_session_meta(&root, target_session, SessionKind::Ui).await;
-        seed_round_history(
-            &root,
-            target_session,
-            "Project Atlas is blocked on DNS verification.",
-        )
-        .await;
-
         let env = test_env(root.clone(), cwd.clone());
-        let read_output = execute(
-            vec![
-                OsString::from("/tmp/read_session_history"),
-                OsString::from(format!("session_id={target_session}")),
-                OsString::from("already_improved"),
-                OsString::from("token_limit=4096"),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("read session history");
-        assert_eq!(read_output.exit_code, EXIT_SUCCESS);
-        let read_payload: Json = serde_json::from_str(&read_output.stdout).expect("read json");
-        assert_eq!(read_payload["detail"]["returned"], 1);
-        assert_eq!(read_payload["detail"]["commit_round_index"], 1);
-        let message_ts = read_payload["detail"]["messages"][0]["ts"]
-            .as_str()
-            .expect("message ts")
-            .to_string();
-
+        let message_ts = "2026-01-01T00:00:00Z";
         let begin_args = json!({
             "session_id": target_session,
             "window_start": message_ts,
@@ -7782,24 +5285,6 @@ methods = ["x_call"]
         .expect("complete extraction");
         assert_eq!(complete_output.exit_code, EXIT_SUCCESS);
 
-        let commit_output = execute(
-            vec![
-                OsString::from("/tmp/commit_session_history_improved"),
-                OsString::from(format!("session_id={target_session}")),
-                OsString::from("round_index=1"),
-            ],
-            env.clone(),
-            None,
-        )
-        .await
-        .expect("commit history progress");
-        assert_eq!(commit_output.exit_code, EXIT_SUCCESS);
-        let committed_meta = load_session_meta(&root.join("sessions").join(target_session))
-            .await
-            .expect("load meta")
-            .expect("meta exists");
-        assert_eq!(committed_meta.already_improved.committed_round_index, 1);
-
         let list_output = execute(
             vec![
                 OsString::from("/tmp/ListPendingAttentionSignals"),
@@ -7824,7 +5309,6 @@ methods = ["x_call"]
         let cwd = root.join("workspace");
         fs::create_dir_all(&cwd).await.expect("create cwd");
         let target_session = "target-session";
-        seed_opendan_session_meta(&root, target_session, SessionKind::Ui).await;
         let env = test_env(root.clone(), cwd);
 
         let begin_args = json!({
@@ -7918,7 +5402,7 @@ methods = ["x_call"]
         let root = temp.path().join("agent");
         let output = execute(
             vec![OsString::from(MAIN_BINARY_NAME), OsString::from("--help")],
-            test_env(root.clone(), root),
+            dev_test_env(root.clone(), root),
             None,
         )
         .await
@@ -7930,60 +5414,6 @@ methods = ["x_call"]
             payload["detail"]["tools"].as_array().map(|v| v.len()),
             Some(TOOL_NAMES.len())
         );
-    }
-
-    #[tokio::test]
-    async fn todo_cli_writes_session_todos_under_agent_env() {
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd)
-            .await
-            .expect("create workspace dir");
-
-        let add_output = execute(
-            vec![
-                OsString::from("/tmp/todo"),
-                OsString::from("add"),
-                OsString::from("first task"),
-                OsString::from("--content"),
-                OsString::from("task body"),
-            ],
-            test_env(root.clone(), cwd.clone()),
-            None,
-        )
-        .await
-        .expect("run todo add");
-        assert_eq!(add_output.exit_code, EXIT_SUCCESS);
-
-        let todos_path = root
-            .join("sessions")
-            .join("session-test")
-            .join("todos.json");
-        let todos: Json = serde_json::from_str(
-            &fs::read_to_string(&todos_path)
-                .await
-                .expect("read todos.json"),
-        )
-        .expect("parse todos");
-        assert_eq!(todos[0]["todo_id"], "T01");
-        assert_eq!(todos[0]["session_id"], "session-test");
-        assert_eq!(todos[0]["title"], "first task");
-
-        let current_output = execute(
-            vec![
-                OsString::from(MAIN_BINARY_NAME),
-                OsString::from("todo"),
-                OsString::from("current"),
-            ],
-            test_env(root, cwd),
-            None,
-        )
-        .await
-        .expect("run todo current");
-        assert_eq!(current_output.exit_code, EXIT_SUCCESS);
-        let payload: Json = serde_json::from_str(&current_output.stdout).expect("parse json");
-        assert_eq!(payload["detail"]["todo"]["todo_id"], "T01");
     }
 
     #[tokio::test]
@@ -8005,18 +5435,47 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
         .expect("run agent-memory set");
         assert_eq!(set_output.exit_code, EXIT_SUCCESS);
 
-        let item_dir = root.join("memory").join("item");
+        let item_dir = cwd.join(".opendan-cli").join("memory").join("item");
         assert!(
             fs::metadata(&item_dir).await.is_ok(),
             "free hints are materialized as canonical item JSON files"
         );
+        // Inside a session shell the same write is refused: cognitions change
+        // only through the consolidation of the memory_maintenance goal.
+        let refused = execute(
+            vec![
+                OsString::from("/tmp/agent-memory"),
+                OsString::from("set"),
+                OsString::from("/user/preference/other"),
+                OsString::from("verbose"),
+                OsString::from("--reason"),
+                OsString::from("user conversation;c=2"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run agent-memory set in a session");
+        assert_ne!(refused.exit_code, EXIT_SUCCESS);
+        assert!(refused.stderr.contains("administrative"), "{}", refused.stderr);
+        let readable = execute(
+            vec![
+                OsString::from("/tmp/agent-memory"),
+                OsString::from("list"),
+            ],
+            test_env(root.clone(), cwd.clone()),
+            None,
+        )
+        .await
+        .expect("run agent-memory list in a session");
+        assert_eq!(readable.exit_code, EXIT_SUCCESS);
 
         // get echoes content directly (no envelope, per §4.5)
         let get_output = execute(
@@ -8025,7 +5484,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/preference/style"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -8042,7 +5501,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user removed"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -8056,7 +5515,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/preference/style"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await
@@ -8082,7 +5541,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             Some(body.to_string()),
         )
         .await
@@ -8095,7 +5554,7 @@ methods = ["x_call"]
                 OsString::from("get"),
                 OsString::from("/user/note"),
             ],
-            test_env(root.clone(), root.join("workspace")),
+            dev_test_env(root.clone(), root.join("workspace")),
             None,
         )
         .await
@@ -8122,7 +5581,7 @@ methods = ["x_call"]
                 OsString::from("--reason"),
                 OsString::from("user conversation;c=1"),
             ],
-            test_env(root.clone(), cwd.clone()),
+            dev_test_env(root.clone(), cwd.clone()),
             None,
         )
         .await
@@ -8134,7 +5593,7 @@ methods = ["x_call"]
                 OsString::from("load"),
                 OsString::from("dental"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await
@@ -8166,7 +5625,7 @@ methods = ["x_call"]
                     OsString::from("--reason"),
                     OsString::from("r"),
                 ],
-                test_env(root.clone(), cwd.clone()),
+                dev_test_env(root.clone(), cwd.clone()),
                 None,
             )
             .await
@@ -8179,7 +5638,7 @@ methods = ["x_call"]
                 OsString::from("list"),
                 OsString::from("/user/"),
             ],
-            test_env(root.clone(), cwd),
+            dev_test_env(root.clone(), cwd),
             None,
         )
         .await
@@ -8210,6 +5669,17 @@ methods = ["x_call"]
         .await;
         let err = result.expect_err("set without --reason must fail at parse");
         assert!(matches!(err, AgentToolError::InvalidArgs(_)));
+    }
+
+    #[test]
+    fn invocation_names_route_to_this_cli_only_when_it_serves_them() {
+        for name in ["agent_tool", "read_file", "agent-memory", "dcrontab"] {
+            assert!(handles_invocation_name(name), "{name}");
+        }
+        // The multi-call `opendan` executable keeps these for itself.
+        for name in ["opendan", "xagent", "llm_understand_media", ""] {
+            assert!(!handles_invocation_name(name), "{name}");
+        }
     }
 
     #[test]
@@ -8544,100 +6014,11 @@ methods = ["x_call"]
         .await
         .expect("run command_not_found proxy");
 
-        // The dispatcher now delegates to `llm_tool_carft::run_subcommand`.
-        // Until step 1 reads behavior cfg, every call falls through with
-        // exit 127 + a structured AgentToolResult on stdout (stderr stays
-        // empty — render_cli_output puts the envelope on stdout). The shell
-        // hook's own `printf 'bash: %s: command not found\n'` is responsible
-        // for re-emitting the canonical error to stderr, not this CLI.
+        // Skipped craft attempts stay silent so bash can emit the canonical
+        // error without protocol JSON polluting stdout.
         assert_eq!(output.exit_code, agent_tool::CLI_EXIT_COMMAND_NOT_FOUND);
         assert!(output.stderr.is_empty());
-        assert!(output.stdout.contains("llm_tool_carft"));
-        assert!(output.stdout.contains("missing_tool"));
-        assert!(output.stdout.contains("skipped"));
-    }
-
-    #[tokio::test]
-    async fn create_workspace_and_get_session_aliases_share_local_state() {
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd)
-            .await
-            .expect("create workspace dir");
-        seed_session(&root, "session-test", &cwd).await;
-
-        let create_output = execute(
-            vec![
-                OsString::from("/tmp/create_workspace"),
-                OsString::from("demo"),
-                OsString::from("workspace summary"),
-            ],
-            test_env(root.clone(), cwd.clone()),
-            None,
-        )
-        .await
-        .expect("run create_workspace");
-        let create_payload: Json =
-            serde_json::from_str(&create_output.stdout).expect("parse create json");
-        assert_eq!(create_payload["status"], "success");
-        let workspace_id = create_payload["detail"]["workspace"]["workspace_id"]
-            .as_str()
-            .expect("workspace id");
-
-        let session_output = execute(
-            vec![OsString::from("/tmp/get_session")],
-            test_env(root.clone(), cwd),
-            None,
-        )
-        .await
-        .expect("run get_session");
-        let session_payload: Json =
-            serde_json::from_str(&session_output.stdout).expect("parse session json");
-        assert_eq!(session_payload["status"], "success");
-        assert_eq!(
-            session_payload["detail"]["session"]["local_workspace_id"],
-            workspace_id
-        );
-    }
-
-    #[tokio::test]
-    async fn create_workspace_alias_uses_title_for_workspace_dir() {
-        let temp = tempdir().expect("create tempdir");
-        let root = temp.path().join("agent");
-        let cwd = root.join("workspace");
-        fs::create_dir_all(&cwd)
-            .await
-            .expect("create workspace dir");
-        seed_session(&root, "session-test", &cwd).await;
-
-        let output = execute(
-            vec![
-                OsString::from("/tmp/create_workspace"),
-                OsString::from("My Workspace"),
-                OsString::from("workspace summary"),
-            ],
-            test_env(root.clone(), cwd),
-            None,
-        )
-        .await
-        .expect("run create_workspace");
-
-        let payload: Json = serde_json::from_str(&output.stdout).expect("parse create json");
-        assert_eq!(payload["status"], "success");
-        assert_eq!(
-            payload["detail"]["binding"]["workspace_rel_path"],
-            "workspaces/My Workspace"
-        );
-        let workspace_path = payload["detail"]["binding"]["workspace_path"]
-            .as_str()
-            .expect("workspace path");
-        assert!(workspace_path.ends_with("workspaces/My Workspace"));
-        assert!(!workspace_path
-            .rsplit('/')
-            .next()
-            .unwrap_or_default()
-            .starts_with("ws-"));
+        assert!(output.stdout.is_empty());
     }
 
     // ----------------------------- agent-notebook CLI tests

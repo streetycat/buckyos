@@ -5,19 +5,11 @@
 //! to an external platform. It shares the `DeliveryExecutor` interface, the
 //! delivery state machine and the idempotency key with tunnels.
 //!
-//! Current scope: targets that live in this zone (zone users, agents, hosted
-//! groups) are delivered natively by dispatching into their mailboxes.
-//! Cross-zone delivery (resolve DID → target zone → POST MsgObject) is the
-//! designed follow-up; until it lands, a non-local target fails the delivery
-//! deterministically (DEAD, diagnosable, manually re-queueable) instead of
-//! falling back to anything.
-
 use crate::msg_center::MessageCenter;
-use crate::msg_tunnel::DeliveryExecutor;
+use crate::msg_tunnel::{DeliveryExecutor, EditCapability};
 use anyhow::{anyhow, Result as AnyResult};
 use async_trait::async_trait;
-use buckyos_api::{DeliveryRecordWithObject, DeliveryReportResult, MsgCenterHandler};
-use kRPC::RPCContext;
+use buckyos_api::{DeliveryRecordWithObject, DeliveryReportResult};
 use log::{info, warn};
 use name_lib::DID;
 
@@ -35,6 +27,16 @@ impl MessageHubExecutor {
             transport_did,
             center,
             name: "message-hub".to_string(),
+        }
+    }
+
+    fn route_changed(message: &str) -> DeliveryReportResult {
+        DeliveryReportResult {
+            ok: false,
+            error_code: Some("native-route-changed".into()),
+            error_message: Some(message.into()),
+            retryable: Some(false),
+            ..Default::default()
         }
     }
 }
@@ -61,6 +63,13 @@ impl DeliveryExecutor for MessageHubExecutor {
 
     fn supports_egress(&self) -> bool {
         true
+    }
+
+    fn edit_capability(&self) -> EditCapability {
+        EditCapability {
+            supported: true,
+            ..Default::default()
+        }
     }
 
     async fn start(&self) -> AnyResult<()> {
@@ -104,13 +113,35 @@ impl DeliveryExecutor for MessageHubExecutor {
             .map_err(|error| anyhow!("load message for hub delivery failed: {}", error))?;
 
         if self.center.is_local_recipient(&envelope.target_did) {
-            // Native local delivery: the destination zone is this zone, so the
-            // "POST MsgObject to the target zone" hop degenerates into a local
-            // dispatch that creates the recipient mailbox records.
-            let idempotency_key = format!("hub:{}", record.record.delivery_id);
+            let settings = self.center.cyfs_dispatch.read().unwrap().clone();
+            let mut paths: Vec<_> = settings
+                .accepted_paths
+                .iter()
+                .filter(|(_, did)| *did == &envelope.target_did)
+                .map(|(path, _)| path)
+                .collect();
+            paths.sort();
+            let configured_target = settings
+                .target_zone
+                .as_ref()
+                .zip(paths.first())
+                .and_then(|(zone, path)| ndn_lib::normalize_cyfs_dispatch_target(zone, path).ok());
+            let snapshot = envelope.address.as_ref().and_then(|a| a.address.as_ref());
+            if snapshot.is_some() && snapshot != configured_target.as_ref() {
+                return Ok(DeliveryReportResult {
+                    ok: false,
+                    error_code: Some("native-route-changed".into()),
+                    error_message: Some("Local receiver differs from the delivery snapshot".into()),
+                    retryable: Some(false),
+                    ..Default::default()
+                });
+            }
+            let target = configured_target.unwrap_or_else(|| {
+                format!("https://local/{}/inbox", envelope.target_did.to_string())
+            });
             let dispatch = self
                 .center
-                .handle_dispatch(msg, None, Some(idempotency_key), RPCContext::default())
+                .dispatch_to_receiver(msg, None, envelope.target_did.clone(), target)
                 .await
                 .map_err(|error| anyhow!("hub local dispatch failed: {}", error))?;
             // Judge the outcome for *this* target: a dispatch can succeed
@@ -146,21 +177,68 @@ impl DeliveryExecutor for MessageHubExecutor {
                 })
             }
         } else {
-            warn!(
-                "message hub cross-zone delivery not implemented yet: delivery_id={} target={}",
-                record.record.delivery_id,
-                envelope.target_did.to_string()
-            );
-            Ok(DeliveryReportResult {
-                ok: false,
-                error_code: Some("remote_zone_delivery_unimplemented".to_string()),
-                error_message: Some(format!(
-                    "target {} is not hosted in this zone and cross-zone hub delivery is not implemented yet",
-                    envelope.target_did.to_string()
-                )),
-                retryable: Some(false),
-                ..Default::default()
-            })
+            let configured = self
+                .center
+                .native_message_route(&msg, &envelope.target_did).await;
+            let snapshot = envelope.address.as_ref().and_then(|a| a.address.clone());
+            let route = match configured {
+                Err(e) => {
+                    return Ok(DeliveryReportResult {
+                        ok: false,
+                        error_code: Some("native-route-not-configured".into()),
+                        error_message: Some(e.to_string()),
+                        retryable: Some(false),
+                        ..Default::default()
+                    })
+                }
+                Ok(Some(route)) => {
+                    if snapshot.as_deref() != Some(route.target.as_str()) {
+                        return Ok(Self::route_changed(
+                            "Configured logical receiver differs from the delivery snapshot",
+                        ));
+                    }
+                    route
+                }
+                Ok(None) => match crate::cyfs_dispatch::auto_route(&self.center, &envelope.target_did).await {
+                    Ok(route) => {
+                        if snapshot.as_ref().is_some_and(|s| s != &route.target) {
+                            return Ok(Self::route_changed(
+                                "Resolved receiver differs from the delivery snapshot",
+                            ));
+                        }
+                        route
+                    }
+                    Err(report) => {
+                        warn!(
+                            "message hub cannot route natively: delivery_id={} target={} reason={:?}",
+                            record.record.delivery_id,
+                            envelope.target_did.to_string(),
+                            report.error_message
+                        );
+                        return Ok(report);
+                    }
+                },
+            };
+            let mut jwt = self
+                .center
+                .msg_box_db
+                .get_msg_jwt(&envelope.msg_id)
+                .await
+                .map_err(|error| anyhow!("load message jwt failed: {}", error))?;
+            if jwt.is_none() && self.center.is_hosted_identity(&msg.from) {
+                if let Some(signer) = self.center.zone_signer.get() {
+                    let signed = msg
+                        .to_jwt(&signer.key, &signer.kid)
+                        .map_err(|error| anyhow!("sign native message failed: {}", error))?;
+                    self.center
+                        .msg_box_db
+                        .put_msg_jwt(&envelope.msg_id, &signed, MessageCenter::now_ms())
+                        .await
+                        .map_err(|error| anyhow!("keep message jwt failed: {}", error))?;
+                    jwt = Some(signed);
+                }
+            }
+            crate::cyfs_dispatch::send_authenticated(Some(&self.center), &route, &msg, jwt.as_deref(), &envelope.msg_id).await
         }
     }
 }

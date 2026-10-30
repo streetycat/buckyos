@@ -1,0 +1,17 @@
+{
+  "ver": "v-work-fixture-decide",
+  "session": "work-fixture-decide",
+  "base": null,
+  "state": "produced",
+  "outputs": [
+    "notes.txt"
+  ],
+  "side_effects": [
+    {
+      "call_id": "c1",
+      "tool": "shell",
+      "note": "shell cannot be undone by the session"
+    }
+  ],
+  "updated_at_ms": 1792976021204
+}

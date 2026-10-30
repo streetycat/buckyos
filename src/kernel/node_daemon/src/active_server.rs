@@ -18,7 +18,9 @@ use http_body_util::{BodyExt, Full};
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use log::*;
-use name_client::GLOBAL_NAME_CLIENT;
+use name_client::{
+    select_authority_current, NameClient, ResolveOpts, Revision, SourceRef, GLOBAL_NAME_CLIENT,
+};
 use name_lib::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -234,7 +236,7 @@ pub struct LocalSystemSettings {
     #[serde(default)]
     pub ai_provider_config: Value,
     #[serde(default)]
-    pub jarvis_msg_tunnel_config: Value,
+    pub owner_telegram_account_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -464,15 +466,25 @@ impl ActiveServer {
 
     async fn commit_active(&self, req: CommitActiveReq) -> Result<CommitActiveResp, RPCErrors> {
         validate_commit_request(&req, &self.config)?;
-        let mut effective_owner = req.owner_document.clone();
-        let needs_owner_publish = req.prepared.names.zone_did != effective_owner.id
-            && !effective_owner.is_bound_to_zone(&req.prepared.names.zone_did);
-        if needs_owner_publish {
-            effective_owner.set_default_zone_did(req.prepared.names.zone_did.clone());
-            validate_owner_document(&effective_owner)?;
+        if req.prepared.names.use_self_domain {
+            wait_for_device_authority(&req).await?;
         }
-
         let bns_client = BnsIndexerClient::new_bns_server_url(req.sn.bns_url.as_str(), None);
+        let projected = bns_client
+            .resolve_document(req.prepared.names.bns_publish_name.as_str(), "owner")
+            .await
+            .map_err(|error| RPCErrors::ReasonError(format!("BNS owner read failed: {error}")))?;
+        let projected_owner: OwnerDocument =
+            serde_json::from_slice(projected.document_state.document.inline_document.as_slice())
+                .map_err(|error| {
+                    RPCErrors::ReasonError(format!("invalid projected OwnerDocument: {error}"))
+                })?;
+        let (effective_owner, needs_owner_publish) = prepare_owner_binding_for_activation(
+            &req.owner_document,
+            &projected_owner,
+            &req.prepared.names.zone_did,
+            req.signed_documents.zone_document.iat,
+        )?;
         let sn_client =
             SnClient::new_krpc(req.sn.sn_url.as_str(), Some(req.sn.access_token.clone()));
 
@@ -490,10 +502,11 @@ impl ActiveServer {
             let owner_value = serde_json::to_value(&effective_owner)
                 .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
             let owner_bytes = canonical_json_bytes(&owner_value)?;
-            let request_id = content_request_id(
+            let request_id = content_request_id_with_context(
                 "owner",
                 req.prepared.names.owner_name.as_str(),
                 owner_bytes.as_slice(),
+                req.signed_documents.zone_document_jwt.as_bytes(),
             );
             if !projection_matches_json(
                 &bns_client,
@@ -587,6 +600,8 @@ impl ActiveServer {
             .await?;
         }
 
+        wait_for_device_authority(&req).await?;
+
         let device_key_did = device_key_did_from_doc(&req.prepared.device_document)?;
         sn_client
             .register_device_online(build_sn_device_online_report(
@@ -598,14 +613,35 @@ impl ActiveServer {
         let zone_info = sn_client.get_zone_info().await?;
         validate_sn_zone_info(&req, &zone_info)?;
 
+        let owner_value = serde_json::to_value(&effective_owner)
+            .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
+        if !projection_matches_json(
+            &bns_client,
+            req.prepared.names.bns_publish_name.as_str(),
+            "owner",
+            &owner_value,
+        )
+        .await?
+        {
+            return Err(RPCErrors::ReasonError(
+                "OwnerDocument changed during activation; retry activation".to_string(),
+            ));
+        }
+
         persist_activation(&req, &effective_owner, &zone_info)?;
 
         if let Some(name_client) = GLOBAL_NAME_CLIENT.get() {
-            if let Err(error) = name_client.add_verified_cache(
-                req.prepared.names.zone_did.clone(),
-                Some(DidDocType::Zone),
-                EncodedDocument::Jwt(req.signed_documents.zone_document_jwt.clone()),
-            ) {
+            // 激活时签出的 Zone Document 以本机配置 trust 候选投递(不改变 latest)。
+            if let Err(error) = name_client
+                .commit_candidate_doc(
+                    &req.prepared.names.zone_did,
+                    Some(DidDocType::Zone),
+                    &EncodedDocument::Jwt(req.signed_documents.zone_document_jwt.clone()),
+                    SourceRef::configured_trust("node-daemon-activation"),
+                    name_client.default_resolve_opts(),
+                )
+                .await
+            {
                 warn!("project activated zone document into DID cache failed: {error}");
             }
         } else {
@@ -637,6 +673,91 @@ impl ActiveServer {
             ))
             .map_err(|error| server_err!(ServerErrorCode::InvalidData, "{}", error))?)
     }
+}
+
+async fn wait_for_device_authority(req: &CommitActiveReq) -> Result<(), RPCErrors> {
+    let client = GLOBAL_NAME_CLIENT.get().ok_or_else(|| {
+        RPCErrors::ReasonError("Device authority validation requires NameClient".into())
+    })?;
+    let deadline = Instant::now() + PROJECTION_DEADLINE;
+    loop {
+        let check = check_device_authority(
+            client,
+            &req.prepared.device_document,
+            &req.signed_documents.device_document_jwt,
+        );
+        let error =
+            match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), check).await {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => error,
+                Err(_) => "Device authority resolution timed out".to_string(),
+            };
+        if Instant::now() >= deadline {
+            return Err(RPCErrors::ReasonError(format!(
+                "Activation is not complete: Relay AuthorityCurrent validation failed for {}: {}",
+                req.prepared.device_document.id.to_string(),
+                error
+            )));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn check_device_authority(
+    client: &NameClient,
+    device: &DeviceDocument,
+    expected_jwt: &str,
+) -> Result<(), String> {
+    // AuthorityCurrent 门禁:关闭两种 locker,只查 authority 并要求本轮真实回答;
+    // 只接受本轮 authority receipt 精确绑定的有效文档。
+    let opts = ResolveOpts::default()
+        .authority_only()
+        .without_local_lock()
+        .without_zone_lock()
+        .with_force_authority_query()
+        .normalize(std::time::Duration::from_secs(20));
+    let result = client
+        .resolve_did_ex(&device.id, Some(DidDocType::Device), Revision::current(), opts.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    let current = select_authority_current(&result, opts.receipts());
+    let matches = current
+        .as_ref()
+        .map_or(false, |choice| choice.doc == EncodedDocument::Jwt(expected_jwt.to_string()));
+    if device.exp <= buckyos_get_unix_timestamp() || !matches {
+        return Err(format!(
+            "Device authority did not return the current published DeviceDocument JWT: {}",
+            result.reason()
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_owner_binding_for_activation(
+    owner_document: &OwnerDocument,
+    projected_owner: &OwnerDocument,
+    zone_did: &DID,
+    activation_iat: u64,
+) -> Result<(OwnerDocument, bool), RPCErrors> {
+    validate_owner_document(projected_owner)?;
+    if projected_owner.id != owner_document.id
+        || projected_owner.name != owner_document.name
+        || projected_owner.get_default_key() != owner_document.get_default_key()
+        || projected_owner.wallets != owner_document.wallets
+    {
+        return Err(RPCErrors::ReasonError(
+            "OwnerDocument identity changed; reload owner before activation".to_string(),
+        ));
+    }
+    let mut effective_owner = projected_owner.clone();
+    effective_owner.set_default_zone_did(zone_did.clone());
+    let needs_owner_publish = effective_owner != *projected_owner;
+    if needs_owner_publish {
+        effective_owner.iat =
+            activation_iat.max(next_document_iat("OwnerDocument", projected_owner.iat)?);
+    }
+    validate_owner_document(&effective_owner)?;
+    Ok((effective_owner, needs_owner_publish))
 }
 
 fn validate_hostname(value: &str) -> Result<(), RPCErrors> {
@@ -677,7 +798,29 @@ fn validate_sn_zone_info(
     Ok(())
 }
 
+/// A node of a product without containers is activated as one: its
+/// DeviceDocument says `support_container = false`, whatever the client
+/// sends.
+fn validate_topology_for_product(
+    topology: &GatewayTopology,
+    product: &ProductProfile,
+) -> Result<(), RPCErrors> {
+    if topology.support_container && !product.container_enabled() {
+        return Err(RPCErrors::ReasonError(format!(
+            "this BuckyOS edition ({}) runs no containers: activate with support_container = false",
+            product.edition
+        )));
+    }
+    Ok(())
+}
+
+fn installed_product() -> Result<&'static ProductProfile, RPCErrors> {
+    crate::product::installed()
+        .map_err(|error| RPCErrors::ReasonError(format!("product profile unusable: {error}")))
+}
+
 fn validate_topology(topology: &GatewayTopology) -> Result<(), RPCErrors> {
+    validate_topology_for_product(topology, installed_product()?)?;
     if !matches!(
         topology.net_id.as_str(),
         "nat" | "wan_dyn" | "portmap" | "wan"
@@ -1100,6 +1243,7 @@ fn assemble_zone_document_internal(
         owner_jwk,
     );
     zone_document.init_by_boot_document(&prepared.boot_document, &boot_document_jwt.to_string());
+    zone_document.owner = prepared.names.owner_did.clone();
     zone_document.iat = next_document_iat("DeviceDocument", prepared.device_document.iat)?;
     zone_document.hostname = prepared.names.access_hostname.clone();
     zone_document.devices.insert(
@@ -1311,6 +1455,26 @@ fn content_request_id(operation: &str, owner_name: &str, bytes: &[u8]) -> String
     )
 }
 
+fn content_request_id_with_context(
+    operation: &str,
+    owner_name: &str,
+    bytes: &[u8],
+    context: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    hasher.update((context.len() as u64).to_be_bytes());
+    hasher.update(context);
+    let digest = hasher.finalize();
+    format!(
+        "node-active:{}:{}:{}",
+        operation,
+        owner_name,
+        hex::encode(digest)
+    )
+}
+
 fn canonical_json_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
@@ -1436,7 +1600,7 @@ fn build_start_config(req: &CommitActiveReq, owner_document: &OwnerDocument) -> 
         "friend_passcode": req.system_settings.friend_passcode,
         "enabled_features": req.system_settings.enabled_features,
         "ai_provider_config": req.system_settings.ai_provider_config,
-        "jarvis_msg_tunnel_config": req.system_settings.jarvis_msg_tunnel_config
+        "owner_telegram_account_id": req.system_settings.owner_telegram_account_id.trim()
     })
 }
 
@@ -1448,8 +1612,14 @@ fn persist_activation(
     let etc_dir = get_buckyos_system_etc_dir();
     let start_config = serde_json::to_vec_pretty(&build_start_config(req, effective_owner))
         .map_err(|error| RPCErrors::ReasonError(error.to_string()))?;
-    atomic_write(etc_dir.join("start_config.json").as_path(), &start_config)
-        .map_err(RPCErrors::ReasonError)?;
+    let security_root = identity_roots()
+        .map_err(RPCErrors::ReasonError)?
+        .security_root;
+    atomic_write(
+        security_root.join("start_config.json").as_path(),
+        &start_config,
+    )
+    .map_err(RPCErrors::ReasonError)?;
     save_sn_zone_info(zone_info).map_err(RPCErrors::ReasonError)?;
     save_zone_document_jwt(
         etc_dir.as_path(),
@@ -1510,6 +1680,7 @@ impl RPCHandler for ActiveServer {
                     seq,
                 )
             }
+            "get_product_profile" => rpc_success(installed_product()?, seq),
             "start_region_probe" => {
                 let params = StartRegionProbeReq::from_json(req.params)?;
                 rpc_success(self.region_probe.start(params.force).await, seq)
@@ -1649,6 +1820,110 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "cross-repository BNS/Relay integration fixture export"]
+    async fn export_node_active_authority_fixture() {
+        let path = std::env::var("BUCKYOS_ACTIVE_FIXTURE").expect("fixture output path");
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let owner = owner_document(mnemonic);
+        let names = ActiveNameMapping::derive(&owner, "alice.web3.example.com", false);
+        let (_, device_public_key) = generate_ed25519_key_pair();
+        let server = ActiveServer::new(active_service_config());
+        let prepared = server
+            .prepare_active_documents(PrepareActiveDocumentsReq {
+                owner_document: owner,
+                names,
+                topology: topology(),
+                device_public_key,
+            })
+            .await
+            .unwrap();
+        let signed = server
+            .sign_web_active_documents(SignWebActiveDocumentsReq {
+                mnemonic_words: mnemonic
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect(),
+                prepared: prepared.clone(),
+            })
+            .unwrap();
+        verify_signed_documents(&prepared, &signed).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec(&json!({
+                "owner": prepared.owner_document,
+                "zone_jwt": signed.zone_document_jwt,
+                "device_jwt": signed.device_document_jwt,
+                "device": prepared.device_document
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+
+    #[tokio::test]
+    async fn custom_web_authority_is_available_before_node_boot_and_rejects_stale_artifacts() {
+        use name_client::{CacheBackend, NameClientConfig, WebProvider};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::RwLock;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (pem, public) = generate_ed25519_key_pair();
+        let key = EncodingKey::from_ed_pem(pem.as_bytes()).unwrap();
+        let device_did = DID::new("web", &format!("127.0.0.1%3A{port}"));
+        let mut device = new_device_config_by_jwk_with_did(
+            "ood1", serde_json::from_value(public).unwrap(), &device_did,
+        ).unwrap();
+        device.owner = DID::new("bns", "alice");
+        device.zone_did = Some(DID::new("web", "home.example.com"));
+        let jwt = device.encode(Some(&key)).unwrap().to_string();
+        let published = Arc::new(RwLock::new(Some(jwt.clone())));
+        let state = published.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let len = stream.read(&mut request).await.unwrap();
+                let request_line = String::from_utf8_lossy(&request[..len]).to_string();
+                assert!(
+                    request_line.starts_with("GET /.well-known/device.json ")
+                        || request_line.starts_with("GET /.well-known/did.json "),
+                    "unexpected request: {request_line}"
+                );
+                let body = state.read().await.clone();
+                let status = if body.is_some() { "200 OK" } else { "404 Not Found" };
+                let body = body.unwrap_or_default();
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/jwt\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = NameClient::new(NameClientConfig {
+            cache_backend: CacheBackend::Memory, enable_zone_locker: false, ..Default::default()
+        });
+        client.set_method_authority("web", Arc::new(WebProvider::new_with_scheme("http")));
+        check_device_authority(&client, &device, &jwt).await.unwrap();
+        *published.write().await = None;
+        assert!(check_device_authority(&client, &device, &jwt).await.is_err());
+        *published.write().await = Some(device.encode(Some(&key)).unwrap().to_json_value().unwrap().to_string());
+        assert!(check_device_authority(&client, &device, &jwt).await.is_err());
+        let mut replaced = device.clone();
+        replaced.iat += 1;
+        let replacement = replaced.encode(Some(&key)).unwrap().to_string();
+        *published.write().await = Some(replacement.clone());
+        assert!(check_device_authority(&client, &device, &jwt).await.is_err());
+        check_device_authority(&client, &replaced, &replacement).await.unwrap();
+        replaced.exp = buckyos_get_unix_timestamp() - 1;
+        let expired = replaced.encode(Some(&key)).unwrap().to_string();
+        *published.write().await = Some(expired.clone());
+        assert!(check_device_authority(&client, &replaced, &expired).await.is_err());
+        *published.write().await = Some(jwt.clone());
+        check_device_authority(&client, &device, &jwt).await.unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
     #[test]
     fn every_request_struct_has_strict_parsing() {
         assert!(GenerateWebOwnerMaterialReq::from_json(json!({})).is_ok());
@@ -1679,6 +1954,109 @@ mod tests {
         assert_eq!(custom.owner_did.to_string(), "did:bns:alice");
         assert_eq!(custom.zone_did.to_string(), "did:web:home.example.com");
         assert_eq!(custom.bns_publish_name, "alice");
+    }
+
+    #[test]
+    fn activation_explicitly_binds_same_name_default_zone_as_v2() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let owner = owner_document(mnemonic);
+        let (effective, needs_publish) =
+            prepare_owner_binding_for_activation(&owner, &owner, &owner.id, owner.iat).unwrap();
+
+        assert!(needs_publish);
+        let value = serde_json::to_value(&effective).unwrap();
+        assert_eq!(value["zone_binding_model_version"], json!(2));
+        assert_eq!(value["binded_zone_list"], json!(["did:bns:alice"]));
+        assert!(value["service"].as_array().unwrap().iter().any(|service| {
+            service["id"] == "did:bns:alice#lastDoc"
+                && service["serviceEndpoint"] == "https://alice.bns.did/resolve/did:bns:alice"
+        }));
+    }
+
+    #[test]
+    fn activation_promotes_selected_zone_without_losing_other_zones() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut owner = owner_document(mnemonic);
+        let first = DID::new("web", "first.example.com");
+        let selected = DID::new("web", "selected.example.com");
+        owner.set_default_zone_did(first.clone());
+        owner.set_default_zone_did(selected.clone());
+        owner.set_default_zone_did(first);
+
+        let (effective, needs_publish) =
+            prepare_owner_binding_for_activation(&owner, &owner, &selected, owner.iat).unwrap();
+        assert!(needs_publish);
+        assert_eq!(
+            effective
+                .binded_zone_list
+                .iter()
+                .map(DID::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "did:web:selected.example.com".to_string(),
+                "did:web:first.example.com".to_string(),
+            ]
+        );
+
+        let (unchanged, needs_publish) = prepare_owner_binding_for_activation(
+            &effective, &effective, &selected, effective.iat + 60,
+        ).unwrap();
+        assert!(!needs_publish);
+        assert_eq!(unchanged, effective);
+    }
+
+    #[test]
+    fn activation_rebind_uses_projected_owner_instead_of_stale_input() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mut projected = owner_document(mnemonic);
+        let activation_iat = buckyos_get_unix_timestamp();
+        projected.iat = activation_iat + 60;
+        let mut stale = projected.clone();
+        stale.set_default_zone_did(stale.id.clone());
+        projected.set_default_zone_did(DID::new("web", "other.example.com"));
+        projected.display_name = "Updated remote profile".to_string();
+        let (effective, needs_publish) =
+            prepare_owner_binding_for_activation(&stale, &projected, &stale.id, activation_iat).unwrap();
+        assert!(needs_publish);
+        assert_eq!(effective.display_name, projected.display_name);
+        assert_eq!(effective.iat, projected.iat + 1);
+        let (retry, _) = prepare_owner_binding_for_activation(
+            &stale, &projected, &stale.id, activation_iat,
+        ).unwrap();
+        assert_eq!(retry, effective);
+        assert_eq!(
+            effective.binded_zone_list,
+            vec![stale.id.clone(), DID::new("web", "other.example.com")]
+        );
+        let (unchanged, needs_publish) =
+            prepare_owner_binding_for_activation(&stale, &effective, &stale.id, activation_iat).unwrap();
+        assert!(!needs_publish);
+        assert_eq!(unchanged, effective);
+
+        let mut unbound = owner_document(mnemonic);
+        unbound.iat = activation_iat - 100;
+        let (rebound, needs_publish) =
+            prepare_owner_binding_for_activation(&stale, &unbound, &stale.id, activation_iat).unwrap();
+        assert!(needs_publish);
+        assert_eq!(rebound.binded_zone_list, vec![stale.id.clone()]);
+        assert!(rebound.iat > unbound.iat);
+        assert_eq!(rebound.iat, activation_iat);
+        projected.id = DID::new("bns", "other");
+        assert!(prepare_owner_binding_for_activation(&stale, &projected, &stale.id, activation_iat).is_err());
+    }
+
+    #[test]
+    fn owner_publish_request_id_is_stable_per_attempt_but_fresh_for_rebind() {
+        let owner = br#"{"id":"did:bns:alice","binded_zone_list":["did:bns:alice"]}"#;
+        let first_attempt =
+            content_request_id_with_context("owner", "alice", owner, b"first-zone-document-jwt");
+        let first_retry =
+            content_request_id_with_context("owner", "alice", owner, b"first-zone-document-jwt");
+        let rebind_attempt =
+            content_request_id_with_context("owner", "alice", owner, b"second-zone-document-jwt");
+
+        assert_eq!(first_attempt, first_retry);
+        assert_ne!(first_attempt, rebind_attempt);
     }
 
     #[tokio::test]
@@ -1719,21 +2097,20 @@ mod tests {
             })
             .unwrap();
         verify_signed_documents(&prepared, &signed).unwrap();
+        assert_eq!(signed.zone_document.owner, prepared.names.owner_did);
         assert_eq!(signed.zone_document.iat, prepared.device_document.iat + 1);
         assert_eq!(signed.zone_document.boot_jwt, signed.boot_document_jwt);
         assert_eq!(
             signed.zone_document.devices.get("ood1"),
             Some(&signed.device_document)
         );
-        assert!(
-            signed
-                .zone_document
-                .devices
-                .get("ood1")
-                .unwrap()
-                .device_mini_document_jwt
-                .is_none()
-        );
+        assert!(signed
+            .zone_document
+            .devices
+            .get("ood1")
+            .unwrap()
+            .device_mini_document_jwt
+            .is_none());
         assert_eq!(
             signed.zone_document.mini_device_jwts.get("ood1"),
             Some(&signed.device_mini_document_jwt)
@@ -1751,7 +2128,7 @@ mod tests {
                 friend_passcode: String::new(),
                 enabled_features: json!({}),
                 ai_provider_config: json!({}),
-                jarvis_msg_tunnel_config: json!({}),
+                owner_telegram_account_id: " 10001 ".to_string(),
             },
             sn: SnCommitConfig {
                 sn_url: "https://sn.example.com/kapi/sn/".to_string(),
@@ -1786,6 +2163,7 @@ mod tests {
         ] {
             assert!(!config_text.contains(forbidden));
         }
+        assert_eq!(config["owner_telegram_account_id"], "10001");
 
         let mut zone_info = SnZoneInfoResp {
             code: 0,
@@ -1889,4 +2267,21 @@ mod tests {
         owner.wallets.get_mut("main").unwrap().address = "0x1234".to_string();
         assert!(validate_owner_document(&owner).is_err());
     }
+
+    #[test]
+    fn a_product_without_containers_activates_only_without_them() {
+        let lite = ProductProfile::parse(include_str!("../../../product/lite.json")).unwrap();
+        let mut topology = GatewayTopology {
+            net_id: "nat".to_string(),
+            rtcp_port: 2980,
+            support_container: true,
+            uses_sn_relay: true,
+            sn_url: "https://sn.buckyos.ai/kapi/sn".to_string(),
+        };
+        assert!(validate_topology_for_product(&topology, &lite).is_err());
+        assert!(validate_topology_for_product(&topology, &ProductProfile::full()).is_ok());
+        topology.support_container = false;
+        assert!(validate_topology_for_product(&topology, &lite).is_ok());
+    }
+
 }

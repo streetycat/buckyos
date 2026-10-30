@@ -1,0 +1,333 @@
+import contextlib
+import importlib.util
+import io
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+SCRIPT_PATH = Path(__file__).parents[2] / "start.py"
+
+
+def _load_start_script():
+    spec = importlib.util.spec_from_file_location("buckyos_start_script", SCRIPT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class BuckyosStartEntrypointTests(unittest.TestCase):
+    def test_invalid_arguments_stop_before_any_side_effects(self) -> None:
+        for args in (
+            ["--release"],
+            ["release"],
+            ["--reinstal", "release"],
+            ["--reinstall", "release", "--skip-update"],
+            ["--all", "--reinstall", "release"],
+        ):
+            with self.subTest(args=args):
+                module = _load_start_script()
+                with (
+                    patch.object(module, "_sdk_tool_distribution_ready") as ready,
+                    patch.object(module, "kill_all_processes") as kill_all,
+                    patch.object(module, "update_files") as update_files,
+                    patch.object(module, "start_system") as start_system,
+                    contextlib.redirect_stderr(io.StringIO()) as stderr,
+                ):
+                    result = module.main(args)
+
+                self.assertEqual(result, 2)
+                self.assertIn("error:", stderr.getvalue())
+                ready.assert_not_called()
+                kill_all.assert_not_called()
+                update_files.assert_not_called()
+                start_system.assert_not_called()
+
+    def test_startup_modes_select_expected_configuration(self) -> None:
+        for args, expected_update in (
+            ([], (False, None, None)),
+            (["--all"], (True, "dev", None)),
+            (["--reinstall"], (True, None, None)),
+            (["--reinstall", "release"], (True, "release", None)),
+            (["--all", "--edition", "lite"], (True, "dev", "lite")),
+            (["--skip-update"], None),
+        ):
+            with self.subTest(args=args):
+                module = _load_start_script()
+                with (
+                    tempfile.TemporaryDirectory() as temporary,
+                    patch.object(module, "resolve_buckyos_root", return_value=Path(temporary)),
+                    patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                    patch.object(module, "kill_all_processes") as kill_all,
+                    patch.object(module, "update_files") as update_files,
+                    patch.object(module, "start_system") as start_system,
+                ):
+                    result = module.main(args)
+
+                self.assertEqual(result, 0)
+                kill_all.assert_called_once_with()
+                start_system.assert_called_once_with()
+                if expected_update is None:
+                    update_files.assert_not_called()
+                else:
+                    update_files.assert_called_once_with(*expected_update)
+
+    def test_wipe_data_needs_a_fresh_install(self) -> None:
+        for args in (["--wipe-data"], ["--skip-update", "--wipe-data"]):
+            with self.subTest(args=args):
+                module = _load_start_script()
+                with (
+                    patch.object(module, "_sdk_tool_distribution_ready") as ready,
+                    patch.object(module, "kill_all_processes") as kill_all,
+                    patch.object(module, "wipe_zone_data") as wipe,
+                    patch.object(module, "start_system") as start_system,
+                    contextlib.redirect_stdout(io.StringIO()) as stdout,
+                ):
+                    result = module.main(args)
+                self.assertEqual(result, 2)
+                self.assertIn("--wipe-data needs", stdout.getvalue())
+                for call in (ready, kill_all, wipe, start_system):
+                    call.assert_not_called()
+
+    def test_wipe_data_empties_data_and_storage_before_the_fresh_install(self) -> None:
+        module = _load_start_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in ("data/homestation/homestation-main.db", "data/home/devtest/a.txt", "storage/named_store1/x", "etc/keep"):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text("x", encoding="utf-8")
+
+            def update(install_all, group, edition):
+                self.assertFalse((root / "data").exists())
+                self.assertFalse((root / "storage").exists())
+                self.assertTrue((root / "etc" / "keep").exists())
+
+            with (
+                patch.object(module, "resolve_buckyos_root", return_value=root),
+                patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                patch.object(module, "kill_all_processes"),
+                patch.object(module, "update_files", side_effect=update) as update_files,
+                patch.object(module, "start_system"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = module.main(["--all", "--wipe-data"])
+
+            self.assertEqual(result, 0)
+            update_files.assert_called_once()
+
+    def test_all_restores_devenv_before_start_and_reports_it_last(self) -> None:
+        module = _load_start_script()
+        original = (
+            b'{\n  "aios": "local/aios-test",\n'
+            b'  "exttool": "local/exttool-test", "other": {"enabled": true}\n}\n'
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "etc" / "devenv.json"
+            config.parent.mkdir()
+            config.write_bytes(original)
+            config.chmod(0o640)
+            original_mode = stat.S_IMODE(config.stat().st_mode)
+
+            def install(command, args):
+                self.assertEqual(command, "buckyos-update")
+                self.assertEqual(args, ["--app=buckyos", "--all"])
+                shutil.rmtree(config.parent)
+                return 0
+
+            def make_config(group, target, edition):
+                self.assertEqual((group, target), ("dev", root))
+                config.parent.mkdir()
+                config.write_text('{"aios": "paios/aios"}', encoding="utf-8")
+
+            def start():
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), original_mode)
+
+            with (
+                patch.object(module, "resolve_buckyos_root", return_value=root),
+                patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                patch.object(module, "kill_all_processes"),
+                patch.object(module, "_run_command", side_effect=install) as run_command,
+                patch.object(module, "_run_make_config", side_effect=make_config) as run_make_config,
+                patch.object(module, "start_system", side_effect=start) as start_system,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                result = module.main(["--all"])
+
+            self.assertEqual(result, 0)
+            run_command.assert_called_once()
+            run_make_config.assert_called_once()
+            start_system.assert_called_once()
+            reminder = stdout.getvalue().split("=== BuckyOS Startup Complete ===", 1)[1]
+            self.assertIn(str(config), reminder)
+            self.assertIn("aios", reminder)
+            self.assertIn("exttool", reminder)
+            self.assertIn("default", reminder.lower())
+
+    def test_all_restores_devenv_when_install_or_config_generation_fails(self) -> None:
+        for failure in ("install_returncode", "install_system_exit", "make_config"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                module = _load_start_script()
+                root = Path(temporary)
+                config = root / "etc" / "devenv.json"
+                config.parent.mkdir()
+                original = b'{"aios": "local/aios-test"}\n'
+                config.write_bytes(original)
+                config.chmod(0o600)
+                original_mode = stat.S_IMODE(config.stat().st_mode)
+
+                def install(command, args):
+                    shutil.rmtree(config.parent)
+                    if failure == "install_system_exit":
+                        raise SystemExit(7)
+                    return 1 if failure == "install_returncode" else 0
+
+                def make_config(group, target, edition):
+                    config.parent.mkdir()
+                    config.write_text("{}", encoding="utf-8")
+                    raise RuntimeError("configuration generation failed")
+
+                with (
+                    patch.object(module, "resolve_buckyos_root", return_value=root),
+                    patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                    patch.object(module, "kill_all_processes"),
+                    patch.object(module, "_run_command", side_effect=install),
+                    patch.object(module, "_run_make_config", side_effect=make_config),
+                    patch.object(module, "start_system") as start_system,
+                    contextlib.redirect_stdout(io.StringIO()),
+                    self.assertRaises(SystemExit) as exit_error,
+                ):
+                    module.main(["--all"])
+
+                self.assertEqual(exit_error.exception.code, 7 if failure == "install_system_exit" else 1)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), original_mode)
+                start_system.assert_not_called()
+
+    def test_all_without_devenv_does_not_create_it_or_print_a_reminder(self) -> None:
+        module = _load_start_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "etc" / "devenv.json"
+
+            with (
+                patch.object(module, "resolve_buckyos_root", return_value=root),
+                patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                patch.object(module, "kill_all_processes"),
+                patch.object(module, "_run_command", return_value=0),
+                patch.object(module, "_run_make_config"),
+                patch.object(module, "start_system"),
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                result = module.main(["--all"])
+
+            self.assertEqual(result, 0)
+            self.assertFalse(config.exists())
+            self.assertNotIn("devenv.json", stdout.getvalue())
+
+    def test_reinstall_keeps_replacing_devenv(self) -> None:
+        module = _load_start_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "etc" / "devenv.json"
+            config.parent.mkdir()
+            config.write_text('{"aios": "local/aios-test"}', encoding="utf-8")
+            generated = b'{"aios": "paios/aios"}\n'
+
+            def install(command, args):
+                self.assertEqual(args, ["--app=buckyos", "--all"])
+                shutil.rmtree(config.parent)
+                return 0
+
+            def make_config(group, target, edition):
+                self.assertEqual((group, target), ("release", root))
+                config.parent.mkdir()
+                config.write_bytes(generated)
+
+            with (
+                patch.object(module, "resolve_buckyos_root", return_value=root),
+                patch.object(module, "_sdk_tool_distribution_ready", return_value=True),
+                patch.object(module, "kill_all_processes"),
+                patch.object(module, "_run_command", side_effect=install),
+                patch.object(module, "_run_make_config", side_effect=make_config),
+                patch.object(module, "start_system") as start_system,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+            ):
+                result = module.main(["--reinstall", "release"])
+
+            self.assertEqual(result, 0)
+            self.assertEqual(config.read_bytes(), generated)
+            start_system.assert_called_once()
+            self.assertNotIn("devenv.json", stdout.getvalue())
+
+    def test_main_stops_before_install_when_sdk_tool_is_missing(self) -> None:
+        module = _load_start_script()
+
+        with (
+            patch.object(module, "_sdk_tool_distribution_ready", return_value=False),
+            patch.object(module, "kill_all_processes") as kill_all,
+            patch.object(module, "update_files") as update_files,
+            patch.object(module, "start_system") as start_system,
+        ):
+            result = module.main([])
+
+        self.assertEqual(result, 2)
+        kill_all.assert_not_called()
+        update_files.assert_not_called()
+        start_system.assert_not_called()
+
+    def test_sdk_tool_distribution_requires_runtime_and_metadata(self) -> None:
+        module = _load_start_script()
+        runtime_name = "deno.exe" if module.os.name == "nt" else "deno"
+
+        with tempfile.TemporaryDirectory() as temporary:
+            tool_dir = Path(temporary) / "buckyos-tool"
+            (tool_dir / "cli").mkdir(parents=True)
+            (tool_dir / "runtime").mkdir()
+            (tool_dir / "distribution.json").write_text("{}", encoding="utf-8")
+            (tool_dir / "cli" / "system_bootstrap.ts").write_text("", encoding="utf-8")
+            (tool_dir / "runtime" / runtime_name).write_bytes(b"runtime")
+
+            with patch.object(module, "SDK_TOOL_DIR", tool_dir):
+                self.assertTrue(module._sdk_tool_distribution_ready())
+
+
+    def test_missing_paios_images_checks_local_mode_images_only(self) -> None:
+        module = _load_start_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "etc").mkdir()
+            (root / "etc" / "devenv.json").write_text('{"aios": "local/aios-test"}', encoding="utf-8")
+            inspected = []
+
+            def fake_run(args, **kwargs):
+                inspected.append(args[-1])
+                return subprocess.CompletedProcess(args, 0 if args[-1].startswith("local/") else 1)
+
+            with (
+                patch.object(module, "_find_command", return_value="docker"),
+                patch.object(module.platform, "machine", return_value="x86_64"),
+                patch.object(module.subprocess, "run", side_effect=fake_run),
+            ):
+                self.assertEqual(module._missing_paios_images(root), ["paios/exttool:latest-amd64"])
+                self.assertEqual(inspected, ["local/aios-test:latest-amd64", "paios/exttool:latest-amd64"])
+
+                (root / "bin" / "paios-images").mkdir(parents=True)
+                (root / "bin" / "paios-images" / "paios_images.json").write_text("{}", encoding="utf-8")
+                inspected.clear()
+                self.assertEqual(module._missing_paios_images(root), [])
+                self.assertEqual(inspected, [])
+
+            with patch.object(module, "_find_command", return_value=None):
+                self.assertEqual(module._missing_paios_images(Path(temporary) / "missing"), [])
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,1328 @@
+use super::*;
+use crate::canonical::CanonicalFieldMapping;
+use crate::catalog::{ModelIdentity, ModelMatchFailure, ProviderModelMatch};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderFieldMode {
+    Unsupported,
+    Optional,
+    Required,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderFieldSchema {
+    pub mode: ProviderFieldMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub allowed_values: BTreeSet<String>,
+}
+
+impl ProviderFieldSchema {
+    pub(crate) fn unsupported() -> Self {
+        Self {
+            mode: ProviderFieldMode::Unsupported,
+            default_value: None,
+            allowed_values: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn optional() -> Self {
+        Self {
+            mode: ProviderFieldMode::Optional,
+            default_value: None,
+            allowed_values: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn optional_with_default(default_value: impl Into<String>) -> Self {
+        Self {
+            mode: ProviderFieldMode::Optional,
+            default_value: Some(default_value.into()),
+            allowed_values: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn required() -> Self {
+        Self {
+            mode: ProviderFieldMode::Required,
+            default_value: None,
+            allowed_values: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn with_allowed_values(
+        mut self,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.allowed_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        field: &str,
+        value: Option<&str>,
+    ) -> ProviderResult<Option<String>> {
+        if self.mode == ProviderFieldMode::Unsupported {
+            if value.is_some() || self.default_value.is_some() || !self.allowed_values.is_empty() {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "{field} is not supported"
+                )));
+            }
+            return Ok(None);
+        }
+        let value = value
+            .map(str::to_owned)
+            .or_else(|| self.default_value.clone());
+        if self.mode == ProviderFieldMode::Required && value.is_none() {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "{field} is required"
+            )));
+        }
+        if let Some(value) = value.as_deref() {
+            validate_endpoint_field(field, value)?;
+            if !self.allowed_values.is_empty() && !self.allowed_values.contains(value) {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "{field} has an unsupported value"
+                )));
+            }
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderConnectionContract {
+    pub default_base_url: String,
+    pub region: ProviderFieldSchema,
+    pub workspace: ProviderFieldSchema,
+    pub account: ProviderFieldSchema,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_region: Option<ProviderFieldSchema>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub region_base_urls: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_base_urls: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProviderConnectionInput<'a> {
+    pub base_url: Option<&'a str>,
+    pub region: Option<&'a str>,
+    pub workspace: Option<&'a str>,
+    pub account: Option<&'a str>,
+    pub operation_base_urls: Option<&'a BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedProviderConnection {
+    pub base_url: String,
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub region: Option<String>,
+    pub workspace: Option<String>,
+    pub account: Option<String>,
+}
+
+impl ProviderConnectionContract {
+    pub(crate) fn resolve(
+        &self,
+        input: ProviderConnectionInput<'_>,
+    ) -> ProviderResult<ResolvedProviderConnection> {
+        let region =
+            if input.region == Some("unknown") && self.region.mode == ProviderFieldMode::Optional {
+                Some("unknown".to_owned())
+            } else {
+                self.region.resolve("region", input.region)?
+            };
+        let workspace = self.workspace.resolve("workspace", input.workspace)?;
+        let account = self.account.resolve("account", input.account)?;
+        let endpoint_region = if region.as_deref() == Some("unknown") {
+            self.region.default_value.as_deref()
+        } else {
+            region.as_deref()
+        };
+        let mut base_url = input
+            .base_url
+            .or_else(|| {
+                endpoint_region
+                    .and_then(|region| self.region_base_urls.get(region))
+                    .map(String::as_str)
+            })
+            .unwrap_or(&self.default_base_url)
+            .to_owned();
+        for (placeholder, value) in [
+            ("{region}", endpoint_region),
+            ("{workspace}", workspace.as_deref()),
+            ("{account}", account.as_deref()),
+        ] {
+            if base_url.contains(placeholder) {
+                let value = value.ok_or_else(|| {
+                    ProviderError::InvalidConfiguration(format!(
+                        "{placeholder} is required to resolve base_url"
+                    ))
+                })?;
+                base_url = base_url.replace(placeholder, value);
+            }
+        }
+        if base_url.contains('{') || base_url.contains('}') {
+            return Err(ProviderError::InvalidConfiguration(
+                "base_url contains an unsupported placeholder".into(),
+            ));
+        }
+        validate_provider_url("base_url", &base_url)?;
+        let uses_custom_base = input.base_url.is_some_and(|url| {
+            url.trim_end_matches('/') != self.default_base_url.trim_end_matches('/')
+                && !self
+                    .region_base_urls
+                    .values()
+                    .any(|known| url.trim_end_matches('/') == known.trim_end_matches('/'))
+        });
+        let mut operation_base_urls = if uses_custom_base {
+            BTreeMap::new()
+        } else {
+            self.operation_base_urls.clone()
+        };
+        if let Some(overrides) = input.operation_base_urls {
+            operation_base_urls.extend(overrides.clone());
+        }
+        for (operation, operation_base_url) in &mut operation_base_urls {
+            validate_id("operation", operation)?;
+            for (placeholder, value) in [
+                ("{region}", region.as_deref()),
+                ("{workspace}", workspace.as_deref()),
+                ("{account}", account.as_deref()),
+            ] {
+                if operation_base_url.contains(placeholder) {
+                    let value = value.ok_or_else(|| {
+                        ProviderError::InvalidConfiguration(format!(
+                            "{placeholder} is required to resolve operation_base_urls"
+                        ))
+                    })?;
+                    *operation_base_url = operation_base_url.replace(placeholder, value);
+                }
+            }
+            if operation_base_url.contains('{') || operation_base_url.contains('}') {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "operation_base_urls.{operation} contains an unsupported placeholder"
+                )));
+            }
+            validate_provider_url(
+                &format!("operation_base_urls.{operation}"),
+                operation_base_url,
+            )?;
+        }
+        Ok(ResolvedProviderConnection {
+            base_url,
+            operation_base_urls,
+            region,
+            workspace,
+            account,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderInstanceConfig {
+    pub provider_instance_name: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub base_url: String,
+    pub operation_base_urls: BTreeMap<String, String>,
+    pub credential: CredentialReference,
+    pub credential_kind: Option<CredentialKind>,
+    pub provider_rules_id: Option<String>,
+    pub region: Option<String>,
+    pub workspace: Option<String>,
+    pub account: Option<String>,
+    pub request_timeout: Duration,
+    pub auto_sync_models: bool,
+    pub instance_rules: Option<buckyos_api::ProviderInstanceRules>,
+}
+
+impl ProviderInstanceConfig {
+    pub(super) fn validate(&self) -> ProviderResult<()> {
+        validate_id("provider_instance_name", &self.provider_instance_name)?;
+        validate_id("provider_profile_id", &self.provider_profile_id)?;
+        validate_id("protocol_adapter_id", &self.protocol_adapter_id)?;
+        if self.credential.reference.trim().is_empty() {
+            return Err(ProviderError::InvalidConfiguration(
+                "credential reference must not be empty".into(),
+            ));
+        }
+        if self.request_timeout.is_zero() {
+            return Err(ProviderError::InvalidConfiguration(
+                "provider request timeout must be greater than zero".into(),
+            ));
+        }
+        let url = reqwest::Url::parse(&self.base_url).map_err(|_| {
+            ProviderError::InvalidConfiguration("base_url must be an absolute URL".into())
+        })?;
+        if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() {
+            return Err(ProviderError::InvalidConfiguration(
+                "base_url must use http or https and support relative paths".into(),
+            ));
+        }
+        for (operation, operation_base_url) in &self.operation_base_urls {
+            validate_id("operation", operation)?;
+            validate_provider_url(
+                &format!("operation_base_urls.{operation}"),
+                operation_base_url,
+            )?;
+        }
+        if let Some(rules) = &self.instance_rules {
+            for (model, routes) in &rules.server_default_routes {
+                validate_nonempty("server default model", model)?;
+                if model.contains(['*', '?', '@', ':']) || model.chars().any(char::is_whitespace) {
+                    return Err(ProviderError::InvalidConfiguration(
+                        "server defaults require explicit physical model IDs".into(),
+                    ));
+                }
+                if routes.is_empty()
+                    || routes
+                        .iter()
+                        .any(|route| !route.starts_with("llm.") || route.contains([':', '@', '/']))
+                {
+                    return Err(ProviderError::InvalidConfiguration(
+                        "server defaults require explicit LLM task paths".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(provider_rules_id) = &self.provider_rules_id {
+            validate_id("provider_rules_id", provider_rules_id)?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub(crate) trait CredentialResolver: Send + Sync {
+    async fn resolve(
+        &self,
+        descriptor: &CredentialDescriptor,
+        reference: &CredentialReference,
+    ) -> ProviderResult<ResolvedCredential>;
+}
+
+#[derive(Clone)]
+pub(crate) struct StaticCredentialResolver {
+    values: BTreeMap<String, String>,
+}
+
+impl StaticCredentialResolver {
+    pub(crate) fn new(values: BTreeMap<String, String>) -> Self {
+        Self { values }
+    }
+}
+
+#[async_trait]
+impl CredentialResolver for StaticCredentialResolver {
+    async fn resolve(
+        &self,
+        descriptor: &CredentialDescriptor,
+        reference: &CredentialReference,
+    ) -> ProviderResult<ResolvedCredential> {
+        let value = self.values.get(&reference.reference).ok_or_else(|| {
+            ProviderError::Credential("credential reference was not resolved".into())
+        })?;
+        let result = match descriptor.kind {
+            CredentialKind::Bearer => {
+                ResolvedCredential::bearer(&reference.reference, value.clone())
+            }
+            CredentialKind::NamedHeader => ResolvedCredential::named_header(
+                &reference.reference,
+                descriptor.header_name.as_deref().unwrap_or_default(),
+                value.clone(),
+            ),
+            CredentialKind::FalKey => {
+                ResolvedCredential::fal_key(&reference.reference, value.clone())
+            }
+            CredentialKind::GlmJwt => ResolvedCredential::glm_jwt(
+                &reference.reference,
+                value,
+                SystemTime::now(),
+                Duration::from_secs(10 * 60),
+            ),
+        };
+        result.map_err(|error| ProviderError::Credential(error.to_string()))
+    }
+}
+
+pub(crate) struct DiscoveryContext<'a> {
+    pub profile: &'a ProviderProfile,
+    pub instance: &'a ProviderInstanceConfig,
+    pub credential: &'a ResolvedCredential,
+}
+
+pub(crate) struct ProviderQuotaContext<'a> {
+    pub profile: &'a ProviderProfile,
+    pub instance: &'a ProviderInstanceConfig,
+    pub credential: &'a ResolvedCredential,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderQuotaLevel {
+    Normal,
+    NearLimit,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderQuotaObservationState {
+    Normal,
+    NearLimit,
+    Exhausted,
+    Unsupported,
+    QueryFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderQuotaReading {
+    pub state: ProviderQuotaLevel,
+    pub remaining_request_units: Option<u64>,
+    pub remaining_cost_usd: Option<AiCost>,
+    pub reset_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderQuotaObservation {
+    pub state: ProviderQuotaObservationState,
+    pub remaining_request_units: Option<u64>,
+    pub remaining_cost: Option<AiCost>,
+    pub reset_at_ms: Option<i64>,
+    pub observed_at_ms: i64,
+    pub source: String,
+}
+
+#[async_trait]
+pub(crate) trait ProviderQuotaObserver: Send + Sync {
+    fn source(&self) -> &'static str;
+
+    async fn observe(
+        &self,
+        context: &ProviderQuotaContext<'_>,
+    ) -> ProviderResult<ProviderQuotaReading>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderHealthState {
+    Unknown,
+    Healthy,
+    Degraded,
+    Unavailable,
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiscoveredModel {
+    pub provider_model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_types: Option<Vec<ApiType>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<BTreeSet<String>>,
+    #[serde(default)]
+    pub unsupported_features: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_methods: Option<BTreeSet<String>>,
+    pub availability: ModelAvailability,
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<Pricing>,
+    /// Video output facts the channel's own catalog reports for this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<crate::video::DiscoveredVideoFacts>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderDiscoverySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub discovered_at_ms: i64,
+    pub health: ProviderHealthState,
+    #[serde(default)]
+    pub models: Vec<DiscoveredModel>,
+}
+
+#[async_trait]
+pub(crate) trait ProviderDiscovery: Send + Sync {
+    fn match_model_driver(
+        &self,
+        _provider_model_id: &str,
+        _catalog: &CatalogSnapshot,
+    ) -> ProviderModelMatch {
+        ProviderModelMatch::NotHandled
+    }
+
+    async fn refresh_catalog(
+        &self,
+        _catalog: &CatalogSnapshot,
+        _provider_profile_id: &str,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+
+    async fn discover(
+        &self,
+        context: &DiscoveryContext<'_>,
+    ) -> ProviderResult<ProviderDiscoverySnapshot>;
+}
+
+pub(crate) struct CatalogOnlyDiscovery {
+    pub(super) snapshot: RwLock<ProviderDiscoverySnapshot>,
+    catalog_managed: bool,
+}
+
+pub(crate) struct FallbackDiscovery {
+    primary: Arc<dyn ProviderDiscovery>,
+    fallback: Arc<dyn ProviderDiscovery>,
+}
+
+impl FallbackDiscovery {
+    pub(crate) fn new(
+        primary: Arc<dyn ProviderDiscovery>,
+        fallback: Arc<dyn ProviderDiscovery>,
+    ) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+#[async_trait]
+impl ProviderDiscovery for FallbackDiscovery {
+    fn match_model_driver(&self, id: &str, catalog: &CatalogSnapshot) -> ProviderModelMatch {
+        self.primary.match_model_driver(id, catalog)
+    }
+
+    async fn refresh_catalog(
+        &self,
+        catalog: &CatalogSnapshot,
+        provider_profile_id: &str,
+    ) -> ProviderResult<()> {
+        self.primary
+            .refresh_catalog(catalog, provider_profile_id)
+            .await?;
+        self.fallback
+            .refresh_catalog(catalog, provider_profile_id)
+            .await
+    }
+
+    async fn discover(
+        &self,
+        context: &DiscoveryContext<'_>,
+    ) -> ProviderResult<ProviderDiscoverySnapshot> {
+        match self.primary.discover(context).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(ProviderError::Discovery(_)) => {
+                let mut snapshot = self.fallback.discover(context).await?;
+                snapshot.health = ProviderHealthState::Degraded;
+                Ok(snapshot)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl CatalogOnlyDiscovery {
+    pub(crate) fn new(snapshot: ProviderDiscoverySnapshot) -> Self {
+        Self {
+            snapshot: RwLock::new(snapshot),
+            catalog_managed: false,
+        }
+    }
+
+    pub(crate) fn catalog_managed(snapshot: ProviderDiscoverySnapshot) -> Self {
+        Self {
+            snapshot: RwLock::new(snapshot),
+            catalog_managed: true,
+        }
+    }
+}
+
+#[async_trait]
+impl ProviderDiscovery for CatalogOnlyDiscovery {
+    async fn refresh_catalog(
+        &self,
+        catalog: &CatalogSnapshot,
+        provider_profile_id: &str,
+    ) -> ProviderResult<()> {
+        if self.catalog_managed {
+            *self.snapshot.write().await = catalog_only_inventory(catalog, provider_profile_id)
+                .ok_or_else(|| {
+                    ProviderError::Discovery(format!(
+                        "provider profile `{provider_profile_id}` has no catalog models"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn discover(
+        &self,
+        _context: &DiscoveryContext<'_>,
+    ) -> ProviderResult<ProviderDiscoverySnapshot> {
+        Ok(self.snapshot.read().await.clone())
+    }
+}
+
+pub(crate) fn catalog_only_inventory(
+    catalog: &CatalogSnapshot,
+    provider_profile_id: &str,
+) -> Option<ProviderDiscoverySnapshot> {
+    let rules = catalog.provider_rules(provider_profile_id)?;
+    let model_ids = rules
+        .static_inventory_models
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let models = model_ids
+        .into_iter()
+        .map(|provider_model_id| DiscoveredModel {
+            provider_model_id,
+            api_types: None,
+            supported_features: None,
+            unsupported_features: BTreeSet::new(),
+            remote_methods: None,
+            availability: ModelAvailability::Available,
+            deprecated: false,
+            pricing: None,
+            video: None,
+        })
+        .collect::<Vec<_>>();
+    Some(ProviderDiscoverySnapshot {
+        revision: Some(format!(
+            "catalog-{provider_profile_id}-{}",
+            rules.revision_seq
+        )),
+        discovered_at_ms: 0,
+        health: ProviderHealthState::Healthy,
+        models,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PricingSource {
+    Discovery,
+    ProviderRules,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InventoryPricing {
+    pub source: PricingSource,
+    pub value: Pricing,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderInventoryModel {
+    #[serde(default)]
+    pub variant_rules: Vec<crate::catalog::ProviderVariantRule>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub server_default_routes: BTreeSet<String>,
+    pub inventory_source: String,
+    pub provider_model_id: String,
+    pub model_uid: String,
+    pub identity_source: ModelIdentitySource,
+    pub model_driver_id: String,
+    pub origin_model_id: String,
+    pub api_types: Vec<ApiType>,
+    #[serde(default)]
+    pub logical_mounts: Vec<String>,
+    #[serde(default)]
+    pub capabilities: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub canonical_fields: BTreeMap<String, CanonicalFieldMapping>,
+    #[serde(default)]
+    pub operations: BTreeMap<String, String>,
+    #[serde(default)]
+    pub variants: Vec<InventoryModelVariant>,
+    pub availability: ModelAvailability,
+    #[serde(default)]
+    pub deprecated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_methods: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<InventoryPricing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_rules_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProviderInventorySnapshot {
+    #[serde(default)]
+    pub instance_rules_fingerprint: String,
+    #[serde(default)]
+    pub discovered_model_ids: BTreeSet<String>,
+    pub schema_version: u32,
+    pub provider_instance_name: String,
+    pub provider_profile_id: String,
+    pub protocol_adapter_id: String,
+    pub provider_model_list_fingerprint: String,
+    pub metadata_applied_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_revision: Option<String>,
+    pub discovered_at_ms: i64,
+    pub health: ProviderHealthState,
+    pub models: Vec<ProviderInventoryModel>,
+    pub filtered_capabilities: Vec<buckyos_api::FilteredProviderCapability>,
+    pub unmatched_models: Vec<UnmatchedInventoryModel>,
+    pub unavailable_presets: Vec<UnavailablePreset>,
+}
+
+impl ProviderInventorySnapshot {
+    pub(crate) fn as_model_inventory(&self) -> ModelProviderInventory {
+        ModelProviderInventory {
+            provider_instance_name: self.provider_instance_name.clone(),
+            provider_profile_id: self.provider_profile_id.clone(),
+            protocol_adapter_id: self.protocol_adapter_id.clone(),
+            inventory_revision: self
+                .inventory_revision
+                .clone()
+                .unwrap_or_else(|| self.provider_model_list_fingerprint.clone()),
+            models: self
+                .models
+                .iter()
+                .filter(|model| {
+                    model.availability == ModelAvailability::Available
+                        && !model.deprecated
+                        && !model.api_types.is_empty()
+                })
+                .map(|model| InventoryModel {
+                    provider_model_id: model.provider_model_id.clone(),
+                    model_driver_id: model.model_driver_id.clone(),
+                    origin_model_id: model.origin_model_id.clone(),
+                    api_types: model.api_types.clone(),
+                    logical_mounts: model.logical_mounts.clone(),
+                    variants: model.variants.clone(),
+                    capabilities: model.capabilities.clone(),
+                    canonical_fields: model.canonical_fields.clone(),
+                    attributes: BTreeMap::from([
+                        ("model_uid".into(), Value::String(model.model_uid.clone())),
+                        (
+                            "server_default_routes".into(),
+                            serde_json::json!(model.server_default_routes),
+                        ),
+                        (
+                            "pricing".into(),
+                            model
+                                .pricing
+                                .as_ref()
+                                .and_then(|pricing| serde_json::to_value(pricing).ok())
+                                .unwrap_or(Value::Null),
+                        ),
+                    ]),
+                    operations: model.operations.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelIdentitySource {
+    InstanceOverride,
+    Provider,
+    Catalog,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnmatchedInventoryModel {
+    pub provider_model_id: String,
+    pub reason: ModelMatchFailure,
+    pub discovered_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnavailablePreset {
+    pub provider_model_id: String,
+    pub effort: String,
+    pub reason: String,
+}
+
+pub(crate) struct InventoryBuilder;
+
+impl InventoryBuilder {
+    pub(crate) fn build(
+        profile: &ProviderProfile,
+        instance: &ProviderInstanceConfig,
+        discovery: ProviderDiscoverySnapshot,
+        catalog: &CatalogSnapshot,
+        codecs: &CodecRegistry,
+    ) -> ProviderResult<ProviderInventorySnapshot> {
+        Self::build_with_matcher(profile, instance, discovery, catalog, codecs, None)
+    }
+
+    pub(crate) fn build_with_matcher(
+        profile: &ProviderProfile,
+        instance: &ProviderInstanceConfig,
+        mut discovery: ProviderDiscoverySnapshot,
+        catalog: &CatalogSnapshot,
+        codecs: &CodecRegistry,
+        matcher: Option<&dyn ProviderDiscovery>,
+    ) -> ProviderResult<ProviderInventorySnapshot> {
+        validate_discovery(&discovery)?;
+        let adapter = codecs
+            .adapter(&instance.protocol_adapter_id)
+            .ok_or_else(|| ProviderError::UnknownAdapter(instance.protocol_adapter_id.clone()))?;
+        let rules_id = instance
+            .provider_rules_id
+            .as_deref()
+            .unwrap_or(&profile.provider_profile_id);
+        let rules = catalog.provider_rules(rules_id);
+        if instance.provider_rules_id.is_some() && rules.is_none() {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "unknown provider_rules_id: {rules_id}"
+            )));
+        }
+        let default_rules_id = if rules.is_none() {
+            catalog.protocol_default_rules_id(
+                &adapter.protocol_family_id,
+                &adapter.protocol_adapter_id,
+            )
+        } else {
+            None
+        };
+        let instance_rules = instance.instance_rules.clone().unwrap_or_default();
+        let enabled_static_models = instance_rules.enabled_inventory_models.as_ref();
+        if let (Some(enabled), Some(rules)) = (enabled_static_models, rules) {
+            discovery.models.retain(|model| {
+                !rules
+                    .static_inventory_models
+                    .contains(&model.provider_model_id)
+                    || enabled.contains(&model.provider_model_id)
+            });
+        }
+        let resolve_identity = |id: &str| {
+            if let Some(target) = instance_rules.model_driver_overrides.get(id) {
+                target
+                    .split_once('/')
+                    .filter(|(driver, model)| catalog.resolve_model(driver, model).is_ok())
+                    .map(|(driver, model)| {
+                        (
+                            ModelIdentity {
+                                model_driver_id: driver.into(),
+                                model_id: model.into(),
+                            },
+                            ModelIdentitySource::InstanceOverride,
+                        )
+                    })
+                    .ok_or_else(|| ModelMatchFailure::InvalidOverride {
+                        target: target.clone(),
+                    })
+            } else if let Some(identity) = catalog.provider_model_identity_override(rules_id, id) {
+                identity.map(|identity| (identity, ModelIdentitySource::Provider))
+            } else {
+                match matcher
+                    .map(|matcher| matcher.match_model_driver(id, catalog))
+                    .unwrap_or(ProviderModelMatch::NotHandled)
+                {
+                    ProviderModelMatch::NotHandled => catalog
+                        .match_model(id)
+                        .map(|id| (id, ModelIdentitySource::Catalog)),
+                    ProviderModelMatch::Failed(reason) => Err(reason),
+                    ProviderModelMatch::Matched(id) => {
+                        if catalog
+                            .resolve_model(&id.model_driver_id, &id.model_id)
+                            .is_ok()
+                        {
+                            Ok((id, ModelIdentitySource::Provider))
+                        } else {
+                            Err(ModelMatchFailure::InvalidProviderMatch {
+                                model_driver_id: id.model_driver_id,
+                                model_id: id.model_id,
+                            })
+                        }
+                    }
+                }
+            }
+        };
+        let mut static_models = BTreeSet::new();
+        if let Some(rules) = rules {
+            for id in &rules.static_inventory_models {
+                if enabled_static_models.is_some_and(|enabled| !enabled.contains(id)) {
+                    continue;
+                }
+                if discovery
+                    .models
+                    .iter()
+                    .any(|model| &model.provider_model_id == id)
+                {
+                    continue;
+                }
+                let Ok((identity, _)) = resolve_identity(id) else {
+                    if !rules.supplemental_inventory_api_types.is_empty() {
+                        static_models.insert(id.clone());
+                        discovery.models.push(DiscoveredModel {
+                            provider_model_id: id.clone(),
+                            api_types: None,
+                            supported_features: None,
+                            unsupported_features: BTreeSet::new(),
+                            remote_methods: None,
+                            availability: ModelAvailability::Available,
+                            deprecated: false,
+                            pricing: None,
+                            video: None,
+                        });
+                    }
+                    continue;
+                };
+                let facts = catalog
+                    .resolve_model(&identity.model_driver_id, &identity.model_id)
+                    .map_err(|e| ProviderError::Inventory(e.to_string()))?;
+                if facts.semantics.api_types.as_ref().is_some_and(|apis| {
+                    !apis.is_empty()
+                        && apis
+                            .iter()
+                            .all(|api| rules.supplemental_inventory_api_types.contains(api))
+                }) {
+                    static_models.insert(id.clone());
+                    discovery.models.push(DiscoveredModel {
+                        provider_model_id: id.clone(),
+                        api_types: None,
+                        supported_features: None,
+                        unsupported_features: BTreeSet::new(),
+                        remote_methods: None,
+                        availability: ModelAvailability::Available,
+                        deprecated: false,
+                        pricing: None,
+                        video: None,
+                    });
+                }
+            }
+        }
+        let discovered_model_ids = discovery
+            .models
+            .iter()
+            .map(|model| model.provider_model_id.clone())
+            .collect();
+        let fingerprint = model_list_fingerprint(&discovery.models);
+        let mut models = Vec::new();
+        let mut filtered_capabilities = Vec::new();
+        let mut unmatched_models = Vec::new();
+        let mut unavailable_presets = Vec::new();
+
+        for mut discovered in discovery.models {
+            if instance_rules
+                .exclude_models
+                .contains(&discovered.provider_model_id)
+            {
+                continue;
+            }
+            let excluded = if catalog.provider_rules(rules_id).is_some() {
+                catalog
+                    .resolve_provider_rule(
+                        rules_id,
+                        &discovered.provider_model_id,
+                        &MatchContext::from([(
+                            "provider_model_id".into(),
+                            Value::String(discovered.provider_model_id.clone()),
+                        )]),
+                    )
+                    .map_err(|e| ProviderError::Inventory(e.to_string()))?
+                    .is_some_and(|rule| rule.action.exclude)
+            } else {
+                false
+            };
+            if excluded {
+                continue;
+            }
+            let identity = resolve_identity(&discovered.provider_model_id);
+            let (identity, identity_source) = match identity {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    unmatched_models.push(UnmatchedInventoryModel {
+                        provider_model_id: discovered.provider_model_id,
+                        reason,
+                        discovered_at_ms: discovery.discovered_at_ms,
+                    });
+                    continue;
+                }
+            };
+            let model_driver_id = identity.model_driver_id;
+            let origin_model_id = identity.model_id;
+            let mut dimensions = MatchContext::from([
+                (
+                    "provider_model_id".into(),
+                    Value::String(discovered.provider_model_id.clone()),
+                ),
+                (
+                    "origin_model_id".into(),
+                    Value::String(origin_model_id.clone()),
+                ),
+            ]);
+            for (name, value) in [
+                ("region", &instance.region),
+                ("workspace", &instance.workspace),
+                ("account", &instance.account),
+            ] {
+                if let Some(value) = value {
+                    dimensions.insert(name.into(), Value::String(value.clone()));
+                }
+            }
+            if let Some(policy_region) = instance_rules.policy_region.as_ref() {
+                dimensions.insert("policy_region".into(), Value::String(policy_region.clone()));
+            }
+            if catalog.provider_rules(rules_id).is_some() {
+                match catalog
+                    .resolve_provider_access(rules_id, &discovered.provider_model_id, &dimensions)
+                    .map_err(|error| ProviderError::Inventory(error.to_string()))?
+                {
+                    crate::catalog::ProviderModelAccess::Denied => {
+                        discovered.availability = ModelAvailability::Unavailable;
+                    }
+                    crate::catalog::ProviderModelAccess::Allowed
+                    | crate::catalog::ProviderModelAccess::Unknown => {}
+                }
+            }
+            let provider_rule = if catalog.provider_rules(rules_id).is_some() {
+                catalog
+                    .resolve_provider_rule(rules_id, &discovered.provider_model_id, &dimensions)
+                    .map_err(|error| ProviderError::Inventory(error.to_string()))?
+            } else {
+                None
+            };
+            if provider_rule
+                .as_ref()
+                .is_some_and(|rule| rule.action.exclude)
+            {
+                continue;
+            }
+            let resolved = catalog
+                .resolve_model(&model_driver_id, &origin_model_id)
+                .map_err(|error| ProviderError::Inventory(error.to_string()))?;
+            if resolved.semantics.exclude.unwrap_or(false) {
+                continue;
+            }
+            let mut static_api_types = resolved.semantics.api_types.unwrap_or_default();
+            let mut capabilities = resolved.semantics.capabilities.unwrap_or_default();
+            let mut canonical_fields = resolved.semantics.canonical_fields.unwrap_or_default();
+            let mut pricing = None;
+            let mut provider_rules_revision = None;
+            let operation_overrides = if let Some(rule) = &provider_rule {
+                let narrowed = rule.action.narrow(&static_api_types, &capabilities);
+                static_api_types = narrowed.api_types;
+                capabilities = narrowed.capabilities;
+                canonical_fields.extend(rule.action.canonical_fields.clone());
+                if let Some(value) = &rule.action.pricing {
+                    pricing = Some(InventoryPricing {
+                        source: PricingSource::ProviderRules,
+                        value: value.clone(),
+                    });
+                }
+                provider_rules_revision = Some(rule.catalog_revision_seq);
+                &rule.action.operations
+            } else {
+                static EMPTY_OPERATIONS: std::sync::LazyLock<BTreeMap<String, String>> =
+                    std::sync::LazyLock::new(BTreeMap::new);
+                &EMPTY_OPERATIONS
+            };
+            if instance.provider_profile_id == "doubao"
+                && std::iter::once(&instance.base_url)
+                    .chain(instance.operation_base_urls.values())
+                    .any(|url| {
+                        reqwest::Url::parse(url)
+                            .ok()
+                            .is_some_and(|url| url.path().split('/').any(|part| part == "plan"))
+                    })
+            {
+                pricing = None;
+            }
+            if let Some(value) = discovered
+                .pricing
+                .clone()
+                .filter(|_| instance_rules.catalog.is_none() || pricing.is_none())
+            {
+                pricing = Some(InventoryPricing {
+                    source: PricingSource::Discovery,
+                    value,
+                });
+            }
+
+            let discovered_api_types = discovered.api_types.as_ref().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|api_type| api_type_name(*api_type).ok())
+                    .collect::<BTreeSet<_>>()
+            });
+            if let Some(discovered_api_types) = &discovered_api_types {
+                static_api_types.retain(|api_type| discovered_api_types.contains(api_type));
+            }
+
+            let default_operations = default_rules_id
+                .map(|id| catalog.resolve_provider_rule(id, &origin_model_id, &dimensions))
+                .transpose()
+                .map_err(|error| ProviderError::Inventory(error.to_string()))?
+                .flatten()
+                .map(|rule| rule.action.operations)
+                .unwrap_or_default();
+            let mut api_types = Vec::new();
+            let mut operations = BTreeMap::new();
+            let mut adapter_features = BTreeSet::new();
+            let filtered_start = filtered_capabilities.len();
+            for api_type_name in static_api_types {
+                let api_type = parse_api_type(&api_type_name)?;
+                let operation_id = resolve_operation(
+                    adapter,
+                    operation_overrides,
+                    discovered.remote_methods.as_ref(),
+                    api_type,
+                    &api_type_name,
+                    default_operations
+                        .get(api_type.typed_method())
+                        .or_else(|| default_operations.get(&api_type_name))
+                        .map(String::as_str),
+                )
+                .map_err(|error| {
+                    ProviderError::Inventory(format!(
+                        "provider instance {:?} model {:?}: {error}",
+                        instance.provider_instance_name, discovered.provider_model_id
+                    ))
+                })?;
+                let Some(operation_id) = operation_id else {
+                    filtered_capabilities.push(buckyos_api::FilteredProviderCapability {
+                        provider_model_id: discovered.provider_model_id.clone(),
+                        protocol_adapter_id: instance.protocol_adapter_id.clone(),
+                        api_type: api_type_name,
+                        operation_id: None,
+                        reason: "unsupported_api_type".into(),
+                    });
+                    continue;
+                };
+                if discovered.remote_methods.as_ref().is_some_and(|methods| {
+                    !methods.contains(&operation_id)
+                        && !methods.contains(api_type.typed_method())
+                        && !methods.contains(&api_type_name)
+                }) {
+                    continue;
+                }
+                let descriptor = match codecs.operation_descriptor(
+                    &instance.protocol_adapter_id,
+                    &operation_id,
+                    api_type,
+                ) {
+                    Ok(descriptor) => descriptor,
+                    Err(error) if error.kind == ProtocolErrorKind::UnsupportedOperation => {
+                        filtered_capabilities.push(buckyos_api::FilteredProviderCapability {
+                            provider_model_id: discovered.provider_model_id.clone(),
+                            protocol_adapter_id: instance.protocol_adapter_id.clone(),
+                            api_type: api_type_name,
+                            operation_id: Some(operation_id),
+                            reason: "unregistered_binding".into(),
+                        });
+                        continue;
+                    }
+                    Err(error) => return Err(ProviderError::Inventory(error.to_string())),
+                };
+                let binding = descriptor
+                    .binding(api_type)
+                    .map_err(|error| ProviderError::Inventory(error.to_string()))?;
+                adapter_features.extend(binding.supported_features.iter().cloned());
+                api_types.push(api_type);
+                operations.insert(api_type_name, operation_id);
+            }
+            if let Some(facts) = &discovered.video {
+                crate::video::apply_discovered_video_facts(&mut capabilities, facts);
+            }
+            retain_supported_features(
+                &mut capabilities,
+                &adapter_features,
+                discovered.supported_features.as_ref(),
+            );
+            for feature in &discovered.unsupported_features {
+                capabilities.remove(feature);
+            }
+            api_types.sort_by_key(|api_type| api_type.typed_method());
+            if discovered.availability != ModelAvailability::Available || discovered.deprecated {
+                api_types.clear();
+                operations.clear();
+            }
+            let mut logical_mounts: Vec<String> = resolved
+                .semantics
+                .logical_mounts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mount| expand_mount_template(&mount, &model_driver_id, &origin_model_id))
+                .collect();
+            logical_mounts.retain(|mount| logical_mount_matches_api_types(mount, &api_types));
+            let model_uid = ModelUid::new(
+                &model_driver_id,
+                &origin_model_id,
+                &instance.protocol_adapter_id,
+                None,
+            )
+            .map_err(|error| ProviderError::Inventory(error.to_string()))?
+            .as_stable_string();
+            let llm = catalog.llm_model(&model_driver_id, &origin_model_id);
+            let variant_rules_id = rules
+                .map(|_| rules_id)
+                .or_else(|| default_rules_id.filter(|_| instance.provider_profile_id != "custom" && llm.is_some()));
+            let mut variant_rules = if let Some(rules_id) = variant_rules_id {
+                catalog
+                    .executable_variants(rules_id, &model_driver_id, &origin_model_id, &dimensions)
+                    .map_err(|error| ProviderError::Inventory(error.to_string()))?
+                    .into_iter()
+                    .filter(|variant| variant.model_driver == model_driver_id)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let mut variants = variant_rules.iter().map(|variant| InventoryModelVariant {
+                name: variant.variant.clone(),
+                logical_mounts: Vec::new(),
+            }).collect::<Vec<_>>();
+            if let Some(llm) = llm {
+                variants.retain(|variant| {
+                    (!discovered.unsupported_features.contains("reasoning")
+                        || variant.name == "reasoning-none")
+                        && llm
+                            .semantics
+                            .supported_efforts
+                            .iter()
+                            .any(|effort| effort.variant().as_deref() == Some(&variant.name))
+                });
+                for effort in &llm.semantics.supported_efforts {
+                    if let Some(name) = effort.variant() {
+                        if !variants.iter().any(|variant| variant.name == name) {
+                            unavailable_presets.push(UnavailablePreset {
+                                provider_model_id: discovered.provider_model_id.clone(),
+                                effort: effort.as_str().into(),
+                                reason: "missing_channel_mapping".into(),
+                            });
+                        }
+                    }
+                }
+            }
+            variants.sort_by(|left, right| left.name.cmp(&right.name));
+            variants.dedup_by(|left, right| left.name == right.name);
+            variant_rules.retain(|rule| variants.iter().any(|variant| variant.name == rule.variant));
+            let inventory_source = if static_models.contains(&discovered.provider_model_id) {
+                "static_supplement"
+            } else if profile.discovery_mode == DiscoveryMode::CatalogOnly {
+                "explicit_catalog"
+            } else if discovery.health == ProviderHealthState::Degraded {
+                "fallback"
+            } else {
+                "discovery"
+            }
+            .to_owned();
+            let mut server_default_routes = instance_rules
+                .server_default_routes
+                .get(&discovered.provider_model_id)
+                .or_else(|| {
+                    rules.and_then(|rules| rules.server_default_routes.get(&discovered.provider_model_id))
+                })
+                .cloned()
+                .unwrap_or_default();
+            if !api_types.contains(&ApiType::Llm)
+                && filtered_capabilities[filtered_start..]
+                    .iter()
+                    .any(|item| item.api_type == "llm")
+            {
+                server_default_routes.clear();
+            }
+            if !server_default_routes.is_empty() && !api_types.contains(&ApiType::Llm) {
+                return Err(ProviderError::InvalidConfiguration(format!(
+                    "server defaults require a recognized LLM: {}",
+                    discovered.provider_model_id
+                )));
+            }
+            models.push(ProviderInventoryModel {
+                variant_rules,
+                server_default_routes,
+                inventory_source,
+                provider_model_id: discovered.provider_model_id,
+                model_uid,
+                identity_source,
+                model_driver_id,
+                origin_model_id,
+                api_types,
+                logical_mounts,
+                capabilities,
+                canonical_fields,
+                operations,
+                variants,
+                availability: discovered.availability,
+                deprecated: discovered.deprecated,
+                remote_methods: discovered.remote_methods,
+                pricing,
+                model_catalog_revision: Some(resolved.catalog_revision_seq),
+                provider_rules_revision,
+            });
+        }
+        models.sort_by(|left, right| left.provider_model_id.cmp(&right.provider_model_id));
+        Ok(ProviderInventorySnapshot {
+            instance_rules_fingerprint: instance_rules_fingerprint(instance),
+            discovered_model_ids,
+            schema_version: INVENTORY_SCHEMA_VERSION,
+            provider_instance_name: instance.provider_instance_name.clone(),
+            provider_profile_id: profile.provider_profile_id.clone(),
+            protocol_adapter_id: instance.protocol_adapter_id.clone(),
+            provider_model_list_fingerprint: fingerprint,
+            metadata_applied_seq: catalog.target_revision_seq(),
+            inventory_revision: discovery.revision,
+            discovered_at_ms: discovery.discovered_at_ms,
+            health: discovery.health,
+            models,
+            filtered_capabilities,
+            unmatched_models,
+            unavailable_presets,
+        })
+    }
+}
+
+fn expand_mount_template(template: &str, driver_id: &str, model_id: &str) -> String {
+    template
+        .replace("{driver}", &logical_mount_segment(driver_id))
+        .replace("{model}", &logical_mount_segment(model_id))
+}
+
+fn logical_mount_segment(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('/')
+        .split(|ch: char| matches!(ch, '/' | '_' | '.' | '-'))
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn logical_mount_matches_api_types(mount: &str, api_types: &[ApiType]) -> bool {
+    let namespace = mount.split('.').next().unwrap_or_default();
+    api_types.iter().any(|api_type| {
+        if *api_type == ApiType::AgentComputerUse {
+            namespace == "agent_runtime"
+        } else {
+            api_type_name(*api_type)
+                .ok()
+                .is_some_and(|name| name.split('.').next() == Some(namespace))
+        }
+    })
+}

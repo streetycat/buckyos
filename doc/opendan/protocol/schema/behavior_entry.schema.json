@@ -1,0 +1,309 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "BehaviorPrompt": {
+      "additionalProperties": false,
+      "description": "`prompt` of a behavior entry.",
+      "properties": {
+        "goal_activation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_context_switch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_init": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "on_input": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "semi_subscription_snapshot": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "system": {
+          "description": "Application system prompt of the context (replaces `prompt.system`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "BehaviorReply": {
+      "additionalProperties": false,
+      "description": "`[reply]`: the reply contract of a behavior's context. The final reply (an assistant text without tool calls) is one JSON value matching `schema`: the provider enforces it natively where it can, the host checks it and asks for one correction (`OutputSpec::Json { max_repairs: Some(1) }`). Function call loop only.",
+      "properties": {
+        "asks_field": {
+          "description": "An array field of the reply that must list every question the context asked the user (`agent-session ask-user`), one entry each.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "JSON Schema of the reply (an object schema)."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
+    "BehaviorToolConfig": {
+      "additionalProperties": false,
+      "description": "`[tool]`: a sub context behavior offered to its callers as a named function. Calling it runs the behavior exactly like `call_behavior` does; the declaration only decides what the caller's model sees.",
+      "properties": {
+        "description": {
+          "default": "",
+          "description": "When to call it: the caller's routing guide.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Function name (letters, digits, `_`); default: the behavior name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameters": {
+          "description": "JSON Schema of the arguments (an object); default: `{task: string}`."
+        },
+        "task": {
+          "description": "Template of the sub context's task (`{{args.<name>}}` only); default: the arguments as JSON (or `args.task` with the default parameters).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ContextMode": {
+      "description": "How a behavior is entered when a hand-over (`next_behavior`) or a `call_behavior` tool call names it. Decided by the target behavior, never by the session as a whole; there is no default mode.",
+      "oneOf": [
+        {
+          "description": "The target has its own context (system, tools, history, run): created on first entry, resumed from its own snapshot afterwards.",
+          "enum": [
+            "switch_context"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A new sub context per call with the target's system and task input, plus an explicit selection of the caller's history; its result returns to the caller.",
+          "enum": [
+            "create_sub_context"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A new branch per call that keeps the caller's system and its complete effective history at the fork point; its result returns to the caller.",
+          "enum": [
+            "fork"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InheritMode": {
+      "description": "History a new context starts with (besides its system and task input).",
+      "oneOf": [
+        {
+          "enum": [
+            "none"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The session history rendered by the host (summary + recent worklog records): a filtered view, labelled `<session_history>`.",
+          "enum": [
+            "recent_dialogue"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller's completed steps as structured records (`create_sub_context`, both contexts in the behavior loop).",
+          "enum": [
+            "steps"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InputBackground": {
+      "description": "What the host shows a context besides its inputs.",
+      "oneOf": [
+        {
+          "description": "Only what an input batch carries (the chat format's background).",
+          "enum": [
+            "batch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Also after every batch of tool results (behavior loop: every step with action results): the TodoList, sub session and runtime / workspace lines that changed since they were last shown, as a `<<background_context>>` message before the next inference.",
+          "enum": [
+            "after_tools"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InputMedia": {
+      "description": "Whether attachments also enter the context as image / document blocks.",
+      "oneOf": [
+        {
+          "description": "Text references only (`<attachment .../>` lines); the agent reads attachments with tools.",
+          "enum": [
+            "reference"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Image / document attachments additionally as content blocks (at most [`MAX_INLINE_MEDIA`] per batch).",
+          "enum": [
+            "inline"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InputMode": {
+      "description": "How many selected inputs one `on_input` batch takes.",
+      "oneOf": [
+        {
+          "description": "One msg / Input event per batch; the rest stays queued.",
+          "enum": [
+            "single"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "As many as the batch budget allows.",
+          "enum": [
+            "batch"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "InputSection": {
+      "additionalProperties": false,
+      "description": "Input consumption policy of a context (separate from its templates).",
+      "properties": {
+        "background": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InputBackground"
+            }
+          ],
+          "default": "batch"
+        },
+        "media": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InputMedia"
+            }
+          ],
+          "default": "reference"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InputMode"
+            }
+          ],
+          "default": "batch"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "description": "`extensions.opendan.behaviors.<name>`: entry configuration of a behavior.",
+  "properties": {
+    "call_intent": {
+      "description": "Every native function call of the context carries a non-empty `intent` (`[capabilities] call_intent`): declared in each function's schema, checked before the call runs, kept with the call's record and removed from the arguments the tool receives.",
+      "type": "boolean"
+    },
+    "inherit": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/InheritMode"
+        }
+      ],
+      "default": "none"
+    },
+    "input": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/InputSection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Input consumption of the context (`None`: the session's)."
+    },
+    "llm_context": {
+      "description": "Top-level keys replacing those of `prompt.llm_context` (model, tools, limits …). Not allowed for `fork`."
+    },
+    "mode": {
+      "$ref": "#/definitions/ContextMode"
+    },
+    "prompt": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BehaviorPrompt"
+        }
+      ],
+      "description": "`prompt.system` and the input templates of the context. A system prompt is not allowed for `fork`."
+    },
+    "reply": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorReply"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[reply]`: the context's final reply is a JSON value of this contract (function call loop only). A fork may declare its own."
+    },
+    "todo": {
+      "description": "The behavior executes the session's serial Todos: a `next_behavior` hand-over to it admits the next one (TodoList, `[entry] todo`).",
+      "type": "boolean"
+    },
+    "tool": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BehaviorToolConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`[tool]` of the behavior: offered to callers that whitelist `behavior:<name>` as a named function running this sub context."
+    }
+  },
+  "required": [
+    "mode"
+  ],
+  "title": "BehaviorEntry",
+  "type": "object"
+}

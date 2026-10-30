@@ -1,22 +1,39 @@
 import { useEffect, useState, type FocusEvent } from 'react'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { ArrowLeft } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
-import { useAICCStore } from '../../../hooks/use-aicc-store'
-import type { ProviderType, ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
+import { useAICCStore, useProviders } from '../../../hooks/use-aicc-store'
+import { type ProviderSetupCatalog, type ProviderType, type ValidationResult, type WizardDraft } from '../../../../../api/aicc_mgr'
 import { Stepper } from '../../shared/Stepper'
 import { StepChooseType } from './StepChooseType'
 import { StepConnection } from './StepConnection'
+import { StepModels } from './StepModels'
 import { StepValidation } from './StepValidation'
 import { StepReview } from './StepReview'
-import { isConnectionValid } from './connectionValidation'
+import { openProviderTo } from '../../../../../api/aicc_quota'
+import { useQuotaApi } from '../../../hooks/use-quota-api'
+import { isConnectionValid, wizardDraftSchema } from './connectionValidation'
 
 const INITIAL_DRAFT: WizardDraft = {
-  provider_type: null,
-  name: '',
-  endpoint: '',
-  protocol_type: null,
+  provider_profile_id: null,
+  display_name: '',
+  base_url: '',
+  operation_base_urls: {},
+  protocol_family_id: null,
+  auth_mode: 'api_key',
   api_key: '',
   auto_sync_models: true,
+}
+
+type WizardStepKey = 'chooseType' | 'connection' | 'models' | 'validation' | 'review'
+
+const STEP_LABELS: Record<WizardStepKey, string> = {
+  chooseType: 'Choose Type',
+  connection: 'Connection',
+  models: 'Models',
+  validation: 'Validation',
+  review: 'Review',
 }
 
 interface WizardShellProps {
@@ -27,52 +44,70 @@ interface WizardShellProps {
 export function WizardShell({ onBack, onCreated }: WizardShellProps) {
   const { t } = useI18n()
   const store = useAICCStore()
+  const providers = useProviders()
 
   const [step, setStep] = useState(0)
-  const [draft, setDraft] = useState<WizardDraft>(INITIAL_DRAFT)
+  const form = useForm<WizardDraft>({
+    resolver: zodResolver(wizardDraftSchema),
+    defaultValues: INITIAL_DRAFT,
+    mode: 'onChange',
+  })
+  const draft = useWatch({ control: form.control }) as WizardDraft
+  const [catalog, setCatalog] = useState<ProviderSetupCatalog | null>(null)
+  const [catalogLoading, setCatalogLoading] = useState(true)
+  const [catalogError, setCatalogError] = useState<string | null>(null)
   const [validation, setValidation] = useState<ValidationResult | null>(null)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [keyboardInset, setKeyboardInset] = useState(0)
+  const [openTo, setOpenTo] = useState<string[]>([])
+  const quotaApi = useQuotaApi()
+  const selectedProfile = catalog?.providers.find((item) => item.provider_profile_id === draft.provider_profile_id)
 
-  const steps = [
-    t('aiCenter.wizard.step.chooseType', 'Choose Type'),
-    t('aiCenter.wizard.step.connection', 'Connection'),
-    t('aiCenter.wizard.step.validation', 'Validation'),
-    t('aiCenter.wizard.step.review', 'Review'),
-  ]
+  const selectsInventoryModels = (selectedProfile?.selectable_inventory_models?.length ?? 0) > 0
+  const stepKeys = (selectsInventoryModels
+    ? ['chooseType', 'connection', 'models', 'validation', 'review']
+    : ['chooseType', 'connection', 'validation', 'review']) as WizardStepKey[]
+  const currentStep = stepKeys[Math.min(step, stepKeys.length - 1)]
+  const steps = stepKeys.map((key) => t(`aiCenter.wizard.step.${key}`, STEP_LABELS[key]))
 
   const updateDraft = (partial: Partial<WizardDraft>) => {
     setCreateError(null)
-    setDraft((prev) => ({ ...prev, ...partial }))
+    for (const [key, value] of Object.entries(partial)) {
+      form.setValue(key as keyof WizardDraft, value as never, { shouldDirty: true, shouldValidate: true })
+    }
   }
 
   const canNext = () => {
-    switch (step) {
-      case 0: return draft.provider_type !== null
-      case 1: return isConnectionValid(draft)
-      case 2: return validation !== null && !validation.errors.some((e) =>
-        !e.includes('balance') // allow balance errors
-      ) && validation.endpoint_reachable && validation.auth_valid
-      case 3: return true
+    switch (currentStep) {
+      case 'chooseType': return draft.provider_profile_id !== null
+      case 'connection': return isConnectionValid(draft) && providerConnectionFieldsValid(draft, selectedProfile)
+      case 'models': return true
+      case 'validation': return validation !== null && validationCanProceed(validation)
+      case 'review': return true
       default: return false
     }
   }
 
   const handleNext = async () => {
-    if (step === 3) {
+    if (currentStep === 'review') {
       setCreating(true)
       setCreateError(null)
       try {
         await new Promise((r) => setTimeout(r, 300))
-        await store.addProvider(draft)
+        const created = await store.addProvider(draft)
+        if (openTo.length > 0) {
+          await openProviderTo(quotaApi, created.config.provider_instance_name, openTo).catch((error: unknown) => {
+            console.error('aicc.visibility.open_provider failed', error)
+          })
+        }
         onCreated()
       } catch (error) {
         const message = error instanceof Error ? error.message : ''
         if (message.includes('provider_validation_required') || message.includes('provider_validation_mismatch')) {
           setCreateError(t('aiCenter.wizard.validationExpired', 'Provider validation expired. Please validate again.'))
           setValidation(null)
-          setStep(2)
+          setStep(stepKeys.indexOf('validation'))
         } else {
           setCreateError(message || t('aiCenter.wizard.createFailed', 'Could not create provider.'))
         }
@@ -81,8 +116,8 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
       }
       return
     }
-    if (step === 1) {
-      // Reset validation when moving to step 2
+    if (currentStep === 'connection') {
+      // Reset validation when leaving the connection step
       setValidation(null)
       setCreateError(null)
     }
@@ -93,19 +128,58 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     if (step === 0) {
       onBack()
     } else {
-      if (step === 2) setValidation(null)
+      if (currentStep === 'validation') setValidation(null)
       setStep((s) => s - 1)
     }
   }
 
   const handleTypeSelect = (type: ProviderType) => {
+    const profile = catalog?.providers.find((item) => item.provider_profile_id === type)
+    const displayName = type === 'sn' ? t('aiCenter.wizard.snRouter', 'SN Router') : profile?.display_name ?? ''
+    const regionField = profile?.connection_fields.region
+    const defaultRegion = regionField?.default_value
+    const requiresExplicitRegion = regionField?.mode === 'required' && !defaultRegion
     updateDraft({
-      provider_type: type,
-      name: '',
-      endpoint: '',
-      protocol_type: null,
+      provider_profile_id: type,
+      provider_instance_name: nextProviderInstanceName(type, displayName, providers.map((provider) => provider.config.provider_instance_name)),
+      display_name: displayName,
+      base_url: requiresExplicitRegion
+        ? ''
+        : defaultRegion
+        ? profile?.region_base_urls[defaultRegion] ?? profile?.base_url ?? ''
+        : profile?.base_url ?? '',
+      operation_base_urls: {},
+      provider_rules_id: undefined,
+      model_driver_overrides_json: undefined,
+      server_default_routes_json: undefined,
+      protocol_family_id: null,
+      protocol_adapter_id: profile?.protocol_adapter_id,
+      region: defaultRegion,
+      workspace: profile?.connection_fields.workspace?.default_value,
+      account: profile?.connection_fields.account?.default_value,
+      policy_region: profile?.connection_fields.policy_region
+        ? profile.connection_fields.policy_region.default_value ?? 'unknown'
+        : undefined,
+      auth_mode: 'api_key',
       api_key: '',
+      discovery_behavior_id: profile?.discovery_behavior_id,
+      selectable_inventory_models: profile?.selectable_inventory_models?.map((model) => model.id),
+      selected_inventory_models: profile?.selectable_inventory_models?.length
+        ? profile.selectable_inventory_models.map((model) => model.id)
+        : undefined,
     })
+  }
+
+  const loadCatalog = async () => {
+    setCatalogLoading(true)
+    setCatalogError(null)
+    try {
+      setCatalog(await store.fetchProviderSetupCatalog())
+    } catch (error) {
+      setCatalogError(error instanceof Error ? error.message : 'provider_catalog_failed')
+    } finally {
+      setCatalogLoading(false)
+    }
   }
 
   const keepFocusedFieldVisible = (event: FocusEvent<HTMLDivElement>) => {
@@ -127,6 +201,21 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
     window.setTimeout(scrollFocusedTarget, 360)
     window.setTimeout(scrollFocusedTarget, 780)
   }
+
+  useEffect(() => {
+    let cancelled = false
+    void store.fetchProviderSetupCatalog()
+      .then((result) => {
+        if (!cancelled) setCatalog(result)
+      })
+      .catch((error) => {
+        if (!cancelled) setCatalogError(error instanceof Error ? error.message : 'provider_catalog_failed')
+      })
+      .finally(() => {
+        if (!cancelled) setCatalogLoading(false)
+      })
+    return () => { cancelled = true }
+  }, [store])
 
   useEffect(() => {
     const viewport = window.visualViewport
@@ -178,20 +267,38 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
         } : undefined}
         onFocusCapture={keepFocusedFieldVisible}
       >
-        {step === 0 && (
-          <StepChooseType selected={draft.provider_type} onSelect={handleTypeSelect} />
+        {currentStep === 'chooseType' && (
+          <StepChooseType
+            selected={draft.provider_profile_id}
+            onSelect={handleTypeSelect}
+            providers={providers}
+            catalog={catalog}
+            loading={catalogLoading}
+            error={catalogError}
+            onRetry={() => void loadCatalog()}
+          />
         )}
-        {step === 1 && (
-          <StepConnection draft={draft} onUpdate={updateDraft} />
+        {currentStep === 'connection' && (
+          <StepConnection
+            key={draft.provider_profile_id}
+            draft={draft}
+            catalog={catalog}
+            onUpdate={updateDraft}
+          />
         )}
-        {step === 2 && (
+        {currentStep === 'models' && (
+          <StepModels draft={draft} profile={selectedProfile ?? null} onUpdate={updateDraft} />
+        )}
+        {currentStep === 'validation' && (
           <StepValidation draft={draft} onResult={setValidation} />
         )}
-        {step === 3 && (
+        {currentStep === 'review' && (
           <StepReview
             draft={draft}
             validation={validation}
             onToggleAutoSync={(v) => updateDraft({ auto_sync_models: v })}
+            openTo={openTo}
+            onOpenToChange={setOpenTo}
           />
         )}
         {createError && (
@@ -224,13 +331,13 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
           className="min-h-11 rounded-lg px-4 py-2 text-sm"
           style={{ color: 'var(--cp-muted)' }}
         >
-          {step === 0 ? t('aiCenter.wizard.back', 'Back') : t('aiCenter.wizard.prev', 'Previous')}
+          {currentStep === 'chooseType' ? t('aiCenter.wizard.back', 'Back') : t('aiCenter.wizard.prev', 'Previous')}
         </button>
 
-        {step === 2 && validation && !validation.auth_valid ? (
+        {currentStep === 'validation' && validation && !validation.auth_valid ? (
           <button
             type="button"
-            onClick={() => { setValidation(null); setStep(1) }}
+            onClick={() => { setValidation(null); setStep(stepKeys.indexOf('connection')) }}
             className="min-h-11 rounded-lg px-4 py-2 text-sm font-medium"
             style={{ background: 'var(--cp-warning)', color: '#fff' }}
           >
@@ -244,7 +351,7 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
             className="min-h-11 rounded-lg px-5 py-2 text-sm font-medium transition-opacity disabled:opacity-40"
             style={{ background: 'var(--cp-accent)', color: '#fff' }}
           >
-            {step === 3
+            {currentStep === 'review'
               ? creating
                 ? t('aiCenter.wizard.creating', 'Creating...')
                 : t('aiCenter.wizard.create', 'Create Provider')
@@ -254,4 +361,59 @@ export function WizardShell({ onBack, onCreated }: WizardShellProps) {
       </div>
     </div>
   )
+}
+
+function providerConnectionFieldsValid(
+  draft: WizardDraft,
+  profile: ProviderSetupCatalog['providers'][number] | undefined,
+): boolean {
+  if (!profile) return draft.provider_profile_id === 'custom'
+  return (['region', 'workspace', 'account', 'policy_region'] as const).every((name) => {
+    const field = profile.connection_fields[name]
+    if (!field) return true
+    const placeholder = `{${name}}`
+    const usedByEndpoint = draft.base_url.includes(placeholder)
+      || Object.values(draft.operation_base_urls).some((url) => url.includes(placeholder))
+    return (field.mode !== 'required' && !usedByEndpoint)
+      || (Boolean(draft[name]?.trim()) && draft[name] !== 'unknown')
+  })
+}
+
+function nextProviderInstanceName(providerType: ProviderType, name: string, existing: string[]): string {
+  const used = new Set(existing)
+  const base = defaultProviderInstanceName(providerType, name)
+  if (!used.has(base)) return base
+  for (let index = 2; index < 100; index += 1) {
+    const candidate = `${base}-${index}`
+    if (!used.has(candidate)) return candidate
+  }
+  return `${base}-${Date.now()}`
+}
+
+function defaultProviderInstanceName(providerType: ProviderType, name: string): string {
+  switch (providerType) {
+    case 'sn': return 'sn-ai-provider-main'
+    case 'openai': return 'openai-main'
+    case 'claude': return 'claude-main'
+    case 'gemini': return 'google-gemini-main'
+    case 'openrouter': return 'openrouter-main'
+    case 'custom': return `custom-${slugify(name || 'provider')}`
+    default: return `${slugify(providerType)}-main`
+  }
+}
+
+function slugify(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'provider'
+}
+
+function validationCanProceed(validation: ValidationResult): boolean {
+  const blockingDetails = validation.error_details?.filter((error) => error.kind !== 'balance') ?? []
+  const hasBlockingError = blockingDetails.length > 0
+    || (!validation.error_details?.length && validation.errors.some((error) => !error.toLowerCase().includes('balance')))
+  return !hasBlockingError && validation.base_url_reachable && validation.auth_valid
 }

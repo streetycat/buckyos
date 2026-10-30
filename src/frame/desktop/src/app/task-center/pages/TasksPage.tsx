@@ -1,6 +1,6 @@
 /* ── TaskCenter Tasks Page (full task list with filters) ── */
 
-import { useState, useMemo } from 'react'
+import { useState } from 'react'
 import {
   Search,
   Play,
@@ -10,10 +10,13 @@ import {
   ChevronRight,
   Filter,
   Pause,
+  MessageSquare,
+  Download,
 } from 'lucide-react'
 import { useI18n } from '../../../i18n/provider'
 import { useTaskCenterStore } from '../hooks/use-task-center-store'
-import type { Task, TaskStatus, TaskType, TaskSource } from '../../../api/task_mgr'
+import { NewDownloadDialog } from '../components/NewDownloadDialog'
+import { notifyCardPath, type Task, type TaskStatus, type TaskType, type TaskSource } from '../../../api/task_mgr'
 import type { TaskCenterNav } from '../components/layout/navigation'
 
 function statusIcon(status: Task['status']) {
@@ -67,20 +70,20 @@ export function TasksPage({ onNavigate }: TasksPageProps) {
   const [filterType, setFilterType] = useState<TaskType | ''>('')
   const [filterSource, setFilterSource] = useState<TaskSource | ''>('')
   const [showFilters, setShowFilters] = useState(false)
+  const [downloadOpen, setDownloadOpen] = useState(false)
 
-  const tasks = useMemo(() => {
-    return store.filterTasks({
-      status: filterStatus || undefined,
-      type: filterType || undefined,
-      source: filterSource || undefined,
-      search: search || undefined,
-    })
-  }, [store, filterStatus, filterType, filterSource, search])
+  // Not memoized: the store keeps its identity and notifies through
+  // useSyncExternalStore, so a memo keyed on it would never recompute.
+  const tasks = store.filterTasks({
+    status: filterStatus || undefined,
+    type: filterType || undefined,
+    source: filterSource || undefined,
+    search: search || undefined,
+  })
 
   // Sort by updatedAt descending
-  const sorted = useMemo(
-    () => [...tasks].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()),
-    [tasks],
+  const sorted = [...tasks].sort(
+    (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
   )
 
   return (
@@ -117,7 +120,29 @@ export function TasksPage({ onNavigate }: TasksPageProps) {
         >
           <Filter size={14} />
         </button>
+        <button
+          type="button"
+          onClick={() => setDownloadOpen(true)}
+          aria-label={t('taskCenter.download.new', 'New Download')}
+          title={t('taskCenter.download.new', 'New Download')}
+          className="flex items-center gap-1.5 rounded-xl px-3 py-2.5 text-sm transition-colors"
+          style={{
+            background: 'var(--cp-surface)',
+            color: 'var(--cp-accent)',
+            border: '1px solid var(--cp-border)',
+          }}
+        >
+          <Download size={14} />
+        </button>
       </div>
+      <NewDownloadDialog
+        open={downloadOpen}
+        onClose={() => setDownloadOpen(false)}
+        onCreated={(taskId) => {
+          setDownloadOpen(false)
+          onNavigate({ page: 'tasks', taskId })
+        }}
+      />
 
       {/* Filters */}
       {showFilters && (
@@ -181,8 +206,8 @@ export function TasksPage({ onNavigate }: TasksPageProps) {
       {/* Task list */}
       <div className="space-y-1.5">
         {sorted.map((task) => (
+          <div key={task.taskId}>
           <button
-            key={task.taskId}
             type="button"
             onClick={() => onNavigate({ page: 'tasks', taskId: task.taskId })}
             className="flex w-full items-center gap-3 rounded-xl p-3 text-left transition-colors"
@@ -239,6 +264,18 @@ export function TasksPage({ onNavigate }: TasksPageProps) {
             </div>
             <ChevronRight size={14} style={{ color: 'var(--cp-muted)' }} />
           </button>
+          {task.notifyId && (
+            <a
+              href={notifyCardPath(task.notifyId)}
+              className="ml-14 mt-1 inline-flex items-center gap-1.5 text-xs font-medium"
+              style={{ color: 'var(--cp-accent)' }}
+              data-testid="task-notify-link"
+            >
+              <MessageSquare size={13} />
+              {t('taskCenter.notify.open', 'Handle in MessageHub')}
+            </a>
+          )}
+          </div>
         ))}
       </div>
 

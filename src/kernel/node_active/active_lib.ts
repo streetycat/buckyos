@@ -28,7 +28,6 @@ export let SN_DEVICEINFO_API_URL = `${SN_API_URL}/deviceinfo`;
 export let SN_BNS_API_URL = `https://bns.${SN_BASE_HOST}/kapi/bns`;
 export let WEB3_BASE_HOST = `web3.${SN_BASE_HOST}`;
 export let AI_PROVIDER_TUTORIAL_URL = "https://buckyos.ai";
-export let TELEGRAM_BOT_API_TOKEN_TUTORIAL_URL = "https://core.telegram.org/bots/tutorial";
 export let TELEGRAM_ACCOUNT_ID_TUTORIAL_URL = "https://core.telegram.org/api/bots/ids";
 
 export async function init_active_lib(config: ActiveConfig) {
@@ -40,8 +39,6 @@ export async function init_active_lib(config: ActiveConfig) {
   SN_BNS_API_URL = `${config.http_schema}://bns.${SN_BASE_HOST}/kapi/bns`;
   WEB3_BASE_HOST = `web3.${SN_BASE_HOST}`;
   AI_PROVIDER_TUTORIAL_URL = config.ai_provider_tutorial_url || AI_PROVIDER_TUTORIAL_URL;
-  TELEGRAM_BOT_API_TOKEN_TUTORIAL_URL =
-    config.telegram_bot_api_token_tutorial_url || TELEGRAM_BOT_API_TOKEN_TUTORIAL_URL;
   TELEGRAM_ACCOUNT_ID_TUTORIAL_URL =
     config.telegram_account_id_tutorial_url || TELEGRAM_ACCOUNT_ID_TUTORIAL_URL;
 }
@@ -68,7 +65,15 @@ export async function createInitialWizardData(
     public_key: Ed25519Jwk;
     private_key: string;
   };
+  // The installed product decides whether this node runs containers
+  // (BuckyOS Desktop Lite does not); node_daemon refuses anything else.
+  const product = (await activeRpc().call("get_product_profile", {})) as {
+    edition: string;
+    capabilities: { container: boolean };
+  };
   return {
+    product_edition: product.edition,
+    support_container: product.capabilities.container,
     gatewy_type: GatewayType.BuckyForward,
     port_mapping_mode: "full",
     rtcp_port: 2980,
@@ -101,10 +106,7 @@ export async function createInitialWizardData(
       openrouter_api_token: "",
       glm_api_token: "",
     },
-    jarvis_msg_tunnel_config: {
-      telegram_bot_api_token: "",
-      telegram_account_id: "",
-    },
+    owner_telegram_account_id: "",
     ...initial,
   };
 }
@@ -309,7 +311,7 @@ export function deriveGatewayTopology(data: ActiveWizzardData): GatewayTopology 
   return {
     net_id: get_net_id_by_gateway_type(data.gatewy_type, data.port_mapping_mode),
     rtcp_port: data.rtcp_port,
-    support_container: true,
+    support_container: data.support_container,
     uses_sn_relay: data.gatewy_type !== GatewayType.WAN,
     sn_url: SN_API_URL,
   };
@@ -501,10 +503,10 @@ async function signWalletDocuments(prepared: PreparedActiveDocuments): Promise<{
   };
 }
 
-export async function activateNode(data: ActiveWizzardData): Promise<{
-  accessHostname: string;
+export async function prepareSignedActivation(data: ActiveWizzardData): Promise<{
   prepared: PreparedActiveDocuments;
   signed: SignedActiveDocuments;
+  adminPasswordHash: string;
 }> {
   if (!data.owner_document) throw new Error("OwnerDocument is missing");
   if (data.use_self_domain && data.domain_binding.state !== "verified") {
@@ -527,6 +529,47 @@ export async function activateNode(data: ActiveWizzardData): Promise<{
   const adminPasswordHash = data.is_wallet_runtime
     ? walletPwdHash || ""
     : data.admin_password_hash;
+  return { prepared, signed, adminPasswordHash };
+}
+
+export function customDomainPublication(data: ActiveWizzardData) {
+  const prepared = data.prepared_documents;
+  const signed = data.signed_documents;
+  if (!data.use_self_domain || !prepared || !signed) {
+    throw new Error("Prepare and publish the custom-domain device document first");
+  }
+  const names = deriveActiveNames(data);
+  const topology = deriveGatewayTopology(data);
+  if (
+    !Object.entries(names).every(([key, value]) => prepared.names[key as keyof ActiveNameMapping] === value) ||
+    !Object.entries(topology).every(([key, value]) => prepared.topology[key as keyof GatewayTopology] === value) ||
+    !sameJwk(prepared.device_document.verificationMethod?.[0]?.publicKeyJwk, data.device_public_key) ||
+    prepared.owner_document.id !== data.owner_document?.id ||
+    !sameJwk(prepared.owner_document.verificationMethod?.[0]?.publicKeyJwk, data.owner_document?.verificationMethod?.[0]?.publicKeyJwk)
+  ) {
+    throw new Error("Activation settings changed; prepare and publish the device document again");
+  }
+  return {
+    prepared,
+    signed,
+    adminPasswordHash: data.admin_password_hash,
+    url: `https://${prepared.device_document.id.slice("did:web:".length)}/.well-known/did.json`,
+    content: signed.device_document_jwt,
+  };
+}
+
+export async function activateNode(data: ActiveWizzardData): Promise<{
+  accessHostname: string;
+  prepared: PreparedActiveDocuments;
+  signed: SignedActiveDocuments;
+}> {
+  if (!data.owner_document) throw new Error("OwnerDocument is missing");
+  if (data.use_self_domain && data.domain_binding.state !== "verified") {
+    throw new Error("Custom domain has not been verified");
+  }
+  const { prepared, signed, adminPasswordHash } = data.use_self_domain
+    ? customDomainPublication(data)
+    : await prepareSignedActivation(data);
   const accessToken = await acquireSnAccessToken(data, adminPasswordHash);
   const result = (await activeRpc().call("commit_active", {
     owner_document: data.owner_document,
@@ -539,7 +582,7 @@ export async function activateNode(data: ActiveWizzardData): Promise<{
       friend_passcode: data.friend_passcode,
       enabled_features: resolveEnabledFeatures(data.sn_active_code, data.enabled_features),
       ai_provider_config: data.ai_provider_config,
-      jarvis_msg_tunnel_config: data.jarvis_msg_tunnel_config,
+      owner_telegram_account_id: data.owner_telegram_account_id,
     },
     sn: {
       sn_url: SN_API_URL,

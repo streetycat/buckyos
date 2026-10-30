@@ -1,0 +1,630 @@
+import { decisionInput, assertDecisionResult } from "./decision.ts";
+import type { MatrixCell } from "./types.ts";
+import computerFixture from "../fixtures/computer_click.json" with { type: "json" };
+
+export type ResourceRef =
+  | { kind: "url"; url: string; mime_hint?: string }
+  | { kind: "named_object"; obj_id: string }
+  | { kind: "base64"; mime: string; data_base64: string };
+
+export type ResourceRepresentation = ResourceRef["kind"];
+
+export function firstReusableResource(candidates:readonly Record<string,unknown>[]): ResourceRef {
+  for(const candidate of candidates) {
+    if(candidate.kind === "named_object" && typeof candidate.obj_id === "string" && candidate.obj_id) {
+      return {kind:"named_object",obj_id:candidate.obj_id};
+    }
+    if(candidate.kind === "url" && typeof candidate.url === "string" && candidate.url) {
+      return {kind:"url",url:candidate.url,...(typeof candidate.mime_hint === "string" ? {mime_hint:candidate.mime_hint} : {})};
+    }
+    if(candidate.kind === "base64" && typeof candidate.data_base64 === "string" && candidate.data_base64 &&
+        typeof candidate.mime === "string" && candidate.mime) {
+      return {kind:"base64",mime:candidate.mime,data_base64:candidate.data_base64};
+    }
+  }
+  throw new Error("generated artifact source did not expose a reusable ResourceRef");
+}
+export type ResourceFixture = ResourceRef | Partial<Record<ResourceRepresentation, ResourceRef>>;
+
+export type FixtureRefs = {
+  image?: ResourceFixture;
+  bgRemoveImage?: ResourceFixture;
+  ocrImage?: ResourceFixture;
+  mask?: ResourceFixture;
+  inpaintImage?: ResourceFixture;
+  inpaintMask?: ResourceFixture;
+  audio?: ResourceFixture;
+  video?: ResourceFixture;
+  document?: ResourceFixture;
+  documents?: Record<string, ResourceFixture>;
+};
+type SingularFixtureKind = Exclude<keyof FixtureRefs, "documents">;
+
+export function requiredFixtureKinds(apiType: string): string[] {
+  if (apiType === "vision.ocr") return ["ocrImage"];
+  if (apiType === "image.img2img" || apiType.startsWith("vision.")) return ["image"];
+  if (apiType === "image.inpaint") return ["inpaintImage", "inpaintMask"];
+  if (apiType === "image.upscale") return ["image"];
+  if (apiType === "image.bg_remove") return ["bgRemoveImage"];
+  if (apiType === "embedding.multimodal") return ["image"];
+  if (apiType === "audio.asr" || apiType === "audio.enhance") return ["audio"];
+  if (apiType === "video.edit" || apiType === "video.extend" || apiType === "video.upscale") return ["video"];
+  return [];
+}
+
+function requireFixture(
+  fixtures: FixtureRefs,
+  kind: SingularFixtureKind,
+  apiType: string,
+  representation?: ResourceRepresentation,
+  documentFormat?: string,
+): ResourceRef {
+  const value = kind === "document" && documentFormat
+    ? fixtures.documents?.[documentFormat] ?? (documentFormat === "pdf" ? fixtures.document : undefined)
+    : fixtures[kind] ?? (
+      kind === "inpaintImage" || kind === "bgRemoveImage" || kind === "ocrImage"
+        ? fixtures.image
+        : kind === "inpaintMask"
+        ? fixtures.mask
+        : undefined
+    );
+  if (!value) throw new Error(`${apiType} requires configured ${kind} fixture`);
+  if ("kind" in value) {
+    if (representation && value.kind !== representation) {
+      throw new Error(`${apiType} requires ${kind} fixture representation ${representation}`);
+    }
+    return value;
+  }
+  const selected = representation ? value[representation] : value.base64 ?? value.named_object ?? value.url;
+  if (!selected) {
+    throw new Error(`${apiType} requires ${kind} fixture representation ${representation ?? "any"}`);
+  }
+  return selected;
+}
+
+function io(
+  apiType: string,
+  fixtures: FixtureRefs,
+  representation?: ResourceRepresentation,
+  documentFormat?: string,
+  inputKinds: string[] = [],
+): {
+  input_json: Record<string, unknown>;
+  resources: ResourceRef[];
+} {
+  switch (apiType) {
+    case "llm":
+      return {
+        input_json: {
+          messages: [{
+            role: "user",
+            content: [{
+              type: "text",
+              text: "Reply with the exact marker BUCKYOS-AICC-4827.",
+            }],
+          }],
+          max_output_tokens: 1024,
+        },
+        resources: [],
+      };
+    case "embedding.text":
+      return {
+        input_json: {
+          items: [
+            { id: "item-1", text: "BuckyOS AICC marker 4827" },
+            { id: "item-2", text: "A second deterministic embedding item" },
+          ],
+        },
+        resources: [],
+      };
+    case "embedding.multimodal":
+      return {
+        input_json: { items: [{ id: "item-1", text: "pink flower" }] },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "decision": return { input_json: decisionInput(), resources: [] };
+    case "rerank":
+      return {
+        input_json: {
+          query: "Which document contains marker 4827?",
+          documents: [
+            { id: "wrong", text: "This record has no marker." },
+            { id: "right", text: "The marker is BUCKYOS-AICC-4827." },
+          ],
+        },
+        resources: [],
+      };
+    case "image.txt2img":
+      return { input_json: { prompt: "A blue square containing 4827", n: 1 }, resources: [] };
+    case "image.img2img":
+      return {
+        input_json: { prompt: "Preserve composition and use warm evening light" },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "image.inpaint":
+      return {
+        input_json: {
+          prompt: "A solid medium-blue square canvas with a compact cluster of realistic green leaves strictly inside the central rectangular masked region. Preserve the uniform medium-blue area outside the mask unchanged, with no glow, gradient, shadow, or extra objects.",
+        },
+        resources: [
+          requireFixture(fixtures, "inpaintImage", apiType, representation),
+          requireFixture(fixtures, "inpaintMask", apiType, representation),
+        ],
+      };
+    case "image.upscale":
+      return {
+        input_json: { scale: 2 },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "image.bg_remove":
+      return {
+        input_json: {},
+        resources: [requireFixture(fixtures, "bgRemoveImage", apiType, representation)],
+      };
+    case "vision.ocr":
+      return {
+        input_json: {
+          prompt: "Read the full BuckyOS marker exactly. It ends in four digits; distinguish the digit 8 from the letter B.",
+        },
+        resources: [requireFixture(fixtures, "ocrImage", apiType, representation)],
+      };
+    case "vision.caption":
+      return {
+        input_json: { prompt: "Accurately describe all prominent text and graphic elements in the supplied marker image." },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "vision.detect":
+      return {
+        input_json: { prompt: "Return structured detections for visible objects and text regions, with descriptive labels and bounding boxes." },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "vision.segment":
+      return {
+        input_json: { prompt: "Segment the prominent pink flower, yellow flower center, green stem, and green leaves. Return a non-empty JSON array with one labeled region per visible subject and normalized polygon or bounding-box coordinates." },
+        resources: [requireFixture(fixtures, "image", apiType, representation)],
+      };
+    case "audio.tts":
+      return { input_json: { text: "BuckyOS four eight two seven" }, resources: [] };
+    case "audio.asr":
+    case "audio.enhance":
+      return {
+        input_json: apiType === "audio.asr" ? { language: "zh" } : { operation: "denoise" },
+        resources: [requireFixture(fixtures, "audio", apiType, representation)],
+      };
+    case "audio.music":
+      return {
+        input_json: {
+          prompt: "A four-second calm ambient instrumental test tone, very slow and quiet, with no vocals, no speech, no samples, no percussion, and no dance beat",
+          duration_seconds: 4,
+          instrumental: true,
+        },
+        resources: [],
+      };
+    case "video.generate":
+      // A cell whose input kinds include an image starts from it as the first
+      // frame; the gateway attaches resources to `conditions` in order.
+      return inputKinds.includes("image")
+        ? {
+          input_json: {
+            prompt: "@{first} comes alive with a slow camera push and subtle motion",
+            conditions: [{ type: "keyframe", id: "first", position: "start" }],
+          },
+          resources: [requireFixture(fixtures, "image", apiType, representation)],
+        }
+        : { input_json: { prompt: "A paper plane moving across a desk" }, resources: [] };
+    case "video.edit":
+    case "video.extend":
+    case "video.upscale":
+      return {
+        input_json: apiType === "video.upscale"
+          ? { target_resolution: "1080p" }
+          : { prompt: "Preserve the scene while adding subtle motion", ...(apiType === "video.extend" ? { duration_seconds: 7 } : {}) },
+        resources: [requireFixture(fixtures, "video", apiType, representation)],
+      };
+    case "agent.computer_use":
+      return {
+        input_json: {
+          task: "Use the computer tool to return exactly one left-click action inside the only blue rectangular button on the attached screenshot. Do not wait or type.",
+          environment: {
+            environment_id: "aicc-t1-browser",
+            session_id: "aicc-t1-computer-session",
+            screenshot: computerFixture.screenshot,
+            viewport: computerFixture.viewport,
+          },
+          allowed_actions: ["left_click"],
+        },
+        resources: [],
+      };
+    default:
+      throw new Error(`no payload builder for ${apiType}`);
+  }
+}
+
+export function buildExactRequest(args: {
+  cell: MatrixCell;
+  runId: string;
+  fixtures: FixtureRefs;
+}): Record<string, unknown> {
+  const payload = io(
+    args.cell.api_type,
+    args.fixtures,
+    args.cell.resource_representation,
+    args.cell.document_format,
+    args.cell.input_kinds,
+  );
+  const inputJson = { ...payload.input_json, ...(args.cell.request_defaults ?? {}) };
+  const resources = [...payload.resources];
+  const fixture = (kind: SingularFixtureKind): ResourceRef => requireFixture(
+    args.fixtures,
+    kind,
+    args.cell.api_type,
+    args.cell.resource_representation,
+    kind === "document" ? args.cell.document_format : undefined,
+  );
+  let requirements: Record<string, unknown> = {};
+  let toolSpecs: Record<string, unknown>[] = [];
+  if (args.cell.api_type === "llm") {
+    if (args.cell.input_kinds.includes("code")) {
+      inputJson.messages = [{
+        role: "user",
+        content: [{ type: "text", text: "Complete this code with marker 4827: const marker =" }],
+      }];
+    }
+    const messages = inputJson.messages as Array<Record<string, unknown>>;
+    const userMessage = messages.find((message) => message.role === "user");
+    const content = userMessage && Array.isArray(userMessage.content)
+      ? userMessage.content
+      : [];
+    if (userMessage) userMessage.content = content;
+    for (const kind of args.cell.input_kinds) {
+      if (kind === "image") {
+        content.push({ type: "image", source: fixture("image") });
+      } else if (kind === "document" || kind === "audio" || kind === "video") {
+        content.push({ type: "document", source: fixture(kind) });
+      }
+    }
+    if (args.cell.input_kinds.includes("image")) requirements = { must_features: ["vision"] };
+  }
+  if (args.cell.api_type === "embedding.multimodal") {
+    resources.length = 0;
+    if (args.cell.input_kinds.length > 0) {
+      inputJson.items = args.cell.input_kinds.includes("text")
+        ? [{ id: "item-1", text: "pink flower" }]
+        : [];
+    }
+    for (const kind of args.cell.input_kinds) {
+      if (kind === "image" && resources.length === 0) resources.push(fixture("image"));
+      else if (kind === "audio") resources.push(fixture("audio"));
+      else if (kind === "video") resources.push(fixture("video"));
+      else if (kind === "document") resources.push(fixture("document"));
+    }
+  }
+  if (args.cell.api_type === "llm" && args.cell.output_kinds.includes("json")) {
+    const messages = inputJson.messages as Array<Record<string, unknown>>;
+    messages[0] = {
+      role: "user",
+      content: [{ type: "text", text: "Return JSON with marker exactly BUCKYOS-AICC-4827." }],
+    };
+    inputJson.response_format = {
+      type: "json_schema",
+      name: "aicc_acceptance_marker",
+      strict: true,
+      schema: {
+        type: "object",
+        properties: { marker: { type: "string", const: "BUCKYOS-AICC-4827" } },
+        required: ["marker"],
+        additionalProperties: false,
+      },
+    };
+    requirements = {
+      ...requirements,
+      must_features: [...new Set([...((requirements.must_features as string[] | undefined) ?? []), "json_output"])],
+      resp_format: "json",
+    };
+  }
+  if (args.cell.api_type === "llm" && args.cell.output_kinds.includes("tool_call")) {
+    const messages = inputJson.messages as Array<Record<string, unknown>>;
+    messages[0] = {
+      role: "user",
+      content: [{ type: "text", text: "Call echo_marker once with marker BUCKYOS-AICC-4827." }],
+    };
+    inputJson.tool_choice = "required";
+    toolSpecs = [{
+      name: "echo_marker",
+      description: "Returns the supplied deterministic marker",
+      args_schema: {
+        type: "object",
+        properties: { marker: { type: "string" } },
+        required: ["marker"],
+        additionalProperties: false,
+      },
+      output_schema: { type: "object" },
+    }];
+    requirements = {
+      ...requirements,
+      must_features: [...new Set([...((requirements.must_features as string[] | undefined) ?? []), "tool_calling"])],
+    };
+  }
+  if (args.cell.variant === "embedding_large_artifact") {
+    inputJson.items = Array.from({ length: 101 }, (_, index) => ({
+      id: `item-${index + 1}`,
+      text: `BuckyOS deterministic embedding row ${index + 1}`,
+    }));
+    inputJson.prefer_artifact = true;
+  }
+  if (toolSpecs.length > 0) inputJson.tool_specs = toolSpecs;
+  return {
+    capability: args.cell.api_type.split(".")[0],
+    model: { alias: args.cell.exact_model },
+    requirements,
+    ...(args.cell.method === "chat.completions.create" ? { disable: { web_search: true } } : {}),
+    payload: {
+      input_json: inputJson,
+      resources,
+      options: {
+        session_id: `${args.runId}:${args.cell.case_id}`,
+        rootid: args.runId,
+      },
+    },
+    idempotency_key: `${args.runId}:${args.cell.case_id}`,
+  };
+}
+
+export function assertResponseShape(
+  cell: MatrixCell,
+  value: unknown,
+): void {
+  if (!value || typeof value !== "object") throw new Error("response must be an object");
+  const response = value as Record<string, unknown>;
+  if (typeof response.task_id !== "string" || typeof response.status !== "string") {
+    throw new Error("response must include task_id and status");
+  }
+  if (!["succeeded", "running"].includes(response.status)) {
+    throw new Error(`unexpected task status ${String(response.status)}`);
+  }
+  if (response.status === "running") return;
+  if (cell.api_type === "decision") { assertDecisionResult(response); return; }
+  const typedArtifacts = [
+    ...(Array.isArray(response.images)
+      ? response.images.map((source) => ({ type: "image", source }))
+      : []),
+    ...(response.image ? [{ type: "image", source: response.image }] : []),
+    ...(response.audio ? [{ type: "audio", source: response.audio }] : []),
+    ...(response.video ? [{ type: "video", source: response.video }] : []),
+    ...(Array.isArray(response.videos) ? response.videos.map((video) => {
+      const value = video as Record<string, unknown>;
+      return { type: "video", source: { ...(value.resource as Record<string, unknown>), mime_hint: value.media_type } };
+    }) : []),
+    ...(response.artifacts && typeof response.artifacts === "object"
+      ? Object.values(response.artifacts as Record<string, unknown>).map((source) => ({ type: "document", source }))
+      : []),
+  ];
+  const typedMessage = response.message && typeof response.message === "object"
+    ? {
+      ...response.message,
+      content: [
+        ...(Array.isArray((response.message as Record<string, unknown>).content)
+          ? (response.message as Record<string, unknown>).content as unknown[] : []),
+        ...typedArtifacts,
+      ],
+    }
+    : {
+      role: "assistant",
+      content: [
+        ...(typeof response.text === "string" ? [{ type: "text", text: response.text }] : []),
+        ...(Array.isArray(response.captions)
+          ? response.captions.map((caption) => ({
+            type: "text",
+            text: String((caption as Record<string, unknown>).text ?? ""),
+          }))
+          : []),
+        ...typedArtifacts,
+      ],
+    };
+  const typedEmbeddingData = Array.isArray(response.data) ? response.data : [];
+  const typedExtra = {
+    ...(response.extra && typeof response.extra === "object" && !Array.isArray(response.extra)
+      ? response.extra as Record<string, unknown>
+      : {}),
+    ...(typedEmbeddingData.length > 0 || response.data_resource
+      ? {
+        embedding: {
+          data: typedEmbeddingData,
+          artifact: response.data_resource,
+          embedding_space_id: (typedEmbeddingData[0] as Record<string, unknown> | undefined)?.embedding_space_id,
+        },
+      }
+      : {}),
+    ...(Array.isArray(response.results) ? { rerank: { results: response.results } } : {}),
+    ...(["pages", "detections", "masks"].some((field) => field in response)
+      ? { vision: Object.fromEntries(["pages", "detections", "masks"].filter((field) => field in response).map((field) => [field, response[field]])) }
+      : {}),
+    ...(Array.isArray(response.artifacts) ? { artifacts: response.artifacts } : {}),
+  };
+  const result = response.result ?? {
+    message: typedMessage,
+    usage: response.usage,
+    cost: response.cost,
+    extra: typedExtra,
+  };
+  if (!result || typeof result !== "object") throw new Error("succeeded response must include result");
+  const resultRecord = result as Record<string, unknown>;
+  for (const legacy of ["text", "tool_calls", "artifacts"]) {
+    if (legacy in resultRecord) throw new Error(`deprecated top-level response field ${legacy}`);
+  }
+  if (!resultRecord.usage || typeof resultRecord.usage !== "object") {
+    throw new Error("successful response must include usage");
+  }
+  const message = resultRecord.message;
+  if (!message || typeof message !== "object") throw new Error("result.message is required");
+  const messageRecord = message as Record<string, unknown>;
+  if (messageRecord.role !== "assistant") throw new Error("result.message.role must be assistant");
+  const content = messageRecord.content;
+  if (!Array.isArray(content)) throw new Error("result.message.content must be an array");
+  const text = content.filter((item) => item && typeof item === "object" &&
+    (item as Record<string, unknown>).type === "text")
+    .map((item) => (item as Record<string, unknown>).text)
+    .filter((item): item is string => typeof item === "string")
+    .join("\n");
+  const extra = resultRecord.extra && typeof resultRecord.extra === "object"
+    ? resultRecord.extra as Record<string, unknown>
+    : {};
+
+  if (cell.api_type === "llm" && cell.output_kinds.includes("json")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("JSON output is not valid JSON");
+    }
+    if (!parsed || typeof parsed !== "object" ||
+      (parsed as Record<string, unknown>).marker !== "BUCKYOS-AICC-4827") {
+      throw new Error("JSON output does not satisfy the marker schema");
+    }
+    return;
+  }
+  if (cell.api_type === "llm" && cell.output_kinds.includes("tool_call")) {
+    const calls = content.filter((item) => item && typeof item === "object" &&
+      (item as Record<string, unknown>).type === "tool_use") as Array<Record<string, unknown>>;
+    if (calls.length !== 1 || calls[0].name !== "echo_marker" ||
+      typeof calls[0].call_id !== "string" || !calls[0].call_id ||
+      !calls[0].args || typeof calls[0].args !== "object" ||
+      (calls[0].args as Record<string, unknown>).marker !== "BUCKYOS-AICC-4827") {
+      throw new Error("tool-call output does not match echo_marker contract");
+    }
+    return;
+  }
+  const normalizedMarkerText = text.replace(/\s*-\s*/g, "-");
+  if (cell.api_type === "llm" && !normalizedMarkerText.includes("BUCKYOS-AICC-4827")) {
+    throw new Error("LLM output omitted the requested acceptance marker");
+  }
+
+  if (cell.api_type.startsWith("embedding.")) {
+    const embedding = extra.embedding;
+    if (!embedding || typeof embedding !== "object") throw new Error("expected extra.embedding");
+    const record = embedding as Record<string, unknown>;
+    if (cell.variant !== "embedding_large_artifact" &&
+      (typeof record.embedding_space_id !== "string" || !record.embedding_space_id)) {
+      throw new Error("embedding_space_id is required");
+    }
+    if (cell.variant === "embedding_large_artifact") {
+      const artifact = record.artifact;
+      if (!artifact || typeof artifact !== "object") {
+        throw new Error("large embedding output must use an artifact");
+      }
+      if (record.data && Array.isArray(record.data) && record.data.length !== 0) {
+        throw new Error("large embedding artifact response must not duplicate inline vectors");
+      }
+      return;
+    }
+    if (!Array.isArray(record.data)) throw new Error("embedding.data must be an array");
+    const expectedItems = cell.api_type === "embedding.text" ? 2 : 1;
+    if (record.data.length !== expectedItems) {
+      throw new Error(`embedding item count ${record.data.length} != ${expectedItems}`);
+    }
+    let dimensions: number | undefined;
+    for (const [index, item] of record.data.entries()) {
+      if (!item || typeof item !== "object") throw new Error(`embedding item ${index} is invalid`);
+      const itemRecord = item as Record<string, unknown>;
+      if (itemRecord.index !== index) {
+        throw new Error(`embedding item ${index} has provider index ${String(itemRecord.index)}`);
+      }
+      const vector = itemRecord.embedding ?? itemRecord.values;
+      if (!Array.isArray(vector) || vector.length === 0 ||
+        vector.some((number) => typeof number !== "number" || !Number.isFinite(number))) {
+        throw new Error(`embedding item ${index} must contain a finite vector`);
+      }
+      dimensions ??= vector.length;
+      if (dimensions !== vector.length) throw new Error("embedding dimensions are inconsistent");
+    }
+    return;
+  }
+  if (cell.api_type === "rerank") {
+    const rerank = extra.rerank;
+    if (!rerank || typeof rerank !== "object") throw new Error("expected extra.rerank");
+    const results = (rerank as Record<string, unknown>).results;
+    if (!Array.isArray(results) || results.length !== 2) throw new Error("rerank must return two results");
+    const first = results[0] as Record<string, unknown>;
+    if (first.id !== "right" || typeof first.score !== "number" || !Number.isFinite(first.score)) {
+      throw new Error("rerank must rank the marker document first with a finite score");
+    }
+    return;
+  }
+  if (cell.api_type === "agent.computer_use") {
+    const actions = response.actions;
+    if (!Array.isArray(actions) || actions.length !== 1) {
+      throw new Error("computer-use must return exactly one action");
+    }
+    const action = actions[0] as Record<string, unknown>;
+    const target = computerFixture.target;
+    if (action.type !== "left_click" || typeof action.x !== "number" || !Number.isFinite(action.x) ||
+      typeof action.y !== "number" || !Number.isFinite(action.y) ||
+      action.x < target.left || action.x >= target.right || action.y < target.top || action.y >= target.bottom ||
+      response.requires_next_observation !== true) {
+      throw new Error("computer-use did not return one allowed click inside the screenshot button");
+    }
+    return;
+  }
+  const artifactKinds = new Set(["image", "audio", "video"]);
+  if (cell.output_kinds.some((kind) => artifactKinds.has(kind))) {
+    const expectedPrefix = `${cell.output_kinds.find((kind) => artifactKinds.has(kind))}/`;
+    const artifacts = content.filter((item) => item && typeof item === "object" &&
+      ["image", "audio", "video", "document"].includes(String((item as Record<string, unknown>).type)));
+    if (artifacts.length === 0) throw new Error(`expected ${expectedPrefix} artifact output`);
+    const materialized = Array.isArray(extra.materialized_artifacts)
+      ? extra.materialized_artifacts.filter((item): item is Record<string, unknown> =>
+        Boolean(item) && typeof item === "object" && !Array.isArray(item))
+      : [];
+    const sidebandArtifacts = Array.isArray(extra.artifacts)
+      ? extra.artifacts.filter((item): item is Record<string, unknown> =>
+        Boolean(item) && typeof item === "object" && !Array.isArray(item))
+      : [];
+    const hasMime = artifacts.some((item, index) => {
+      const source = (item as Record<string, unknown>).source;
+      if (!source || typeof source !== "object") return false;
+      const envelope = source as Record<string, unknown>;
+      const resource = envelope.resource && typeof envelope.resource === "object" && !Array.isArray(envelope.resource)
+        ? envelope.resource as Record<string, unknown> : envelope;
+      const materializedMime = materialized.find((entry) => entry.content_index === index)?.mime;
+      const sidebandMime = sidebandArtifacts.find((entry) => {
+        const artifactResource = entry.resource;
+        return artifactResource && typeof artifactResource === "object" && !Array.isArray(artifactResource) &&
+          (artifactResource as Record<string, unknown>).obj_id === resource.obj_id;
+      })?.mime;
+      const mime = resource.mime_hint ?? envelope.mime ?? resource.mime ?? materializedMime ?? sidebandMime;
+      const contentType = (item as Record<string, unknown>).type;
+      const addressable = typeof resource.url === "string" || typeof resource.obj_id === "string" ||
+        typeof resource.data_base64 === "string";
+      return addressable &&
+        ((typeof mime === "string" && mime.startsWith(expectedPrefix)) ||
+          contentType === expectedPrefix.replace(/\/$/, ""));
+    });
+    if (!hasMime) {
+      const diagnostic = {
+        content: content.map((item) => {
+          if (!item || typeof item !== "object") return item;
+          const record = item as Record<string, unknown>;
+          return { type: record.type, source: record.source };
+        }),
+        materialized,
+        artifacts: sidebandArtifacts,
+      };
+      throw new Error(
+        `artifact must be addressable and use MIME ${expectedPrefix}*: ${JSON.stringify(diagnostic).slice(0, 1000)}`,
+      );
+    }
+    return;
+  }
+  if (cell.api_type === "vision.detect" || cell.api_type === "vision.segment") {
+    if (!text.trim() && Object.keys(extra).length === 0 &&
+      !Array.isArray(response.detections) && !Array.isArray(response.masks)) {
+      throw new Error(
+        `expected structured vision output: ${JSON.stringify(response).slice(0, 1000)}`,
+      );
+    }
+    return;
+  }
+  if (cell.output_kinds.includes("text") && !text.trim()) {
+    throw new Error("expected non-empty text output block");
+  }
+}

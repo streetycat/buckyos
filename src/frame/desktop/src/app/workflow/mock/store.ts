@@ -109,7 +109,7 @@ const kbImportPipeline: WorkflowDefinition = {
         executor: {
           raw: '/agent/aicc',
           resolvedNamespace: 'service',
-          resolvedTarget: 'service::aicc.llm.chat',
+          resolvedTarget: 'service::aicc.helper.llm_chat',
         },
         outputMode: 'single',
         idempotent: true,
@@ -347,7 +347,7 @@ const myImported: WorkflowDefinition = {
         executor: {
           raw: '/agent/normalize',
           resolvedNamespace: 'service',
-          resolvedTarget: 'service::aicc.llm.chat',
+          resolvedTarget: 'service::aicc.helper.llm_chat',
         },
         outputMode: 'single',
         idempotent: true,
@@ -454,7 +454,7 @@ const fileOrganizer: WorkflowDefinition = {
         executor: {
           raw: '/agent/aicc',
           resolvedNamespace: 'service',
-          resolvedTarget: 'service::aicc.llm.chat',
+          resolvedTarget: 'service::aicc.helper.llm_chat',
         },
         outputMode: 'single',
         idempotent: true,
@@ -682,7 +682,7 @@ const seedAmendments: AmendmentSummary[] = [
 
 const seedExecutors: ExecutorEntry[] = [
   {
-    id: 'service::aicc.llm.chat',
+    id: 'service::aicc.helper.llm_chat',
     namespace: 'service',
     description: 'AI completion via aicc service.',
     inputSummary: '{ prompt: string, model?: string }',
@@ -740,12 +740,31 @@ const seedExecutors: ExecutorEntry[] = [
 ]
 
 export class WorkflowMockStore {
-  definitions: WorkflowDefinition[] = seedDefinitions
-  apps: WorkflowApp[] = seedApps
-  runs: WorkflowRunSummary[] = seedRuns
-  amendments: AmendmentSummary[] = seedAmendments
-  executors: ExecutorEntry[] = seedExecutors
+  // Cloned so mutations never leak into the module-level seeds shared by
+  // other store instances.
+  definitions: WorkflowDefinition[] = structuredClone(seedDefinitions)
+  apps: WorkflowApp[] = structuredClone(seedApps)
+  runs: WorkflowRunSummary[] = structuredClone(seedRuns)
+  amendments: AmendmentSummary[] = structuredClone(seedAmendments)
+  executors: ExecutorEntry[] = structuredClone(seedExecutors)
   schemaVersion = SCHEMA_VERSION
+  private version = 0
+  private listeners = new Set<() => void>()
+
+  /** Revision counter for `useSyncExternalStore`; bumps on every mutation. */
+  getSnapshot = (): number => this.version
+
+  subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    return () => {
+      this.listeners.delete(listener)
+    }
+  }
+
+  private emitChange(): void {
+    this.version += 1
+    this.listeners.forEach((listener) => listener())
+  }
 
   listDefinitions(): WorkflowDefinition[] {
     return this.definitions
@@ -801,6 +820,7 @@ export class WorkflowMockStore {
 
   addDefinition(def: WorkflowDefinition): void {
     this.definitions.unshift(def)
+    this.emitChange()
   }
 
   bindMountPoint(
@@ -817,6 +837,7 @@ export class WorkflowMockStore {
       boundAt: new Date().toISOString(),
       boundBy: 'user',
     }
+    this.emitChange()
     return true
   }
 
@@ -828,6 +849,7 @@ export class WorkflowMockStore {
       : undefined
     if (!def) {
       found.mp.currentBinding = undefined
+      this.emitChange()
       return true
     }
     found.mp.currentBinding = {
@@ -836,6 +858,7 @@ export class WorkflowMockStore {
       boundAt: new Date().toISOString(),
       boundBy: 'user',
     }
+    this.emitChange()
     return true
   }
 
@@ -843,6 +866,7 @@ export class WorkflowMockStore {
     const found = this.findMountPoint(appId, mountPointId)
     if (!found || !found.mp.allowEmpty) return false
     found.mp.currentBinding = undefined
+    this.emitChange()
     return true
   }
 

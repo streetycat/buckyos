@@ -8,13 +8,18 @@ import {
   Clock3,
   FolderOpen,
   FlaskConical,
-  Home,
+  Waypoints,
   LayoutGrid,
   MessageSquare,
   Network,
+  ScanEye,
+  Share2,
   Settings,
   SlidersHorizontal,
+  Sparkles,
+  UserRoundPlus,
   StickyNote,
+  NotebookTabs,
   Store,
   Users,
   Workflow as WorkflowIcon,
@@ -22,6 +27,7 @@ import {
 } from 'lucide-react'
 import type { AppDefinition } from '../models/ui'
 import { panelToneClasses } from './DesktopVisualTokens'
+import { ObjectImage } from '../presentation/ObjectIcon'
 
 const iconMap = {
   'ai-center': BrainCircuit,
@@ -35,12 +41,17 @@ const iconMap = {
   docs: BookOpen,
   codeassistant: Bot,
   messagehub: MessageSquare,
-  homestation: Home,
+  homestation: Waypoints,
   systest: FlaskConical,
   'task-center': ClipboardList,
   workflow: WorkflowIcon,
+  aiworkspace: NotebookTabs,
+  preview: ScanEye,
   'users-agents': Users,
+  'agent-setup': UserRoundPlus,
+  'agent-guide': Sparkles,
   'my-network': Network,
+  'my-content': Share2,
   clock: Clock3,
   notepad: StickyNote,
 }
@@ -63,18 +74,32 @@ export function TierBadge({ tier }: { tier: AppDefinition['tier'] }) {
 
 export function AppIcon({
   iconKey,
+  iconUrl,
+  fill = false,
   className,
   style,
 }: {
   iconKey: string
+  /** Image shown instead of the built-in icon; the icon stays as the fallback when it fails to load. */
+  iconUrl?: string
+  /** The image covers the whole icon tile instead of the glyph area. */
+  fill?: boolean
   className?: string
   style?: React.CSSProperties
 }) {
   const Icon = iconMap[iconKey as keyof typeof iconMap] ?? LayoutGrid
+  const size = fill ? 'var(--icon-size)' : 'calc(var(--icon-size) * 0.5)'
   return (
-    <Icon
-      className={clsx('relative z-10', className)}
-      style={{ width: 'calc(var(--icon-size) * 0.5)', height: 'calc(var(--icon-size) * 0.5)', ...style }}
+    <ObjectImage
+      icons={[iconUrl]}
+      className={clsx('relative z-10 shrink-0 object-cover', fill ? '' : 'rounded-full', className)}
+      style={{ width: size, height: size, ...style }}
+      fallback={
+        <Icon
+          className={clsx('relative z-10', className)}
+          style={{ width: 'calc(var(--icon-size) * 0.5)', height: 'calc(var(--icon-size) * 0.5)', ...style }}
+        />
+      }
     />
   )
 }

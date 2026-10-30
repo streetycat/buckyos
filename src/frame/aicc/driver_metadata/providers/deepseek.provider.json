@@ -1,0 +1,278 @@
+{
+  "format": "buckyos.aicc.provider-rules-catalog",
+  "schema_version": 1,
+  "schema_revision": 1,
+  "revision_seq": 5,
+  "provider_profile_id": "deepseek",
+  "model_driver_overrides": {
+    "deepseek-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek/deepseek-v4.1-flash"
+  },
+  "models": [
+    {
+      "id": "deepseek-chat",
+      "exclude": true
+    },
+    {
+      "id": "deepseek-reasoner",
+      "exclude": true
+    }
+  ],
+  "patterns": [
+    {
+      "match": "*",
+      "operations": {
+        "llm": "responses.create",
+        "vision.ocr": "responses.create",
+        "vision.caption": "responses.create"
+      },
+      "request_rules": [
+        {
+          "remove": [
+            "/background",
+            "/context_management",
+            "/conversation",
+            "/include",
+            "/max_tool_calls",
+            "/metadata",
+            "/parallel_tool_calls",
+            "/previous_response_id",
+            "/prompt",
+            "/prompt_cache_key",
+            "/prompt_cache_retention",
+            "/safety_identifier",
+            "/service_tier",
+            "/store",
+            "/stream_options",
+            "/truncation",
+            "/seed",
+            "/stop"
+          ]
+        },
+        {
+          "when": {
+            "/reasoning/effort": {
+              "not": "none"
+            }
+          },
+          "remove": [
+            "/frequency_penalty",
+            "/presence_penalty",
+            "/temperature",
+            "/top_p"
+          ]
+        }
+      ]
+    }
+  ],
+  "variants": [
+    {
+      "model_driver": "deepseek",
+      "variant": "reasoning-none",
+      "match": {
+        "origin_model_id": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "deepseek-v4-flash-vision-exp"
+        ],
+        "variant": "reasoning-none"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "none"
+        }
+      }
+    },
+    {
+      "model_driver": "deepseek",
+      "variant": "reasoning-low",
+      "match": {
+        "origin_model_id": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro"
+        ],
+        "variant": "reasoning-low"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "low"
+        }
+      }
+    },
+    {
+      "model_driver": "deepseek",
+      "variant": "reasoning-high",
+      "match": {
+        "origin_model_id": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "deepseek-v4-flash-vision-exp"
+        ],
+        "variant": "reasoning-high"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "high"
+        }
+      }
+    },
+    {
+      "model_driver": "deepseek",
+      "variant": "reasoning-max",
+      "match": {
+        "origin_model_id": [
+          "deepseek-v4.1-flash",
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "deepseek-v4-flash-vision-exp"
+        ],
+        "variant": "reasoning-max"
+      },
+      "provider_options": {
+        "reasoning": {
+          "effort": "max"
+        }
+      }
+    }
+  ],
+  "model_pricing": [
+    {
+      "id": "deepseek-v4-pro",
+      "pricing": {
+        "currency": "USD",
+        "input_token": 6.6e-07,
+        "output_token": 1.98e-06,
+        "cache_input_token": 2.2e-08,
+        "time_windows": [
+          {
+            "from": "01:00",
+            "to": "04:00",
+            "utc_offset_minutes": 0,
+            "input_token": 1.32e-06,
+            "cache_input_token": 4.4e-08,
+            "output_token": 3.96e-06,
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ]
+          },
+          {
+            "from": "06:00",
+            "to": "10:00",
+            "utc_offset_minutes": 0,
+            "input_token": 1.32e-06,
+            "cache_input_token": 4.4e-08,
+            "output_token": 3.96e-06,
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ]
+          }
+        ],
+        "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+        "verified_at": "2026-09-25"
+      }
+    },
+    {
+      "id": "deepseek-flash",
+      "pricing": {
+        "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 1.5e-7,
+        "output_token": 6e-7,
+        "cache_input_token": 3e-9,
+        "time_windows": [
+          {
+            "from": "09:00",
+            "to": "12:00",
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ],
+            "utc_offset_minutes": 480,
+            "input_token": 3e-7,
+            "output_token": 0.0000012,
+            "cache_input_token": 6e-9
+          },
+          {
+            "from": "14:00",
+            "to": "18:00",
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ],
+            "utc_offset_minutes": 480,
+            "input_token": 3e-7,
+            "output_token": 0.0000012,
+            "cache_input_token": 6e-9
+          }
+        ]
+      }
+    },
+    {
+      "match": {
+        "provider_model_id": [
+          "deepseek-v4.1-flash*",
+          "deepseek-v4-flash*"
+        ]
+      },
+      "pricing": {
+        "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
+        "verified_at": "2026-09-26",
+        "currency": "USD",
+        "input_token": 1.5e-7,
+        "output_token": 6e-7,
+        "cache_input_token": 3e-9,
+        "time_windows": [
+          {
+            "from": "09:00",
+            "to": "12:00",
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ],
+            "utc_offset_minutes": 480,
+            "input_token": 3e-7,
+            "output_token": 0.0000012,
+            "cache_input_token": 6e-9
+          },
+          {
+            "from": "14:00",
+            "to": "18:00",
+            "days": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri"
+            ],
+            "utc_offset_minutes": 480,
+            "input_token": 3e-7,
+            "output_token": 0.0000012,
+            "cache_input_token": 6e-9
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -23,6 +23,21 @@ sys_cfg_client.set("key","value")
 
 需要访问 buckyos 的服务，都应当在进程启动时按 `init -> login -> set` 顺序初始化 api-runtime。
 
+## NamedStore 访问
+
+应用、Agent 和工具通过 `runtime.get_named_store().await?` 获取统一存储接口，使用 `get_object()`、`open_reader()` 等操作，不自行读取 NamedStore 配置或判断是否处于容器内。后端由 runtime 类型决定：
+
+| Runtime 类型 | 存储后端 |
+| --- | --- |
+| `Kernel`、`KernelService` | 本机 `NamedDataMgr`，读取 `$BUCKYOS_ROOT/storage/named_store.json` |
+| `AppService`、`AppClient`、`FrameService` | `NdmClient`，通过 NFS 服务的 `/ndm/proxy/v1` 访问 |
+
+远程访问的服务地址解析、当前 session token 和续期由 SDK/runtime 处理，服务端继续验证调用身份与对象权限。应用私有 storage 无需放置宿主机的 `named_store.json`，也不需要挂载宿主机 NamedStore。选择后端不依赖配置文件是否存在；初始化或鉴权失败会返回错误，不自动切换到另一个后端。
+
+`AppService`、`FrameService` 的 NFS kRPC（包括 `get_bucket_client()`）与 NamedStore 使用同一 NodeGateway：`http://<host gateway>:<node_gateway_port>/kapi/nfs-server`。NFS 系统服务只监听宿主机回环地址，容器不能使用宿主网桥地址直连其 `4110` 端口。`AppClient` 继续使用显式网关或 Zone 地址；内核侧保留本机服务发现。Bucket client 保持短会话语义，每次操作重新获取，以使用当前 token；认证已失效时拒绝创建客户端。
+
+负责本机存储管理的内核服务可以调用 `runtime.get_local_named_store().await?`，取得具体的 `NamedDataMgr`，用于布局、保留关系、网关装配及本地包处理。该入口只允许 `Kernel`、`KernelService` 使用；普通附件读取和产物存储使用统一入口。
+
 ## init 到 login 之间的语义
 
 `init()` 到 `login()` 之间，runtime 可以持有:
@@ -30,6 +45,8 @@ sys_cfg_client.set("key","value")
 - `app_id`
 - `user_id`
 - 本地配置、私钥、设备信息
+
+AppClient 开发模式加载 `user_config.json` 时，若尚无 Zone DID，则取 owner 的 `binded_zone_list` 第一项；列表为空时取 owner DID 本身，支持 owner DID 与 Zone DID 相同的自托管 Zone。
 
 但这个阶段还没有“可验证的身份”，因为:
 
@@ -120,7 +137,7 @@ buckyos是一个典型的多进程系统，因此为了简化配置，减少配�
     隐式继承：读取特定的环境变量
     默认读取：读取标准环境的配置文件
 
-标准环境有3个目录 (注意其选择是整体的，不会用优先级补足) ，Owner私钥只会存在于。Buckycli中
+标准环境有3个目录 (注意其选择是整体的，不会用优先级补足)，Owner 私钥只会存在客户端身份目录中：
 /BUCKYOS_ROOT/etc or /$dev_home/.buckycli or $PWD 
 
 系统里所有的，对行为有影响的全局配置，都应通过buckyos-api-runtime来统一管理
@@ -130,13 +147,18 @@ buckyos是一个典型的多进程系统，因此为了简化配置，减少配�
 
 ### 所有的环境配置 (变量名，环境变量名，所在配置文件)
 
-- full_app_id (owner_user_id + app_id)
+- app_did, `BUCKYOS_APP_DID`, node-daemon 固定注入
+- app_id, `BUCKYOS_APP_ID`, AppDID raw hostname
+- app_instance_id, `BUCKYOS_APP_INSTANCE_ID`, `{app_id}@{owner_user_id}`
+- owner_user_id, `BUCKYOS_OWNER_USER_ID`, AppInstance Owner
+- app data dir, `BUCKYOS_DATA_DIR`, 已解析的私有数据目录
+- app token, `BUCKYOS_APP_TOKEN`, 精确绑定 AppInstanceId
 
 - zone_did,NULL,node_identiy.json
 - NULL,BUCKYOS_ZONE_DOC,node-daemon boot env
 
 - CURRENT_DEVICE_CONFIG,BUCKYOS_THIS_DEVICE,node_identiy.json (移动到cyfs-gateway-lib)
-- NULL,NULL,node_private_key.pem 设备私钥
+- NULL,NULL,security/<device host>/authentication.private.pem 设备私钥
 
 - user_id,NULL,/.buckycli/user_config.json
 - user_config,NULL,/.buckycli/user_config.json
@@ -144,11 +166,7 @@ buckyos是一个典型的多进程系统，因此为了简化配置，减少配�
 
 
 
-下面两个是login后有的
-full_appid = f"{appid}-{username}"
-app_token = os.getenv(f"{full_appid}_token")
-- NULL,$fullid_token,NULL
-- NULL,BUCKYOS_ZONE_CONFIG, 登陆成功后获得 (./did_hostname.zone.josn ) 不需要？
+登录后 runtime 还会获得 `BUCKYOS_ZONE_CONFIG` 对应的 ZoneConfig，并把启动 token 兑换成 verify-hub session/refresh token。SDK 不从 `app_instance_config` 或动态变量名推断自身身份。
 
 
 下面的是一些全局环境

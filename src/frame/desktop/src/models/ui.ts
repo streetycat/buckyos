@@ -16,7 +16,7 @@ export type ThemeMode = 'light' | 'dark'
 export type RuntimeContainer = 'browser' | 'desktop-app' | 'mobile-app'
 export type FormFactor = 'desktop' | 'mobile'
 export type MockScenario = 'normal' | 'empty' | 'error'
-export type DesktopItemType = 'app' | 'widget'
+export type DesktopItemType = 'app' | 'widget' | 'file'
 
 /**
  * Placement provenance — tracks how an item ended up at its current slot.
@@ -25,7 +25,12 @@ export type DesktopItemType = 'app' | 'widget'
  * - `reflow`: system re-placed due to resize / init recovery
  */
 export type PlacementType = 'manual' | 'auto' | 'reflow'
-export type DesktopWallpaperMode = 'panorama' | 'tile' | 'infinite'
+/**
+ * `infinite` is the built-in theme background. With an image: `fill` covers the screen (cropping), `fit` shows
+ * the whole image, `stretch` distorts it to the screen, `tile` repeats it, `center` shows it at its own pixel
+ * size, and `panorama` spans it across the desktop pages and pans with them.
+ */
+export type DesktopWallpaperMode = 'panorama' | 'tile' | 'infinite' | 'fill' | 'fit' | 'stretch' | 'center'
 export type WidgetType = string
 export type DisplayMode = 'windowed' | 'maximized' | 'fullscreen'
 export type WindowState = 'windowed' | 'maximized' | 'minimized'
@@ -74,7 +79,16 @@ export interface WidgetItem extends LayoutItemBase {
   config: Record<string, unknown>
 }
 
-export type LayoutItem = AppIconItem | WidgetItem
+/** A document or folder in the Desktop folder (see models/desktopFolder.ts). */
+export interface FileIconItem extends LayoutItemBase {
+  type: 'file'
+  fileKind: 'file' | 'folder'
+  /** As Files shows it, e.g. `/home/alice/Desktop/photo.jpg`. */
+  path: string
+  size?: number
+}
+
+export type LayoutItem = AppIconItem | WidgetItem | FileIconItem
 
 export interface DesktopPageState {
   id: string
@@ -91,7 +105,16 @@ export interface LayoutState {
 export interface DesktopWallpaper {
   mode: DesktopWallpaperMode
   imageUrl?: string
+  /** Square tile of the built-in pattern, in CSS px. */
   tileSize?: number
+  /** Pixel size of `imageUrl`; `center` and `tile` show the image at it (device pixels). */
+  imageWidth?: number
+  imageHeight?: number
+  /** `tile` with an image: percent of the image's own size. */
+  tileScale?: number
+  /** `fill` / `panorama`: the point of the image kept in view when it is cropped, 0–100 on each axis. */
+  focusX?: number
+  focusY?: number
 }
 
 export interface WindowAppearancePreferences {
@@ -139,15 +162,28 @@ export interface AppDefinition {
   logicalAppId?: string
   appInstanceId?: string
   ownerUserId?: string
-  appClass?: 'system_builtin' | 'user_installed' | 'zone_installed'
   /** Gateway Web hosts from the authoritative AppSpec, in launch preference order. */
   webHosts?: string[]
   iconKey: string
+  /** Image shown instead of the built-in icon (e.g. an Agent avatar); the icon is the fallback. */
+  iconUrl?: string
+  /** Small status mark on the launcher tile. */
+  iconBadge?: 'busy' | 'error'
+  /** i18n keys of the built-in catalog; `text` (when set) is shown instead. */
   labelKey: string
   summaryKey: string
+  /** The app's DID when it has one; built-in apps have none. */
+  did?: string
+  /** Literal display text from the app's own document (or an Agent's name), per language. */
+  text?: AppDisplayText
   accent: string
   tier: IntegrationTier
   manifest: WindowManifest
+}
+
+export interface AppDisplayText {
+  title?: string | Readonly<Record<string, string>>
+  summary?: string | Readonly<Record<string, string>>
 }
 
 export function supportsFormFactor(
@@ -177,21 +213,19 @@ export interface DataState<T> {
   error: string | null
 }
 
-export interface SystemSidebarAppItem {
+/** A taskbar button: a pinned app, an app with open windows, or both. */
+export interface TaskbarAppItem {
   appId: string
+  accent: string
   iconKey: string
+  iconUrl?: string
   labelKey: string
-}
-
-export interface SystemSidebarSwitchAppItem extends SystemSidebarAppItem {
-  minimizedOrder: number
-}
-
-export interface SystemSidebarDataModel {
-  currentAppId?: string
-  runningAppCount: number
-  switchApps: SystemSidebarSwitchAppItem[]
-  systemApps: SystemSidebarAppItem[]
+  text?: AppDisplayText
+  pinned: boolean
+  /** Open windows of the app, minimized ones included. */
+  windowCount: number
+  /** The app owns the front-most visible window. */
+  active: boolean
 }
 
 export const systemPreferencesInputSchema = z.object({
@@ -208,22 +242,42 @@ export const systemPreferencesInputSchema = z.object({
 
 export type SystemPreferencesInput = z.infer<typeof systemPreferencesInputSchema>
 
+/** A note widget's text is a small file in the Desktop folder; this keeps it a note. */
+export const NOTE_MAX_LENGTH = 2000
+
 export const noteInputSchema = z.object({
   content: z
     .string()
     .trim()
     .min(1)
-    .max(180),
+    .max(NOTE_MAX_LENGTH),
 })
 
 export type NoteInput = z.infer<typeof noteInputSchema>
+
+/**
+ * Launch request carried by a window (multi-instance apps such as Preview).
+ * `requestId` changes on every re-targeting of the same window so the app
+ * panel can react to a new request without comparing payloads.
+ */
+export interface WindowLaunch {
+  requestId: string
+  payload: unknown
+}
 
 export interface WindowRecord {
   id: string
   appId: string
   state: WindowState
+  /** The state a minimized window comes back to; unset until it is first minimized. */
+  restoreState?: Exclude<WindowState, 'minimized'>
   minimizedOrder: number | null
   titleKey: string
+  /** Literal title (e.g. the open file name); falls back to `titleKey`. */
+  title?: string
+  /** Distinguishes multiple windows of one app; undefined = the app's singleton. */
+  instanceKey?: string
+  launch?: WindowLaunch
   x: number
   y: number
   width: number

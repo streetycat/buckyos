@@ -15,8 +15,8 @@ use crate::runtime::{NodeRunState, RunStatus, WorkflowRun};
 use async_trait::async_trait;
 use buckyos_api::{
     get_buckyos_api_runtime, BindAppExecutorReq, CreatePromisedTaskReq, CreateTaskExecutor,
-    CreateTaskReq, Task, TaskDataErrorInfo, TaskDataProgress, TaskError, TaskExecutor,
-    TaskManagerClient, TaskPhase, TaskWaitReason, TaskWaitReasonKind, ThunkTaskData,
+    CreateTaskReq, StorageDomain, Task, TaskDataErrorInfo, TaskDataProgress, TaskError,
+    TaskExecutor, TaskManagerClient, TaskPhase, TaskWaitReason, TaskWaitReasonKind, ThunkTaskData,
     ThunkTaskRequest, WorkflowMapShardTaskData, WorkflowMapShardTaskRequest, WorkflowRunTaskData,
     WorkflowRunTaskRequest, WorkflowRunTaskResult, WorkflowStepTaskData, WorkflowStepTaskRequest,
 };
@@ -326,6 +326,7 @@ impl TaskManagerTaskTracker {
                     child_control_policy: None,
                     policy_preset: None,
                     permission_boundary: false,
+                    storage_domain: Some(StorageDomain::System),
                     idempotency_key,
                     retry_of: None,
                     supersedes: None,
@@ -352,6 +353,7 @@ impl TaskManagerTaskTracker {
                 child_control_policy: None,
                 policy_preset: None,
                 permission_boundary: false,
+                storage_domain: None,
                 idempotency_key: idempotency_key.clone(),
                 wait_reason: None,
                 message: None,
@@ -810,11 +812,7 @@ pub const WORKFLOW_THUNK_SCHEMA_ID: &str = "workflow.thunk/v1";
 fn run_task_parent(run: &WorkflowRun) -> Option<String> {
     run.metrics
         .get("schedule_task")
-        .and_then(|schedule_task| {
-            schedule_task
-                .get("task_id")
-                .or_else(|| schedule_task.get("root_task_id"))
-        })
+        .and_then(|schedule_task| schedule_task.get("root_task_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|value| !value.is_empty())

@@ -1,9 +1,15 @@
 import {
   buckyos,
+  DOWNLOAD_TASK_SCHEMA_ID,
   taskMgrErrorCode,
+  taskMgrTaskEventPath,
+  taskMgrTreeEventPath,
   HUMAN_APPROVAL_SCHEMA_ID,
   HUMAN_INPUT_TASK_SCHEMA_ID,
+  TASK_ERR_NOT_FOUND,
+  TASK_ERR_PERMISSION_DENIED,
   TASK_ERR_REVISION_CONFLICT,
+  TaskControlAction as TaskControlActionKind,
   TaskExecutorKind,
   TaskPhase,
   TaskOutcome,
@@ -17,7 +23,19 @@ import type {
   TaskWaitReason,
 } from 'buckyos'
 import { isMockRuntime } from '../runtime'
+import { fetchAgentList } from './user_mgr'
+import { getSharedAppServiceStore } from '../app/app-service/hooks/use-app-service-store'
+import type { InstallTask } from '../app/app-service/types'
 import { TaskCenterMockStore } from './task_mgr_mock.ts'
+import { createDownloadTask, type CreateDownloadInput } from './downloads.ts'
+import { toProgressPercent } from './task_progress.ts'
+import {
+  cancelMockDownload,
+  listMockDownloads,
+  mockDownloadState,
+  subscribeMockDownloads,
+  type MockDownload,
+} from './downloads_mock.ts'
 
 // The 2.0 protocol vocabulary is the websdk's; re-exported so Task Center
 // code has one import site for both the view model and the wire enums.
@@ -101,6 +119,7 @@ export interface Task {
   progress: number | null
   schemaType: string | null
   payload: Record<string, unknown>
+  aiccRequest?: { method: string; params: Record<string, unknown> }
   children: Task[]
   /**
    * 2.0 composite state kept alongside the coarse `status`, so the UI can
@@ -113,6 +132,22 @@ export interface Task {
   pendingControlAction?: TaskControlAction | null
   waitReason?: TaskWaitReason | null
   error?: string | null
+  /**
+   * The System Notify this task answers (`input.notify.notify_id` of a
+   * `human.input/v1` task). Such a task is handled on its MessageHub card
+   * (`/messagehub?notify=<id>`), never by an approve / reject card here.
+   */
+  notifyId?: string
+  /** The runner accepts a cancel request now (and none is pending). */
+  cancellable?: boolean
+  /** A URL download (`download/v1`): where from and, once done, where it was saved. */
+  download?: TaskDownloadInfo
+}
+
+export interface TaskDownloadInfo {
+  url: string
+  /** Path in the user's files (`/home/<user>/Downloads/<name>`) once complete. */
+  localPath?: string
 }
 
 export type SystemNotificationAction = 'confirm' | 'dismiss' | 'approve' | 'reject'
@@ -170,6 +205,12 @@ export interface TaskCenterModel {
    * (doc §14.3). No-op once the cached copy is current.
    */
   loadTaskDetail(taskId: string): Promise<void>
+  /**
+   * Release upstream subscriptions/timers. Safe to call more than once; a
+   * later `subscribe` re-attaches, which StrictMode's simulated
+   * unmount/remount relies on.
+   */
+  dispose(): void
   getAllTasks(): Task[]
   getRunningTasks(): Task[]
   getRecentFinishedTasks(): Task[]
@@ -179,6 +220,10 @@ export interface TaskCenterModel {
   getPendingNotifications(): SystemNotification[]
   handleNotification(id: string, action: string): void
   getEvents(): SystemEvent[]
+  /** Starts a URL download into `~/Downloads`; resolves to its task id. */
+  createDownload(input: CreateDownloadInput): Promise<string>
+  /** Asks the task's runner to cancel it (a `Cancel` control request). */
+  cancelTask(taskId: string): Promise<void>
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +244,8 @@ interface TaskCenterRpcProvider {
   listTasks(): Promise<TaskSnapshot[]>
   loadDetail(taskId: string): Promise<TaskMgrTask | null>
   handleNotificationAction(task: Task, action: string): Promise<void>
+  createDownload(input: CreateDownloadInput): Promise<string>
+  cancelTask(taskId: string): Promise<void>
 }
 
 /** Apps whose tasks are platform work rather than a user-installed app's. */
@@ -293,36 +340,43 @@ function toTaskType(schemaId: string): TaskType {
   return 'one-time'
 }
 
-function toTaskSource(summary: TaskSummary): TaskSource {
+/** Each Agent runs as its own constructed App whose AppId is the AgentId. */
+function toTaskSource(summary: TaskSummary, agentAppIds: ReadonlySet<string>): TaskSource {
   const appId = (summary.creator.app_id ?? '').toLowerCase()
-  if (appId.includes('opendan') || appId.includes('agent') || appId.includes('jarvis')) return 'agent'
+  if (agentAppIds.has(appId)) return 'agent'
   if (summary.schema_id.startsWith('agent.')) return 'agent'
   if (KERNEL_APP_IDS.has(appId)) return 'system'
   if (appId) return 'app'
   return 'user'
 }
 
-/**
- * 2.0 progress is free-form JSON owned by the runner, so pull a percentage
- * out of the shapes the platform runners actually write and give up rather
- * than guess.
- */
-function toProgressPercent(progress: unknown): number | null {
-  const clamp = (value: number) => Math.max(0, Math.min(100, Math.round(value)))
-  const direct = asNumber(progress)
-  if (direct !== null) return clamp(direct <= 1 ? direct * 100 : direct)
-  if (!isRecord(progress)) return null
+/** Source URL and saved path of a `download/v1` task, when its detail is loaded. */
+function downloadInfoOf(summary: TaskSummary, detail: TaskMgrTask | null): TaskDownloadInfo | undefined {
+  if (summary.schema_id !== DOWNLOAD_TASK_SCHEMA_ID || !detail) return undefined
+  const request = asRecord(asRecord(detail.input).request)
+  const url = asString(request.download_url) ?? (Array.isArray(request.urls) ? asString(request.urls[0]) : null)
+  if (!url) return undefined
+  const localPath = asString(asRecord(detail.result).local_path)
+  return { url, ...(localPath ? { localPath } : {}) }
+}
 
-  const percent = asNumber(progress.percent) ?? asNumber(progress.percentage)
-  if (percent !== null) return clamp(percent)
+/** A live task whose runner declared it can be canceled, with no cancel already requested. */
+function isCancellable(summary: TaskSummary, detail: TaskMgrTask | null): boolean {
+  if (!detail || summary.phase === TaskPhase.Terminal) return false
+  if (detail.pending_control?.action === TaskControlActionKind.Cancel) return false
+  const cancel = detail.control_profile?.cancel?.kind
+  return cancel === 'Safe' || cancel === 'Interrupt'
+}
 
-  const ratio = asNumber(progress.ratio)
-  if (ratio !== null) return clamp(ratio * 100)
+/** The notification an input task answers (`input.notify.notify_id`), when it is one. */
+function notifyIdOf(detail: TaskMgrTask | null): string | undefined {
+  const notifyId = asRecord(asRecord(detail?.input).notify).notify_id
+  return typeof notifyId === 'string' && notifyId ? notifyId : undefined
+}
 
-  const completed = asNumber(progress.completed) ?? asNumber(progress.completed_items)
-  const total = asNumber(progress.total) ?? asNumber(progress.total_items)
-  if (completed !== null && total !== null && total > 0) return clamp((completed / total) * 100)
-  return null
+/** Where the MessageHub card of a notification opens. */
+export function notifyCardPath(notifyId: string): string {
+  return `/messagehub?notify=${encodeURIComponent(notifyId)}`
 }
 
 /** Payload view of a task: result wins, then progress, then immutable input. */
@@ -406,7 +460,7 @@ function normalizeSchedulePayload(
   }
 }
 
-export function toTaskCenterTask({ summary, detail }: TaskSnapshot): Task {
+export function toTaskCenterTask({ summary, detail }: TaskSnapshot, agentAppIds: ReadonlySet<string> = new Set()): Task {
   const status = toTaskStatus(summary.phase, summary.outcome)
   const type = toTaskType(summary.schema_id)
   const createdAt = toIsoTime(summary.created_at)
@@ -414,13 +468,15 @@ export function toTaskCenterTask({ summary, detail }: TaskSnapshot): Task {
   const waitReason = detail?.wait_reason ?? summary.wait_reason ?? null
   const errorMessage = detail?.error?.message ?? null
   const data = taskPayload(detail)
+  const notifyId = notifyIdOf(detail)
+  const download = downloadInfoOf(summary, detail)
   const isSchedule = summary.schema_id === WORKFLOW_SCHEDULE_TASK_SCHEMA_ID
 
   return {
     rootTaskId: summary.root_id || summary.task_id,
     taskId: summary.task_id,
     parentTaskId: normalizeTaskId(summary.parent_id),
-    source: toTaskSource(summary),
+    source: toTaskSource(summary, agentAppIds),
     type,
     status,
     title: summary.name || `Task ${summary.task_id}`,
@@ -442,6 +498,10 @@ export function toTaskCenterTask({ summary, detail }: TaskSnapshot): Task {
     progress: toProgressPercent(detail?.progress),
     schemaType: summary.schema_id,
     payload: isSchedule ? normalizeSchedulePayload(summary, data, status) : data,
+    ...(summary.schema_id === 'aicc.compute/v1' && detail ? { aiccRequest: {
+      method: summary.name.replace(/^AICC /, ''),
+      params: asRecord(asRecord(asRecord(detail.input).request).request),
+    } } : {}),
     children: [],
     phase: summary.phase,
     outcome: summary.outcome ?? null,
@@ -449,11 +509,14 @@ export function toTaskCenterTask({ summary, detail }: TaskSnapshot): Task {
     pendingControlAction: detail?.pending_control?.action ?? summary.pending_control_action ?? null,
     waitReason,
     error: errorMessage,
+    ...(notifyId ? { notifyId } : {}),
+    cancellable: isCancellable(summary, detail),
+    ...(download ? { download } : {}),
   }
 }
 
-function buildTaskTree(snapshots: TaskSnapshot[]): Task[] {
-  const tasks = snapshots.map(toTaskCenterTask)
+function buildTaskTree(snapshots: TaskSnapshot[], agentAppIds: ReadonlySet<string>): Task[] {
+  const tasks = snapshots.map((snapshot) => toTaskCenterTask(snapshot, agentAppIds))
   const byId = new Map(tasks.map((task) => [task.taskId, task]))
   const roots: Task[] = []
 
@@ -531,10 +594,11 @@ function deriveEvents(tasks: Task[]): SystemEvent[] {
 
 /**
  * A pending human task is the 2.0 shape of "needs a decision from you": a
- * HumanSet executor that has not been committed yet (doc §10.2).
+ * HumanSet executor that has not been committed yet (doc §10.2). The task of
+ * a System Notify is answered on its MessageHub card, so it gets no card here.
  */
 function isPendingHumanTask(task: Task): boolean {
-  return task.executorKind === TaskExecutorKind.HumanSet && task.phase !== TaskPhase.Terminal
+  return task.executorKind === TaskExecutorKind.HumanSet && task.phase !== TaskPhase.Terminal && !task.notifyId
 }
 
 function deriveNotifications(tasks: Task[]): SystemNotification[] {
@@ -630,25 +694,207 @@ class SubscribableModel {
     return () => this.listeners.delete(listener)
   }
 
+  protected hasListeners(): boolean {
+    return this.listeners.size > 0
+  }
+
   emitChange(): void {
     this.version += 1
     this.listeners.forEach((listener) => listener())
   }
 }
 
-export class TaskCenterMockModel extends TaskCenterMockStore implements TaskCenterModel {
+/** A mock download as the Task Center shows a `download/v1` task. */
+function mockDownloadTaskView(download: MockDownload, now: number): Task {
+  const state = mockDownloadState(download, now)
+  const status: TaskStatus =
+    state.outcome === 'Succeeded'
+      ? 'completed'
+      : state.outcome === 'Failed'
+        ? 'failed'
+        : state.outcome === 'Canceled'
+          ? 'cancelled'
+          : 'running'
+  const created = new Date(download.createdAt).toISOString()
+  const updated = new Date(state.updatedAt).toISOString()
+  const localPath = state.outcome === 'Succeeded' ? `/home/self/Downloads/${download.filename}` : undefined
+  return {
+    rootTaskId: download.taskId,
+    taskId: download.taskId,
+    parentTaskId: null,
+    source: 'user',
+    type: 'download',
+    status,
+    title: `Download ${download.filename}`,
+    summary: state.error ?? `${formatMockBytes(state.completedBytes)} / ${formatMockBytes(download.totalBytes)}`,
+    createdAt: created,
+    updatedAt: updated,
+    startedAt: created,
+    endedAt: state.completedAt ? new Date(state.completedAt).toISOString() : null,
+    progress: Math.round((state.completedBytes / download.totalBytes) * 100),
+    schemaType: DOWNLOAD_TASK_SCHEMA_ID,
+    payload: localPath ? { state: 'completed', local_path: localPath } : { download_url: download.url },
+    children: [],
+    phase: state.phase === 'Terminal' ? TaskPhase.Terminal : TaskPhase.Running,
+    outcome: (state.outcome as TaskOutcome | undefined) ?? null,
+    error: state.error ?? null,
+    cancellable: state.phase === 'Running',
+    download: { url: download.url, ...(localPath ? { localPath } : {}) },
+  }
+}
+
+function formatMockBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${value.toFixed(1)} ${units[unit]}`
+}
+
+function installationTaskView(task: InstallTask): Task {
+  const time = new Date(task.updated_at).toISOString()
+  return {
+    rootTaskId: task.task_id,
+    taskId: task.task_id,
+    parentTaskId: null,
+    source: 'system',
+    type: 'install',
+    status:
+      task.outcome === 'Succeeded'
+        ? 'completed'
+        : task.outcome === 'Failed'
+          ? 'failed'
+          : task.outcome === 'Canceled'
+            ? 'cancelled'
+            : task.phase === 'Waiting'
+              ? 'paused'
+              : task.phase === 'Unknown'
+                ? 'pending'
+                : 'running',
+    title: task.app.show_name,
+    summary: `${task.stage} · ${task.owner_user_id}`,
+    createdAt: new Date(task.plan.created_at).toISOString(),
+    updatedAt: time,
+    startedAt: time,
+    endedAt: task.phase === 'Terminal' ? time : null,
+    progress: task.progress,
+    schemaType: task.schema_id,
+    children: [],
+    payload: {
+      task_id: task.task_id,
+      app_instance_id: task.app_instance_id,
+      retry_of: task.retry_of,
+      phase: task.phase,
+      outcome: task.outcome,
+      desired_state_committed: task.desired_state_committed,
+    },
+  }
+}
+
+export class TaskCenterMockModel
+  extends TaskCenterMockStore
+  implements TaskCenterModel
+{
   private readonly subscription = new SubscribableModel()
+  private readonly appServiceStore = getSharedAppServiceStore()
+  /**
+   * Upstream unsubscribe. Attached lazily on the first `subscribe` (so a
+   * model StrictMode discards from a double-invoked `useState` initializer
+   * never listens) and released only by `dispose`.
+   */
+  private detachAppService: (() => void) | null = null
+  private detachDownloads: (() => void) | null = null
+  /** Re-renders running mock downloads, whose progress follows the clock. */
+  private downloadTimer: ReturnType<typeof setInterval> | null = null
+
+  constructor() {
+    super()
+    this.syncInstallTasks()
+    this.syncDownloadTasks()
+  }
+
+  private syncDownloadTasks(): void {
+    const now = Date.now()
+    const downloads = listMockDownloads().map((download) => mockDownloadTaskView(download, now))
+    this.tasks = [
+      ...downloads.sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      ...this.tasks.filter((task) => !task.taskId.startsWith('mock-dl-')),
+    ]
+    this.subscription.emitChange()
+  }
+
+  private syncInstallTasks(): void {
+    this.tasks = [
+      ...this.tasks.filter(
+        (task) =>
+          !['app.install/v1', 'app.update/v1'].includes(
+            task.schemaType ?? '',
+          ),
+      ),
+      ...this.appServiceStore.getTasks().map(installationTaskView),
+    ]
+    this.subscription.emitChange()
+  }
+
+  /** Idempotent, so re-subscribing on every render cannot cause churn. */
+  private attach(): void {
+    if (this.detachAppService) return
+    this.detachAppService = this.appServiceStore.subscribe(() =>
+      this.syncInstallTasks(),
+    )
+    this.detachDownloads = subscribeMockDownloads(() => this.syncDownloadTasks())
+    this.downloadTimer = setInterval(() => {
+      if (this.tasks.some((task) => task.taskId.startsWith('mock-dl-') && task.status === 'running')) {
+        this.syncDownloadTasks()
+      }
+    }, 500)
+    // Catch up on anything that changed while detached.
+    this.syncInstallTasks()
+    this.syncDownloadTasks()
+  }
 
   getSnapshot(): number {
     return this.subscription.getSnapshot()
   }
 
+  /** The scripted notifications plus a card for each pending human task, as the RPC model derives them. */
+  override getPendingNotifications(): SystemNotification[] {
+    return [...super.getPendingNotifications(), ...deriveNotifications(this.tasks).filter((notification) => !this.handledTasks.has(notification.id))]
+  }
+
+  private readonly handledTasks = new Set<string>()
+
   subscribe(listener: () => void): () => void {
+    this.attach()
     return this.subscription.subscribe(listener)
   }
 
+  dispose(): void {
+    this.detachAppService?.()
+    this.detachAppService = null
+    this.detachDownloads?.()
+    this.detachDownloads = null
+    if (this.downloadTimer) clearInterval(this.downloadTimer)
+    this.downloadTimer = null
+  }
+
   async refresh(): Promise<void> {
-    this.subscription.emitChange()
+    this.syncDownloadTasks()
+  }
+
+  async createDownload(input: CreateDownloadInput): Promise<string> {
+    const taskId = await createDownloadTask(input)
+    this.syncDownloadTasks()
+    return taskId
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    cancelMockDownload(taskId)
+    this.syncDownloadTasks()
   }
 
   async loadTaskDetail(): Promise<void> {
@@ -656,18 +902,25 @@ export class TaskCenterMockModel extends TaskCenterMockStore implements TaskCent
   }
 
   override handleNotification(id: string, action: string): void {
-    super.handleNotification(id, action)
+    if (notificationTaskId(id)) this.handledTasks.add(id)
+    else super.handleNotification(id, action)
     this.subscription.emitChange()
   }
 }
 
 export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterModel {
   private snapshots: TaskSnapshot[] = []
+  private agentAppIds: ReadonlySet<string> = new Set()
   private tasks: Task[] = []
   private notifications: SystemNotification[] = []
   private events: SystemEvent[] = []
   private handledNotifications = new Map<string, Pick<SystemNotification, 'handledAction' | 'handledAt'>>()
   private readonly provider: TaskCenterRpcProvider
+  /** The list fetch in flight, so detail loads can wait for it. */
+  private pendingRefresh: Promise<void> | null = null
+  /** Keeps an open Task Center current: often while a task runs, rarely when idle. */
+  private pollTimer: ReturnType<typeof setTimeout> | null = null
+  private lastRefreshAt = 0
 
   constructor(provider: TaskCenterRpcProvider = new BuckyOSTaskMgrProvider()) {
     super()
@@ -675,17 +928,81 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
     void this.refresh()
   }
 
-  async refresh(): Promise<void> {
+  refresh(): Promise<void> {
+    const pending = this.fetchTasks().finally(() => {
+      if (this.pendingRefresh === pending) this.pendingRefresh = null
+    })
+    this.pendingRefresh = pending
+    return pending
+  }
+
+  private async fetchTasks(): Promise<void> {
+    this.lastRefreshAt = Date.now()
+    const agents = fetchAgentList().then(({ data }) => data?.agents ?? null)
     try {
       this.snapshots = await this.provider.listTasks()
     } catch (error) {
       console.error('task_mgr.list_tasks failed', error)
       return
     }
+    const list = await agents
+    // AppId == AgentId for each Agent's constructed App; keep the last known set when the list fails.
+    if (list) this.agentAppIds = new Set(list.map((agent) => agent.agent_id.toLowerCase()))
     this.rebuild()
   }
 
+  /** Polling runs only while someone is subscribed, and a later `subscribe` restarts it. */
+  override subscribe(listener: () => void): () => void {
+    const unsubscribe = super.subscribe(listener)
+    this.schedulePoll()
+    return () => {
+      unsubscribe()
+      if (!this.hasListeners()) this.stopPoll()
+    }
+  }
+
+  private schedulePoll(): void {
+    if (this.pollTimer || !this.hasListeners()) return
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = null
+      if (!this.hasListeners()) return
+      const active = flattenTasks(this.tasks).some(
+        (task) =>
+          task.schemaType !== WORKFLOW_SCHEDULE_TASK_SCHEMA_ID &&
+          (task.status === 'running' || task.status === 'pending'),
+      )
+      const due = active || Date.now() - this.lastRefreshAt >= IDLE_POLL_MS
+      if (!due || (typeof document !== 'undefined' && document.hidden)) {
+        this.schedulePoll()
+        return
+      }
+      void this.refresh().finally(() => this.schedulePoll())
+    }, ACTIVE_POLL_MS)
+  }
+
+  private stopPoll(): void {
+    if (this.pollTimer) clearTimeout(this.pollTimer)
+    this.pollTimer = null
+  }
+
+  dispose(): void {
+    this.stopPoll()
+  }
+
+  async createDownload(input: CreateDownloadInput): Promise<string> {
+    const taskId = await this.provider.createDownload(input)
+    await this.refresh()
+    return taskId
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    await this.provider.cancelTask(taskId)
+    await this.refresh()
+  }
+
   async loadTaskDetail(taskId: string): Promise<void> {
+    // A deep link (`?taskid=`) can open before the initial list resolves.
+    if (this.pendingRefresh) await this.pendingRefresh
     const snapshot = this.snapshots.find((item) => item.summary.task_id === taskId)
     if (!snapshot || snapshot.detail) return
     let detail: TaskMgrTask | null
@@ -701,7 +1018,7 @@ export class TaskCenterRpcModel extends SubscribableModel implements TaskCenterM
   }
 
   private rebuild(): void {
-    this.tasks = buildTaskTree(this.snapshots)
+    this.tasks = buildTaskTree(this.snapshots, this.agentAppIds)
     this.notifications = deriveNotifications(this.tasks).map((notification) => {
       const handled = this.handledNotifications.get(notification.id)
       return handled
@@ -794,6 +1111,10 @@ export function createTaskCenterModel(options: { useMock?: boolean } = {}): Task
   return (options.useMock ?? isMockRuntime()) ? new TaskCenterMockModel() : new TaskCenterRpcModel()
 }
 
+/** Refresh cadence of an open Task Center while a task runs / when nothing does. */
+const ACTIVE_POLL_MS = 3_000
+const IDLE_POLL_MS = 30_000
+
 /** Pages to walk before giving up; the Task Center is a human-scale list. */
 const LIST_PAGE_LIMIT = 200
 const MAX_LIST_PAGES = 10
@@ -847,6 +1168,19 @@ class BuckyOSTaskMgrProvider implements TaskCenterRpcProvider {
     }
   }
 
+  createDownload(input: CreateDownloadInput): Promise<string> {
+    return createDownloadTask(input)
+  }
+
+  async cancelTask(taskId: string): Promise<void> {
+    await this.getClient().requestControl({
+      task_id: taskId,
+      action: TaskControlActionKind.Cancel,
+      request_id: crypto.randomUUID(),
+    })
+    this.details.delete(taskId)
+  }
+
   private async commitResult(task: TaskMgrTask, decision: 'Approve' | 'Reject'): Promise<void> {
     await this.getClient().commitResult({
       task_id: task.task_id,
@@ -876,6 +1210,8 @@ class BuckyOSTaskMgrProvider implements TaskCenterRpcProvider {
   private static needsRefreshDetail(summary: TaskSummary): boolean {
     return (
       summary.schema_id === WORKFLOW_SCHEDULE_TASK_SCHEMA_ID ||
+      // An input task names its notification only in its input: the list links it to MessageHub.
+      summary.schema_id === HUMAN_INPUT_TASK_SCHEMA_ID ||
       summary.phase !== TaskPhase.Terminal
     )
   }
@@ -930,5 +1266,145 @@ class BuckyOSTaskMgrProvider implements TaskCenterRpcProvider {
       this.client = buckyos.getTaskManagerClient()
     }
     return this.client
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Per-task reads (MessageHub task area)
+// ---------------------------------------------------------------------------
+//
+// A consumer that follows a handful of known task ids reads them one by one
+// with the logged-in user's own TaskMgr permissions, instead of listing every
+// task the way the Task Center does.
+
+/** One node of a task tree: what `get_subtasks` returns, with millisecond times. */
+export interface TaskWatchNode {
+  taskId: string
+  name: string
+  parentId?: string
+  rootId: string
+  phase: 'Promised' | 'Accepted' | 'Running' | 'Waiting' | 'Paused' | 'Terminal'
+  waitReason?: { kind: string; code?: string; relatedTaskId?: string; message?: string }
+  outcome?: 'Succeeded' | 'Failed' | 'Canceled'
+  /** A control request that has not been applied yet. */
+  pendingControl?: 'Pause' | 'Resume' | 'Cancel'
+  message?: string
+  revision: number
+  createdAt: number
+  updatedAt: number
+  completedAt?: number
+}
+
+/** `get_task`: the node plus its payload. */
+export interface TaskWatchDetail extends TaskWatchNode {
+  schemaId: string
+  input?: unknown
+  progress?: unknown
+  result?: unknown
+  error?: { code: string; message: string }
+  originRef?: { kind: string; id: string }
+}
+
+export interface TaskWatchEvent {
+  eventId: string
+  taskId: string
+  type: string
+  revision: number
+  at: number
+}
+
+export type TaskReadFailure = 'denied' | 'missing' | 'error'
+
+export interface TaskWatchSource {
+  getTask(taskId: string): Promise<TaskWatchDetail>
+  getSubtasks(taskId: string, cursor: string | undefined, limit: number): Promise<{ tasks: TaskWatchNode[]; nextCursor?: string }>
+  /** Persisted events of the whole tree under `rootId` the reader may see, oldest first. */
+  listEvents(rootId: string, limit: number): Promise<TaskWatchEvent[]>
+  /** `task`: `/obj/taskmgr/<id>/changed`; `tree`: `/obj/taskmgr/<root_id>/tree`. An event only says "read again". */
+  subscribe(scope: 'task' | 'tree', id: string, onHint: () => void): () => void
+  failure(error: unknown): TaskReadFailure
+}
+
+function toMillis(value: number): number {
+  return value > 0 && value < 10_000_000_000 ? value * 1000 : value
+}
+
+function toWatchNode(task: TaskSummary | TaskMgrTask): TaskWatchNode {
+  const pending = 'pending_control' in task ? task.pending_control?.action : (task as TaskSummary).pending_control_action
+  return {
+    taskId: task.task_id,
+    name: task.name,
+    parentId: task.parent_id,
+    rootId: task.root_id,
+    phase: task.phase,
+    waitReason: task.wait_reason ? { kind: task.wait_reason.kind, code: task.wait_reason.code, relatedTaskId: task.wait_reason.related_task_id, message: task.wait_reason.message } : undefined,
+    outcome: task.outcome,
+    pendingControl: pending,
+    message: task.message,
+    revision: task.revision,
+    createdAt: toMillis(task.created_at),
+    updatedAt: toMillis(task.updated_at),
+    completedAt: task.completed_at ? toMillis(task.completed_at) : undefined,
+  }
+}
+
+export function createTaskWatchSource(): TaskWatchSource {
+  let client: TaskManagerClient | null = null
+  const getClient = () => client ??= buckyos.getTaskManagerClient()
+  // One event stream for every watched task: a stream per task would use up
+  // the browser's connections to the zone host and starve the reads.
+  const listeners = new Map<string, Set<() => void>>()
+  let stream: { close(): Promise<void> } | null = null
+  let generation = 0
+  let timer: ReturnType<typeof setTimeout> | null = null
+  const reopen = () => {
+    timer = null
+    const mine = ++generation
+    const previous = stream
+    stream = null
+    if (previous) void previous.close()
+    const paths = [...listeners.keys()]
+    if (paths.length === 0) return
+    void buckyos.subscribeKEvent(paths, event => {
+      if (mine !== generation) return
+      for (const [path, set] of listeners) {
+        if (event.eventid === path || event.eventid.startsWith(`${path}/`)) set.forEach(hint => hint())
+      }
+    })
+      .then(subscription => { if (mine === generation) stream = subscription; else void subscription.close() })
+      .catch(() => { /* polling remains the baseline */ })
+  }
+  const scheduleStream = () => { timer ??= setTimeout(reopen, 250) }
+  return {
+    async getTask(taskId) {
+      const task = await getClient().getTask(taskId)
+      return { ...toWatchNode(task), schemaId: task.schema_id, input: task.input, progress: task.progress, result: task.result, error: task.error ? { code: task.error.code, message: task.error.message } : undefined, originRef: task.origin_ref }
+    },
+    async getSubtasks(taskId, cursor, limit) {
+      const page = await getClient().getSubtasks({ task_id: taskId, cursor, limit })
+      return { tasks: (page.tasks ?? []).map(toWatchNode), nextCursor: page.next_cursor }
+    },
+    async listEvents(rootId, limit) {
+      const result = await getClient().listTaskEvents({ root_id: rootId, limit })
+      return (result.events ?? []).map(event => ({ eventId: event.event_id, taskId: event.task_id, type: event.event_type, revision: event.task_revision, at: toMillis(event.created_at) }))
+    },
+    subscribe(scope, id, onHint) {
+      const path = scope === 'tree' ? taskMgrTreeEventPath(id) : taskMgrTaskEventPath(id)
+      const set = listeners.get(path) ?? new Set<() => void>()
+      listeners.set(path, set)
+      set.add(onHint)
+      if (set.size === 1) scheduleStream()
+      return () => {
+        set.delete(onHint)
+        if (set.size === 0 && listeners.get(path) === set) {
+          listeners.delete(path)
+          scheduleStream()
+        }
+      }
+    },
+    failure(error) {
+      const code = taskMgrErrorCode(error)
+      return code === TASK_ERR_PERMISSION_DENIED ? 'denied' : code === TASK_ERR_NOT_FOUND ? 'missing' : 'error'
+    },
   }
 }

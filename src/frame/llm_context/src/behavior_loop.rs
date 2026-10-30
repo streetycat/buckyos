@@ -79,6 +79,8 @@ pub struct StepRecord {
     pub assistant_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_message: Option<AiMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_messages: Vec<AiMessage>,
 
     /// "Observation" slot — LLM's reading of the previous action's result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,11 +92,6 @@ pub struct StepRecord {
     /// pure-thought / terminal-only steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<AiToolCall>,
-    /// "Next behavior" slot — when `Some` on a step with no action side
-    /// effects, this step is terminal and the loop returns. If the LLM emits
-    /// actions / sendmsg and next_behavior together, the loop suppresses
-    /// next_behavior so action observations are seen before any behavior
-    /// change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_behavior: Option<String>,
     /// Self Report (`<report>`) — overwrites
@@ -102,6 +99,16 @@ pub struct StepRecord {
     /// so the rendered history preserves the report-emit event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_report: Option<String>,
+    #[serde(default)]
+    pub report_end: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub report_artifacts: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_report_result"
+    )]
+    pub report_result: Option<serde_json::Value>,
     /// SendMessage actions (`<sendmsg target=...>`) emitted in this step.
     /// Stub in v2 first cut: parser captures them, executor only emits a
     /// worklog event. Real delivery moves to a standard `send_message`
@@ -140,17 +147,24 @@ impl StepRecord {
             do_actions,
             next_behavior,
             self_report,
+            report_end,
+            report_artifacts,
+            report_result,
             messages_to_send,
         } = result;
         Self {
             meta: StepMeta::default(),
             assistant_text,
             assistant_message: None,
+            native_messages: Vec::new(),
             observation,
             thought,
             actions: do_actions,
             next_behavior,
             self_report,
+            report_end,
+            report_artifacts,
+            report_result,
             messages_sent: messages_to_send,
             action_results: Vec::new(),
             next_user_message: None,
@@ -172,16 +186,32 @@ impl StepRecord {
         Self::synthetic_error(format!("policy rejected: {error}"))
     }
 
+    /// `true` for a synthetic step built by [`Self::from_parse_error`] /
+    /// [`Self::from_policy_rejection`]: it records a rejected response fed
+    /// back for self-correction, not a behavior decision. It still takes a
+    /// step index (numbering is allocation order).
+    pub fn is_correction(&self) -> bool {
+        self.actions.is_empty()
+            && matches!(
+                self.action_results.as_slice(),
+                [Observation::Error { call_id, .. }] if call_id.is_empty()
+            )
+    }
+
     fn synthetic_error(message: String) -> Self {
         Self {
             meta: StepMeta::default(),
             assistant_text: String::new(),
             assistant_message: None,
+            native_messages: Vec::new(),
             observation: None,
             thought: None,
             actions: Vec::new(),
             next_behavior: None,
             self_report: None,
+            report_end: false,
+            report_artifacts: Vec::new(),
+            report_result: None,
             messages_sent: Vec::new(),
             action_results: vec![Observation::Error {
                 call_id: String::new(),
@@ -202,10 +232,6 @@ pub struct LLMBehaviorResult {
     /// excluding parser-side tags like `<sendmsg>` and `<report>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub do_actions: Vec<AiToolCall>,
-    /// Terminal signal + jump target. `Some(_)` is terminal only when
-    /// `do_actions` is empty; otherwise the loop suppresses it and requires
-    /// the next inference to observe action results first. The loop does
-    /// **not** interpret the string — that belongs to the worksession above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_behavior: Option<String>,
 
@@ -216,17 +242,106 @@ pub struct LLMBehaviorResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought: Option<String>,
 
-    /// Self Report (`<report>`) — at most one per step;
-    /// last occurrence wins. Overwrites `LLMContextState.last_report`.
+    /// Self Report (`<report>`) — at most one per step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_report: Option<String>,
+    #[serde(default)]
+    pub report_end: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub report_artifacts: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_report_result"
+    )]
+    pub report_result: Option<serde_json::Value>,
     /// SendMessage actions (`<sendmsg target=...>`); recorded in order of
     /// appearance. Stub-delivered in v2 first cut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub messages_to_send: Vec<SendMessageRecord>,
 }
 
+fn deserialize_report_result<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
+}
+
 impl LLMBehaviorResult {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.next_behavior.as_deref().is_some_and(|next| {
+            next.trim().eq_ignore_ascii_case("END") || next.trim().eq_ignore_ascii_case("done")
+        }) {
+            return Err(
+                "next_behavior END/done is invalid; submit <report end=\"true\"> to finish".into(),
+            );
+        }
+        if self.self_report.is_none()
+            && (!self.report_artifacts.is_empty() || self.report_result.is_some())
+        {
+            return Err("artifacts/result require a report in the same response".into());
+        }
+        if self.report_end {
+            if self
+                .self_report
+                .as_deref()
+                .is_none_or(|report| report.trim().is_empty())
+            {
+                return Err("an ending report must contain non-empty text".into());
+            }
+            if !self.do_actions.is_empty() || !self.messages_to_send.is_empty() {
+                return Err(
+                    "an ending report cannot contain actions, sendmsg, or native tool_calls".into(),
+                );
+            }
+            if self
+                .next_behavior
+                .as_deref()
+                .is_some_and(|next| !next.trim().is_empty())
+            {
+                return Err("an ending report cannot contain next_behavior".into());
+            }
+        }
+        if self.self_report.is_none()
+            && self.do_actions.is_empty()
+            && self.messages_to_send.is_empty()
+            && self
+                .next_behavior
+                .as_deref()
+                .is_none_or(|next| next.trim().is_empty())
+        {
+            return Err("response requires actions, report, or next_behavior; submit <report end=\"true\"> to finish".into());
+        }
+        Ok(())
+    }
+
+    /// What this result decides about the control of its context, when it
+    /// decides something the host may want to review: a hand-over
+    /// (`next_behavior` without actions or sendmsg — with them the
+    /// hand-over is ignored anyway) or a yield (a progress report and
+    /// nothing else). Pure shape check; the meaning is the host's.
+    pub fn decision(&self) -> Option<StepDecision> {
+        if !self.do_actions.is_empty() || !self.messages_to_send.is_empty() {
+            return None;
+        }
+        if self
+            .next_behavior
+            .as_deref()
+            .is_some_and(|next| !next.trim().is_empty())
+        {
+            return Some(StepDecision::Handover);
+        }
+        if !self.report_end
+            && self
+                .self_report
+                .as_deref()
+                .is_some_and(|report| !report.trim().is_empty())
+        {
+            return Some(StepDecision::Yield);
+        }
+        None
+    }
+
     /// Reconstruct a behavior result from a finished step. Used at terminal
     /// time so `Done.behavior_result` carries the same payload that the
     /// parser produced.
@@ -238,6 +353,9 @@ impl LLMBehaviorResult {
             observation: step.observation.clone(),
             thought: step.thought.clone(),
             self_report: step.self_report.clone(),
+            report_end: step.report_end,
+            report_artifacts: step.report_artifacts.clone(),
+            report_result: step.report_result.clone(),
             messages_to_send: step.messages_sent.clone(),
         }
     }
@@ -319,6 +437,30 @@ pub trait StepRenderer: Send + Sync {
     }
 }
 
+/// A behavior step that changes who acts next, offered to the host for
+/// review ([`crate::deps::CheckpointHook::review_decision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepDecision {
+    /// `next_behavior` names another behavior (or WAIT_USER_MSG).
+    Handover,
+    /// Only a progress report: no actions, no sendmsg, no next_behavior.
+    /// Accepted, it ends the loop with `Done` and the host decides what
+    /// follows; without a verdict the loop continues as before.
+    Yield,
+}
+
+/// The host's verdict on a [`StepDecision`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecisionVerdict {
+    /// The decision stands: a hand-over ends the loop with `Done` as usual,
+    /// a yield ends it with `Done` carrying the progress report.
+    Accept,
+    /// The decision is refused: the step becomes a correction step whose
+    /// text is this message, and the same run infers again (counts as a
+    /// consecutive error, like a refused report).
+    Refuse(String),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StepResultHookOutput {
     /// Override the user message rendered immediately after this step on the
@@ -330,6 +472,11 @@ pub struct StepResultHookOutput {
     pub skip_next_inference: bool,
 }
 
+/// Post-step extension point. Failure contract: an `Err` is always treated
+/// as a degradable failure — the loop logs it and renders the default
+/// observation. Implementations therefore must not commit state (consume
+/// inputs, advance cursors) before they can return `Ok`; anything that must
+/// block progress on failure belongs in `InferenceHook::before_inference`.
 #[async_trait]
 pub trait StepResultHook: Send + Sync {
     async fn on_behavior_step_ob(

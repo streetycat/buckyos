@@ -1,19 +1,34 @@
-name: Build Buckyos Windows Components
-on: 
-    workflow_call:
-        inputs:
-            arch:
-                required: true
-                type: string
-            enable_tests:
-                required: false
-                type: boolean
-                default: false
+name: Build BuckyOS Windows Staged Artifact
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        required: true
+        type: string
+      enable_tests:
+        required: false
+        type: boolean
+        default: false
+      paios_images:
+        description: Pin paios images with the paios-images-manifest artifact of this run
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  DENO_VERSION: v2.9.2
 
 jobs:
   build:
-    name: build
+    name: Windows ${{ inputs.arch }}
     runs-on: ${{ inputs.arch == 'aarch64' && 'windows-11-arm' || 'windows-2025' }}
+    env:
+      PYTHONIOENCODING: 'utf-8'
+      PYTHONUTF8: '1'
     steps:
     - name: Checkout
       uses: actions/checkout@v6
@@ -25,6 +40,10 @@ jobs:
       uses: actions/setup-node@v6
       with:
         node-version: '24.x'
+    - name: Setup Deno
+      uses: denoland/setup-deno@v2
+      with:
+        deno-version: ${{ env.DENO_VERSION }}
     - name: Setup Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -34,56 +53,93 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
     - uses: actions/setup-python@v6
       with:
-        python-version: '3.11' 
+        python-version: '3.11'
     - name: cargo test
       working-directory: ./src
-      if: ${{inputs.enable_tests == true}}
+      if: ${{ inputs.enable_tests }}
       run: cargo test -- --test-threads=1
-    - name: install buckyos devkit
-      run: pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git"
-    - name: build buckyos
+    - name: Install BuckyOS devkit
+      run: |
+        python -m pip install "buckyos-devkit @ git+https://github.com/buckyos/buckyos-devkit.git@main"
+        if ($LASTEXITCODE -ne 0) {
+          throw "Devkit installation failed with exit code $LASTEXITCODE"
+        }
+        python -c "import sys, yaml; print('Python:', sys.executable); print('PyYAML:', yaml.__version__)"
+    - name: Build BuckyOS
       working-directory: ./src
-      run: buckyos-build
-      env:
-        PYTHONIOENCODING: 'utf-8'
-        PYTHONLEGACYWINDOWSSTDIO: "utf-8"
-    - name: Get Version
-      id: get_version
+      run: python buckyos-build.py --app=buckyos --target=${{ inputs.arch }}-pc-windows-msvc
+    - name: Install staged payload
+      working-directory: ./src
       shell: pwsh
       run: |
-        $version = (& './src/rootfs/bin/node-daemon/node_daemon' --version)
-
-        if ($version -match '\d+(?:\.\d+)*\+build\S+') {
-            $full_version = $matches[0]
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "full_version=$full_version"
+        $stageRoot = Join-Path $env:RUNNER_TEMP 'staged'
+        $payloadRoot = Join-Path $stageRoot 'buckyos'
+        if (Test-Path $stageRoot) {
+          Remove-Item -Recurse -Force $stageRoot
         }
-
-        if ($version -match '\d+(?:\.\d+)*\+build\d+') {
-            $short_version = $matches[0]
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "short_version=$short_version"
+        New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
+        buckyos-install --app=buckyos --all "--target-rootfs=$payloadRoot"
+        if ($LASTEXITCODE -ne 0) {
+          throw "buckyos-install failed with exit code $LASTEXITCODE"
         }
-    - name: Prepare tools
-      run: |
-        mkdir tools
-        copy src\rootfs\bin\buckycli\buckycli.exe tools
-    - name: Upload tools
-      uses: actions/upload-artifact@v6
+        if (-not (Get-ChildItem -Force $payloadRoot | Select-Object -First 1)) {
+          throw "staged BuckyOS payload is empty: $payloadRoot"
+        }
+    - name: Download paios_images.json
+      if: ${{ inputs.paios_images }}
+      uses: actions/download-artifact@v6
       with:
-        name: buckyos-tools-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}-${{steps.get_version.outputs.short_version}}
-        path: tools
-        if-no-files-found: error
-    - name: Upload
-      id: upload
-      uses: actions/upload-artifact@v6
-      with:
-        name: buckyos-windows-${{inputs.arch == 'x86_64' && 'amd64' || 'aarch64'}}-${{steps.get_version.outputs.short_version}}
-        path: src/rootfs
-        if-no-files-found: error
-    - name: Report Upload Urls
+        name: paios-images-manifest
+        path: ${{ runner.temp }}/paios-images-manifest
+    - name: Pin paios images
+      if: ${{ inputs.paios_images }}
+      shell: pwsh
       run: |
-        npm install @buckyos/test-server-client
-        npx test-server-client seturl buckyos ${{steps.get_version.outputs.short_version}} windows ${{inputs.arch}} ${{steps.upload.outputs.artifact-url}} ${{github.sha}}
+        $manifest = Join-Path $env:RUNNER_TEMP 'staged/buckyos/bin/paios-images/paios_images.json'
+        Copy-Item (Join-Path $env:RUNNER_TEMP 'paios-images-manifest/paios_images.json') $manifest
+        python .github/scripts/paios_images.py validate $manifest
+        if ($LASTEXITCODE -ne 0) {
+          throw "paios_images.json validation failed with exit code $LASTEXITCODE"
+        }
+    - name: Get staged BuckyOS version
+      id: version
+      shell: pwsh
+      run: |
+        $binary = Join-Path $env:RUNNER_TEMP 'staged\buckyos\bin\node-daemon\node_daemon.exe'
+        $versionOutput = (& $binary --version) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+          throw "node_daemon --version failed with exit code $LASTEXITCODE"
+        }
+        $versionMatch = [regex]::Match($versionOutput, '\d+(?:\.\d+)*\+build\d+')
+        if (-not $versionMatch.Success) {
+          throw "Unable to parse BuckyOS version from: $versionOutput"
+        }
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "value=$($versionMatch.Value)"
+    - name: Add installation descriptor
+      working-directory: ./src
+      shell: pwsh
       env:
-        USERNAME: ${{ secrets.TEST_SERVER_USERNAME }}
-        PRIVATE_KEY: ${{ secrets.TEST_SERVER_PRIVATE_KEY }}
-        ENDPOINT: "https://buckyos.ai"
+        PAYLOAD_VERSION: ${{ steps.version.outputs.value }}
+        PAYLOAD_PLATFORM: ${{ inputs.arch == 'x86_64' && 'amd64-windows' || 'arm64-windows' }}
+      run: |
+        $payloadRoot = Join-Path $env:RUNNER_TEMP 'staged/buckyos'
+        python ../.github/scripts/write-install-descriptor.py --project bucky_project.yaml --component buckyos --root $payloadRoot --version $env:PAYLOAD_VERSION --platform $env:PAYLOAD_PLATFORM
+        if ($LASTEXITCODE -ne 0) {
+          throw "Installation descriptor generation failed with exit code $LASTEXITCODE"
+        }
+    - name: Archive staged payload
+      shell: pwsh
+      run: |
+        $stageRoot = Join-Path $env:RUNNER_TEMP 'staged'
+        $archivePath = Join-Path $env:RUNNER_TEMP "buckyos-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz"
+        tar -czf $archivePath -C $stageRoot .
+        if ($LASTEXITCODE -ne 0) {
+          throw "tar failed with exit code $LASTEXITCODE"
+        }
+    - name: Upload staged artifact
+      uses: actions/upload-artifact@v6
+      with:
+        name: buckyos-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}
+        path: ${{ runner.temp }}/buckyos-windows-${{ inputs.arch == 'x86_64' && 'amd64' || 'aarch64' }}-${{ steps.version.outputs.value }}.tar.gz
+        if-no-files-found: error
+        compression-level: 0

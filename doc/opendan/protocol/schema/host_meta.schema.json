@@ -1,0 +1,410 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "EventReceipt": {
+      "description": "A semi-subscription state version a batch actually injected.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/EventSource"
+        },
+        "subscription_id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "source"
+      ],
+      "type": "object"
+    },
+    "EventSource": {
+      "description": "Where an event comes from.",
+      "properties": {
+        "id": {
+          "default": "",
+          "description": "object: object id; session: sid; task: task_id; timer: timer name; system: may be empty.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`object | session | task | timer | system`; unknown kinds are not a format error (an event without a matching subscription is dropped).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "InputReceipt": {
+      "description": "Structured receipt of one input batch that entered the context. Persisted inside the run snapshot together with its 1–2 messages; recovery completes state from it and never renders again.",
+      "properties": {
+        "after_step": {
+          "default": 0,
+          "description": "Behavior runs: `next_step_index` when the batch was injected (orders a `request_input` message among the steps).",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "bootstrap": {
+          "default": false,
+          "type": "boolean"
+        },
+        "events": {
+          "description": "Semi-subscription state versions the snapshot message injected; cleared from `pending_events` by exact `(subscription_id, source, key)` (and `seq` when present).",
+          "items": {
+            "$ref": "#/definitions/EventReceipt"
+          },
+          "type": "array"
+        },
+        "extra": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "hook": {
+          "description": "`on_init | on_input | on_context_switch`.",
+          "type": "string"
+        },
+        "input_seq": {
+          "description": "Monotonic within the run; batch id = (run_id, input_seq).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "inputs": {
+          "description": "Delivery positions of the msg / Input events this batch consumed.",
+          "items": {
+            "$ref": "#/definitions/InputRef"
+          },
+          "type": "array"
+        },
+        "opens_turn": {
+          "default": false,
+          "description": "`true` when this batch opened the Turn; hand-over and supplementary batches join the open Turn.",
+          "type": "boolean"
+        },
+        "parts": {
+          "description": "The 1–2 messages of the batch, in injection order.",
+          "items": {
+            "$ref": "#/definitions/ReceiptPart"
+          },
+          "type": "array"
+        },
+        "reply": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ReplyRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Default reply path after this batch."
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "turn": {
+          "description": "Logical Turn the batch belongs to (`SessionState.open_turn`).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "at_ms",
+        "hook",
+        "input_seq",
+        "run_id",
+        "turn"
+      ],
+      "type": "object"
+    },
+    "InputRef": {
+      "description": "Stable reference to one consumed input instance.",
+      "properties": {
+        "index": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "key": {
+          "type": "string"
+        },
+        "kind": {
+          "description": "`msg | event | control`.",
+          "type": "string"
+        },
+        "src": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "src"
+      ],
+      "type": "object"
+    },
+    "MessagePos": {
+      "description": "Where a message of a receipt batch lives inside the snapshot.",
+      "oneOf": [
+        {
+          "description": "In `request.input` (behavior runs before their first step).",
+          "properties": {
+            "index": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "request_input"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "index",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "In `state.accumulated` (function-call runs).",
+          "properties": {
+            "index": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "accumulated"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "index",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Merged into a behavior step's `next_user_message`.",
+          "properties": {
+            "index": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "kind": {
+              "enum": [
+                "step"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "index",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReceiptPart": {
+      "description": "One message injected by a batch.",
+      "properties": {
+        "brief": {
+          "description": "One line standing for the message once it is history (a Goal header is not repeated in full by later Activations).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "part": {
+          "description": "`goal_activation | semi_subscription_snapshot | input`.",
+          "type": "string"
+        },
+        "pos": {
+          "$ref": "#/definitions/MessagePos"
+        },
+        "text": {
+          "description": "The message's text block (evidence, worklog `user_message`). Image / document blocks are not repeated: read them at `pos` in the snapshot.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "part",
+        "pos",
+        "text"
+      ],
+      "type": "object"
+    },
+    "ReplyRoute": {
+      "description": "Default reply path of a session.",
+      "oneOf": [
+        {
+          "description": "Reply the way the last consumed input message came.",
+          "properties": {
+            "kind": {
+              "description": "MsgObject kind of the reply.",
+              "type": "string"
+            },
+            "reply_to": {
+              "default": null,
+              "description": "ObjId of the message replied to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "route": {
+              "enum": [
+                "message"
+              ],
+              "type": "string"
+            },
+            "to": {
+              "description": "The sender (one-to-one) or the group.",
+              "type": "string"
+            },
+            "to_session": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tunnel": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "route",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Hand the result back to the parent session.",
+          "properties": {
+            "route": {
+              "enum": [
+                "parent_session"
+              ],
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "route",
+            "session_id"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "description": "libopendan host metadata stored in `LLMContextState.host[\"libopendan\"]`.",
+  "properties": {
+    "base_input_len": {
+      "default": 0,
+      "description": "Number of `request.input` messages assembled by the host before the run's first input batch (system + history). Messages after it belong to the run.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "epoch_input_seq": {
+      "description": "Receipts with `input_seq ≤` this belong to earlier epochs: their message positions no longer apply (their identity still does).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "epoch_turn": {
+      "description": "Turn in effect when the current epoch started.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "history_epoch": {
+      "description": "Mid-run history rewrites (context limit) of this run so far. Each rewrite starts a new epoch: the run's history before it is in the worklog, `request.input` is rebuilt from the session history.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "inherited_below": {
+      "default": 0,
+      "description": "Fork child runs: steps with `step_index` below this were inherited from the parent process and are never flushed by this run.",
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "input_receipts": {
+      "default": [],
+      "items": {
+        "$ref": "#/definitions/InputReceipt"
+      },
+      "type": "array"
+    },
+    "media_degraded": {
+      "description": "The run's inline media blocks were removed once after the provider refused the request (`input.media = inline` degraded to references); it is not tried again.",
+      "type": "boolean"
+    },
+    "observed": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Background lines shown after tool results (`[input] background = \"after_tools\"`): line key → digest of the text last shown. Committed with the message that showed them, so a crash before that commit shows them again and one after it never twice.",
+      "type": "object"
+    },
+    "observed_epoch": {
+      "description": "The history epoch `observed` belongs to: after a rewrite the lines are shown afresh.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "process_entry": {
+      "description": "Behavior process entry the run belongs to.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id"
+  ],
+  "title": "HostMeta",
+  "type": "object"
+}

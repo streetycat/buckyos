@@ -1,14 +1,14 @@
 import { Network, Zap, Cpu, Globe, Cloud, Server } from 'lucide-react'
 import { StatusBadge } from '../shared/StatusBadge'
 import { LongField } from '../shared/LongField'
-import type { ProviderView } from '../../../../api/aicc_mgr'
-import type { AuthStatus } from '../../../../api/aicc_mgr'
+import { isManagedSnProvider, type AuthStatus, type ProviderView } from '../../../../api/aicc_mgr'
+import { useI18n } from '../../../../i18n/provider'
 
 const providerIcons: Record<string, typeof Network> = {
-  sn_router: Network,
+  sn: Network,
   openai: Zap,
-  anthropic: Cpu,
-  google: Globe,
+  claude: Cpu,
+  gemini: Globe,
   openrouter: Cloud,
   custom: Server,
 }
@@ -29,9 +29,16 @@ interface ProviderCardProps {
 }
 
 export function ProviderCard({ provider, selected, onClick }: ProviderCardProps) {
+  const { t } = useI18n()
   const Icon = providerIcons[provider.config.provider_type] ?? Server
   const modelCount = provider.status.discovered_models.length
   const degradedCount = provider.status.discovered_models.filter((m) => m.health.status !== 'available').length
+  const managedSn = isManagedSnProvider(provider)
+  const statusVariant = !provider.config.enabled
+    ? 'unknown'
+    : provider.status.model_sync_status === 'failed'
+    ? 'warning'
+    : authStatusToVariant(provider.status.auth_status)
 
   return (
     <button
@@ -46,14 +53,26 @@ export function ProviderCard({ provider, selected, onClick }: ProviderCardProps)
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
         <LongField value={provider.config.name} className="text-sm font-medium" copyable={false} />
         <LongField
-          value={`${provider.config.provider_instance_name}/${provider.config.provider_driver}`}
+          value={`${provider.config.provider_instance_name}/${provider.config.provider_profile_id}`}
           className="text-[11px]"
           tone="muted"
           copyable={false}
         />
+        {managedSn && (
+          <span className="text-[11px]" style={{ color: 'var(--cp-muted)' }}>
+            {t('aiCenter.providers.systemManaged', 'System managed')}
+          </span>
+        )}
       </div>
       <div className="flex shrink-0 flex-col items-end gap-1">
-        <StatusBadge status={authStatusToVariant(provider.status.auth_status)} />
+        <StatusBadge
+          status={statusVariant}
+          label={!provider.config.enabled
+            ? t('aiCenter.providers.disabled', 'Disabled')
+            : provider.status.model_sync_status === 'failed'
+            ? t('aiCenter.providers.syncFailedShort', 'Sync failed')
+            : undefined}
+        />
         <span className="text-[11px]" style={{ color: 'var(--cp-muted)' }}>
           {modelCount}{degradedCount > 0 ? `/${degradedCount}` : ''}
         </span>

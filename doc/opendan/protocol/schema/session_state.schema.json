@@ -1,0 +1,2676 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "Acceptance": {
+      "enum": [
+        "n/a",
+        "pending",
+        "accepted",
+        "discarded"
+      ],
+      "type": "string"
+    },
+    "ActivationBudget": {
+      "additionalProperties": false,
+      "description": "Hard limits of one Activation (accumulated over its runs).",
+      "properties": {
+        "max_runs": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_total_tokens": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ActivationCost": {
+      "properties": {
+        "runs": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "total_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ActivationDecision": {
+      "oneOf": [
+        {
+          "enum": [
+            "acted",
+            "created_work",
+            "needs_info"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Looked, nothing to do now (not \"achieved\").",
+          "enum": [
+            "no_action"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "No valid result was submitted.",
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "ActivationOutcome": {
+      "enum": [
+        "completed",
+        "failed",
+        "budget_exhausted",
+        "stopped",
+        "needs_input"
+      ],
+      "type": "string"
+    },
+    "ActivationReason": {
+      "properties": {
+        "key": {
+          "description": "Input key.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/ActivationReasonKind"
+        },
+        "missed": {
+          "description": "Slots that passed while no fire was possible (`scheduled`).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "description": "Work sid (`child`), message key (`feedback`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "ActivationReasonKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "created",
+            "scheduled",
+            "manual",
+            "reopened",
+            "restarted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A Work of the Goal finished (or needs attention).",
+          "enum": [
+            "child"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A message handed over from a UI.",
+          "enum": [
+            "feedback"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Any other subscribed event (a followed task, an object).",
+          "enum": [
+            "event"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A question of the Goal was answered (or closed) by the user: `ref` is its notification.",
+          "enum": [
+            "answer"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Activity": {
+      "description": "What this session is doing and roughly what it modifies (§6.7).",
+      "properties": {
+        "heartbeat_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        },
+        "touching": {
+          "items": {
+            "$ref": "#/definitions/Touching"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "CallTrigger": {
+      "description": "How a sub context was called, i.e. where its result returns to.",
+      "oneOf": [
+        {
+          "description": "`next_behavior` of a complete Step: the result returns as `process_result` in the caller's hand-over batch.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "behavior"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A tool call / behavior action: the caller is suspended on `PendingTool`, the result is filled as the tool result of `call_id`.",
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "tool"
+              ],
+              "type": "string"
+            },
+            "task_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "call_id",
+            "kind",
+            "task_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CandidateKind": {
+      "enum": [
+        "goal",
+        "schedule"
+      ],
+      "type": "string"
+    },
+    "CandidateStatus": {
+      "enum": [
+        "proposed",
+        "needs_confirmation",
+        "approved",
+        "materializing",
+        "created",
+        "linked",
+        "rejected",
+        "expired",
+        "blocked"
+      ],
+      "type": "string"
+    },
+    "ChildCall": {
+      "description": "The sub context a `Caller` frame waits for.",
+      "properties": {
+        "behavior": {
+          "type": "string"
+        },
+        "mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ContextMode"
+            }
+          ],
+          "description": "`create_sub_context | fork` (how the child was constructed)."
+        },
+        "task": {
+          "description": "Task given to the child (tool trigger: the call's `task` argument; a Todo executor: the admitted Todo's body).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "todo": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TodoBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The serial Todo attempt this call executes."
+        },
+        "trigger": {
+          "$ref": "#/definitions/CallTrigger"
+        }
+      },
+      "required": [
+        "behavior",
+        "mode",
+        "trigger"
+      ],
+      "type": "object"
+    },
+    "ConsolidationReceipt": {
+      "description": "One batch of one Activation of the consolidation Goal (§4.1).",
+      "properties": {
+        "activation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "batch": {
+          "description": "The complete `Batch` (replayed into the commit as it was read)."
+        },
+        "batch_id": {
+          "type": "string"
+        },
+        "cleanup_pending": {
+          "default": false,
+          "type": "boolean"
+        },
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "dispositions": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "graph_seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memory_occasion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation_id": {
+          "description": "Stable operation id = Memory idempotency key.",
+          "type": "string"
+        },
+        "operations": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "plan": {
+          "description": "The complete `ConsolidationCommit` once submitted."
+        },
+        "refs": {
+          "default": [],
+          "description": "Materials that may be disposed by this batch.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "stage": {
+          "$ref": "#/definitions/ReceiptStage"
+        },
+        "updated_at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "activation",
+        "batch",
+        "batch_id",
+        "created_at_ms",
+        "epoch",
+        "graph_seq",
+        "operation_id",
+        "stage"
+      ],
+      "type": "object"
+    },
+    "ContextMode": {
+      "description": "How a behavior is entered when a hand-over (`next_behavior`) or a `call_behavior` tool call names it. Decided by the target behavior, never by the session as a whole; there is no default mode.",
+      "oneOf": [
+        {
+          "description": "The target has its own context (system, tools, history, run): created on first entry, resumed from its own snapshot afterwards.",
+          "enum": [
+            "switch_context"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A new sub context per call with the target's system and task input, plus an explicit selection of the caller's history; its result returns to the caller.",
+          "enum": [
+            "create_sub_context"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A new branch per call that keeps the caller's system and its complete effective history at the fork point; its result returns to the caller.",
+          "enum": [
+            "fork"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EpochEnd": {
+      "oneOf": [
+        {
+          "enum": [
+            "archived",
+            "achieved"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A restart opened the next epoch (the Work keeps running).",
+          "enum": [
+            "restarted"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "EventSource": {
+      "description": "Where an event comes from.",
+      "properties": {
+        "id": {
+          "default": "",
+          "description": "object: object id; session: sid; task: task_id; timer: timer name; system: may be empty.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`object | session | task | timer | system`; unknown kinds are not a format error (an event without a matching subscription is dropped).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "FrameRole": {
+      "description": "Why a run sits in `process_stack`.",
+      "oneOf": [
+        {
+          "description": "A context left through SWITCH_CONTEXT: re-entered when a hand-over names its entry again.",
+          "enum": [
+            "parked"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The caller of a sub context (create-sub-context / fork): live again when the child returns.",
+          "enum": [
+            "caller"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "GoalActivation": {
+      "description": "One line of `activations.jsonl`.",
+      "properties": {
+        "cost": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ActivationCost"
+            }
+          ],
+          "default": {
+            "runs": 0,
+            "total_tokens": 0
+          }
+        },
+        "decision": {
+          "$ref": "#/definitions/ActivationDecision"
+        },
+        "end_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ended_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "goal_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outcome": {
+          "$ref": "#/definitions/ActivationOutcome"
+        },
+        "reasons": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ActivationReason"
+          },
+          "type": "array"
+        },
+        "report_ref": {
+          "description": "Where the full report is (`worklog:<sid>:turn:<seq>`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "description": "The submitted Goal result, as accepted."
+        },
+        "schema": {
+          "type": "string"
+        },
+        "seq": {
+          "description": "= the Turn index of the epoch's Goal Session.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        },
+        "works_absorbed": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "works_created": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "decision",
+        "ended_at_ms",
+        "epoch",
+        "goal_id",
+        "goal_revision",
+        "outcome",
+        "schema",
+        "seq",
+        "session_id",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
+    "GoalDistance": {
+      "properties": {
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "observed_at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "unknowns": {
+          "description": "What is not known (never \"no change\").",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "GoalEnding": {
+      "description": "How the Goal Session ends (decided by its Goal).",
+      "properties": {
+        "cascade": {
+          "default": false,
+          "description": "The Goal's running Work is stopped too (archive).",
+          "type": "boolean"
+        },
+        "end": {
+          "$ref": "#/definitions/EpochEnd"
+        },
+        "outcome": {
+          "$ref": "#/definitions/Outcome"
+        },
+        "reason": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "end",
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "GoalQuestion": {
+      "properties": {
+        "activation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "answer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "candidate_id": {
+          "description": "The maintenance candidate this question confirms (§5.1).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "notify_id": {
+          "description": "The notification that asks it (none: not sent, or no notification service).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalQuestionStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "activation",
+        "at_ms",
+        "epoch",
+        "text"
+      ],
+      "type": "object"
+    },
+    "GoalQuestionStatus": {
+      "enum": [
+        "open",
+        "answered",
+        "dismissed",
+        "expired",
+        "canceled"
+      ],
+      "type": "string"
+    },
+    "GoalSessionState": {
+      "description": "`state.json.goal` of a Goal Session: the Goal State the session owns (committed with the session, published to `state/goals/<id>/state.json` afterwards), Activation records not appended yet, the open Activation.",
+      "properties": {
+        "activation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenActivation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ending": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalEnding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "published_rev": {
+          "default": 0,
+          "description": "`state.rev` published last.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/definitions/GoalState"
+        },
+        "unwritten": {
+          "items": {
+            "$ref": "#/definitions/GoalActivation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "epoch",
+        "goal_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "GoalSkill": {
+      "description": "A method / capability the Goal works with (architecture §10.2).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "description": "Where it is read (path, object id, behavior name).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "GoalState": {
+      "description": "`state.json`.",
+      "properties": {
+        "absorbed": {
+          "description": "Work whose end was taken in by an Activation (any epoch; bounded).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "active_works": {
+          "items": {
+            "$ref": "#/definitions/GoalWork"
+          },
+          "type": "array"
+        },
+        "current_skills": {
+          "items": {
+            "$ref": "#/definitions/GoalSkill"
+          },
+          "type": "array"
+        },
+        "distance": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalDistance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "goal_revision_seen": {
+          "default": 0,
+          "description": "Goal revision the last Activation worked with.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "last_activation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LastActivation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_error": true,
+        "maintenance": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MaintenanceState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The consolidation Goal's typed maintenance state (receipts, candidates, consolidation summary); committed with the session."
+        },
+        "pending": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "questions": {
+          "description": "Questions for the user: sent as notifications when the host has a notification service; answers come back as `answer` Activations.",
+          "items": {
+            "$ref": "#/definitions/GoalQuestion"
+          },
+          "type": "array"
+        },
+        "recent_works": {
+          "items": {
+            "$ref": "#/definitions/RecentWork"
+          },
+          "type": "array"
+        },
+        "rev": {
+          "description": "Monotonic; every published change.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "usage": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoalUsage"
+            }
+          ],
+          "default": {
+            "activations": 0,
+            "period_start_ms": 0,
+            "tokens": 0,
+            "work_tokens": 0,
+            "works": 0
+          }
+        }
+      },
+      "required": [
+        "epoch",
+        "goal_id",
+        "rev",
+        "schema"
+      ],
+      "type": "object"
+    },
+    "GoalUsage": {
+      "description": "Usage of the current statistics period.",
+      "properties": {
+        "activations": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "period_start_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tokens": {
+          "default": 0,
+          "description": "Tokens of the Goal Session's Activations.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "work_tokens": {
+          "default": 0,
+          "description": "Tokens of the Work absorbed in the period.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "works": {
+          "default": 0,
+          "description": "Work created in the period.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "period_start_ms"
+      ],
+      "type": "object"
+    },
+    "GoalWork": {
+      "description": "A Work of the Goal not absorbed yet.",
+      "properties": {
+        "created_in_activation": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "goal_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "objective": {
+          "default": "",
+          "type": "string"
+        },
+        "sid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "created_in_activation",
+        "epoch",
+        "goal_revision",
+        "sid"
+      ],
+      "type": "object"
+    },
+    "InputPos": {
+      "description": "Delivery position of a bus record.",
+      "properties": {
+        "index": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "src": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "src"
+      ],
+      "type": "object"
+    },
+    "LastActivation": {
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "decision": {
+          "$ref": "#/definitions/ActivationDecision"
+        },
+        "epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "outcome": {
+          "$ref": "#/definitions/ActivationOutcome"
+        },
+        "reasons": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ActivationReason"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "summary": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at_ms",
+        "decision",
+        "epoch",
+        "outcome",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "LiveRun": {
+      "description": "A run that is not finished yet (xllm run directory).",
+      "properties": {
+        "applied_input_seq": {
+          "default": 0,
+          "description": "Receipt batches of this run already applied to state (§8.3).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_epoch": {
+          "description": "History epoch (`HostMeta.history_epoch`) `flushed_message_count` counts in. A snapshot of a newer epoch starts at zero: its whole history before the rewrite was flushed before the rewrite was published.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_input_seq": {
+          "default": 0,
+          "description": "Behavior runs: receipts (injected messages) with `input_seq ≤` this are in the worklog.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_message_count": {
+          "description": "Function call runs: messages after the history prefix (within `flushed_epoch`) already in the worklog.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_step_index": {
+          "description": "Behavior runs: steps with `step_index <` this are in the worklog (identity high-water mark, not a count: inherited steps of a fork child and steps rewritten away are never written).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "handover_at_ms": {
+          "description": "`at_ms` of the run's hand-over record (run.json `handover`) this state already committed: a record with this stamp is not a transfer left to do.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "process_entry": {
+          "description": "Process entry the run belongs to (behavior process ↔ run).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "turns": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/TurnInputs"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "MaintenanceCandidate": {
+      "description": "A Goal / schedule the consolidation discovered (§5.1). P0 freezes the contract; discovery and confirmation are P1.",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "approved_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "approved_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approved_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "authorization_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "candidate_id": {
+          "type": "string"
+        },
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "estimated_budget": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expected_effects": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expires_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "intent_basis": {
+          "description": "`explicit | inferred`.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/definitions/CandidateKind"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "linked_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "missing_fields": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "notify_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operation_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proposed": true,
+        "question_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "review_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scope": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "semantic_key": {
+          "type": "string"
+        },
+        "source_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/CandidateStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "candidate_id",
+        "created_at_ms",
+        "intent_basis",
+        "kind",
+        "revision",
+        "semantic_key",
+        "status",
+        "title"
+      ],
+      "type": "object"
+    },
+    "MaintenanceState": {
+      "description": "`GoalState.maintenance` of the consolidation Goal.",
+      "properties": {
+        "abandoned_batches": {
+          "default": 0,
+          "description": "Batches read but never committed (recovery dropped them; the material stays for the next batch).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "candidates": {
+          "items": {
+            "$ref": "#/definitions/MaintenanceCandidate"
+          },
+          "type": "array"
+        },
+        "consolidations": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "dispositions": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_successful_consolidation_at_ms": {
+          "description": "Last commit that really changed or disposed something.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "operations": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "receipts": {
+          "items": {
+            "$ref": "#/definitions/ConsolidationReceipt"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "OpenActivation": {
+      "description": "The Activation in progress of a Goal Session (= its open Turn).",
+      "properties": {
+        "absorbed": {
+          "description": "Work whose end it consumed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "budget": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ActivationBudget"
+            }
+          ],
+          "default": {},
+          "description": "Effective limits, frozen when it opened. Its tokens and runs are those of the `usage.jsonl` records after `usage_offset`."
+        },
+        "goal_revision": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "reasons": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ActivationReason"
+          },
+          "type": "array"
+        },
+        "seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "started_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "usage_offset": {
+          "default": 0,
+          "description": "Length of the session's `usage.jsonl` when it opened: its tokens are the records after it.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "goal_revision",
+        "seq",
+        "started_at_ms"
+      ],
+      "type": "object"
+    },
+    "OpenTurn": {
+      "description": "The logical Turn in progress (one Input → result of the AgentSession).\n\nOpened by the first input batch committed while no Turn is open (bootstrap, msg / event). Context switches, sub context calls and returns, observation injections, resumable suspensions (interrupt, retryable error, context limit, pending tool), history epoch rewrites and restarts keep it open; inputs consumed while it is open join it. Only the session closes it, when it interprets an outcome as the Turn's result or failure ([`TurnStatus`]).",
+      "properties": {
+        "at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "has_msg": {
+          "description": "A message (not only events) is among them.",
+          "type": "boolean"
+        },
+        "hook": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "index": {
+          "description": "Session-wide Turn number, starting at 1.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "input_seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "inputs": {
+          "description": "msg / event inputs that make up the Turn's logical input: those of the opening batch, then those consumed while it was open.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "run_id": {
+          "description": "Input batch that opened it: `(run_id, input_seq)`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at_ms",
+        "index",
+        "input_seq",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "OutboxEntry": {
+      "description": "One outbound message of a session.",
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "deliveries": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "Idempotency key: `(sid, turn, run_id, n)`.",
+          "type": "string"
+        },
+        "msg": {
+          "description": "The complete message, `created_at_ms` included: re-sent unchanged."
+        },
+        "msg_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "$ref": "#/definitions/OutboxPurpose"
+        },
+        "status": {
+          "$ref": "#/definitions/OutboxStatus"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "updated_at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "key",
+        "msg",
+        "status",
+        "turn"
+      ],
+      "type": "object"
+    },
+    "OutboxPurpose": {
+      "description": "What an outbox entry is for.",
+      "oneOf": [
+        {
+          "description": "The reply of a Turn as a message of its own.",
+          "enum": [
+            "reply"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "\"Accepted, working on it\": sent while the Turn is open, replaced by the Turn's final edit.",
+          "enum": [
+            "placeholder"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The reply of a Turn as an edit of its placeholder.",
+          "enum": [
+            "final_edit"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A question to the user while the Turn is open (`ask-user`): a `thread` message on the placeholder, carrying `agent_ask`.",
+          "enum": [
+            "question"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "OutboxStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "sent"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Not handed to the outbound sink yet, or the hand-over failed in a way worth retrying.",
+          "enum": [
+            "pending"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refused (route mismatch, rejected by the message service); never retried.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Outcome": {
+      "enum": [
+        "succeeded",
+        "failed",
+        "stopped"
+      ],
+      "type": "string"
+    },
+    "PendingEvent": {
+      "description": "Semi-subscription state waiting to be injected: the newest version of one `(subscription_id, source)`, its terminal event kept separately. Saved when received (the delivery is then consumed); cleared only by the receipt of the batch that injected exactly these versions, by `unsubscribe`, or replaced by a newer version.",
+      "properties": {
+        "latest": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PendingEventVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "source": {
+          "$ref": "#/definitions/EventSource"
+        },
+        "subscription_id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "superseded": {
+          "default": 0,
+          "description": "Versions replaced before they were injected.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PendingEventVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Never replaced by later non-terminal versions."
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "PendingEventVersion": {
+      "description": "One version of an observed source's state.",
+      "properties": {
+        "data_ref": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "event": {
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InputPos"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Where it was delivered (`None`: synthesized by the runner, e.g. a pull-mode session subscription)."
+        },
+        "key": {
+          "type": "string"
+        },
+        "received_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "seq": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event",
+        "key",
+        "received_at_ms",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ProcessFrame": {
+      "description": "Suspended behavior process (its run is kept, §4.4).",
+      "properties": {
+        "applied_input_seq": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "call": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ChildCall"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`Caller` frames: the child being waited for."
+        },
+        "entry": {
+          "type": "string"
+        },
+        "flushed_epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_input_seq": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_message_count": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "flushed_step_index": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "handover_at_ms": {
+          "description": "`at_ms` of the hand-over record this suspension committed (see [`LiveRun::handover_at_ms`]).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "role": {
+          "$ref": "#/definitions/FrameRole"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "turns": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/TurnInputs"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entry",
+        "role",
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "ReceiptStage": {
+      "description": "Stage of a consolidation receipt (§4.1): each step is re-entrant, a crash resumes from the stage it reached.",
+      "oneOf": [
+        {
+          "description": "The batch was read (and, with `plan`, the plan persisted).",
+          "enum": [
+            "prepared"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The Memory envelope is committed under `operation_id`.",
+          "enum": [
+            "memory_committed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Candidates are published to the Goal State.",
+          "enum": [
+            "published"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Cleanup of the disposed bodies ran (retried on its own when it failed: `cleanup_pending`).",
+          "enum": [
+            "completed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The commit was refused for good (a stale lease); needs attention.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "RecentKeys": {
+      "description": "Bounded dedup cache of producer `key`s (§4.5). It only filters duplicate deliveries; it never replaces the receipts persisted in snapshots or the per-source consumption positions.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "RecentWork": {
+      "properties": {
+        "absorbed_in": {
+          "description": "`(epoch, activation)` that absorbed it.",
+          "items": [
+            {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          ],
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "one_line_status": {
+          "default": "",
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Outcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "report_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "absorbed_in",
+        "sid"
+      ],
+      "type": "object"
+    },
+    "ReplyRoute": {
+      "description": "Default reply path of a session.",
+      "oneOf": [
+        {
+          "description": "Reply the way the last consumed input message came.",
+          "properties": {
+            "kind": {
+              "description": "MsgObject kind of the reply.",
+              "type": "string"
+            },
+            "reply_to": {
+              "default": null,
+              "description": "ObjId of the message replied to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "route": {
+              "enum": [
+                "message"
+              ],
+              "type": "string"
+            },
+            "to": {
+              "description": "The sender (one-to-one) or the group.",
+              "type": "string"
+            },
+            "to_session": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tunnel": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "route",
+            "to"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Hand the result back to the parent session.",
+          "properties": {
+            "route": {
+              "enum": [
+                "parent_session"
+              ],
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "route",
+            "session_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReportArtifact": {
+      "description": "One artifact of a report: a file of the work directory (`path`, copied to `reference`), a named object (`path` is its id) or a bucket object (`path` is its `obj://bucket/...`). `obj_id` is what leaves the session: the submitted id, or what the host's object store keeps (`None`: the host has no object store); `url` is the host's bucket binding that retains it, after which the copy at `reference` is removed.",
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "obj_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ReportSource": {
+      "oneOf": [
+        {
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "tool"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "call_id",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "behavior"
+              ],
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ReportSubmission": {
+      "properties": {
+        "accepted_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "artifacts": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ReportArtifact"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "is_end": {
+          "type": "boolean"
+        },
+        "report": {
+          "type": "string"
+        },
+        "result": true,
+        "run_id": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/definitions/ReportSource"
+        }
+      },
+      "required": [
+        "accepted_at_ms",
+        "id",
+        "is_end",
+        "report",
+        "run_id",
+        "source"
+      ],
+      "type": "object"
+    },
+    "RunState": {
+      "enum": [
+        "created",
+        "ready",
+        "running",
+        "waiting",
+        "finished"
+      ],
+      "type": "string"
+    },
+    "SourceProgress": {
+      "description": "Consumption progress of one input source (§4.5).",
+      "properties": {
+        "accepted": {
+          "description": "Input events accepted by an active subscription that are still pending: their routing was decided when they were first seen, so a later `unsubscribe` does not turn them into dropped events.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "acked_index": {
+          "default": 0,
+          "description": "Highest index acknowledged-able: every index ≤ this was consumed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "consumed_above": {
+          "description": "Consumed indices above `acked_index` (selective consumption).",
+          "items": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "TodoBinding": {
+      "description": "A sub context call bound to a serial Todo attempt (TodoList §2.1): its result is written back to that attempt when the call returns.",
+      "properties": {
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "todo_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempt",
+        "todo_id"
+      ],
+      "type": "object"
+    },
+    "Topic": {
+      "properties": {
+        "tags": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "Touching": {
+      "properties": {
+        "kind": {
+          "description": "`path | object | artifact`.",
+          "type": "string"
+        },
+        "mode": {
+          "default": "write",
+          "description": "`read | write`.",
+          "type": "string"
+        },
+        "ref": {
+          "type": "string"
+        },
+        "since_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "type": "object"
+    },
+    "TurnInputs": {
+      "description": "Inputs of one logical Turn that entered a run. The input batch that opens the Turn (or the first batch of an already open Turn in this run) starts an entry; later batches of the same Turn (hand-over, observation, supplementary input) extend it, so the list grows with Turns, not with batches.",
+      "properties": {
+        "at_ms": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "events": {
+          "description": "Keys of the semi-subscription state versions injected with them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hook": {
+          "description": "Controlled input of the first batch (`on_init`, `on_input`, `on_context_switch`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_seq": {
+          "default": 0,
+          "description": "`input_seq` of the first batch of this Turn in the run.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "inputs": {
+          "description": "Stable input ids, e.g. `q#121`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "turn"
+      ],
+      "type": "object"
+    },
+    "TurnStatus": {
+      "description": "How a logical Turn ended (decided by the session from the outcome and the hand-over state, never by the waist alone).",
+      "oneOf": [
+        {
+          "description": "A result was delivered (final answer, a reply before waiting for input, or the session finished).",
+          "enum": [
+            "completed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A non-recoverable error ended the run.",
+          "enum": [
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The run's budget was exhausted.",
+          "enum": [
+            "budget_exhausted"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "`control(stop)`.",
+          "enum": [
+            "stopped"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "TurnTask": {
+      "description": "A Turn and the task the host's task service keeps for it. Written when the task was created (the Turn is open), closed in the commit that closes the Turn, `reported` once the task service took the terminal state.",
+      "properties": {
+        "closed": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error": true,
+        "has_msg": {
+          "description": "The batch that opened the Turn had a message: a placeholder may be sent for it.",
+          "type": "boolean"
+        },
+        "opened_at_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "placeholder": {
+          "description": "ObjId of the placeholder message of this Turn (the anchor its final edit targets).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reported": {
+          "type": "boolean"
+        },
+        "summary": {
+          "description": "Result summary handed to the task service with the terminal state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "turn": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "opened_at_ms",
+        "task_id",
+        "turn"
+      ],
+      "type": "object"
+    },
+    "WaitingFor": {
+      "properties": {
+        "deadline_ms": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "human_tasks": {
+          "description": "TaskMgr human tasks the wait depends on: questions asked through a notification (`ask-user` of a Work).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/definitions/WaitingKind"
+        },
+        "refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "WaitingKind": {
+      "description": "What a waiting session waits for (`waiting_for.kind`).",
+      "enum": [
+        "input",
+        "tool",
+        "event",
+        "children"
+      ],
+      "type": "string"
+    },
+    "WorklogBoundary": {
+      "properties": {
+        "committed_bytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "committed_seq": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "committed_bytes",
+        "committed_seq"
+      ],
+      "type": "object"
+    },
+    "WriterInfo": {
+      "properties": {
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lock_epoch": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "principal": {
+          "type": "string"
+        },
+        "runner_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "lock_epoch",
+        "pid",
+        "principal",
+        "runner_id"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "acceptance": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Acceptance"
+        }
+      ],
+      "default": "n/a"
+    },
+    "activity": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Activity"
+        }
+      ],
+      "default": {
+        "heartbeat_ms": 0,
+        "summary": ""
+      }
+    },
+    "background_shown": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Chat input format (UI sessions): the background context lines last shown, `key → digest` (`time` → the epoch ms it was shown at). A line is shown again only when its digest changes; the time line at most every [`BACKGROUND_TIME_STEP_MS`].",
+      "type": "object"
+    },
+    "bootstrap_done": {
+      "default": false,
+      "type": "boolean"
+    },
+    "current_behavior": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "final_report": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReportSubmission"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "goal": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/GoalSessionState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Goal Sessions: the Goal State it owns and the Activation in progress."
+    },
+    "inputs": {
+      "additionalProperties": {
+        "$ref": "#/definitions/SourceProgress"
+      },
+      "default": {},
+      "description": "Per input source consumption progress, keyed by source id.",
+      "type": "object"
+    },
+    "internal_continuation": {
+      "description": "An input batch to commit without new input (context switch, sub context call / return through `next_behavior`); it joins the open Turn.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_error": true,
+    "last_run": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "latest_report": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReportSubmission"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "live_run": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/LiveRun"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "one_line_status": {
+      "default": "",
+      "type": "string"
+    },
+    "open_turn": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenTurn"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The Turn in progress, if any."
+    },
+    "outbox": {
+      "description": "Replies produced by committed Turns and their delivery: written in the commit that closes the Turn, sent afterwards, re-sent as they are after a restart (the idempotency key and the message never change).",
+      "items": {
+        "$ref": "#/definitions/OutboxEntry"
+      },
+      "type": "array"
+    },
+    "outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Outcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "pending_decision": {
+      "description": "Decisions seen in the queue but not applied yet (UI display)."
+    },
+    "pending_events": {
+      "description": "Semi-subscription state received and not injected yet.",
+      "items": {
+        "$ref": "#/definitions/PendingEvent"
+      },
+      "type": "array"
+    },
+    "perception_seq": {
+      "default": 0,
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "process_entry": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "process_result": {
+      "description": "Result of a sub context, handed to its caller: `{behavior, result, status: ok | failed | needs_user_input, next_action_id, next_step_index}`. Behavior trigger: rendered into the caller's hand-over batch. Tool trigger: carries `call_id` and is filled as that call's tool result when the caller's run is opened."
+    },
+    "process_stack": {
+      "items": {
+        "$ref": "#/definitions/ProcessFrame"
+      },
+      "type": "array"
+    },
+    "recent_keys": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RecentKeys"
+        }
+      ],
+      "default": []
+    },
+    "reply": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ReplyRoute"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Default reply path: the way the last consumed input message came, else the parent session."
+    },
+    "reported_rev": {
+      "default": 0,
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "result": true,
+    "rev": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "run_state": {
+      "$ref": "#/definitions/RunState"
+    },
+    "schema": {
+      "type": "string"
+    },
+    "stop_requested": {
+      "default": false,
+      "description": "Stop requested through `control(stop)`; applied at the next safe point.",
+      "type": "boolean"
+    },
+    "subscription_cursors": {
+      "additionalProperties": true,
+      "description": "Pull-mode cursors only (registry rev of session subscriptions).",
+      "type": "object"
+    },
+    "todo_view_rev": {
+      "description": "Revision of the TodoList (`todos.json`) last shown to the session's top-level context in an input batch: the compact view is rendered again only when the list changed since (0: never shown).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "topic": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/Topic"
+        }
+      ],
+      "default": {
+        "title": ""
+      }
+    },
+    "turn_seq": {
+      "default": 0,
+      "description": "Number of the latest Turn opened (0 before the first input batch).",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "turn_stop_requested": {
+      "description": "Only the open Turn is to be stopped (`control(stop, scope = turn)`, or any stop of a Goal Session): the session goes on waiting afterwards.",
+      "type": "boolean"
+    },
+    "turn_tasks": {
+      "description": "Turns bound to a task of the host's task service: the open Turn's, closed ones whose terminal state is not reported yet, and the most recent settled ones.",
+      "items": {
+        "$ref": "#/definitions/TurnTask"
+      },
+      "type": "array"
+    },
+    "turns_completed": {
+      "default": 0,
+      "description": "Turns closed with [`TurnStatus::Completed`].",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "updated_at_ms": {
+      "default": 0,
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "waiting_for": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WaitingFor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "watched_tasks": {
+      "description": "Background tasks of ended runs the runner follows for this session (implicit active subscriptions on `task:<task_id>`): when one ends, its completion is handled like a subscribed event.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "worklog": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/WorklogBoundary"
+        }
+      ],
+      "default": {
+        "committed_bytes": 0,
+        "committed_seq": 0
+      }
+    },
+    "writer": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/WriterInfo"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "rev",
+    "run_state",
+    "schema"
+  ],
+  "title": "SessionState",
+  "type": "object"
+}

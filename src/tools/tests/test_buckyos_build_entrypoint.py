@@ -1,0 +1,241 @@
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+SCRIPT_PATH = Path(__file__).parents[2] / "buckyos-build.py"
+
+
+def _load_build_script():
+    spec = importlib.util.spec_from_file_location("buckyos_build_script", SCRIPT_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class BuckyosBuildEntrypointTests(unittest.TestCase):
+    def test_standalone_daemon_build_does_not_require_sdk_or_web_tools(self) -> None:
+        module = _load_build_script()
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution") as sdk,
+            patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
+        ):
+            for target in ("x86_64-unknown-linux-musl", "aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+                with self.subTest(target=target):
+                    self.assertEqual(module.main(["--agent-daemon", f"--target={target}"]), 0)
+                    sdk.assert_not_called()
+                    self.assertEqual(run.call_args.args[0], ["/runtime/buckyos-build", f"--target={target}", "--select", "buckyos_agent_daemon"])
+            run.reset_mock()
+            self.assertEqual(module.main(["--agent-daemon", "-s", "scheduler"]), 2)
+            run.assert_not_called()
+
+    def test_main_delegates_arguments_to_devkit_build(self) -> None:
+        module = _load_build_script()
+        completed = module.subprocess.CompletedProcess([], 23)
+
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
+            patch.object(module, "_prepare_agent_tools", return_value=0) as agent_tools,
+            patch.object(module.subprocess, "run", return_value=completed) as run,
+        ):
+            result = module.main(["--skip-web", "-s", "scheduler"])
+        agent_tools.assert_called_once_with()
+
+        self.assertEqual(result, 23)
+        run.assert_called_once_with(
+            ["/runtime/buckyos-build", "--skip-web", "-s", "scheduler"],
+            env={**module.os.environ.copy(), "BUCKYOS_PIKG_COMMAND": module.json.dumps([
+                "/runtime/buckyos-build", str(SCRIPT_PATH.resolve().parent / "rootfs" / "libexec" / "buckyos-tool" / "cli" / "launcher.mjs"),
+            ])},
+        )
+
+    def test_successful_build_assembles_the_macos_runtime_bundle(self) -> None:
+        module = _load_build_script()
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution", return_value=0),
+            patch.object(module, "_prepare_agent_tools", return_value=0),
+            patch.object(module.subprocess, "run", return_value=module.subprocess.CompletedProcess([], 0)) as run,
+        ):
+            self.assertEqual(module.main(["-s", "node_daemon"]), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], ["/runtime/buckyos-build", "-s", "node_daemon"])
+        self.assertEqual(run.call_args_list[1].args[0], [
+            module.sys.executable,
+            str(SCRIPT_PATH.resolve().parent / "tools" / "macos_runtime_bundle.py"),
+            "assemble",
+        ])
+
+    def test_agent_tools_are_copied_with_the_host_sdk_import(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "src"
+            (source / "commands").mkdir(parents=True)
+            (source / "aicc-tool.ts").write_text("// entry\n", encoding="utf-8")
+            (source / "commands" / "gen_image.ts").write_text("// cmd\n", encoding="utf-8")
+            (source / "deno.json").write_text('{"imports": {"buckyos": "../../rootfs/x.mjs"}}', encoding="utf-8")
+            target = Path(temporary) / "rootfs" / "libexec" / "buckyos-agent"
+            target.mkdir(parents=True)
+            (target / "stale.ts").write_text("old", encoding="utf-8")
+            self.assertEqual(module._prepare_agent_tools(source, target), 0)
+            config = module.json.loads((target / "deno.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["imports"]["buckyos"], "../buckyos-tool/dist/node.mjs")
+            self.assertTrue((target / "commands" / "gen_image.ts").is_file())
+            self.assertFalse((target / "stale.ts").exists())
+            self.assertEqual(module._prepare_agent_tools(Path(temporary) / "missing", target), 2)
+
+    def test_main_prepares_sdk_tool_distribution_before_build(self) -> None:
+        module = _load_build_script()
+        env = {
+            "BUCKYOS_SDK_TOOL_ARTIFACT": "/inputs/buckyos.tgz",
+            "BUCKYOS_SDK_TOOL_RELEASE_MANIFEST": "/inputs/release.json",
+            "BUCKYOS_SDK_TOOL_DENO": "/inputs/deno",
+            "BUCKYOS_SDK_TOOL_SBOM": "/inputs/sbom.json",
+        }
+        completed = module.subprocess.CompletedProcess([], 0)
+
+        with patch.object(module.subprocess, "run", return_value=completed) as run:
+            result = module._prepare_sdk_tool_distribution(env)
+
+        self.assertEqual(result, 0)
+        run.assert_called_once_with(
+            [
+                module.sys.executable,
+                str(
+                    module.Path(module.__file__).parent
+                    / "tools"
+                    / "build_sdk_tool_distribution.py"
+                ),
+                "--artifact",
+                "/inputs/buckyos.tgz",
+                "--release-manifest",
+                "/inputs/release.json",
+                "--deno",
+                "/inputs/deno",
+                "--sbom",
+                "/inputs/sbom.json",
+                *(["--windows"] if module.os.name == "nt" else []),
+            ],
+            env=env,
+        )
+
+    def test_prepare_sdk_tool_distribution_reports_missing_inputs(self) -> None:
+        module = _load_build_script()
+
+        with patch.object(module.subprocess, "run") as run:
+            result = module._prepare_sdk_tool_distribution({
+                "BUCKYOS_SDK_TOOL_ARTIFACT": "/inputs/buckyos.tgz",
+            })
+
+        self.assertEqual(result, 2)
+        run.assert_not_called()
+
+    def test_default_build_uses_local_source_even_with_deno_override(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "buckyos-websdk"
+            source.mkdir()
+            script = Path(temporary) / "buckyos" / "src" / "buckyos-build.py"
+            for env in ({}, {"BUCKYOS_SDK_TOOL_DENO": "/inputs/deno"}):
+                with (
+                    patch.object(module, "__file__", str(script)),
+                    patch.object(module, "_build_local_sdk_tool_distribution", return_value=17) as build,
+                    patch.object(module, "_build_published_sdk_tool_distribution") as published,
+                ):
+                    self.assertEqual(module._prepare_sdk_tool_distribution(env), 17)
+                    build.assert_called_once_with(env, source.resolve())
+                    published.assert_not_called()
+
+    def test_missing_source_uses_published_package(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "buckyos" / "src" / "buckyos-build.py"
+            for env in ({}, {
+                "BUCKYOS_SDK_TOOL_SOURCE": str(Path(temporary) / "missing-sdk"),
+                "BUCKYOS_SDK_TOOL_DENO": "/inputs/deno",
+            }):
+                with (
+                    patch.object(module, "__file__", str(script)),
+                    patch.object(module, "_build_local_sdk_tool_distribution") as local,
+                    patch.object(module, "_build_published_sdk_tool_distribution", return_value=0) as published,
+                ):
+                    self.assertEqual(module._prepare_sdk_tool_distribution(env), 0)
+                    published.assert_called_once_with(env)
+                    local.assert_not_called()
+
+    def test_published_build_delegates_to_release_preparation_and_cleans_up(self) -> None:
+        module = _load_build_script()
+        env = {"BUCKYOS_SDK_TOOL_DENO": "/inputs/deno"}
+        for returncode in (0, 19):
+            with self.subTest(returncode=returncode):
+                work_dirs = []
+
+                def run(command, **kwargs):
+                    self.assertEqual(command[:3], [
+                        module.sys.executable,
+                        str(SCRIPT_PATH.parent / "tools" / "prepare_sdk_tool_distribution.py"),
+                        "--work-dir",
+                    ])
+                    self.assertEqual(kwargs, {"env": env})
+                    work_dirs.append(Path(command[3]))
+                    self.assertTrue(work_dirs[-1].is_dir())
+                    return module.subprocess.CompletedProcess(command, returncode)
+
+                with patch.object(module.subprocess, "run", side_effect=run) as prepare:
+                    self.assertEqual(module._build_published_sdk_tool_distribution(env), returncode)
+                    prepare.assert_called_once()
+                self.assertFalse(work_dirs[0].exists())
+
+    def test_main_does_not_build_modules_when_sdk_build_fails(self) -> None:
+        module = _load_build_script()
+        with (
+            patch.object(module, "_find_command", return_value="/runtime/buckyos-build"),
+            patch.object(module, "_prepare_sdk_tool_distribution", return_value=17),
+            patch.object(module.subprocess, "run") as run,
+        ):
+            self.assertEqual(module.main([]), 17)
+        run.assert_not_called()
+
+    def test_local_build_failure_does_not_replace_distribution(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            (Path(temporary) / "package.json").write_text("{}", encoding="utf-8")
+            env = {"BUCKYOS_SDK_TOOL_SOURCE": temporary}
+            with (
+                patch.object(module, "_find_command", side_effect=lambda name: f"/runtime/{name}"),
+                patch.object(module.subprocess, "run", side_effect=[
+                    module.subprocess.CompletedProcess([], 0),
+                    module.subprocess.CompletedProcess([], 19),
+                ]) as run,
+                patch.object(module, "_build_sdk_tool_distribution") as install,
+            ):
+                self.assertEqual(module._prepare_sdk_tool_distribution(env), 19)
+                self.assertEqual(run.call_count, 2)
+                install.assert_not_called()
+
+    def test_invalid_local_source_does_not_fall_back_to_published_package(self) -> None:
+        module = _load_build_script()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(module.subprocess, "run") as run:
+                self.assertEqual(module._prepare_sdk_tool_distribution({
+                    "BUCKYOS_SDK_TOOL_SOURCE": temporary,
+                }), 2)
+                run.assert_not_called()
+
+    def test_main_reports_missing_devkit_build(self) -> None:
+        module = _load_build_script()
+
+        with patch.object(module, "_find_command", return_value=None):
+            result = module.main([])
+
+        self.assertEqual(result, 127)
+
+
+if __name__ == "__main__":
+    unittest.main()

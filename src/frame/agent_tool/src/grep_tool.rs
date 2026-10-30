@@ -461,7 +461,7 @@ async fn run_ripgrep(
 
     rg_args.push(display_search_arg(root_dir, search_path));
 
-    let output = Command::new("rg")
+    let output = buckyos_api::hide_child_console_async(&mut Command::new("rg"))
         .current_dir(root_dir)
         .args(&rg_args)
         .stdout(Stdio::piped())
@@ -744,7 +744,7 @@ mod tests {
             trace_id: "t".into(),
             agent_name: "a".into(),
             behavior: "b".into(),
-            step_idx: 0,
+            tool_call_index: 0,
             wakeup_id: "w".into(),
             session_id: "s".into(),
             read_token_limit: crate::DEFAULT_READ_TOKEN_LIMIT,

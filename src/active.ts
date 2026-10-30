@@ -259,7 +259,8 @@ function commitStagedTree(stagedRoot: string, targetRoot: string): void {
       throw new Error(`staged file escaped activation root: ${source}`);
     }
     const destination = path.join(targetRoot, relative);
-    const isPrivate = relative.startsWith(`security${path.sep}`);
+    const isPrivate = relative.startsWith(`security${path.sep}`) ||
+      relative === path.join("etc", "node_identity.json");
     atomicCopyFile(source, destination, isPrivate ? 0o600 : 0o644);
   }
 }
@@ -306,13 +307,13 @@ function requireUnactivatedRoot(rootDir: string, domain: string): void {
   }
   for (
     const marker of [
-      "node_identity.json",
-      "start_config.json",
-      "zone_document.jwt",
-      `${domain}.zone.json`,
+      path.join("etc", "node_identity.json"),
+      path.join("security", "start_config.json"),
+      path.join("etc", "zone_document.jwt"),
+      path.join("etc", `${domain}.zone.json`),
     ]
   ) {
-    const markerPath = path.join(rootDir, "etc", marker);
+    const markerPath = path.join(rootDir, marker);
     if (fs.existsSync(markerPath)) {
       throw new Error(
         `BuckyOS is already or partially activated: ${markerPath}`,
@@ -389,7 +390,7 @@ export async function activateOffline(
       );
     }
 
-    const startConfigPath = path.join(stagedRoot, "etc", "start_config.json");
+    const startConfigPath = path.join(stagedRoot, "security", "start_config.json");
     const startConfig = readJsonObject(startConfigPath);
     startConfig.admin_password_hash = hashAdminPassword(
       ownerName,
@@ -399,7 +400,6 @@ export async function activateOffline(
     startConfig.friend_passcode = "";
     startConfig.enabled_features = {};
     startConfig.ai_provider_config = {};
-    startConfig.jarvis_msg_tunnel_config = {};
     writeJson(startConfigPath, startConfig);
 
     writeJson(
@@ -631,7 +631,7 @@ async function main(): Promise<void> {
       }; no DNS BOOT/PKX/DEV records are required.`,
     );
     console.log(
-      "Restart BuckyOS to leave activation mode and boot the new Zone.",
+      "Activation only writes files. Start or restart BuckyOS separately after TLS/ACME is configured.",
     );
     console.log(
       "TLS/ACME is not provided by SN in this mode; configure it on the public gateway.",

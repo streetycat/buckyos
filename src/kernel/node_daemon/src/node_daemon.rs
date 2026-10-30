@@ -46,6 +46,7 @@ use crate::kernel_mgr::*;
 use crate::kevent_server::*;
 use crate::local_app_mgr::LocalAppRunItem;
 use crate::run_item::*;
+use crate::run_plist::begin_run_plist_batch;
 use crate::service_pkg::*;
 use crate::sn_zone_info::{load_sn_zone_info, relay_node_for_keep_tunnel, save_sn_zone_info};
 use crate::zone_boot_resolve::{
@@ -205,11 +206,10 @@ fn resolve_static_dir_pkg_id(app_info: &serde_json::Map<String, Value>) -> Resul
             })?
         }
         None => {
-            warn!(
-                "static web app dir package {} missing dir_pkg_objid, fallback to pkg id only",
+            return Err(NodeDaemonErrors::ReasonError(format!(
+                "static web app dir package {} is missing its Package Meta ObjectId",
                 dir_pkg_id
-            );
-            dir_pkg_id.to_string()
+            )))
         }
     };
 
@@ -260,21 +260,14 @@ async fn index_static_dir_pkg_meta_from_named_store(
         })
     })?;
 
-    let expected_pkg_name = if package_id.name.contains('.') {
-        package_id.name.clone()
-    } else {
-        format!(
-            "{}.{}",
-            new_package_env(pkg_env_path.to_path_buf()).get_prefix(),
-            package_id.name
-        )
-    };
-    let meta_obj_id_string = meta_obj_id.to_string();
-    let mut indexed_pkg_meta = pkg_meta.clone();
-    if indexed_pkg_meta.name != expected_pkg_name {
-        indexed_pkg_meta.name = expected_pkg_name;
+    if pkg_meta.name != package_id.name {
+        return Err(NodeDaemonErrors::ReasonError(format!(
+            "static dir PackageMeta name {} does not match exact PackageId name {}",
+            pkg_meta.name, package_id.name
+        )));
     }
-    let indexed_pkg_meta_str = serde_json::to_string(&indexed_pkg_meta).map_err(|err| {
+    let meta_obj_id_string = meta_obj_id.to_string();
+    let indexed_pkg_meta_str = serde_json::to_string(&pkg_meta).map_err(|err| {
         NodeDaemonErrors::ReasonError(format!(
             "serialize indexed static dir pkg meta {} failed: {}",
             meta_obj_id, err
@@ -290,7 +283,7 @@ async fn index_static_dir_pkg_meta_from_named_store(
     })?;
 
     let meta_db =
-        MetaIndexDb::new(pkg_env_path.join("pkgs/meta_index.db"), false).map_err(|err| {
+        MetaIndexDb::create_or_open(pkg_env_path.join("pkgs/meta_index.db")).map_err(|err| {
             NodeDaemonErrors::ReasonError(format!(
                 "open pkg env meta db for {} failed: {}",
                 resolved_pkg_id, err
@@ -300,7 +293,7 @@ async fn index_static_dir_pkg_meta_from_named_store(
         .add_pkg_meta(
             meta_obj_id_string.as_str(),
             indexed_pkg_meta_str.as_str(),
-            indexed_pkg_meta.author.as_str(),
+            pkg_meta.author.as_str(),
             None,
         )
         .map_err(|err| {
@@ -311,11 +304,11 @@ async fn index_static_dir_pkg_meta_from_named_store(
         })?;
     meta_db
         .set_pkg_version(
-            indexed_pkg_meta.name.as_str(),
-            indexed_pkg_meta.author.as_str(),
-            indexed_pkg_meta.version.as_str(),
+            pkg_meta.name.as_str(),
+            pkg_meta.author.as_str(),
+            pkg_meta.version.as_str(),
             meta_obj_id_string.as_str(),
-            indexed_pkg_meta.version_tag.as_deref(),
+            pkg_meta.version_tag.as_deref(),
         )
         .map_err(|err| {
             NodeDaemonErrors::ReasonError(format!(
@@ -347,7 +340,7 @@ async fn index_static_dir_pkg_meta_from_current_named_store(
             resolved_pkg_id, err
         ))
     })?;
-    let store_mgr = runtime.get_named_store().await.map_err(|err| {
+    let store_mgr = runtime.get_local_named_store().await.map_err(|err| {
         NodeDaemonErrors::ReasonError(format!(
             "get named store for static dir pkg {} failed: {}",
             resolved_pkg_id, err
@@ -357,17 +350,20 @@ async fn index_static_dir_pkg_meta_from_current_named_store(
     index_static_dir_pkg_meta_from_named_store(pkg_env_path, resolved_pkg_id, &store_mgr).await
 }
 
+// Returns whether any pkg was installed or repaired (even when others failed): cyfs-gateway
+// skips a dir server whose root is missing, so such a pkg is only served after a reload.
 async fn ensure_node_gateway_dir_pkgs_installed_in_env(
     pkg_env_path: &Path,
     node_gateway_info: &Value,
-) -> Result<()> {
+) -> (bool, Result<()>) {
     let Some(app_info_map) = node_gateway_info.get("app_info").and_then(Value::as_object) else {
-        return Ok(());
+        return (false, Ok(()));
     };
 
     let mut pkg_env = new_package_env(pkg_env_path.to_path_buf());
     let mut checked_pkg_ids = std::collections::HashSet::new();
     let mut failures = Vec::new();
+    let mut installed_any = false;
 
     for (host, app_entry) in app_info_map {
         let Some(app_info) = app_entry.as_object() else {
@@ -393,8 +389,10 @@ async fn ensure_node_gateway_dir_pkgs_installed_in_env(
             continue;
         };
 
+        let friendly_path =
+            pkg_env_path.join(PackageId::get_pkg_id_unique_name(resolved_pkg_id.as_str()));
         match pkg_env.load(resolved_pkg_id.as_str()).await {
-            Ok(media_info) => {
+            Ok(media_info) if friendly_path.is_dir() => {
                 info!(
                     "static web dir pkg {} for app {} already installed at {}",
                     resolved_pkg_id,
@@ -402,6 +400,14 @@ async fn ensure_node_gateway_dir_pkgs_installed_in_env(
                     media_info.full_path.display()
                 );
                 continue;
+            }
+            Ok(_) => {
+                info!(
+                    "static web dir pkg {} for app {} friendly path {} is missing, will repair",
+                    resolved_pkg_id,
+                    app_id,
+                    friendly_path.display()
+                );
             }
             Err(err) => {
                 info!(
@@ -462,17 +468,88 @@ async fn ensure_node_gateway_dir_pkgs_installed_in_env(
                 "load static web dir pkg {} for app {} after install failed: {}",
                 resolved_pkg_id, app_id, err
             ));
+            continue;
         }
+
+        if !friendly_path.is_dir() {
+            failures.push(format!(
+                "static web dir pkg {} for app {} friendly path {} is missing after install",
+                resolved_pkg_id,
+                app_id,
+                friendly_path.display()
+            ));
+            continue;
+        }
+        installed_any = true;
     }
 
     if failures.is_empty() {
-        Ok(())
+        (installed_any, Ok(()))
     } else {
-        Err(NodeDaemonErrors::ReasonError(failures.join("; ")))
+        (
+            installed_any,
+            Err(NodeDaemonErrors::ReasonError(failures.join("; "))),
+        )
     }
 }
 
-async fn ensure_node_gateway_dir_pkgs_installed(node_gateway_info: &Value) -> Result<()> {
+async fn publish_static_web_deployment_evidence(
+    node_gateway_info: &Value,
+    client: &SystemConfigClient,
+    node_id: &str,
+    gateway_config_generation: Option<&str>,
+    failure: Option<&str>,
+) {
+    let Some(app_info) = node_gateway_info.get("app_info").and_then(Value::as_object) else {
+        return;
+    };
+    let now = buckyos_get_unix_timestamp();
+    for entry in app_info.values().filter_map(Value::as_object) {
+        let Some(dir_pkg_id) = entry.get("dir_pkg_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(app_instance_id) = entry.get("app_instance_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(deployment_value) = entry.get("deployment") else {
+            continue;
+        };
+        let Ok(deployment) = serde_json::from_value::<DeploymentIdentity>(deployment_value.clone())
+        else {
+            continue;
+        };
+        let content_id = entry
+            .get("dir_pkg_objid")
+            .and_then(Value::as_str)
+            .unwrap_or(dir_pkg_id)
+            .to_string();
+        let evidence = StaticWebDeploymentEvidence {
+            deployment,
+            node_id: node_id.to_string(),
+            content_id,
+            gateway_config_generation: gateway_config_generation.unwrap_or_default().to_string(),
+            materialized_at: failure.is_none().then_some(now).unwrap_or(0),
+            gateway_ready_at: (failure.is_none() && gateway_config_generation.is_some())
+                .then_some(now)
+                .unwrap_or(0),
+            observed_at: now,
+            expires_at: now.saturating_add(90),
+            deployment_error: failure.map(|message| DeploymentError {
+                code: "static_web_materialization_failed".to_string(),
+                message: message.to_string(),
+                detail: None,
+            }),
+        };
+        if let Ok(raw) = serde_json::to_string(&evidence) {
+            let key = format!("services/{app_instance_id}/static_evidence/{node_id}");
+            if let Err(error) = client.set(&key, &raw).await {
+                warn!("publish static web deployment evidence `{key}` failed: {error}");
+            }
+        }
+    }
+}
+
+async fn ensure_node_gateway_dir_pkgs_installed(node_gateway_info: &Value) -> (bool, Result<()>) {
     ensure_node_gateway_dir_pkgs_installed_in_env(
         get_buckyos_system_bin_dir().as_path(),
         node_gateway_info,
@@ -616,13 +693,12 @@ async fn populate_network_observation(
 async fn update_device_info_checked(
     device_info: &DeviceInfo,
     syste_config_client: &SystemConfigClient,
-) -> std::result::Result<(), String> {
+) -> SytemConfigResult<()> {
     let device_key = format!("devices/{}/info", device_info.name.as_str());
     let device_info_str = serde_json::to_string(&device_info).unwrap();
     syste_config_client
         .set(device_key.as_str(), device_info_str.as_str())
-        .await
-        .map_err(|err| format!("update device info to system_config failed! {}", err))?;
+        .await?;
     info!(
         "update {} info to system_config success!",
         device_info.name.as_str()
@@ -632,7 +708,7 @@ async fn update_device_info_checked(
 
 async fn update_device_info(device_info: &DeviceInfo, syste_config_client: &SystemConfigClient) {
     if let Err(err) = update_device_info_checked(device_info, syste_config_client).await {
-        error!("{}", err);
+        error!("update device info to system_config failed! {}", err);
     }
 }
 
@@ -642,10 +718,13 @@ async fn register_boot_device(
     system_config_client: &SystemConfigClient,
 ) -> std::result::Result<(), String> {
     let device_doc_key = format!("devices/{}/doc", device_doc.name.as_str());
-    system_config_client
-        .set(device_doc_key.as_str(), device_doc_jwt)
-        .await
-        .map_err(|err| format!("register device doc to system_config failed! {}", err))?;
+    retry_system_config_boot(
+        "register device document",
+        SYSTEM_CONFIG_BOOT_TIMEOUT,
+        SYSTEM_CONFIG_REQUEST_TIMEOUT,
+        || system_config_client.set(device_doc_key.as_str(), device_doc_jwt),
+    )
+    .await?;
     info!(
         "register {} device doc to system_config success!",
         device_doc.name.as_str()
@@ -658,7 +737,13 @@ async fn register_boot_device(
         .map_err(|err| format!("auto fill device info failed! {}", err))?;
     let mut boot_observer = NetworkObserver::new(NetworkObserverConfig::default());
     populate_network_observation(&mut boot_observer, &mut device_info, system_config_client).await;
-    update_device_info_checked(&device_info, system_config_client).await
+    retry_system_config_boot(
+        "register device info",
+        SYSTEM_CONFIG_BOOT_TIMEOUT,
+        SYSTEM_CONFIG_REQUEST_TIMEOUT,
+        || update_device_info_checked(&device_info, system_config_client),
+    )
+    .await
 }
 
 static KEVENT_SERVICE: OnceLock<Arc<kevent::KEventService>> = OnceLock::new();
@@ -667,6 +752,47 @@ fn get_kevent_service(source_node: &str) -> Arc<kevent::KEventService> {
     KEVENT_SERVICE
         .get_or_init(|| Arc::new(kevent::KEventService::new(source_node.to_string())))
         .clone()
+}
+
+/// Body of the `/devices/{name}/info` event.
+///
+/// The full `DeviceInfo` is written to system_config immediately before this is
+/// published, and every consumer reads the record from there, so the event only
+/// has to say which device changed. Carrying the whole record instead overflows
+/// the kevent slot (`SLOT_DATA_SIZE`), and the flattened DID document would put
+/// key material on a bus any local process can drain.
+#[derive(Serialize)]
+struct DeviceInfoChangedEvent<'a> {
+    name: &'a str,
+    id: &'a DID,
+    device_type: &'a str,
+    owner: &'a DID,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zone_did: Option<&'a DID>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    update_time: u64,
+}
+
+impl<'a> DeviceInfoChangedEvent<'a> {
+    fn from_device_info(device_info: &'a DeviceInfo) -> Self {
+        let doc = &device_info.device_doc;
+        Self {
+            name: doc.name.as_str(),
+            id: &doc.id,
+            device_type: doc.device_type.as_str(),
+            owner: &doc.owner,
+            zone_did: doc.zone_did.as_ref(),
+            net_id: doc.net_id.as_deref(),
+            version_seq: doc.version_seq,
+            state: device_info.state.as_deref(),
+            update_time: device_info.update_time,
+        }
+    }
 }
 
 async fn publish_device_info_kevent(device_info: &DeviceInfo) {
@@ -678,7 +804,8 @@ async fn publish_device_info_kevent(device_info: &DeviceInfo) {
         return;
     };
     let eventid = format!("/devices/{}/info", device_info.name.as_str());
-    let event_data = serde_json::to_value(device_info).unwrap();
+    let event_data =
+        serde_json::to_value(DeviceInfoChangedEvent::from_device_info(device_info)).unwrap();
 
     if let Err(err) = service
         .publish_local_global(eventid.as_str(), event_data)
@@ -869,8 +996,60 @@ async fn do_boot_schedule() -> std::result::Result<(), String> {
     }
 }
 
-async fn wait_sysmte_config_sync() -> std::result::Result<(), String> {
-    return Ok(());
+const SYSTEM_CONFIG_BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const SYSTEM_CONFIG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn retry_system_config_boot<T, F, Fut>(
+    operation: &str,
+    timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+    mut request: F,
+) -> std::result::Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = SytemConfigResult<T>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut delay = std::time::Duration::from_millis(200);
+    let mut attempts = 0;
+    let mut last_error = "no RPC attempt completed".to_string();
+    while tokio::time::Instant::now() < deadline {
+        attempts += 1;
+        let request_deadline = deadline.min(tokio::time::Instant::now() + request_timeout);
+        match tokio::time::timeout_at(request_deadline, request()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(
+                error @ (SystemConfigError::Timeout(_) | SystemConfigError::TransportError(_)),
+            )) => {
+                last_error = error.to_string();
+            }
+            Ok(Err(error)) => return Err(format!("system-config {operation} failed: {error}")),
+            Err(_) => last_error = "RPC request timed out".to_string(),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        warn!("system-config {operation} attempt {attempts} failed: {last_error}; retrying");
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + delay)).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(2));
+    }
+    Err(format!(
+        "system-config {operation} timed out after {timeout:?} ({attempts} attempts): {last_error}"
+    ))
+}
+
+async fn wait_system_config_ready(
+    client: &SystemConfigClient,
+    timeout: std::time::Duration,
+    request_timeout: std::time::Duration,
+) -> std::result::Result<(), String> {
+    retry_system_config_boot("RPC readiness", timeout, request_timeout, || async {
+        match client.get("boot/config").await {
+            Ok(_) | Err(SystemConfigError::KeyNotFound(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .await
 }
 
 async fn keep_system_config_service(
@@ -1145,6 +1324,18 @@ async fn node_main(
         return Ok(false);
     }
 
+    let _run_plist_batch = begin_run_plist_batch();
+    stop_orphan_native_apps(&node_config).await;
+    let mut managed_service_names = node_config
+        .kernel
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    managed_service_names.insert("cyfs-gateway".to_string());
+    if is_ood {
+        managed_service_names.insert("system-config".to_string());
+    }
+    begin_service_process_round(&managed_service_names).await;
     let kernel_stream = stream::iter(node_config.kernel);
     let kernel_task =
         kernel_stream.for_each_concurrent(4, |(kernel_service_name, kernel_cfg)| async move {
@@ -1179,7 +1370,11 @@ async fn node_main(
     //     .await;
 
     //app services is "userA-appB-service", run in docker container
-    let app_ids = node_config.apps.keys().cloned().collect::<Vec<String>>();
+    let app_ids = node_config
+        .apps
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>();
 
     let app_stream = stream::iter(node_config.apps);
     let app_task = app_stream.for_each_concurrent(4, |(app_id_with_name, app_cfg)| async move {
@@ -1194,7 +1389,7 @@ async fn node_main(
                     app_id_with_name.clone(),
                     err
                 );
-                return NodeDaemonErrors::SystemConfigError(app_id_with_name.clone());
+                return NodeDaemonErrors::SystemConfigError(app_id_with_name.to_string());
             });
     });
 
@@ -1210,6 +1405,41 @@ async fn node_main(
     Ok(true)
 }
 
+/// Native app processes (`local/app_native`) whose instance this node no
+/// longer runs, e.g. an app uninstalled while node_daemon was down: stopped,
+/// so an old process never runs beside a new one.
+async fn stop_orphan_native_apps(node_config: &NodeConfig) {
+    let dir = get_buckyos_root_dir()
+        .join("local")
+        .join(crate::native_app::NATIVE_APP_STATE_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let wanted: std::collections::HashSet<String> = node_config
+        .apps
+        .values()
+        .filter(|app| app.target_state == ServiceInstanceState::Started)
+        .map(|app| app.node_execution_spec.app_instance_id.runtime_key())
+        .collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(key) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if key.ends_with(".failure") || wanted.contains(key) {
+            continue;
+        }
+        let process = crate::native_app::NativeProcess::new(dir.clone(), key);
+        if process.running().is_some() {
+            warn!("native app {key} is no longer scheduled on this node, stopping it");
+        }
+        if let Err(error) = process.stop().await {
+            warn!("stop orphan native app {key} failed: {error}");
+        }
+        process.clear_failure();
+    }
+}
+
 async fn get_system_config_client(
     is_ood: bool,
     session_token: String,
@@ -1220,42 +1450,6 @@ async fn get_system_config_client(
     } else {
         unimplemented!();
     }
-}
-
-#[cfg(unix)]
-fn reap_exited_children_nonblocking() -> usize {
-    let mut reaped = 0usize;
-
-    loop {
-        let mut status = 0i32;
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid > 0 {
-            reaped += 1;
-            info!("reaped exited child process pid={} status={}", pid, status);
-            continue;
-        }
-
-        if pid == 0 {
-            break;
-        }
-
-        let err = std::io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::ECHILD) => break,
-            Some(libc::EINTR) => continue,
-            _ => {
-                warn!("waitpid(-1, WNOHANG) failed: {}", err);
-                break;
-            }
-        }
-    }
-
-    reaped
-}
-
-#[cfg(not(unix))]
-fn reap_exited_children_nonblocking() -> usize {
-    0
 }
 
 async fn node_daemon_main_loop(
@@ -1271,6 +1465,7 @@ async fn node_daemon_main_loop(
     let mut node_gateway_info_id: Option<ObjId> = None;
     let mut keep_tunnel_config_id: Option<ObjId> = None;
     let mut network_observer = NetworkObserver::new(NetworkObserverConfig::default());
+    let mut device_sampler = DeviceSystemInfoSampler::new();
     let mut last_zone_info_refresh: Option<Instant> = None;
     let mut sn_zone_info = match load_sn_zone_info() {
         Ok(zone_info) => zone_info,
@@ -1288,13 +1483,15 @@ async fn node_daemon_main_loop(
     let mut name_provider_registered = false;
 
     loop {
-        let reaped = reap_exited_children_nonblocking();
+        let reaped = crate::service_pkg::reap_detached_children();
         if reaped > 0 {
             info!("node daemon reaped {} exited child process(es)", reaped);
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         loop_step += 1;
         info!("node daemon main loop step:{}", loop_step);
+        let loop_started = Instant::now();
+        let (scans_before, pid_checks_before, fast_hits_before) = service_process_check_counts();
 
         let buckyos_runtime = get_buckyos_api_runtime();
         if buckyos_runtime.is_err() {
@@ -1328,14 +1525,14 @@ async fn node_daemon_main_loop(
         {
             last_zone_info_refresh = Some(Instant::now());
             let previous_relay_node = relay_node_for_keep_tunnel(
-                device_doc.net_id.as_deref(),
+                device_doc,
                 zone_document.sn.as_deref(),
                 sn_zone_info.as_ref(),
             );
             match refresh_sn_zone_info(device_doc, device_private_key, &zone_document).await {
                 Ok(new_zone_info) => {
                     let new_relay_node = relay_node_for_keep_tunnel(
-                        device_doc.net_id.as_deref(),
+                        device_doc,
                         zone_document.sn.as_deref(),
                         new_zone_info.as_ref(),
                     );
@@ -1353,7 +1550,9 @@ async fn node_daemon_main_loop(
         let now = buckyos_get_unix_timestamp();
         if now - last_register_time > 30 {
             let mut device_info = DeviceInfo::from_device_doc(device_doc);
-            let fill_result = device_info.auto_fill_by_system_info().await;
+            let fill_result = device_info
+                .auto_fill_by_system_info_with_sampler(&mut device_sampler)
+                .await;
             if fill_result.is_err() {
                 error!(
                     "auto fill device info failed! {}",
@@ -1413,6 +1612,7 @@ async fn node_daemon_main_loop(
                 break;
             }
             let mut gateway_info_keep_tunnels: Vec<String> = Vec::new();
+            let mut pending_static_gateway_info: Option<(Value, String)> = None;
             let gateway_info_path =
                 buckyos_kit::get_buckyos_system_etc_dir().join("node_gateway_info.json");
             let new_node_gateway_info =
@@ -1426,15 +1626,34 @@ async fn node_daemon_main_loop(
                     None => true,
                     Some(old_id) => old_id != &new_node_gateway_info_id_value,
                 };
-                let ensure_result =
+                let (dir_pkgs_installed, ensure_result) =
                     ensure_node_gateway_dir_pkgs_installed(&new_node_gateway_info).await;
+                if dir_pkgs_installed {
+                    // Force a gateway reload below even if the gateway config is unchanged.
+                    node_gateway_config_id = None;
+                }
                 if let Err(err) = ensure_result {
                     error!("ensure static web dir pkg installed failed! {}", err);
-                } else if need_write {
-                    node_gateway_info_id = Some(new_node_gateway_info_id_value);
-                    info!("node gateway_info changed, will write to node_gateway_info.json");
-                    std::fs::write(gateway_info_path, new_node_gateway_info_str.as_bytes())
-                        .unwrap();
+                    let err_message = err.to_string();
+                    publish_static_web_deployment_evidence(
+                        &new_node_gateway_info,
+                        &system_config_client,
+                        node_id,
+                        None,
+                        Some(err_message.as_str()),
+                    )
+                    .await;
+                } else {
+                    if need_write {
+                        node_gateway_info_id = Some(new_node_gateway_info_id_value.clone());
+                        info!("node gateway_info changed, will write to node_gateway_info.json");
+                        std::fs::write(gateway_info_path, new_node_gateway_info_str.as_bytes())
+                            .unwrap();
+                    }
+                    pending_static_gateway_info = Some((
+                        new_node_gateway_info,
+                        new_node_gateway_info_id_value.to_string(),
+                    ));
                 }
             } else {
                 error!("load node gateway_info from system_config failed!");
@@ -1457,7 +1676,7 @@ async fn node_daemon_main_loop(
                 let new_node_gateway_config = new_node_gateway_config.unwrap();
                 let sn = zone_document.sn.clone();
                 let relay_node = relay_node_for_keep_tunnel(
-                    device_doc.net_id.as_deref(),
+                    device_doc,
                     sn.as_deref(),
                     sn_zone_info.as_ref(),
                 );
@@ -1524,10 +1743,36 @@ async fn node_daemon_main_loop(
                     need_reload,
                     need_restart,
                 )
-                .await
-                .map_err(|err| {
+                .await;
+
+                if let Some((gateway_info, generation)) = pending_static_gateway_info.as_ref() {
+                    match keep_result.as_ref() {
+                        Ok(_) => {
+                            publish_static_web_deployment_evidence(
+                                gateway_info,
+                                &system_config_client,
+                                node_id,
+                                Some(generation.as_str()),
+                                None,
+                            )
+                            .await;
+                        }
+                        Err(err) => {
+                            let message = format!("cyfs-gateway reload failed: {err}");
+                            publish_static_web_deployment_evidence(
+                                gateway_info,
+                                &system_config_client,
+                                node_id,
+                                None,
+                                Some(message.as_str()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                if let Err(err) = keep_result.as_ref() {
                     error!("keep cyfs_gateway service failed! {}", err);
-                });
+                }
 
                 if need_restart {
                     name_provider_registered = false;
@@ -1539,8 +1784,27 @@ async fn node_daemon_main_loop(
                 }
             } else {
                 error!("load node gateway_cconfig from system_config failed!");
+                if let Some((gateway_info, _)) = pending_static_gateway_info.as_ref() {
+                    publish_static_web_deployment_evidence(
+                        gateway_info,
+                        &system_config_client,
+                        node_id,
+                        None,
+                        Some("load node gateway config failed"),
+                    )
+                    .await;
+                }
             }
         }
+        let (scans, pid_checks, fast_hits) = service_process_check_counts();
+        info!(
+            "node daemon main loop work: step={} elapsed_ms={} process_scans={} pid_checks={} fast_hits={}",
+            loop_step,
+            loop_started.elapsed().as_millis(),
+            scans - scans_before,
+            pid_checks - pid_checks_before,
+            fast_hits - fast_hits_before
+        );
     }
     Ok(())
 }
@@ -1558,7 +1822,10 @@ async fn generate_boot_session_token(
         appid: Some("node-daemon".to_string()),
         jti: Some(login_jti),
         sub: Some("kernel".to_string()),
-        aud: None,
+        // This assertion exists only to break the System Config/Verify Hub
+        // bootstrap cycle. System Config validates this exact audience and
+        // restricts it to boot-time operations; it is never a session token.
+        aud: Some(SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE.to_string()),
         exp: Some(timestamp + 60 * 15),
         iss: Some(device_doc.name.clone()),
         token: None,
@@ -1580,30 +1847,54 @@ fn generate_node_daemon_login_token(
     device_doc: &DeviceDocument,
     device_private_key: &EncodingKey,
 ) -> std::result::Result<String, String> {
-    generate_service_login_jwt(
+    let (_, mut assertion) = generate_service_login_assertion(
         device_doc.name.as_str(),
         "node-daemon",
         device_doc.name.as_str(),
         device_private_key,
     )
-    .map(|(jwt, _)| jwt)
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    assertion.aud = Some(SYSTEM_CONFIG_BOOTSTRAP_AUDIENCE.to_string());
+    assertion.token = None;
+    assertion
+        .generate_jwt(Some(device_doc.name.clone()), device_private_key)
+        .map_err(|err| err.to_string())
 }
 
 async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
     let node_id = matches.get_one::<String>("id");
     let enable_active = matches.get_flag("enable_active");
-    let is_desktop = matches.get_flag("desktop_daemon");
+    // BuckyOS Desktop Lite is a desktop product: its node runs as the
+    // desktop user's node whatever the launcher passes (Node Executor in the
+    // user's session, the owner's Agents opened on it).
+    let is_desktop = matches.get_flag("desktop_daemon")
+        || crate::product::installed().is_ok_and(|product| product.is_lite());
     let default_node_id = "node".to_string();
     let node_id = node_id.unwrap_or(&default_node_id);
 
     info!("node_daemon start...");
+    #[cfg(target_os = "macos")]
+    if is_desktop && crate::node_executor_host::desktop_mode(true) {
+        crate::desktop_runtime::spawn_desktop_status_writer();
+    }
     let mut real_machine_config = BuckyOSMachineConfig::default();
     let machine_config = BuckyOSMachineConfig::load_machine_config();
     if machine_config.is_some() {
         real_machine_config = machine_config.unwrap();
     }
     info!("machine_config: {:?}", &real_machine_config);
+    // The shipped product decides what this node may run; a broken profile
+    // stops here instead of running as some other edition.
+    let product = crate::product::installed().map_err(|error| {
+        error!("product profile unusable: {error}");
+        format!("product profile unusable: {error}")
+    })?;
+    info!(
+        "product edition: {} (containers {})",
+        product.edition,
+        if product.container_enabled() { "enabled" } else { "disabled" }
+    );
+    crate::paios_images::spawn_preload();
 
     init_name_lib(&real_machine_config.web3_bridge)
         .await
@@ -1676,12 +1967,15 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
             );
             return String::from("load device private key failed!");
         })?;
-    save_node_gateway_params(&get_buckyos_system_etc_dir(), &node_identity.device_did).map_err(
-        |error| {
-            error!("write node_gateway_params.json failed! {}", error);
-            return String::from("write node_gateway_params.json failed!");
-        },
-    )?;
+    save_node_gateway_params(
+        &get_buckyos_system_etc_dir(),
+        &node_identity.device_did,
+        device_doc.rtcp_port,
+    )
+    .map_err(|error| {
+        error!("write node_gateway_params.json failed! {}", error);
+        String::from("write node_gateway_params.json failed!")
+    })?;
 
     //lookup zone config
     info!(
@@ -1775,7 +2069,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         }
     };
     let sn_host_name = relay_node_for_keep_tunnel(
-        device_doc.net_id.as_deref(),
+        &device_doc,
         zone_document.sn.as_deref(),
         sn_zone_info.as_ref(),
     );
@@ -1784,7 +2078,7 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
     //  - service_info.system_config 让 boot_gateway.yaml 能把 /kapi/system_config 转发到 OOD；
     //  - node_route_map / routes 提供 OOD / ZoneGateway / SN-relay 的显式候选；
     // 这样 cyfs-gateway 起来时本机 3180 就已经能访问 system-config 了。
-    let zone_host = node_identity.zone_did.to_host_name();
+    let zone_host = zone_document_hostname(&zone_document);
     let boot_gateway_info = build_boot_node_gateway_info(
         &device_name,
         zone_host.as_str(),
@@ -1807,6 +2101,9 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
     dedup_keep_tunnel_targets(&mut keep_tunnels);
     if let Err(err) = write_boot_node_gateway_config(&keep_tunnels) {
         warn!("write boot node_gateway.json failed: {}", err);
+    }
+    if let Err(err) = crate::node_executor_host::write_boot_executor_acl() {
+        warn!("write boot node_executor_acl.json failed: {}", err);
     }
 
     keep_cyfs_gateway_service(
@@ -1853,13 +2150,16 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
                 error!("start system_config_service failed! {}", err);
                 return String::from("start system_config_service failed!");
             })?;
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        info!("wait system_config_service sync...");
-        wait_sysmte_config_sync().await?;
-        info!("system_config_service sync OK!,will connect to local system_config_service...");
-
         //This is ood, so we MUST connect to localhost's system_config_service
         syc_cfg_client = SystemConfigClient::new(None, Some(device_session_token_jwt.as_str()));
+        info!("wait for local system-config RPC readiness...");
+        wait_system_config_ready(
+            &syc_cfg_client,
+            SYSTEM_CONFIG_BOOT_TIMEOUT,
+            SYSTEM_CONFIG_REQUEST_TIMEOUT,
+        )
+        .await?;
+        info!("local system-config RPC ready");
         register_boot_device(device_doc_jwt.as_str(), &device_doc, &syc_cfg_client).await?;
 
         while boot_config_result_str.is_empty() {
@@ -2043,6 +2343,12 @@ async fn async_main(matches: ArgMatches) -> std::result::Result<(), String> {
         warn!("kevent service returned, node_daemon will continue without kevent http endpoint");
     });
 
+    crate::node_executor_host::spawn_node_executor(
+        device_name.clone(),
+        node_identity.device_did.to_string(),
+        is_desktop,
+    );
+
     node_daemon_main_loop(node_id, &device_name, is_ood, is_desktop)
         .await
         .map_err(|err| {
@@ -2063,8 +2369,22 @@ pub(crate) fn run(matches: ArgMatches) -> std::result::Result<(), String> {
         String::from("create tokio runtime failed!")
     })?;
 
-    runtime.block_on(async_main(matches))
+    runtime.block_on(async {
+        tokio::select! {
+            result = async_main(matches) => result,
+            signal = crate::desktop_runtime::termination_signal() => {
+                info!("node_daemon received {}, closing the node executor", signal);
+                crate::node_executor_host::shutdown_node_executor().await;
+                info!("node_daemon stopped; run items keep running");
+                std::process::exit(0);
+            }
+        }
+    })
 }
+
+#[cfg(test)]
+#[path = "system_config_boot_tests.rs"]
+mod system_config_boot_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2109,21 +2429,6 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             Ok(name_client::NameInfo::new(name))
         }
 
-        async fn query_did(
-            &self,
-            did: &DID,
-            doc_type: Option<name_client::DidDocType>,
-            _from_ip: Option<std::net::IpAddr>,
-        ) -> name_lib::NSResult<EncodedDocument> {
-            Err(name_lib::NSError::NotFound(format!(
-                "{}#{}",
-                did.to_string(),
-                doc_type
-                    .as_ref()
-                    .map(name_client::DidDocType::as_str)
-                    .unwrap_or("")
-            )))
-        }
     }
 
     async fn ensure_name_client_for_tests() {
@@ -2137,19 +2442,25 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             let _ = name_client::IS_NAME_LIB_INITED.set(true);
         }
         let client = name_client::GLOBAL_NAME_CLIENT.get().unwrap();
-        client
-            .add_provider(Box::new(EmptyNameProvider), Some(-100))
-            .await;
-        client
-            .add_method_supplement("bns", Box::new(EmptyNameProvider))
-            .await;
-        client.set_local_authority_override(
+        client.add_dns_provider(Box::new(EmptyNameProvider)).await;
+        client.lock_document(
             DID::new("bns", "alice"),
             DidDocType::Owner,
             test_owner_document(),
-            "node-daemon-test",
-            None,
+            name_client::LockOptions {
+                scope: "node-daemon-test".to_string(),
+                simulate_history: true,
+                ..Default::default()
+            },
         );
+    }
+
+    fn same_zone_device_ip_options(target_did: &DID) -> ResolveIpOptions {
+        ResolveIpOptions::verified_same_zone_device(VerifiedSameZoneDevice::from_verified_relation(
+            target_did.clone(),
+            DID::new("bns", "alice"),
+            SameZoneEvidenceSource::VerifiedOwnerZoneDeviceRelation,
+        ))
     }
 
     fn unique_test_id(prefix: &str) -> String {
@@ -2275,7 +2586,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let pkg_meta_str = serde_json::to_string(&pkg_meta).unwrap();
         let (meta_obj_id, _) = pkg_meta.gen_obj_id();
         let meta_obj_id_str = meta_obj_id.to_string();
-        let meta_db = MetaIndexDb::new(pkg_env_path.join("pkgs/meta_index.db"), false).unwrap();
+        let meta_db = MetaIndexDb::create_or_open(pkg_env_path.join("pkgs/meta_index.db")).unwrap();
         let package_id = pkg_meta.get_package_id();
 
         meta_db
@@ -2309,6 +2620,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
                 }
             }
         })
+    }
+
+    #[test]
+    fn static_web_directory_package_requires_exact_object_id() {
+        let app_info = json!({ "dir_pkg_id": "portal-web#1.0.0" });
+        let error = resolve_static_dir_pkg_id(app_info.as_object().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("Package Meta ObjectId"));
     }
 
     async fn create_test_store_mgr(base_dir: &Path) -> NamedDataMgr {
@@ -2356,10 +2674,16 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         add_discovered_device_cache(&discovered);
 
+        assert!(name_client::resolve_ips(peer_did.to_string().as_str())
+            .await
+            .is_err());
         assert_eq!(
-            name_client::resolve_ips(peer_did.to_string().as_str())
-                .await
-                .unwrap(),
+            name_client::resolve_ips_with_options(
+                peer_did.to_string().as_str(),
+                same_zone_device_ip_options(&peer_did),
+            )
+            .await
+            .unwrap(),
             vec![endpoint_ip]
         );
         let resolved_doc = name_client::resolve_did(&peer_did, Some(DidDocType::Device))
@@ -2371,15 +2695,13 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         let resolved_info = name_client::resolve_did_ex(
             &peer_did,
             Some(name_client::DOC_TYPE_INFO),
-            name_client::ResolvePolicy::default(),
+            name_client::Revision::current(),
+            name_client::ResolveOpts::default(),
         )
         .await
         .unwrap();
-        assert_eq!(
-            resolved_info.document_metadata.buckyos.document_status,
-            None
-        );
-        assert_eq!(resolved_info.document_metadata.deactivated, None);
+        assert!(resolved_info.type_state.is_none());
+        assert!(!resolved_info.is_disabled());
     }
 
     #[tokio::test]
@@ -2395,7 +2717,8 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .await
             .unwrap();
 
-        let resolved_pkg_id = format!("portal-web#{}", meta_obj_id);
+        let resolved_pkg_id =
+            PackageId::get_pkgid_with_objid("portal-web#1.0.0", Some(meta_obj_id.clone())).unwrap();
         index_static_dir_pkg_meta_from_named_store(
             pkg_env_path.as_path(),
             resolved_pkg_id.as_str(),
@@ -2412,14 +2735,7 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
 
         cleanup_temp_pkg_env_path(&pkg_env_path);
         assert_eq!(indexed_meta_obj_id, meta_obj_id.to_string());
-        assert_eq!(
-            indexed_meta.name,
-            format!(
-                "{}.{}",
-                PackageEnvConfig::get_default_prefix(),
-                "portal-web"
-            )
-        );
+        assert_eq!(indexed_meta.name, "portal-web");
         assert_eq!(indexed_meta.version, pkg_meta.version);
     }
 
@@ -2433,14 +2749,39 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
             .join(pkg_name)
             .join(ObjId::new(meta_obj_id.as_str()).unwrap().to_filename());
         std::fs::create_dir_all(&strict_dir).unwrap();
+        std::fs::create_dir_all(pkg_env_path.join("portal-web")).unwrap();
 
         let gateway_info = build_static_web_gateway_info("portal-web", meta_obj_id.as_str());
-        let result =
+        let (installed, result) =
             ensure_node_gateway_dir_pkgs_installed_in_env(pkg_env_path.as_path(), &gateway_info)
                 .await;
 
         cleanup_temp_pkg_env_path(&pkg_env_path);
         result.unwrap();
+        assert!(!installed);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_node_gateway_dir_pkgs_installed_repairs_friendly_path_for_exact_pkg() {
+        let pkg_env_path =
+            create_temp_pkg_env_path("ensure_node_gateway_dir_pkgs_installed_repairs_friendly");
+        let (pkg_name, meta_obj_id) = index_test_pkg(&pkg_env_path, "portal-web", "1.0.0");
+        let strict_dir = pkg_env_path
+            .join("pkgs")
+            .join(pkg_name)
+            .join(ObjId::new(meta_obj_id.as_str()).unwrap().to_filename());
+        std::fs::create_dir_all(&strict_dir).unwrap();
+
+        let gateway_info = build_static_web_gateway_info("portal-web", meta_obj_id.as_str());
+        let (installed, result) =
+            ensure_node_gateway_dir_pkgs_installed_in_env(pkg_env_path.as_path(), &gateway_info)
+                .await;
+        let friendly_is_dir = pkg_env_path.join("portal-web").is_dir();
+
+        cleanup_temp_pkg_env_path(&pkg_env_path);
+        result.unwrap();
+        assert!(installed);
+        assert!(friendly_is_dir);
     }
 
     #[tokio::test]
@@ -2453,11 +2794,12 @@ MC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr
         std::fs::create_dir_all(&friendly_dir).unwrap();
 
         let gateway_info = build_static_web_gateway_info("portal-web", meta_obj_id.as_str());
-        let result =
+        let (installed, result) =
             ensure_node_gateway_dir_pkgs_installed_in_env(pkg_env_path.as_path(), &gateway_info)
                 .await;
 
         cleanup_temp_pkg_env_path(&pkg_env_path);
+        assert!(!installed);
         let err = result.expect_err("friendly dir should not satisfy exact pkg objid");
         match err {
             NodeDaemonErrors::ReasonError(msg) => {

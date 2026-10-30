@@ -15,11 +15,65 @@
 
 use anyhow::{bail, Result as AnyResult};
 use async_trait::async_trait;
-use buckyos_api::{DeliveryRecordWithObject, DeliveryReportResult};
+use buckyos_api::{DeliveryRecordWithObject, DeliveryReportResult, MsgCenterHandler};
+use kRPC::RPCErrors;
 use name_lib::DID;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use thiserror::Error;
+
+/// Declared ability of an executor's targets to replace an already delivered
+/// message of its sender in place (`relates_to = edit`). This is a property
+/// of the target, known before sending; whether one specific message can
+/// still be edited is only known at execution time, see `EditFailure`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EditCapability {
+    /// The target lets a sender edit its own delivered messages.
+    pub supported: bool,
+    /// How long after delivery the platform accepts an edit, if limited.
+    pub edit_window_ms: Option<u64>,
+    /// Only the text is replaced in place; attachments are not.
+    pub text_only: bool,
+}
+
+/// Why one edit could not be applied in place although the target declares
+/// `EditCapability::supported`. All of these are final for that message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditFailure {
+    WindowExpired,
+    /// The original was never delivered to this target or no longer exists.
+    OriginalMissing,
+    /// The new content (format, size, attachments) cannot replace the original.
+    NotReplaceable(String),
+}
+
+impl std::fmt::Display for EditFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WindowExpired => f.write_str("edit window expired"),
+            Self::OriginalMissing => f.write_str("original message missing"),
+            Self::NotReplaceable(reason) => write!(f, "not replaceable in place: {}", reason),
+        }
+    }
+}
+
+/// Key of `IngressContext.extra` naming who the ingress message speaks for
+/// when the transport identified its sender, e.g. the Owner of the Agent
+/// whose bot received it. `MsgObject.from` stays the endpoint DID.
+pub const INGRESS_PRINCIPAL_KEY: &str = "principal_did";
+
+/// The MessageCenter as seen by a tunnel's ingress.
+#[async_trait]
+pub trait TunnelIngressHandler: MsgCenterHandler {
+    /// The Owner of the zone Agent `agent` when `platform:account_id` is
+    /// bound to that Owner in the Agent's contacts; `None` otherwise.
+    async fn resolve_owner_principal(
+        &self,
+        agent: &DID,
+        platform: &str,
+        account_id: &str,
+    ) -> std::result::Result<Option<DID>, RPCErrors>;
+}
 
 #[async_trait]
 pub trait DeliveryExecutor: Send + Sync {
@@ -34,6 +88,10 @@ pub trait DeliveryExecutor: Send + Sync {
 
     fn supports_egress(&self) -> bool {
         true
+    }
+
+    fn edit_capability(&self) -> EditCapability {
+        EditCapability::default()
     }
 
     async fn start(&self) -> AnyResult<()>;

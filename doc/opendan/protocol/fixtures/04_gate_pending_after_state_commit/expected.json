@@ -1,0 +1,47 @@
+{
+  "description": "state.json consumed input q#1 (applied batch 1); run.json still has host_commit_pending=1; ack not confirmed.",
+  "generated_by": "libopendan examples/fixtures.rs",
+  "next": {
+    "action": "clear_gate_confirm_ack_resume_run",
+    "confirm_ack": 1,
+    "reappend_message": false
+  },
+  "scenario": "gate_pending_after_state_commit",
+  "sessions": [
+    {
+      "live_run": {
+        "applied_input_seq": 1,
+        "host_commit_pending": 1,
+        "inflight": [],
+        "run_id": "20261025-175340-0cdeea",
+        "run_status": "running"
+      },
+      "runs_on_disk": [
+        "20261025-175340-0cdeea"
+      ],
+      "session_id": "work-fixture-gate",
+      "state": {
+        "acceptance": "n/a",
+        "inputs": {
+          "q": {
+            "acked_index": 1
+          }
+        },
+        "last_run": null,
+        "open_turn": 1,
+        "outcome": null,
+        "process_stack": [],
+        "rev": 2,
+        "run_state": "running",
+        "turn_seq": 1,
+        "turns_completed": 0
+      },
+      "worklog": {
+        "committed_bytes": 131,
+        "committed_seq": 1,
+        "file_bytes": 131,
+        "uncommitted_tail": false
+      }
+    }
+  ]
+}

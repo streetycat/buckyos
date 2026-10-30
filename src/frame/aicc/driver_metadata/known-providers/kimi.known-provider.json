@@ -1,0 +1,49 @@
+{
+  "format": "buckyos.aicc.known-provider-catalog",
+  "schema_version": 1,
+  "schema_revision": 1,
+  "revision_seq": 3,
+  "catalog_id": "kimi",
+  "providers": [
+    {
+      "provider_profile_id": "kimi",
+      "display_name": "Moonshot Kimi",
+      "base_url": "https://api.moonshot.ai/v1",
+      "protocol_adapter_id": "kimi-chat",
+      "discovery_behavior_id": "kimi-models",
+      "provider_rules_id": "kimi",
+      "credential": { "kind": "bearer" },
+      "connection": {
+        "region": { "mode": "optional", "default_value": "global", "allowed_values": ["china", "global"] },
+        "workspace": { "mode": "unsupported" },
+        "account": { "mode": "unsupported" },
+        "region_base_urls": {
+          "china": "https://api.moonshot.cn/v1",
+          "global": "https://api.moonshot.ai/v1"
+        }
+      },
+      "ui_hints": {
+        "credential": {
+          "kind": "bearer",
+          "required": true,
+          "secret": true
+        },
+        "instance_fields": {
+          "region": { "mode": "required", "allowed_values": ["china", "global"] },
+          "workspace": { "mode": "unsupported" },
+          "account": { "mode": "unsupported" }
+        },
+        "access_endpoints": {
+          "china": {
+            "label": "China",
+            "description": "Use API Keys created on platform.kimi.com. China and global accounts, balances, and keys are isolated."
+          },
+          "global": {
+            "label": "Global",
+            "description": "Use API Keys created on platform.kimi.ai. China and global accounts, balances, and keys are isolated."
+          }
+        }
+      }
+    }
+  ]
+}

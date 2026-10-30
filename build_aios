@@ -12,33 +12,39 @@ VERSION_FILE="$SRC_DIR/VERSION"
 VERSION_TAG="${VERSION_TAG:-}"
 SUPPORTED_ARCHES=("amd64" "aarch64")
 # Core runtime + predefined Worker Image CLI tool set (see container
-# requirements §6.3). No compile toolchain — Crafter is deferred.
+# requirements §6.3). No compile toolchain — Crafter is deferred. Python apps
+# use uv with this system Python 3.12; Node.js comes from the official tarball
+# (NODE_VERSION in the Dockerfile), not Debian's EOL nodejs/npm. pandoc is a
+# tool package of the ExtTool volume (publish/exttool/install_pandoc.sh).
 RUNTIME_PACKAGES=(
-  "bash" "ca-certificates" "curl" "git" "jq" "locales" "rsync"
-  "tmux" "tree" "unzip" "xz-utils"
-  "python3" "python3-venv"
-  "nodejs" "npm"
-  "ffmpeg" "imagemagick" "poppler-utils" "pandoc" "tesseract-ocr"
+  "bash" "ca-certificates" "curl" "git" "jq" "rsync"
+  "tree" "unzip" "xz-utils"
+  "python3"
+  "ffmpeg" "imagemagick" "poppler-utils" "tesseract-ocr"
 )
-# Legacy flag kept for CLI compat; the Worker Image always ships the tool set.
-WORKSPACE_PACKAGES=()
 EXTRA_APT_PACKAGES=()
 SELECTED_ARCHES=()
 PUSH=0
-INSTALL_WORKSPACE_TOOLS=1
+PREPARE_CONTEXT_DIR=""
 ENTRYPOINT_SOURCE="$ROOT_DIR/publish/aios/entrypoint.sh"
 BUCKYOS_AGENT_TOOLS_SOURCE="$SRC_DIR/tools/buckyos-agent"
 AICC_TOOL_LAUNCHER_SOURCE="$ROOT_DIR/publish/aios/aicc-tool"
+BUCKYOS_LAUNCHER_SOURCE="$ROOT_DIR/publish/aios/buckyos"
+OPENDAN_WEB_SOURCE="$SRC_DIR/frame/opendan/web"
+LOCAL_TEST=0
+LOCAL_TEST_IMAGE_NAME="local/aios-test"
 BUCKYOS_WEBSDK_REPO="https://github.com/buckyos/buckyos-websdk.git"
 BUCKYOS_WEBSDK_REF="${BUCKYOS_WEBSDK_REF:-main}"
 REUSE_CARGO_TARGET=0
 CARGO_TARGET_DIR_OVERRIDE="${AIOS_CARGO_TARGET_DIR:-}"
+AIOS_SOURCE_REVISION=""
+AIOS_BUILD_CREATED=""
 
 usage() {
   cat <<'EOF'
-Usage: ./build_aios [--push] [--image <name>] [--tag <tag>] [--runtime-only] [--arch <arch>] [--apt-package <name>] [--reuse-cargo-target] [--cargo-target-dir <dir>]
+Usage: ./build_aios [--local-test] [--push] [--prepare-context <dir>] [--image <name>] [--tag <tag>] [--arch <arch>] [--apt-package <name>] [--reuse-cargo-target] [--cargo-target-dir <dir>]
 
-Builds the OpenDAN binary with cargo for:
+Builds the multi-call OpenDAN binary (also run as agent_tool and xagent) with cargo and the OpenDAN WebUI with pnpm for:
   - amd64   -> x86_64-unknown-linux-musl
   - aarch64 -> aarch64-unknown-linux-musl
 
@@ -49,10 +55,20 @@ Then packages each binary into an Ubuntu-based Docker image:
   - <image>:latest-aarch64
 
 Options:
+  --local-test    Build a test image of the local source tree for this machine only:
+                  the host architecture, image local/aios-test (unless --image), Cargo
+                  artifacts reused across runs, never pushed. Then point the local
+                  BuckyOS at it ($BUCKYOS_ROOT/etc/devenv.json "aios"), so that after
+                  `uv run src/start.py --skip-update` apps run in it as they would in a
+                  published image. Remove that key to go back to the published image.
   --push          Push arch-specific images and create multi-arch manifests
+  --prepare-context <dir>
+                  Compile and export Docker contexts plus metadata.env to a new directory;
+                  skip Docker build/push. Cannot be combined with --push. On a clean work
+                  tree metadata.env carries immutable_tag=<tag>-<commit12>; CI publishes
+                  <image>:<immutable_tag>-<arch> and pins release packages to it.
   --image <name>  Override image name, default: devenv.json["aios"] or paios/aios
   --tag <tag>     Override version tag, default: src/VERSION
-  --runtime-only  Install only required runtime dependencies in the image
   --arch <arch>   Build only one architecture (amd64|aarch64); can be repeated
   --apt-package   Add an extra apt package to the image; can be repeated
   --reuse-cargo-target
@@ -63,15 +79,26 @@ Options:
 
 Env overrides:
   BUCKYOS_WEBSDK_REF
-                  buckyos-websdk Git ref packaged with buckyos-agent tools (default: main)
+                  buckyos-websdk Git ref whose dist/ backs the build-time checks of the
+                  buckyos-agent tools (default: main). It is not shipped in the image: at
+                  run time the tools use the host SDK that node_daemon mounts read-only at
+                  /opt/buckyos/libexec/buckyos-tool/dist.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --local-test)
+      LOCAL_TEST=1
+      shift
+      ;;
     --push)
       PUSH=1
       shift
+      ;;
+    --prepare-context)
+      PREPARE_CONTEXT_DIR="${2:?--prepare-context requires an output directory}"
+      shift 2
       ;;
     --image)
       IMAGE_NAME="$2"
@@ -80,10 +107,6 @@ while [[ $# -gt 0 ]]; do
     --tag)
       VERSION_TAG="$2"
       shift 2
-      ;;
-    --runtime-only)
-      INSTALL_WORKSPACE_TOOLS=0
-      shift
       ;;
     --arch)
       SELECTED_ARCHES+=("$2")
@@ -115,6 +138,70 @@ done
 
 log() {
   printf '[build_aios] %s\n' "$*"
+}
+
+resolve_build_metadata() {
+  local revision="unknown"
+
+  if revision="$(git -C "$ROOT_DIR" rev-parse --verify HEAD 2>/dev/null)"; then
+    if ! git -C "$ROOT_DIR" diff --quiet --ignore-submodules HEAD --; then
+      revision="${revision}-dirty"
+    fi
+  fi
+
+  AIOS_SOURCE_REVISION="$revision"
+  AIOS_BUILD_CREATED="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+
+sha256_file() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return
+  fi
+
+  "$(resolve_python)" - "$path" <<'PY'
+import hashlib
+import sys
+
+digest = hashlib.sha256()
+with open(sys.argv[1], "rb") as fh:
+    for chunk in iter(lambda: fh.read(1 << 20), b""):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+validate_entrypoint_contract() {
+  if [[ ! -f "$ENTRYPOINT_SOURCE" ]]; then
+    echo "Missing paios/aios entrypoint at $ENTRYPOINT_SOURCE" >&2
+    exit 1
+  fi
+
+  if grep -Fq -- '--agent-id' "$ENTRYPOINT_SOURCE"; then
+    cat >&2 <<EOF
+The AIOS entrypoint still passes the removed OpenDAN --agent-id argument:
+  $ENTRYPOINT_SOURCE
+Agent identity is resolved from the bound AgentSpec. Pass the runtime AppId with
+--appid and let OpenDAN load AgentId/AgentDID from system config.
+EOF
+    exit 1
+  fi
+
+  if ! grep -Fq -- '--appid "$BUCKYOS_APP_ID"' "$ENTRYPOINT_SOURCE"; then
+    cat >&2 <<EOF
+The AIOS entrypoint does not pass the runtime AppId using the supported contract:
+  --appid "\$BUCKYOS_APP_ID"
+Entry point: $ENTRYPOINT_SOURCE
+EOF
+    exit 1
+  fi
 }
 
 default_reused_cargo_target_dir() {
@@ -288,10 +375,95 @@ package_list_to_string() {
   printf '%s' "$*"
 }
 
+host_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'amd64\n'
+      ;;
+    aarch64|arm64)
+      printf 'aarch64\n'
+      ;;
+    *)
+      echo "Unsupported host architecture for --local-test: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+apply_local_test_defaults() {
+  if [[ "$LOCAL_TEST" -ne 1 ]]; then
+    return
+  fi
+  if [[ "$PUSH" -eq 1 || -n "$PREPARE_CONTEXT_DIR" ]]; then
+    echo "--local-test cannot be combined with --push or --prepare-context" >&2
+    exit 1
+  fi
+  if [[ -z "$IMAGE_NAME" ]]; then
+    IMAGE_NAME="$LOCAL_TEST_IMAGE_NAME"
+  fi
+  if [[ ${#SELECTED_ARCHES[@]} -eq 0 ]]; then
+    SELECTED_ARCHES=("$(host_arch)")
+  fi
+  REUSE_CARGO_TARGET=1
+}
+
+# node-daemon reads the worker image repo from $BUCKYOS_ROOT/etc/devenv.json.
+use_image_in_local_buckyos() {
+  local python_bin="$1"
+  local buckyos_root="${BUCKYOS_ROOT:-/opt/buckyos}"
+  local devenv_path="$buckyos_root/etc/devenv.json"
+
+  if [[ ! -d "$buckyos_root/etc" ]]; then
+    log "No BuckyOS at $buckyos_root; to use the image write {\"aios\": \"$IMAGE_NAME\"} to <BUCKYOS_ROOT>/etc/devenv.json"
+    return
+  fi
+
+  "$python_bin" - "$devenv_path" "$IMAGE_NAME" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        config = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+config["aios"] = sys.argv[2]
+path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+  log "Local BuckyOS now uses $IMAGE_NAME ($devenv_path)."
+  log "Restart to recreate the app containers: (cd src && uv run start.py --skip-update)"
+  log "A fresh install (start.py --all) preserves devenv.json; remove its aios override and restart to use the published image."
+}
+
+prepare_opendan_web() {
+  local output_dir="$1"
+
+  if ! command -v pnpm >/dev/null 2>&1; then
+    echo "pnpm is required to build the OpenDAN WebUI ($OPENDAN_WEB_SOURCE)" >&2
+    exit 1
+  fi
+  log "Building the OpenDAN WebUI"
+  (
+    cd "$OPENDAN_WEB_SOURCE"
+    pnpm install
+    pnpm build
+  )
+  if [[ ! -f "$OPENDAN_WEB_SOURCE/dist/index.html" ]]; then
+    echo "OpenDAN WebUI build output not found: $OPENDAN_WEB_SOURCE/dist/index.html" >&2
+    exit 1
+  fi
+  mkdir -p "$output_dir"
+  cp -R "$OPENDAN_WEB_SOURCE/dist/." "$output_dir/"
+}
+
 prepare_buckyos_agent_package() {
   local output_dir="$1"
-  local tmp_root="$2"
-  local python_bin="$3"
+  local check_sdk_dir="$2"
+  local tmp_root="$3"
+  local python_bin="$4"
   local sdk_dist=""
   local sdk_checkout="$tmp_root/buckyos-websdk"
   local fetched_commit
@@ -304,10 +476,14 @@ prepare_buckyos_agent_package() {
     echo "Missing AICC tool launcher: $AICC_TOOL_LAUNCHER_SOURCE" >&2
     exit 1
   fi
+  if [[ ! -f "$BUCKYOS_LAUNCHER_SOURCE" ]]; then
+    echo "Missing buckyos launcher: $BUCKYOS_LAUNCHER_SOURCE" >&2
+    exit 1
+  fi
   mkdir -p "$output_dir"
   cp -R "$BUCKYOS_AGENT_TOOLS_SOURCE/." "$output_dir/"
 
-  log "Fetching buckyos-websdk ref $BUCKYOS_WEBSDK_REF for AICC tools"
+  log "Fetching buckyos-websdk ref $BUCKYOS_WEBSDK_REF for the AICC tool build checks"
   git init -q "$sdk_checkout"
   git -C "$sdk_checkout" remote add origin "$BUCKYOS_WEBSDK_REPO"
   git -C "$sdk_checkout" fetch -q --depth 1 origin "$BUCKYOS_WEBSDK_REF"
@@ -321,8 +497,8 @@ prepare_buckyos_agent_package() {
     exit 1
   fi
 
-  mkdir -p "$output_dir/vendor/buckyos-websdk"
-  cp -R "$sdk_dist/." "$output_dir/vendor/buckyos-websdk/"
+  mkdir -p "$check_sdk_dir"
+  cp -R "$sdk_dist/." "$check_sdk_dir/"
 
   "$python_bin" - "$output_dir/deno.json" <<'PY'
 import json
@@ -331,7 +507,7 @@ from pathlib import Path
 
 config_path = Path(sys.argv[1])
 config = json.loads(config_path.read_text(encoding="utf-8"))
-config.setdefault("imports", {})["buckyos"] = "./vendor/buckyos-websdk/node.mjs"
+config.setdefault("imports", {})["buckyos"] = "/opt/buckyos/libexec/buckyos-tool/dist/node.mjs"
 config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -349,16 +525,15 @@ render_dockerfile() {
 FROM ubuntu:24.04
 
 ARG TARGET_ARCH
-
-LABEL org.opencontainers.image.title="paios/aios (BuckyOS Worker Image)" \
-EOF
-    printf '      org.opencontainers.image.description="Unified worker runtime for %s" \\\n' "$IMAGE_NAME"
-    cat <<'EOF'
-      org.opencontainers.image.vendor="BuckyOS DAO"
+ARG OPENDAN_SHA256
+ARG DENO_VERSION=v2.9.2
+ARG NODE_VERSION=v24.21.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime + predefined worker CLI tools (see container spec §6.3).
+# Runtime + predefined worker CLI tools (see container spec §6.3). The GPU /
+# LLVM stack that ffmpeg's SDL/GL dependencies drag in is never linked by the
+# headless tools, so it is dropped in the same layer (~190 MB).
 RUN apt-get update && apt-get install -y --no-install-recommends \
 EOF
 
@@ -368,26 +543,44 @@ EOF
 
     cat <<'EOF'
     && rm -rf /var/lib/apt/lists/* \
-    && locale-gen en_US.UTF-8
+    && rm -f /usr/lib/*-linux-gnu/libLLVM*.so* /usr/lib/*-linux-gnu/libgallium-*.so \
+       /usr/lib/*-linux-gnu/libGLX_mesa.so* \
+    && rm -rf /usr/lib/*-linux-gnu/dri
 
-ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# uv — managed Python + dependency installer used by Script apps.
+# Node.js LTS (official build; npm/npx/corepack included).
+RUN case "${TARGET_ARCH}" in amd64) node_arch=x64 ;; aarch64) node_arch=arm64 ;; *) exit 1 ;; esac && \
+    node_tar="node-${NODE_VERSION}-linux-${node_arch}.tar.xz" && \
+    curl -fsSLO "https://nodejs.org/dist/${NODE_VERSION}/${node_tar}" && \
+    curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt" | grep " ${node_tar}\$" | sha256sum -c - && \
+    tar -xJf "${node_tar}" -C /usr/local --strip-components=1 --no-same-owner \
+      --exclude='*/include' --exclude='*/share/doc' --exclude='*/CHANGELOG.md' --exclude='*/README.md' && \
+    rm -f "${node_tar}" && \
+    node --version && npm --version
+
+# uv — dependency installer used by Script apps, on the system Python 3.12.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
-RUN uv python install 3.12
 
 # Deno — TypeScript runtime used by Script apps and Worker-layer Agents.
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- "${DENO_VERSION}" && \
+    deno --version
 
 ENV BUCKYOS_ROOT=/opt/buckyos
 WORKDIR /opt/buckyos
 
 # BuckyOS Agent AICC CLI tools. Keep these outside /opt/buckyos/tools because
 # that path is shadowed by the shared ExtTool volume at runtime.
+# They and the `buckyos` launcher run on the host's Tool scripts and SDK,
+# which node_daemon mounts read-only at /opt/buckyos/libexec/buckyos-tool.
+# The checks below borrow a build-time SDK through a bind mount, so no SDK
+# lands in the image.
 COPY buckyos-agent /opt/buckyos/bin/opendan/buckyos-agent
 COPY aicc-tool-launcher /usr/local/bin/aicc-tool
-RUN chmod 755 /usr/local/bin/aicc-tool && \
+COPY buckyos-launcher /usr/local/bin/buckyos
+RUN --mount=type=bind,source=buckyos-tool-check-dist,target=/opt/buckyos/libexec/buckyos-tool/dist \
+    chmod 755 /usr/local/bin/aicc-tool /usr/local/bin/buckyos && \
     for command_path in /opt/buckyos/bin/opendan/buckyos-agent/commands/*.ts; do \
       command_name="$(basename "$command_path" .ts)"; \
       ln -sf aicc-tool "/usr/local/bin/$command_name"; \
@@ -395,7 +588,7 @@ RUN chmod 755 /usr/local/bin/aicc-tool && \
     deno check \
       --config /opt/buckyos/bin/opendan/buckyos-agent/deno.json \
       /opt/buckyos/bin/opendan/buckyos-agent/aicc-tool.ts && \
-    (cd /opt/buckyos/bin/opendan/buckyos-agent && deno task gen_image --help >/dev/null 2>&1) && \
+    (cd /opt/buckyos/bin/opendan/buckyos-agent && deno task gen_image --help >/dev/null) && \
     printf '%s\n' \
       'import { teardown } from "/opt/buckyos/bin/opendan/buckyos-agent/lib/runtime.ts";' \
       'teardown();' > /tmp/buckyos-agent-compose-smoke.ts && \
@@ -408,14 +601,15 @@ RUN chmod 755 /usr/local/bin/aicc-tool && \
     command -v aicc-tool >/dev/null && \
     command -v gen_image >/dev/null && \
     command -v edit_image >/dev/null && \
-    aicc-tool --help >/dev/null 2>&1 && \
-    gen_image --help >/dev/null 2>&1 && \
-    edit_image --help >/dev/null 2>&1
+    aicc-tool --help >/dev/null && \
+    gen_image --help >/dev/null && \
+    edit_image --help >/dev/null && \
+    rm -rf /root/.cache/deno
 
 # ExtTool Volume mount point — kept empty in the Worker image. The real
-# payload (FreeCAD, pre-warmed uv/deno caches, tool packages) ships in the
-# separate paios/exttool image and lands in the buckyos-exttool named
-# volume, which node_daemon mounts here ro at run time (§6.3 of paios容器需求.md).
+# payload (pre-warmed uv/deno caches, optional tool packages) ships in the
+# separate paios/exttool image and lands in the buckyos-exttool-<image id>
+# named volume, which node_daemon mounts here ro at run time (§6.3 of paios容器需求.md).
 RUN mkdir -p \
     /opt/buckyos/bin/opendan \
     /opt/buckyos/data \
@@ -425,14 +619,16 @@ RUN mkdir -p \
     /opt/buckyos/tools/bin \
     /mnt/buckyos/pkg
 
-COPY opendan /opt/buckyos/bin/opendan/opendan
-COPY agent_tool /opt/buckyos/bin/opendan/agent_tool
-RUN chmod 755 /opt/buckyos/bin/opendan/opendan /opt/buckyos/bin/opendan/agent_tool
+COPY --chmod=755 opendan /opt/buckyos/bin/opendan/
+COPY web /opt/buckyos/bin/opendan/web
+# One multi-call executable: agent_tool and xagent dispatch on argv[0].
+RUN printf '%s  %s\n' "${OPENDAN_SHA256}" /opt/buckyos/bin/opendan/opendan | sha256sum -c - && \
+    ln -s opendan /opt/buckyos/bin/opendan/agent_tool && \
+    ln -s opendan /opt/buckyos/bin/opendan/xagent
 
 # Unified entrypoint: instance-volume bootstrap + file-level upstream sync +
 # agent/script/custom dispatch.
-COPY entrypoint.sh /opt/buckyos/entrypoint.sh
-RUN chmod 755 /opt/buckyos/entrypoint.sh
+COPY --chmod=755 entrypoint.sh /opt/buckyos/entrypoint.sh
 
 ENV AIOS_TARGET_ARCH="${TARGET_ARCH}" \
     BUCKYOS_INSTANCE_VOLUME=/opt/buckyos/instance \
@@ -442,9 +638,26 @@ ENV AIOS_TARGET_ARCH="${TARGET_ARCH}" \
     UV_CACHE_DIR=/opt/buckyos/instance/uv-cache \
     NPM_CONFIG_CACHE=/opt/buckyos/instance/npm-cache \
     PIP_CACHE_DIR=/opt/buckyos/instance/pip-cache \
-    PATH="/opt/buckyos/tools/bin:${PATH}"
+    PATH="/opt/buckyos/tools/bin:/opt/buckyos/bin/opendan:${PATH}"
+
+# The standard environment baseline (libopendan `baseline.rs`): every
+# command it lists must be here; session helpers come from the session bin.
+RUN xagent --help >/dev/null && agent_tool --help >/dev/null && \
+    xagent runtime baseline --check --overlay >/dev/null
 
 EXPOSE 3180
+
+ARG IMAGE_VERSION
+ARG SOURCE_REVISION
+ARG BUILD_CREATED
+LABEL org.opencontainers.image.title="paios/aios (BuckyOS Worker Image)" \
+EOF
+    printf '      org.opencontainers.image.description="Unified worker runtime for %s" \\\n' "$IMAGE_NAME"
+    cat <<'EOF'
+      org.opencontainers.image.vendor="BuckyOS DAO" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}"
 
 ENTRYPOINT ["/opt/buckyos/entrypoint.sh"]
 EOF
@@ -871,7 +1084,6 @@ build_runtime_binaries() {
   local python_bin="$4"
   local rust_target
   local source_opendan
-  local source_agent_tool
   local -a cargo_cmd
   local -a env_cmd
   local -a env_lines
@@ -894,16 +1106,15 @@ build_runtime_binaries() {
     exit 1
   fi
 
+  # One executable: agent_tool and xagent are symlinks to opendan in the image,
+  # which dispatches on argv[0] (frame/opendan/src/main.rs).
   source_opendan="$cargo_target_dir/$rust_target/release/opendan"
-  source_agent_tool="$cargo_target_dir/$rust_target/release/agent_tool"
 
   cargo_cmd=(
     cargo
     build
     -p
     opendan
-    -p
-    agent_tool_cli_dev
     --release
     --target
     "$rust_target"
@@ -938,7 +1149,7 @@ build_runtime_binaries() {
     env_cmd+=("${normalized_env_lines[@]}")
   fi
 
-  log "Building opendan and agent_tool_cli_dev for $arch using target $rust_target via ${cargo_cmd[*]}"
+  log "Building opendan for $arch using target $rust_target via ${cargo_cmd[*]}"
   (
     cd "$SRC_DIR"
     "${env_cmd[@]}" "${cargo_cmd[@]}"
@@ -949,15 +1160,9 @@ build_runtime_binaries() {
     exit 1
   fi
 
-  if [[ ! -f "$source_agent_tool" ]]; then
-    echo "Expected build output not found: $source_agent_tool" >&2
-    exit 1
-  fi
-
   mkdir -p "$context_dir"
   cp "$source_opendan" "$context_dir/opendan"
-  cp "$source_agent_tool" "$context_dir/agent_tool"
-  chmod 755 "$context_dir/opendan" "$context_dir/agent_tool"
+  chmod 755 "$context_dir/opendan"
 
   if [[ ! -f "$ENTRYPOINT_SOURCE" ]]; then
     echo "Missing paios/aios entrypoint at $ENTRYPOINT_SOURCE" >&2
@@ -1035,6 +1240,9 @@ build_image() {
   local dockerfile_path="$4"
   local version_arch_tag="$IMAGE_NAME:$VERSION_TAG-$arch"
   local latest_arch_tag="$IMAGE_NAME:latest-$arch"
+  local opendan_sha256
+
+  opendan_sha256="$(sha256_file "$context_dir/opendan")"
 
   log "Building Docker image $version_arch_tag"
 
@@ -1042,6 +1250,10 @@ build_image() {
     docker buildx build \
       --platform "$platform" \
       --build-arg TARGET_ARCH="$arch" \
+      --build-arg IMAGE_VERSION="$VERSION_TAG" \
+      --build-arg SOURCE_REVISION="$AIOS_SOURCE_REVISION" \
+      --build-arg BUILD_CREATED="$AIOS_BUILD_CREATED" \
+      --build-arg OPENDAN_SHA256="$opendan_sha256" \
       --tag "$version_arch_tag" \
       --tag "$latest_arch_tag" \
       --push \
@@ -1051,12 +1263,57 @@ build_image() {
     docker buildx build \
       --platform "$platform" \
       --build-arg TARGET_ARCH="$arch" \
+      --build-arg IMAGE_VERSION="$VERSION_TAG" \
+      --build-arg SOURCE_REVISION="$AIOS_SOURCE_REVISION" \
+      --build-arg BUILD_CREATED="$AIOS_BUILD_CREATED" \
+      --build-arg OPENDAN_SHA256="$opendan_sha256" \
       --tag "$version_arch_tag" \
       --tag "$latest_arch_tag" \
       --load \
       -f "$dockerfile_path" \
       "$context_dir"
+
+    verify_loaded_image "$latest_arch_tag" "$platform" "$opendan_sha256"
   fi
+}
+
+verify_loaded_image() {
+  local image_ref="$1"
+  local platform="$2"
+  local expected_opendan_sha256="$3"
+  local actual_opendan_sha256
+  local actual_revision
+  local actual_version
+
+  actual_opendan_sha256="$(
+    docker run --rm \
+      --platform "$platform" \
+      --entrypoint sha256sum \
+      "$image_ref" \
+      /opt/buckyos/bin/opendan/opendan \
+      | awk '{print $1}'
+  )"
+  if [[ "$actual_opendan_sha256" != "$expected_opendan_sha256" ]]; then
+    cat >&2 <<EOF
+Loaded image OpenDAN digest mismatch for $image_ref:
+  expected: $expected_opendan_sha256
+  actual:   ${actual_opendan_sha256:-<empty>}
+EOF
+    exit 1
+  fi
+
+  actual_revision="$(docker image inspect "$image_ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+  actual_version="$(docker image inspect "$image_ref" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+  if [[ "$actual_revision" != "$AIOS_SOURCE_REVISION" || "$actual_version" != "$VERSION_TAG" ]]; then
+    cat >&2 <<EOF
+Loaded image metadata mismatch for $image_ref:
+  expected revision/version: $AIOS_SOURCE_REVISION / $VERSION_TAG
+  actual revision/version:   $actual_revision / $actual_version
+EOF
+    exit 1
+  fi
+
+  log "Verified $image_ref: opendan_sha256=$actual_opendan_sha256 revision=$actual_revision version=$actual_version"
 }
 
 publish_manifests() {
@@ -1078,15 +1335,33 @@ main() {
   local cargo_target_dir
   local cargo_target_mode
   local buckyos_agent_package_dir
+  local buckyos_tool_check_dist_dir
+  local opendan_web_dir
   local -a target_arches=()
+
+  apply_local_test_defaults
 
   if [[ ! -f "$PROJECT_CONFIG_PATH" ]]; then
     echo "Missing project config: $PROJECT_CONFIG_PATH" >&2
     exit 1
   fi
 
+  if [[ -n "$PREPARE_CONTEXT_DIR" ]]; then
+    if [[ "$PUSH" -eq 1 ]]; then
+      echo "--prepare-context cannot be combined with --push" >&2
+      exit 1
+    fi
+    if [[ "$PREPARE_CONTEXT_DIR" != /* ]]; then
+      PREPARE_CONTEXT_DIR="$ROOT_DIR/$PREPARE_CONTEXT_DIR"
+    fi
+    mkdir -p "$(dirname "$PREPARE_CONTEXT_DIR")"
+    mkdir "$PREPARE_CONTEXT_DIR"
+  fi
+
   resolve_default_image_name
   resolve_version_tag
+  resolve_build_metadata
+  validate_entrypoint_contract
   python_bin="$(resolve_python)"
   while IFS= read -r _arch_line; do
     target_arches+=("$_arch_line")
@@ -1096,7 +1371,11 @@ main() {
   trap "rm -rf '$tmp_root'" EXIT
 
   buckyos_agent_package_dir="$tmp_root/buckyos-agent-package"
-  prepare_buckyos_agent_package "$buckyos_agent_package_dir" "$tmp_root" "$python_bin"
+  buckyos_tool_check_dist_dir="$tmp_root/buckyos-tool-check-dist"
+  prepare_buckyos_agent_package "$buckyos_agent_package_dir" "$buckyos_tool_check_dist_dir" "$tmp_root" "$python_bin"
+
+  opendan_web_dir="$tmp_root/opendan-web"
+  prepare_opendan_web "$opendan_web_dir"
 
   cargo_target_dir="$(resolve_cargo_target_dir "$tmp_root")"
   mkdir -p "$cargo_target_dir"
@@ -1109,29 +1388,24 @@ main() {
     cargo_target_mode="ephemeral"
   fi
 
-  prepare_docker_config "$tmp_root"
-  ensure_buildx_support "${target_arches[@]}"
+  if [[ -z "$PREPARE_CONTEXT_DIR" ]]; then
+    prepare_docker_config "$tmp_root"
+    ensure_buildx_support "${target_arches[@]}"
+  fi
 
   log "Version tag: $VERSION_TAG"
+  log "Source revision: $AIOS_SOURCE_REVISION"
+  log "Build created: $AIOS_BUILD_CREATED"
   log "Image repo: $IMAGE_NAME"
   log "Target arches: $(package_list_to_string "${target_arches[@]}")"
   log "Cargo target dir: $cargo_target_dir ($cargo_target_mode)"
   log "Runtime packages: $(package_list_to_string "${RUNTIME_PACKAGES[@]}")"
-  if [[ "$INSTALL_WORKSPACE_TOOLS" -eq 1 ]]; then
-    if [[ ${#WORKSPACE_PACKAGES[@]} -gt 0 ]]; then
-      log "Workspace packages: $(package_list_to_string "${WORKSPACE_PACKAGES[@]}")"
-    else
-      log "Workspace packages: (none)"
-    fi
-  else
-    log "Workspace packages: skipped (--runtime-only)"
-  fi
   if [[ ${#EXTRA_APT_PACKAGES[@]} -gt 0 ]]; then
     log "Extra apt packages: $(package_list_to_string "${EXTRA_APT_PACKAGES[@]}")"
   fi
 
   for arch in "${target_arches[@]}"; do
-    local context_dir="$tmp_root/$arch"
+    local context_dir="${PREPARE_CONTEXT_DIR:-$tmp_root}/$arch"
     local dockerfile_path="$context_dir/Dockerfile"
     local platform
 
@@ -1140,10 +1414,33 @@ main() {
 
     build_runtime_binaries "$arch" "$context_dir" "$cargo_target_dir" "$python_bin"
     cp -R "$buckyos_agent_package_dir" "$context_dir/buckyos-agent"
+    cp -R "$buckyos_tool_check_dist_dir" "$context_dir/buckyos-tool-check-dist"
     cp "$AICC_TOOL_LAUNCHER_SOURCE" "$context_dir/aicc-tool-launcher"
+    cp "$BUCKYOS_LAUNCHER_SOURCE" "$context_dir/buckyos-launcher"
+    cp -R "$opendan_web_dir" "$context_dir/web"
     render_dockerfile "$dockerfile_path"
-    build_image "$arch" "$context_dir" "$platform" "$dockerfile_path"
+    if [[ -z "$PREPARE_CONTEXT_DIR" ]]; then
+      build_image "$arch" "$context_dir" "$platform" "$dockerfile_path"
+    fi
   done
+
+  if [[ -n "$PREPARE_CONTEXT_DIR" ]]; then
+    {
+      printf 'version=%s\n' "$VERSION_TAG"
+      printf 'revision=%s\n' "$AIOS_SOURCE_REVISION"
+      printf 'created=%s\n' "$AIOS_BUILD_CREATED"
+      if [[ "$AIOS_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+        printf 'immutable_tag=%s-%s\n' "$VERSION_TAG" "${AIOS_SOURCE_REVISION:0:12}"
+      else
+        printf 'immutable_tag=\n'
+      fi
+      for arch in "${target_arches[@]}"; do
+        printf '%s_sha256=%s\n' "$arch" "$(sha256_file "$PREPARE_CONTEXT_DIR/$arch/opendan")"
+      done
+    } > "$PREPARE_CONTEXT_DIR/metadata.env"
+    log "Prepared Docker contexts and metadata.env at $PREPARE_CONTEXT_DIR"
+    return
+  fi
 
   if [[ "$PUSH" -eq 1 ]]; then
     publish_manifests
@@ -1154,10 +1451,14 @@ main() {
     log "Pushed: $IMAGE_NAME:$VERSION_TAG and $IMAGE_NAME:latest"
   else
     log "Loaded local images:"
-    log "  $IMAGE_NAME:$VERSION_TAG-amd64"
-    log "  $IMAGE_NAME:latest-amd64"
-    log "  $IMAGE_NAME:$VERSION_TAG-aarch64"
-    log "  $IMAGE_NAME:latest-aarch64"
+    local built_arch
+    for built_arch in "${target_arches[@]}"; do
+      log "  $IMAGE_NAME:$VERSION_TAG-$built_arch"
+      log "  $IMAGE_NAME:latest-$built_arch"
+    done
+  fi
+  if [[ "$LOCAL_TEST" -eq 1 ]]; then
+    use_image_in_local_buckyos "$python_bin"
   fi
 }
 

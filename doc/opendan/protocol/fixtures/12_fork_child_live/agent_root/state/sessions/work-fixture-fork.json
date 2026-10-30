@@ -1,0 +1,38 @@
+{
+  "session_id": "work-fixture-fork",
+  "kind": "work",
+  "class": "work",
+  "created_by": {
+    "principal": "app:app2@alice",
+    "via": "app"
+  },
+  "driver": {
+    "principal": "app:app2@alice"
+  },
+  "location": "${FIXTURE_ROOT}/app/work-fixture-fork",
+  "input_queue": "app2::alice::opendan.session.work-fixture-fork",
+  "wake_event": "/opendan/jarvis.alice/session/work-fixture-fork/input",
+  "agent_access": "full",
+  "objective": "research then answer",
+  "status": {
+    "rev": 4,
+    "run_state": "running",
+    "acceptance": "n/a",
+    "one_line_status": "",
+    "report_brief": "",
+    "turn_open": true,
+    "activity": {
+      "summary": "research then answer",
+      "heartbeat_ms": 1792976021902
+    },
+    "last_runner": {
+      "runner_id": "rn-1285053299944501",
+      "host": "${FIXTURE_HOST}",
+      "pid": 3021255,
+      "lock_epoch": 1,
+      "at_ms": 1792976021903
+    },
+    "updated_at_ms": 1792976021902
+  },
+  "location_rev": 0
+}

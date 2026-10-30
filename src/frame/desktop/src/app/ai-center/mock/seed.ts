@@ -263,7 +263,7 @@ function provider(
     balanceValue?: number
     estimatedCost?: number
     pricingMode?: 'per_token' | 'subscription' | 'free_quota' | 'unknown'
-    endpoint?: string
+    baseUrl?: string
     syncStatus?: 'ok' | 'syncing' | 'failed'
   } = {},
 ): ProviderView {
@@ -271,21 +271,25 @@ function provider(
     config: {
       id,
       name,
+      enabled: true,
       provider_type: providerType,
       provider_instance_name: instanceName,
-      provider_runtime_type: providerType === 'sn_router' ? 'proxy_unknown' : 'cloud_api',
-      provider_driver: driver,
-      provider_origin: providerType === 'sn_router' ? 'builtin' : 'user_config',
-      auth_mode: providerType === 'sn_router' ? 'oauth' : 'api_key',
-      endpoint: options.endpoint,
+      provider_runtime_type: 'cloud_api',
+      provider_profile_id: driver,
+      protocol_adapter_id: providerType === 'claude' ? 'claude-messages' : providerType === 'sn' ? 'sn-openai' : 'openai-responses',
+      provider_origin: providerType === 'sn' ? 'system_config' : 'user_config',
+      auth_mode: providerType === 'sn' ? 'dynamic_login' : 'api_key',
+      credential_configured: true,
+      base_url: options.baseUrl ?? '',
       auto_sync_models: true,
       created_at: '2026-05-20T08:00:00Z',
     },
     inventory: {
       provider_instance_name: instanceName,
-      provider_type: providerType === 'sn_router' ? 'proxy_unknown' : 'cloud_api',
-      provider_driver: driver,
-      provider_origin: providerType === 'sn_router' ? 'builtin' : 'user_config',
+      provider_type: 'cloud_api',
+      provider_profile_id: driver,
+      protocol_adapter_id: providerType === 'claude' ? 'claude-messages' : providerType === 'sn' ? 'sn-openai' : 'openai-responses',
+      provider_origin: providerType === 'sn' ? 'system_config' : 'user_config',
       inventory_revision: `${instanceName}-rev-20260529`,
       version: '2026.05',
       models,
@@ -316,22 +320,18 @@ function provider(
 }
 
 const providers = [
-  provider('sn-router-1', 'SN Router', 'sn_router', 'sn-router', 'sn', snModels, {
-    balanceUnit: 'credit',
-    balanceValue: 860,
-    pricingMode: 'free_quota',
-  }),
+  provider('sn-router-1', 'SN Router', 'sn', 'sn-ai-provider-default', 'sn', snModels),
   provider('openai-1', 'OpenAI Main Key', 'openai', 'openai-main', 'openai', openaiModels, {
     balanceUnit: 'usd',
     balanceValue: 38.25,
     estimatedCost: 12.84,
-    endpoint: 'https://api.openai.com',
+    baseUrl: 'https://api.openai.com/v1',
   }),
-  provider('anthropic-1', 'Anthropic Work', 'anthropic', 'anthropic-work', 'anthropic', anthropicModels, {
+  provider('anthropic-1', 'Claude Work', 'claude', 'anthropic-work', 'claude', anthropicModels, {
     connected: true,
     authStatus: 'ok',
     estimatedCost: 18.4,
-    endpoint: 'https://api.anthropic.com',
+    baseUrl: 'https://api.anthropic.com/v1',
     syncStatus: 'failed',
   }),
 ]
@@ -621,7 +621,7 @@ function generateUsageEvents(): UsageEvent[] {
       estimated_cost: estimatedCost,
       finance_snapshot: {
         amount: estimatedCost,
-        currency: 'USD',
+        currency: i % 9 === 0 ? 'CNY' : i % 7 === 0 ? 'EUR' : 'USD',
         provider_trace_id: `trace-${i.toString().padStart(3, '0')}`,
       },
       status: i % 23 === 0 ? 'failed' : 'success',
@@ -631,11 +631,9 @@ function generateUsageEvents(): UsageEvent[] {
   return events.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
 }
 
-function scoreInputs(cost: number, latency: number, reliability: number, quality: number, preference: number, local: number) {
+function scoreInputs(cost: number, quality: number, preference: number, local: number) {
   return {
     cost,
-    latency,
-    reliability,
     quality,
     preference,
     cache: 0,
@@ -680,7 +678,7 @@ const routeTraces: RouteTrace[] = [
           exact_model_weight_effect: 'neutral',
           provider_weight_effect: 'neutral',
         },
-        score_inputs: scoreInputs(0.6, 0.4, 0.08, 0.02, 0.5, 1),
+        score_inputs: scoreInputs(0.6, 0.02, 0.5, 1),
       },
       {
         exact_model: 'gpt-5.1@openai-main',
@@ -702,7 +700,7 @@ const routeTraces: RouteTrace[] = [
           exact_model_weight_effect: 'neutral',
           provider_weight_effect: 'downweighted',
         },
-        score_inputs: scoreInputs(0.2, 0.35, 0.03, 0.04, 1, 1),
+        score_inputs: scoreInputs(0.2, 0.04, 1, 1),
       },
       {
         exact_model: 'qwen2.5-coder-32b@local',
@@ -721,7 +719,7 @@ const routeTraces: RouteTrace[] = [
           exact_model_weight_effect: 'upweighted',
           provider_weight_effect: 'neutral',
         },
-        score_inputs: scoreInputs(0, 0.1, 0.01, 0.18, 0.3, 0),
+        score_inputs: scoreInputs(0, 0.18, 0.3, 0),
       },
     ],
     filtered_candidates: [
@@ -752,9 +750,9 @@ const routeTraces: RouteTrace[] = [
     selected_exact_model: 'qwen2.5-coder-32b@local',
     selected_provider_instance_name: 'local',
     ranked_candidates: [
-      { exact_model: 'qwen2.5-coder-32b@local', final_score: 0.88, selected: true, score_inputs: scoreInputs(0, 0.1, 0.01, 0.12, 0.4, 0) },
-      { exact_model: 'claude-sonnet-4.5@anthropic-work', final_score: 0.86, selected: false, score_inputs: scoreInputs(0.7, 0.45, 0.05, 0.04, 0.6, 1) },
-      { exact_model: 'gpt-5.1@openai-main', final_score: 0.81, selected: false, score_inputs: scoreInputs(0.35, 0.3, 0.03, 0.08, 0.6, 1) },
+      { exact_model: 'qwen2.5-coder-32b@local', final_score: 0.88, selected: true, score_inputs: scoreInputs(0, 0.12, 0.4, 0) },
+      { exact_model: 'claude-sonnet-4.5@anthropic-work', final_score: 0.86, selected: false, score_inputs: scoreInputs(0.7, 0.04, 0.6, 1) },
+      { exact_model: 'gpt-5.1@openai-main', final_score: 0.81, selected: false, score_inputs: scoreInputs(0.35, 0.08, 0.6, 1) },
     ],
     filtered_candidates: [],
     fallback_applied: false,

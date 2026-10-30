@@ -4,14 +4,8 @@ import type {
   DesktopWallpaper,
   DeadZone,
   FormFactor,
-  LayoutItem,
-  LayoutState,
-  MockScenario,
 } from '../models/ui'
-import {
-  isLauncherApp,
-  supportsFormFactor,
-} from '../models/ui'
+import { supportsFormFactor } from '../models/ui'
 
 export const defaultDeadZone: DeadZone = {
   top: 0,
@@ -311,6 +305,52 @@ const appCatalog: AppDefinition[] = [
     },
   },
   {
+    id: 'agent-setup',
+    iconKey: 'agent-setup',
+    labelKey: 'apps.agentSetup',
+    summaryKey: 'appSummary.agentSetup',
+    accent: 'var(--cp-accent)',
+    tier: 'system',
+    manifest: {
+      defaultMode: 'windowed',
+      allowMinimize: true,
+      allowMaximize: true,
+      allowClose: true,
+      allowFullscreen: false,
+      mobileFullscreenBehavior: 'cover_dead_zone',
+      mobileStatusBarMode: 'standard',
+      titleBarMode: 'system',
+      placement: 'inplace',
+      contentPadding: 'none',
+      showInLauncher: false,
+      desktopWindow: {
+        width: 860,
+        height: 720,
+        minWidth: 560,
+        minHeight: 520,
+      },
+    },
+  },
+  {
+    id: 'agent-guide',
+    iconKey: 'agent-guide',
+    labelKey: 'apps.agentGuide',
+    summaryKey: 'appSummary.agentGuide',
+    accent: 'var(--cp-accent)',
+    tier: 'system',
+    manifest: {
+      defaultMode: 'windowed',
+      allowMinimize: true,
+      allowMaximize: true,
+      allowClose: true,
+      allowFullscreen: false,
+      mobileFullscreenBehavior: 'cover_dead_zone',
+      mobileStatusBarMode: 'standard',
+      titleBarMode: 'system',
+      placement: 'inplace',
+    },
+  },
+  {
     id: 'my-network',
     iconKey: 'my-network',
     labelKey: 'apps.myNetwork',
@@ -333,6 +373,32 @@ const appCatalog: AppDefinition[] = [
         height: 720,
         minWidth: 840,
         minHeight: 520,
+      },
+    },
+  },
+  {
+    id: 'my-content',
+    iconKey: 'my-content',
+    labelKey: 'apps.myContent',
+    summaryKey: 'appSummary.myContent',
+    accent: 'var(--cp-accent)',
+    tier: 'system',
+    manifest: {
+      defaultMode: 'windowed',
+      allowMinimize: true,
+      allowMaximize: true,
+      allowClose: true,
+      allowFullscreen: false,
+      mobileFullscreenBehavior: 'cover_dead_zone',
+      mobileStatusBarMode: 'standard',
+      titleBarMode: 'system',
+      placement: 'inplace',
+      contentPadding: 'none',
+      desktopWindow: {
+        width: 1080,
+        height: 720,
+        minWidth: 720,
+        minHeight: 480,
       },
     },
   },
@@ -386,6 +452,59 @@ const appCatalog: AppDefinition[] = [
         height: 800,
         minWidth: 900,
         minHeight: 560,
+      },
+    },
+  },
+  {
+    id: 'aiworkspace',
+    iconKey: 'aiworkspace',
+    labelKey: 'apps.aiworkspace',
+    summaryKey: 'appSummary.aiworkspace',
+    accent: 'var(--cp-accent)',
+    tier: 'system',
+    manifest: {
+      defaultMode: 'windowed',
+      allowMinimize: true,
+      allowMaximize: true,
+      allowClose: true,
+      allowFullscreen: true,
+      mobileFullscreenBehavior: 'cover_dead_zone',
+      mobileStatusBarMode: 'standard',
+      titleBarMode: 'system',
+      placement: 'inplace',
+      contentPadding: 'none',
+      mobileRedirectPath: '/workspace',
+      desktopWindow: {
+        width: 1280,
+        height: 820,
+        minWidth: 900,
+        minHeight: 560,
+      },
+    },
+  },
+  {
+    id: 'preview',
+    iconKey: 'preview',
+    labelKey: 'apps.preview',
+    summaryKey: 'appSummary.preview',
+    accent: 'var(--cp-accent-soft)',
+    tier: 'system',
+    manifest: {
+      defaultMode: 'windowed',
+      allowMinimize: true,
+      allowMaximize: true,
+      allowClose: true,
+      allowFullscreen: true,
+      mobileFullscreenBehavior: 'cover_dead_zone',
+      mobileStatusBarMode: 'standard',
+      titleBarMode: 'system',
+      placement: 'inplace',
+      contentPadding: 'none',
+      desktopWindow: {
+        width: 1100,
+        height: 760,
+        minWidth: 480,
+        minHeight: 320,
       },
     },
   },
@@ -463,429 +582,29 @@ const appCatalog: AppDefinition[] = [
   },
 ]
 
-const desktopItems: LayoutItem[][] = [
-  [
-    {
-      id: 'widget-clock',
-      type: 'widget',
-      widgetType: 'clock',
-      x: 0,
-      y: 0,
-      w: 2,
-      h: 1,
-      config: {},
-    },
-    {
-      id: 'app-settings',
-      type: 'app',
-      appId: 'settings',
-      x: 2,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-files',
-      type: 'app',
-      appId: 'files',
-      x: 3,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-studio',
-      type: 'app',
-      appId: 'studio',
-      x: 4,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-market',
-      type: 'app',
-      appId: 'market',
-      x: 5,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-docs',
-      type: 'app',
-      appId: 'docs',
-      x: 6,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-demos',
-      type: 'app',
-      appId: 'demos',
-      x: 7,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-codeassistant',
-      type: 'app',
-      appId: 'codeassistant',
-      x: 8,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-messagehub',
-      type: 'app',
-      appId: 'messagehub',
-      x: 9,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-ai-center',
-      type: 'app',
-      appId: 'ai-center',
-      x: 2,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-homestation',
-      type: 'app',
-      appId: 'homestation',
-      x: 3,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-systest',
-      type: 'app',
-      appId: 'systest',
-      x: 4,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'widget-notepad',
-      type: 'widget',
-      widgetType: 'notepad',
-      x: 0,
-      y: 1,
-      w: 2,
-      h: 2,
-      config: {
-        content: 'Review drag semantics, dead zone behavior, and window polish.',
-      },
-    },
-  ],
-  [
-    {
-      id: 'app-diagnostics',
-      type: 'app',
-      appId: 'diagnostics',
-      x: 0,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-users-agents',
-      type: 'app',
-      appId: 'users-agents',
-      x: 1,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-task-center',
-      type: 'app',
-      appId: 'task-center',
-      x: 2,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-my-network',
-      type: 'app',
-      appId: 'my-network',
-      x: 3,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-app-service',
-      type: 'app',
-      appId: 'app-service',
-      x: 0,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-workflow',
-      type: 'app',
-      appId: 'workflow',
-      x: 1,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-  ],
-]
-
-const mobileItems: LayoutItem[][] = [
-  [
-    {
-      id: 'widget-clock-mobile',
-      type: 'widget',
-      widgetType: 'clock',
-      x: 0,
-      y: 0,
-      w: 2,
-      h: 1,
-      config: {},
-    },
-    {
-      id: 'app-settings-mobile',
-      type: 'app',
-      appId: 'settings',
-      x: 2,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-files-mobile',
-      type: 'app',
-      appId: 'files',
-      x: 3,
-      y: 0,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-studio-mobile',
-      type: 'app',
-      appId: 'studio',
-      x: 0,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-market-mobile',
-      type: 'app',
-      appId: 'market',
-      x: 1,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-docs-mobile',
-      type: 'app',
-      appId: 'docs',
-      x: 2,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-diagnostics-mobile',
-      type: 'app',
-      appId: 'diagnostics',
-      x: 3,
-      y: 1,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-codeassistant-mobile',
-      type: 'app',
-      appId: 'codeassistant',
-      x: 1,
-      y: 2,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-messagehub-mobile',
-      type: 'app',
-      appId: 'messagehub',
-      x: 2,
-      y: 2,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-demos-mobile',
-      type: 'app',
-      appId: 'demos',
-      x: 0,
-      y: 2,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-ai-center-mobile',
-      type: 'app',
-      appId: 'ai-center',
-      x: 3,
-      y: 2,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-homestation-mobile',
-      type: 'app',
-      appId: 'homestation',
-      x: 0,
-      y: 3,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-users-agents-mobile',
-      type: 'app',
-      appId: 'users-agents',
-      x: 1,
-      y: 3,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-my-network-mobile',
-      type: 'app',
-      appId: 'my-network',
-      x: 2,
-      y: 3,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-task-center-mobile',
-      type: 'app',
-      appId: 'task-center',
-      x: 3,
-      y: 3,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-app-service-mobile',
-      type: 'app',
-      appId: 'app-service',
-      x: 0,
-      y: 4,
-      w: 1,
-      h: 1,
-    },
-    {
-      id: 'app-workflow-mobile',
-      type: 'app',
-      appId: 'workflow',
-      x: 0,
-      y: 4,
-      w: 1,
-      h: 1,
-    },
-  ],
-  [
-    {
-      id: 'widget-notepad-mobile',
-      type: 'widget',
-      widgetType: 'notepad',
-      x: 0,
-      y: 0,
-      w: 2,
-      h: 2,
-      config: {
-        content: 'Validate mobile maximize semantics and external app fallback.',
-      },
-    },
-  ],
-]
-
-function createLayout(formFactor: FormFactor, items: LayoutItem[][]): LayoutState {
-  return {
-    version: 1,
-    formFactor,
-    deadZone: defaultDeadZone,
-    pages: items.map((pageItems, index) => ({
-      id: `${formFactor}-page-${index + 1}`,
-      items: pageItems,
-    })),
-  }
-}
-
 function availableAppsForFormFactor(formFactor: FormFactor) {
   return appCatalog.filter((app) => supportsFormFactor(app, formFactor))
 }
 
-function filterLauncherItems(
-  items: LayoutItem[][],
-  apps: AppDefinition[],
-) {
-  const launcherAppIds = new Set(
-    apps
-      .filter((app) => isLauncherApp(app))
-      .map((app) => app.id),
-  )
-
-  return items.map((pageItems) =>
-    pageItems.filter((item) => item.type === 'widget' || launcherAppIds.has(item.appId)),
-  )
-}
-
-export function buildDesktopPayload(
-  formFactor: FormFactor,
-  scenario: MockScenario,
-): DesktopPayload {
-  const availableApps = availableAppsForFormFactor(formFactor)
-
-  if (scenario === 'empty') {
-    return {
-      overview: {
-        titleKey: 'shell.title',
-        subtitleKey: 'shell.subtitle',
-      },
-      wallpaper: defaultWallpaper,
-      apps: availableApps,
-      layout: {
-        version: 1,
-        formFactor,
-        deadZone: defaultDeadZone,
-        pages: [{ id: `${formFactor}-page-1`, items: [] }],
-      },
-    }
-  }
-
+/**
+ * The payload carries the app catalog, wallpaper and dead zone. What the desktop shows comes from the user's
+ * Desktop folder (models/desktopFolder.ts), not from here.
+ */
+// The empty scenario's desktop is empty because it lists no folder (DesktopUIDataModel.initByMock).
+export function buildDesktopPayload(formFactor: FormFactor): DesktopPayload {
   return {
     overview: {
       titleKey: 'shell.title',
       subtitleKey: 'shell.subtitle',
     },
     wallpaper: defaultWallpaper,
-    apps: availableApps,
-    layout: createLayout(
+    apps: availableAppsForFormFactor(formFactor),
+    layout: {
+      version: 1,
       formFactor,
-      filterLauncherItems(
-        formFactor === 'desktop' ? desktopItems : mobileItems,
-        availableApps,
-      ),
-    ),
+      deadZone: defaultDeadZone,
+      pages: [{ id: `${formFactor}-page-1`, items: [] }],
+    },
   }
 }
 

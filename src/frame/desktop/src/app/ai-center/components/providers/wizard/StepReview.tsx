@@ -2,33 +2,40 @@ import { Check } from 'lucide-react'
 import { useI18n } from '../../../../../i18n/provider'
 import { LongField } from '../../shared/LongField'
 import type { ValidationResult, WizardDraft } from '../../../../../api/aicc_mgr'
+import { ProviderAccessSection } from './ProviderAccessSection'
 
 interface StepReviewProps {
   draft: WizardDraft
   validation: ValidationResult | null
   onToggleAutoSync: (value: boolean) => void
+  openTo?: string[]
+  onOpenToChange?: (subjects: string[]) => void
 }
 
-const defaultNames: Record<string, string> = {
-  sn_router: 'SN Router',
-  openai: 'OpenAI',
-  anthropic: 'Anthropic',
-  google: 'Google AI',
-  openrouter: 'OpenRouter',
-  custom: '',
-}
-
-export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewProps) {
+export function StepReview({ draft, validation, onToggleAutoSync, openTo = [], onOpenToChange }: StepReviewProps) {
   const { t } = useI18n()
-  const providerName = draft.name || defaultNames[draft.provider_type ?? ''] || draft.provider_instance_name || '-'
+  const providerName = draft.display_name || draft.provider_instance_name || '-'
 
   const rows = [
-    { label: t('aiCenter.providers.type', 'Type'), value: draft.provider_type ?? '-' },
+    { label: t('aiCenter.providers.profile', 'Profile'), value: draft.provider_profile_id ?? '-' },
     { label: t('aiCenter.wizard.providerName', 'Provider Name'), value: providerName },
-    { label: t('aiCenter.providers.endpoint', 'Endpoint'), value: draft.endpoint || t('aiCenter.providers.default', 'Default') },
-    { label: t('aiCenter.providers.auth', 'Authentication'), value: draft.api_key ? 'API Key' : '-' },
+    { label: t('aiCenter.providers.baseUrl', 'Base URL'), value: draft.base_url || t('aiCenter.providers.default', 'Default') },
+    ...Object.entries(draft.operation_base_urls).map(([operation, url]) => ({
+      label: `${t('aiCenter.wizard.operationBaseUrl', 'Operation Base URL')} · ${operation}`,
+      value: url,
+    })),
+    { label: t('aiCenter.providers.adapter', 'Protocol Adapter'), value: validation?.resolved_protocol_adapter_id ?? draft.protocol_adapter_id ?? t('aiCenter.wizard.detectedOnValidation', 'Detected during validation') },
+    ...(['region', 'workspace', 'account', 'policy_region'] as const)
+      .filter((name) => Boolean(draft[name]) && draft[name] !== 'unknown')
+      .map((name) => ({
+        label: name === 'region'
+          ? t('aiCenter.wizard.accessEndpoint', 'Access endpoint')
+          : t(`aiCenter.wizard.${name}`, name),
+        value: draft[name] ?? '-',
+      })),
+    { label: t('aiCenter.providers.auth', 'Authentication'), value: draft.auth_mode === 'api_key' ? t('aiCenter.wizard.apiKey', 'API Key') : t('aiCenter.providers.dynamicLogin', 'Dynamic login') },
     {
-      label: 'Connection',
+      label: t('aiCenter.providers.connection', 'Connection'),
       value: (
         <span className="inline-flex items-center gap-1">
           <Check size={14} style={{ color: 'var(--cp-success)' }} />
@@ -40,6 +47,14 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
       label: t('aiCenter.providers.models', 'Models'),
       value: `${validation?.models_discovered.length ?? 0}`,
     },
+    ...(draft.selected_inventory_models
+      ? [{
+        label: t('aiCenter.wizard.publishedModels', 'Published models'),
+        value: draft.selected_inventory_models.length > 0
+          ? draft.selected_inventory_models.join(', ')
+          : t('aiCenter.wizard.noPublishedModels', 'None'),
+      }]
+      : []),
   ]
 
   return (
@@ -50,10 +65,12 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
       >
         <div className="flex flex-col gap-3">
           {rows.map((row) => (
-            <div key={row.label} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.35fr)] gap-4 text-sm">
-              <span className="min-w-0 truncate" style={{ color: 'var(--cp-muted)' }}>{row.label}</span>
-              <span className="min-w-0 justify-self-end text-right font-medium" style={{ color: 'var(--cp-text)' }}>
-                {typeof row.value === 'string' ? <LongField value={row.value} expandable /> : row.value}
+            <div key={row.label} className="grid grid-cols-[minmax(8rem,0.9fr)_minmax(0,1.6fr)] gap-4 text-sm">
+              <span className="min-w-0 truncate" title={row.label} style={{ color: 'var(--cp-muted)' }}>{row.label}</span>
+              <span className="w-full min-w-0 overflow-hidden text-right font-medium" style={{ color: 'var(--cp-text)' }}>
+                {typeof row.value === 'string'
+                  ? <LongField value={row.value} expandable className="w-full justify-end" />
+                  : row.value}
               </span>
             </div>
           ))}
@@ -80,6 +97,7 @@ export function StepReview({ draft, validation, onToggleAutoSync }: StepReviewPr
           </div>
         </div>
       </div>
+      {onOpenToChange && <ProviderAccessSection selected={openTo} onChange={onOpenToChange} />}
     </div>
   )
 }
